@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+mod constant;
 pub mod db;
 pub mod error;
 ///

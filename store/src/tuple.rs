@@ -7,7 +7,7 @@ use crate::{db::DBSizeType, error::StoreError};
 pub(crate) struct Tuple {
     #[serde(with = "postcard::fixint::le")]
     pub(crate) id: DBSizeType,
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

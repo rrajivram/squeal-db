@@ -62,6 +62,18 @@ impl Page {
         }
     }
 
+    pub(crate) fn new_pinned(size: DBSizeType) -> Self {
+        let ds = size - PAGE_OVERHEAD as DBSizeType;
+        Self {
+            data: Arc::new(BTreeMap::new()),
+            next_page: AtomicU64::new(0),
+            dirty: AtomicBool::new(true),
+            data_size: ds,
+            capacity: ds,
+            flags: PageFlags::PINNED,
+        }
+    }
+
     pub(crate) fn get_next_page(&self) -> DBSizeType {
         self.next_page.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -250,5 +262,14 @@ mod tests {
         assert!(p1.is_ok());
         let p1 = p1.unwrap();
         assert_eq!(p1, p);
+    }
+
+    #[test]
+    fn page_test_4() {
+        let p = Page::new(1024);
+        let b = p.to_bytes();
+        assert_eq!(b.len(), 1024);
+        let p1 = Page::from_bytes(&b).unwrap();
+        assert_eq!(p, p1);
     }
 }

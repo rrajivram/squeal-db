@@ -5,12 +5,12 @@ use crate::{
     error::StoreError,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Table {
-    name: String,
-    table_type: TableType,
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Table {
+    pub(crate) name: String,
+    pub(crate) table_type: TableType,
     #[serde(with = "postcard::fixint::le")]
-    first_page: DBSizeType,
+    pub(crate) first_page: DBSizeType,
 }
 
 impl Table {

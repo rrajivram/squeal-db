@@ -20,4 +20,10 @@ pub enum StoreError {
     DuplicateKey(DBSizeType),
     #[error("Key not found {0}")]
     KeyNotFound(DBSizeType),
+    #[error("Table name max length is {0}, got {1}")]
+    TableNameInvalid(usize, usize),
+    #[error("Unknown error {0}")]
+    UnknownError(String),
+    #[error("Duplicate table name {0}")]
+    DuplicateTableName(String),
 }
