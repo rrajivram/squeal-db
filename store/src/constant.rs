@@ -1,5 +1,7 @@
 use crate::db::DBSizeType;
 
 pub(crate) const MAX_TABLE_NAME_LEN: usize = 128;
-pub(crate) const SYSTEM_TABLE_NAME: &str = "__system.core.table__";
+pub(crate) const SYSTEM_TABLE_NAME: &str = "__system.core.tables__";
 pub(crate) const SYSTEM_TABLE_PAGE: DBSizeType = 0;
+pub(crate) const GENERATOR_TABLE_PAGE: DBSizeType = 1;
+pub(crate) const EMPTY_PAGE_TABLE_PAGE: DBSizeType = 2;

@@ -11,6 +11,7 @@ use postcard::from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::remove_file;
@@ -54,7 +55,7 @@ pub struct Db {
     file: File,
     wal_file: File,
     page_count: AtomicU64,
-    tables: Arc<RwLock<Vec<Table>>>,
+    tables: Arc<RwLock<HashMap<String, Table>>>,
 }
 
 impl Db {
@@ -66,7 +67,9 @@ impl Db {
         name: S,
         page_size: DBSizeType,
     ) -> Result<Self, StoreError> {
-        Ok(Self::create_core_db(name.as_ref().to_string(), page_size)?)
+        let sf = Self::create_core_db(name.as_ref().to_string(), page_size)?;
+        sf.create_system_tables()?;
+        Ok(sf)
     }
 
     pub fn open<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
@@ -93,7 +96,7 @@ impl Db {
             file: f,
             wal_file: wf,
             name: name.as_ref().to_string(),
-            tables: Arc::new(RwLock::new(vec![])),
+            tables: Arc::new(RwLock::new(HashMap::new())),
         };
         sf.load_system_tables()?;
         Ok(sf)
@@ -119,7 +122,7 @@ impl Db {
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             let table_page = self.alloc_page(false)?;
             let table = Table::new(name, TableType::Table, table_page)?;
-            tables.push(table.clone());
+            tables.insert(table.name.clone(), table.clone());
             table
         };
         self.write_system_table()?;
@@ -140,7 +143,7 @@ impl Db {
             .tables
             .read()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        if let Some(_) = tables.iter().find(|t| t.name == *name) {
+        if tables.contains_key(name) {
             return Err(StoreError::DuplicateTableName(name.to_string()));
         }
         Ok(())
@@ -152,8 +155,9 @@ impl Db {
             .tables
             .read()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        for i in 0..tables.len() {
-            let bytes = to_allocvec(&tables[i])?;
+        for (i, t) in tables.values().enumerate() {
+            let bytes = to_allocvec(&t)?;
+            // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
         let bytes = page.to_bytes();
@@ -171,7 +175,7 @@ impl Db {
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             for t in p.iter() {
                 let t: Table = from_bytes(&t.data)?;
-                tables.push(t);
+                tables.insert(t.name.clone(), t);
             }
         }
         Ok(())
@@ -182,7 +186,7 @@ impl Db {
             .tables
             .read()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?
-            .iter()
+            .values()
             .map(|t| t.clone())
             .collect::<Vec<_>>())
     }
@@ -220,7 +224,7 @@ impl Db {
             file: f,
             wal_file: wf,
             page_count: AtomicU64::new(0),
-            tables: Arc::new(RwLock::new(vec![])),
+            tables: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

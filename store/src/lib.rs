@@ -1,7 +1,10 @@
 #![allow(dead_code)]
+mod arclock;
+mod buffer;
 mod constant;
 pub mod db;
 pub mod error;
+mod logger;
 ///
 /// Core storage library.
 /// Does the following:
