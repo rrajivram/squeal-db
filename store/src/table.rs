@@ -7,6 +7,7 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Table {
+    pub(crate) id: DBSizeType,
     pub(crate) name: String,
     pub(crate) table_type: TableType,
     #[serde(with = "postcard::fixint::le")]
@@ -15,11 +16,13 @@ pub struct Table {
 
 impl Table {
     pub fn new(
+        id: DBSizeType,
         name: String,
         table_type: TableType,
         first_page: DBSizeType,
     ) -> Result<Self, StoreError> {
         Ok(Self {
+            id,
             name,
             table_type,
             first_page,

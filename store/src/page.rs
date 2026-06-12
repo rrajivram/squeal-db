@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn page_test_2() {
-        let mut p = Page::new(77);
+        let mut p = Page::new(125);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert_eq!(p.capacity, 1);
@@ -245,8 +245,8 @@ mod tests {
     #[test]
     fn page_test_3() {
         let mut p = Page::new(1000);
-        // 1000 - 24 = 976 avaolable - at 22 b/tuple  = 44 max
-        for i in 0..44 {
+        // 1000 - 24 = 976 avaolable - at 46 b/tuple  = 21 max
+        for i in 0..21 {
             assert!(
                 p.add_tuple(Tuple::new(i, b"abcdef")).is_ok(),
                 "Failed at i={i}"

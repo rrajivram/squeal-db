@@ -1,3 +1,5 @@
+use std::sync::PoisonError;
+
 use thiserror::Error;
 
 use crate::db::DBSizeType;
@@ -25,5 +27,13 @@ pub enum StoreError {
     #[error("Unknown error {0}")]
     UnknownError(String),
     #[error("Duplicate table name {0}")]
-    DuplicateTableName(String),
+    DuplicateName(String),
+    #[error("Missing key {0}")]
+    MissingKey(String),
+}
+
+impl<T> From<PoisonError<T>> for StoreError {
+    fn from(value: PoisonError<T>) -> Self {
+        StoreError::UnknownError(value.to_string())
+    }
 }

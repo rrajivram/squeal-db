@@ -2,6 +2,7 @@ use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::error::StoreError;
+use crate::generator::Generator;
 use crate::page::Page;
 use crate::table::Table;
 use crate::tuple::Tuple;
@@ -38,7 +39,7 @@ pub enum TableType {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-struct Header {
+pub(crate) struct Header {
     magic: [u8; 2],
     #[serde(with = "postcard::fixint::le")]
     first_page_offset: DBSizeType,
@@ -51,11 +52,13 @@ struct Header {
 #[derive(Debug)]
 pub struct Db {
     name: String,
-    header: Header,
+    pub(crate) header: Header,
     file: File,
-    wal_file: File,
+    pub(crate) undo_file: File,
+    pub(crate) redo_file: File,
     page_count: AtomicU64,
     tables: Arc<RwLock<HashMap<String, Table>>>,
+    generator: Generator,
 }
 
 impl Db {
@@ -73,17 +76,24 @@ impl Db {
     }
 
     pub fn open<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
-        let wal_name = name.as_ref().to_string() + ".wal";
+        let uf_name = name.as_ref().to_string() + ".undo";
+        let rf_name = name.as_ref().to_string() + ".redo";
         let mut f = OpenOptions::new()
             .create(false)
             .read(true)
             .write(true)
             .open(name.as_ref())?;
-        let wf = OpenOptions::new()
+        let undo_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(wal_name)?;
+            .open(uf_name)?;
+        let redo_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(rf_name)?;
+
         let mut bytes = vec![0u8; size_of::<Header>()];
         f.read_exact(&mut bytes)?;
         let header: Header = from_bytes(&bytes)?;
@@ -94,9 +104,11 @@ impl Db {
             page_count: AtomicU64::new(header.page_count),
             header: header,
             file: f,
-            wal_file: wf,
+            undo_file,
+            redo_file,
             name: name.as_ref().to_string(),
             tables: Arc::new(RwLock::new(HashMap::new())),
+            generator: Generator::new(),
         };
         sf.load_system_tables()?;
         Ok(sf)
@@ -104,7 +116,8 @@ impl Db {
 
     pub fn close(mut self) -> Result<(), StoreError> {
         self.closeup()?;
-        self.wal_file.sync_data()?;
+        self.undo_file.sync_data()?;
+        self.redo_file.sync_data()?;
         self.file.sync_data()?;
         Ok(())
     }
@@ -120,8 +133,14 @@ impl Db {
                 .tables
                 .write()
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            self.generator.create_generator(&name, None)?;
             let table_page = self.alloc_page(false)?;
-            let table = Table::new(name, TableType::Table, table_page)?;
+            let table = Table::new(
+                self.generator.gen_key(SYSTEM_TABLE_NAME)?,
+                name,
+                TableType::Table,
+                table_page,
+            )?;
             tables.insert(table.name.clone(), table.clone());
             table
         };
@@ -129,9 +148,50 @@ impl Db {
         Ok(table)
     }
 
+    fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
+        let uf_name = name.to_string() + ".undo";
+        let rf_name = name.to_string() + ".redo";
+        let mut f = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&name)?;
+        let undo_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(uf_name)?;
+        let redo_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(rf_name)?;
+
+        let header = Header {
+            magic: MAGIC,
+            first_page_offset: ZERO_PAGE_SIZE,
+            page_count: 0,
+            page_size,
+        };
+        let bytes = to_allocvec(&header)?;
+        f.write(&bytes)?;
+        let gens = Generator::new();
+        gens.create_generator(&SYSTEM_TABLE_NAME.to_owned(), None)?;
+        Ok(Self {
+            name: name,
+            header: header,
+            file: f,
+            undo_file,
+            redo_file,
+            page_count: AtomicU64::new(0),
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            generator: gens,
+        })
+    }
+
     fn create_system_table(&self, name: String) -> Result<Table, StoreError> {
         let table_page = self.alloc_page(true)?;
-        let table = Table::new(name, TableType::Table, table_page)?;
+        let table = Table::new(0, name, TableType::Table, table_page)?;
         Ok(table)
     }
 
@@ -144,7 +204,7 @@ impl Db {
             .read()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         if tables.contains_key(name) {
-            return Err(StoreError::DuplicateTableName(name.to_string()));
+            return Err(StoreError::DuplicateName(name.to_string()));
         }
         Ok(())
     }
@@ -197,37 +257,6 @@ impl Db {
         Ok(())
     }
 
-    fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
-        let wal_name = name.clone() + ".wal";
-        let mut f = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&name)?;
-        let wf = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(wal_name)?;
-        let header = Header {
-            magic: MAGIC,
-            first_page_offset: ZERO_PAGE_SIZE,
-            page_count: 0,
-            page_size,
-        };
-        let bytes = to_allocvec(&header)?;
-        f.write(&bytes)?;
-
-        Ok(Self {
-            name: name,
-            header: header,
-            file: f,
-            wal_file: wf,
-            page_count: AtomicU64::new(0),
-            tables: Arc::new(RwLock::new(HashMap::new())),
-        })
-    }
-
     fn closeup(&mut self) -> Result<(), StoreError> {
         self.write_system_table()?;
         self.write_header()?;
@@ -252,9 +281,11 @@ impl Db {
     }
 
     pub fn delete<S: AsRef<str>>(name: S) -> Result<(), StoreError> {
-        let wal_file = name.as_ref().to_string() + ".wal";
+        let uf_name = name.as_ref().to_string() + ".undo";
+        let rf_name = name.as_ref().to_string() + ".redo";
         remove_file(name.as_ref())?;
-        remove_file(wal_file)?;
+        remove_file(uf_name)?;
+        remove_file(rf_name)?;
         Ok(())
     }
 
@@ -383,7 +414,7 @@ mod tests {
         assert!(t.len() == 1);
         assert_eq!(t[0].name, "table_1");
         let r = db.create_table("table_1".to_string());
-        assert!(matches!(r, Err(StoreError::DuplicateTableName(_))));
+        assert!(matches!(r, Err(StoreError::DuplicateName(_))));
         Db::delete(DB_NAME).unwrap_or_default()
     }
 }
