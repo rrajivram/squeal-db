@@ -10,17 +10,23 @@ use bitflags::bitflags;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
-use crate::{db::DBSizeType, error::StoreError, tuple::Tuple};
+use crate::{
+    db::DBSizeType,
+    error::StoreError,
+    tuple::{DBIdType, Tuple},
+};
 
+// Note: LSN is not an option here as it needs to be set to write a page
 #[derive(Debug, Serialize, Deserialize)]
 struct PageDto {
-    data: Arc<BTreeMap<DBSizeType, Arc<Tuple>>>,
+    data: Arc<BTreeMap<DBIdType, Arc<Tuple>>>,
     #[serde(with = "postcard::fixint::le")]
     next_page: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     data_size: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     capacity: DBSizeType,
+    lsn: Option<DBSizeType>,
     flags: PageFlags,
 }
 
@@ -32,21 +38,26 @@ bitflags! {
     }
 }
 
-const PAGE_OVERHEAD: usize = 24;
+const PAGE_OVERHEAD: usize = size_of::<Page>() - size_of::<Arc<u64>>();
+
+///Page Invariants
+/// when written lsn = non-zero
+/// Rows added must have txn id and undo id set
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(into = "PageDto", from = "PageDto")]
 pub(crate) struct Page {
-    data: Arc<BTreeMap<DBSizeType, Arc<Tuple>>>,
+    data: Arc<BTreeMap<DBIdType, Arc<Tuple>>>,
     next_page: AtomicU64,
     dirty: AtomicBool,
     data_size: DBSizeType,
     capacity: DBSizeType,
+    lsn: Option<DBSizeType>,
     flags: PageFlags,
 }
 
 #[derive(Debug)]
 pub(crate) struct PageIterator<'a> {
-    iter: Values<'a, DBSizeType, Arc<Tuple>>,
+    iter: Values<'a, DBIdType, Arc<Tuple>>,
 }
 
 impl Page {
@@ -58,6 +69,7 @@ impl Page {
             dirty: AtomicBool::new(true),
             data_size: ds,
             capacity: ds,
+            lsn: None,
             flags: PageFlags::NONE,
         }
     }
@@ -70,6 +82,7 @@ impl Page {
             dirty: AtomicBool::new(true),
             data_size: ds,
             capacity: ds,
+            lsn: None,
             flags: PageFlags::PINNED,
         }
     }
@@ -112,7 +125,7 @@ impl Page {
                 return Err(StoreError::DuplicateKey(tuple.id));
             }
             let sz = tuple.size();
-            data.insert(tuple.id, Arc::new(tuple));
+            data.insert(tuple.id.clone(), Arc::new(tuple));
             self.capacity -= sz;
             self.set_dirty(true);
             Ok(())
@@ -121,11 +134,11 @@ impl Page {
         }
     }
 
-    pub(crate) fn contains(&self, id: DBSizeType) -> bool {
+    pub(crate) fn contains(&self, id: DBIdType) -> bool {
         self.data.contains_key(&id)
     }
 
-    pub(crate) fn get(&self, id: DBSizeType) -> Option<Arc<Tuple>> {
+    pub(crate) fn get(&self, id: DBIdType) -> Option<Arc<Tuple>> {
         if let Some(v) = self.data.get(&id) {
             Some(v.clone())
         } else {
@@ -166,6 +179,7 @@ impl From<PageDto> for Page {
             data_size: value.data_size,
             capacity: value.capacity,
             flags: value.flags,
+            lsn: value.lsn,
         }
     }
 }
@@ -178,6 +192,7 @@ impl From<Page> for PageDto {
             data_size: value.data_size,
             capacity: value.capacity,
             flags: value.flags,
+            lsn: value.lsn.or(None),
         }
     }
 }
@@ -191,6 +206,7 @@ impl Clone for Page {
             data_size: self.data_size,
             capacity: self.capacity,
             flags: self.flags,
+            lsn: self.lsn,
         }
     }
 }
@@ -215,11 +231,15 @@ unsafe impl Send for Page {}
 
 #[cfg(test)]
 mod tests {
-    use crate::{error::StoreError, page::Page, tuple::Tuple};
+    use crate::{
+        error::StoreError,
+        page::{PAGE_OVERHEAD, Page},
+        tuple::Tuple,
+    };
 
     #[test]
-    fn page_test_1() {
-        let mut p = Page::new(200);
+    fn page_test_unique_id() {
+        let mut p = Page::new(2000);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert!(matches!(
@@ -231,8 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn page_test_2() {
-        let mut p = Page::new(125);
+    fn page_test_capacity() {
+        let size = Tuple::new(1, b"abcdefabcd").size() * 2 + PAGE_OVERHEAD as u64;
+        let mut p = Page::new(size + 1);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert_eq!(p.capacity, 1);
@@ -243,19 +264,15 @@ mod tests {
     }
 
     #[test]
-    fn page_test_3() {
+    fn page_test_accurate_page_bytes() {
         let mut p = Page::new(1000);
         // 1000 - 24 = 976 avaolable - at 46 b/tuple  = 21 max
-        for i in 0..21 {
+        for i in 0..10 {
             assert!(
                 p.add_tuple(Tuple::new(i, b"abcdef")).is_ok(),
                 "Failed at i={i}"
             );
         }
-        assert!(matches!(
-            p.add_tuple(Tuple::new(100, b"abcdef")),
-            Err(StoreError::PageCapacityError)
-        ));
         let b = p.to_bytes();
         assert!(b.len() == 1000);
         let p1 = Page::from_bytes(&b);

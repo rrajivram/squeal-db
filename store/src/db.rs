@@ -1,3 +1,4 @@
+#![allow(private_bounds)]
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
@@ -16,10 +17,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::remove_file;
-use std::io::Read;
-use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
@@ -29,8 +29,29 @@ const MAGIC: [u8; 2] = [0x53, 0x65];
 const ZERO_PAGE_SIZE: DBSizeType = 8 * 1024;
 const DEFAULT_PAGE_SIZE: DBSizeType = 16 * 1024;
 
-trait DBFile: std::io::Write + std::io::Read + std::io::Seek {}
+pub type FileDB = Db<File>;
+pub(crate) struct Meta {
+    pub(crate) len: u64,
+}
+
+pub(crate) trait Opener {
+    type Item;
+    fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<Self::Item>;
+    fn do_sync(&mut self) -> std::io::Result<()>;
+    fn do_clone(&self) -> std::io::Result<Self::Item>;
+    fn get_metadata(&self) -> std::io::Result<Meta>;
+}
+
+pub(crate) trait DBFile:
+    std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
+{
+}
 pub(crate) type DBSizeType = u64;
+
+impl<T> DBFile for T where
+    T: std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
+{
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum TableType {
@@ -50,18 +71,21 @@ pub(crate) struct Header {
 }
 
 #[derive(Debug)]
-pub struct Db {
+pub struct Db<F: DBFile> {
     name: String,
     pub(crate) header: Header,
-    file: File,
-    pub(crate) undo_file: File,
-    pub(crate) redo_file: File,
+    file: F,
+    pub(crate) undo_file: F,
+    pub(crate) redo_file: F,
     page_count: AtomicU64,
     tables: Arc<RwLock<HashMap<String, Table>>>,
     generator: Generator,
 }
 
-impl Db {
+impl<F: DBFile> Db<F>
+where
+    F: DBFile<Item = F>,
+{
     pub fn create<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
         Ok(Self::create_with_page_size(name, DEFAULT_PAGE_SIZE)?)
     }
@@ -78,21 +102,24 @@ impl Db {
     pub fn open<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
         let uf_name = name.as_ref().to_string() + ".undo";
         let rf_name = name.as_ref().to_string() + ".redo";
-        let mut f = OpenOptions::new()
+        let f = OpenOptions::new()
             .create(false)
             .read(true)
             .write(true)
-            .open(name.as_ref())?;
+            .clone();
+        let mut f = F::open(f, name.as_ref())?;
         let undo_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(uf_name)?;
+            .clone();
+        let undo_file = F::open(undo_file, uf_name)?;
         let redo_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(rf_name)?;
+            .clone();
+        let redo_file = F::open(redo_file, rf_name)?;
 
         let mut bytes = vec![0u8; size_of::<Header>()];
         f.read_exact(&mut bytes)?;
@@ -116,9 +143,9 @@ impl Db {
 
     pub fn close(mut self) -> Result<(), StoreError> {
         self.closeup()?;
-        self.undo_file.sync_data()?;
-        self.redo_file.sync_data()?;
-        self.file.sync_data()?;
+        self.undo_file.do_sync()?;
+        self.redo_file.do_sync()?;
+        self.file.do_sync()?;
         Ok(())
     }
 
@@ -151,21 +178,24 @@ impl Db {
     fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
         let uf_name = name.to_string() + ".undo";
         let rf_name = name.to_string() + ".redo";
-        let mut f = OpenOptions::new()
+        let f = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(&name)?;
+            .clone();
+        let mut f = F::open(f, &name)?;
         let undo_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(uf_name)?;
+            .clone();
+        let undo_file = F::open(undo_file, uf_name)?;
         let redo_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
-            .open(rf_name)?;
+            .clone();
+        let redo_file = F::open(redo_file, rf_name)?;
 
         let header = Header {
             magic: MAGIC,
@@ -310,7 +340,7 @@ impl Db {
 
     fn write_page(&self, page_num: DBSizeType, bytes: &[u8]) -> Result<(), StoreError> {
         let offset = self.header.first_page_offset + page_num * self.header.page_size;
-        let mut file = self.file.try_clone()?;
+        let mut file = self.file.do_clone()?;
         file.seek(SeekFrom::Start(offset))?;
         file.write(&bytes)?;
         Ok(())
@@ -318,7 +348,7 @@ impl Db {
 
     fn read_page(&self, page_num: DBSizeType) -> Result<Vec<u8>, StoreError> {
         let offset = self.header.first_page_offset + page_num * self.header.page_size;
-        let mut file = self.file.try_clone()?;
+        let mut file = self.file.do_clone()?;
         file.seek(SeekFrom::Start(offset))?;
         let mut v = vec![0u8; self.header.page_size as usize];
         file.read_exact(&mut v)?;
@@ -352,55 +382,57 @@ fn init_logger() {
 #[cfg(test)]
 mod tests {
     use crate::{
-        db::{DEFAULT_PAGE_SIZE, Db, ZERO_PAGE_SIZE},
+        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
+        memfile::MemFile,
     };
+    type TestDB = Db<MemFile>;
 
     #[test]
     fn test_create() {
         const DB_NAME: &str = "test1.db";
-        Db::delete(DB_NAME).unwrap_or_default();
-        let db = Db::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE);
+        FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = FileDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.first_page_offset, ZERO_PAGE_SIZE);
         assert_eq!(db.header.page_count, 0);
         db.close().unwrap();
-        let db = Db::open(DB_NAME);
+        let db = FileDB::open(DB_NAME);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.page_count, 0);
         assert_eq!(db.header.page_size, DEFAULT_PAGE_SIZE);
-        Db::delete(DB_NAME).unwrap_or_default();
+        FileDB::delete(DB_NAME).unwrap_or_default();
     }
 
     #[test]
     fn test_simple_alloc_page() {
         const DB_NAME: &str = "test2.db";
-        Db::delete(DB_NAME).unwrap_or_default();
-        let db = Db::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE).unwrap();
+        FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = FileDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE).unwrap();
         let page = db.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
         assert_eq!(page, 0);
-        let m = db.file.metadata().unwrap();
-        assert_eq!(m.len(), DEFAULT_PAGE_SIZE + ZERO_PAGE_SIZE);
+        let m = db.file.get_metadata().unwrap();
+        assert_eq!(m.len, DEFAULT_PAGE_SIZE + ZERO_PAGE_SIZE);
         let page = db.alloc_page(false).unwrap_or(0);
         assert_eq!(page, 1);
-        let m = db.file.metadata().unwrap();
-        assert_eq!(m.len(), ZERO_PAGE_SIZE + 2 * DEFAULT_PAGE_SIZE);
+        let m = db.file.get_metadata().unwrap();
+        assert_eq!(m.len, ZERO_PAGE_SIZE + 2 * DEFAULT_PAGE_SIZE);
         assert_eq!(db.page_count(), 2);
         db.close().unwrap();
-        let db = Db::open(DB_NAME).unwrap();
+        let db = FileDB::open(DB_NAME).unwrap();
         assert_eq!(db.page_count(), 2);
-        Db::delete(DB_NAME).unwrap_or_default();
+        FileDB::delete(DB_NAME).unwrap_or_default();
     }
 
     #[test]
     fn test_create_table() {
         const DB_NAME: &str = "test3.db";
-        Db::delete(DB_NAME).unwrap_or_default();
-        let db = Db::create(DB_NAME.to_string());
+        FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = FileDB::create(DB_NAME.to_string());
         assert!(db.is_ok());
         let db = db.unwrap();
         let r = db.create_table("table_1".to_string());
@@ -409,12 +441,12 @@ mod tests {
         assert_eq!(r.name, "table_1");
         assert_eq!(db.get_tables().unwrap().len(), 1);
         db.close().unwrap();
-        let db = Db::open(DB_NAME.to_string()).unwrap();
+        let db = FileDB::open(DB_NAME.to_string()).unwrap();
         let t = db.get_tables().unwrap();
         assert!(t.len() == 1);
         assert_eq!(t[0].name, "table_1");
         let r = db.create_table("table_1".to_string());
         assert!(matches!(r, Err(StoreError::DuplicateName(_))));
-        Db::delete(DB_NAME).unwrap_or_default()
+        //Db::delete(DB_NAME).unwrap_or_default()
     }
 }

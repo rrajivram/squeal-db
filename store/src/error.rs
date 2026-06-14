@@ -2,7 +2,7 @@ use std::sync::PoisonError;
 
 use thiserror::Error;
 
-use crate::db::DBSizeType;
+use crate::{db::DBSizeType, tuple::DBIdType};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -19,9 +19,9 @@ pub enum StoreError {
     #[error("Lock contention.")]
     LockContentionError,
     #[error("Duplicate key {0}")]
-    DuplicateKey(DBSizeType),
+    DuplicateKey(DBIdType),
     #[error("Key not found {0}")]
-    KeyNotFound(DBSizeType),
+    KeyNotFound(DBIdType),
     #[error("Table name max length is {0}, got {1}")]
     TableNameInvalid(usize, usize),
     #[error("Unknown error {0}")]

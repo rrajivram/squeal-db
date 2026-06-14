@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
-    fs::File,
-    io::{Seek, SeekFrom, Write},
+    io::SeekFrom,
     sync::{
         RwLock,
+        atomic::AtomicU64,
         mpsc::{Receiver, Sender, channel},
     },
     thread::{self, JoinHandle},
@@ -15,16 +15,34 @@ use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    db::{DBSizeType, Db},
+    db::{DBFile, DBSizeType},
     error::StoreError,
     tuple::Tuple,
     txn::TransactionId,
 };
 
+static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct LsnId(u64);
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub(crate) enum LogType {
-    Undo(Operation),
-    Redo(Operation),
+pub(crate) enum MsgType {
+    Undo(UndoOperation),
+    Redo(RedoOperation),
+    ShutDown,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct RedoOperation {
+    lsn_id: LsnId,
+    operation: Operation,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct UndoOperation {
+    undo_id: Option<u16>,
+    operation: Operation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,9 +52,6 @@ pub(crate) enum Operation {
     Mod(TransactionId, Record),
     Commit(TransactionId, u128),
     Rollback(TransactionId, u128),
-    CreateTable(String, DBSizeType),
-    DropTable(String, DBSizeType),
-    ShutDown,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -48,81 +63,88 @@ pub(crate) struct Record {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Logger<'a> {
-    db: Option<&'a Db>,
+pub(crate) struct Logger {
     redo_handle: Option<JoinHandle<Result<(), StoreError>>>,
     undo_handle: Option<JoinHandle<Result<(), StoreError>>>,
-    undo_tx: Option<Sender<Operation>>,
-    redo_tx: Option<Sender<Operation>>,
-    undo_logs: RwLock<HashMap<DBSizeType, Vec<Operation>>>,
+    undo_tx: Option<Sender<MsgType>>,
+    redo_tx: Option<Sender<MsgType>>,
+    undo_txns: RwLock<HashMap<TransactionId, u16>>,
 }
 
-impl<'a> Logger<'a> {
+impl Logger {
     pub(crate) fn new() -> Self {
         Self {
             ..Default::default()
         }
     }
 
-    pub(crate) fn set_db(&mut self, db: &'a Db) -> Result<(), StoreError> {
-        self.db = Some(db);
+    pub(crate) fn set_db(
+        &mut self,
+        undo_file: impl DBFile + 'static,
+        redo_file: impl DBFile + 'static,
+    ) -> Result<(), StoreError> {
         let (redo_tx, redo_rx) = channel();
         let (undo_tx, undo_rx) = channel();
         self.undo_tx = Some(undo_tx);
         self.redo_tx = Some(redo_tx);
-        let undo_file = db.undo_file.try_clone()?;
-        let redo_file = db.redo_file.try_clone()?;
 
-        self.undo_handle = Some(thread::spawn(move || log_runner(undo_file, undo_rx)));
-        self.redo_handle = Some(thread::spawn(move || log_runner(redo_file, redo_rx)));
+        self.undo_handle = Some(thread::spawn(move || undo_log_runner(undo_file, undo_rx)));
+        self.redo_handle = Some(thread::spawn(move || redo_log_runner(redo_file, redo_rx)));
         Ok(())
     }
 
     pub(crate) fn log_undo(&self, op: Operation) -> Result<(), StoreError> {
-        let record_op = match &op {
+        let msg = match &op {
             Operation::Add(_, record) | Operation::Del(_, record) | Operation::Mod(_, record) => {
-                Some(record)
+                let mut undo_txns = self.undo_txns.write()?;
+                let id = undo_txns
+                    .entry(
+                        record
+                            .tuple
+                            .txn_id
+                            .ok_or(StoreError::UnknownError("Missing transaction".into()))?,
+                    )
+                    .and_modify(|v| *v += 1)
+                    .or_insert(0);
+                MsgType::Undo(UndoOperation {
+                    undo_id: Some(*id),
+                    operation: op,
+                })
             }
-            _ => None,
+            _ => MsgType::Undo(UndoOperation {
+                undo_id: None,
+                operation: op,
+            }),
         };
         if let Some(tx) = &self.undo_tx {
-            tx.send(op.clone())
+            tx.send(msg)
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             // Now store record if available
-            if let Some(record) = record_op {
-                self.undo_logs
-                    .write()?
-                    .entry(record.table_id)
-                    .and_modify(|v| v.push(op.clone()))
-                    .or_insert(vec![op.clone()]);
-            }
-            // Remove undo logs on commit and rollback
-            match op {
-                Operation::Add(txn, _) | Operation::Rollback(txn, _) => {
-                    let mut map = self.undo_logs.write()?;
-                    //map.values_mut().
-                }
-                _ => {}
-            }
         }
         Ok(())
     }
 
-    pub(crate) fn log_redo(&self, op: Operation) -> Result<(), StoreError> {
+    pub(crate) fn log_redo(&self, op: Operation) -> Result<LsnId, StoreError> {
+        let lsn_id = LsnId(LSN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel));
+        let msg = MsgType::Redo(RedoOperation {
+            lsn_id,
+            operation: op,
+        });
+
         if let Some(tx) = &self.redo_tx {
-            tx.send(op.clone())
+            tx.send(msg)
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         }
-        Ok(())
+        Ok(lsn_id)
     }
 
     pub(crate) fn shutdown(self) -> Result<(), StoreError> {
         if let Some(tx) = self.redo_tx {
-            tx.send(Operation::ShutDown)
+            tx.send(MsgType::ShutDown)
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         }
         if let Some(tx) = self.undo_tx {
-            tx.send(Operation::ShutDown)
+            tx.send(MsgType::ShutDown)
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         }
         if let Some(h) = self.redo_handle {
@@ -198,40 +220,53 @@ impl Operation {
                 .as_nanos(),
         )
     }
-
-    pub(crate) fn new_table(name: String, id: DBSizeType) -> Self {
-        Self::CreateTable(name, id)
-    }
-
-    pub(crate) fn drop_table(name: String, id: DBSizeType) -> Self {
-        Self::DropTable(name, id)
-    }
 }
 
-impl LogType {
-    pub(crate) fn new_undo(operation: Operation) -> Self {
+impl MsgType {
+    pub(crate) fn new_undo(operation: UndoOperation) -> Self {
         Self::Undo(operation)
     }
 
-    pub(crate) fn new_redo(operation: Operation) -> Self {
+    pub(crate) fn new_redo(operation: RedoOperation) -> Self {
         Self::Redo(operation)
     }
 }
 
-fn log_runner(file: File, recv: Receiver<Operation>) -> Result<(), StoreError> {
+fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), StoreError> {
     let mut file = file;
     loop {
         let msg = recv
             .recv()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         match msg {
-            Operation::ShutDown => {
+            MsgType::ShutDown => {
                 break;
             }
-            _ => {
+            MsgType::Undo(msg) => {
                 file.seek(SeekFrom::End(0))?;
                 file.write(&to_allocvec(&msg)?)?;
             }
+            MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
+        }
+    }
+    Ok(())
+}
+
+fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), StoreError> {
+    let mut file = file;
+    loop {
+        let msg = recv
+            .recv()
+            .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        match msg {
+            MsgType::ShutDown => {
+                break;
+            }
+            MsgType::Redo(msg) => {
+                file.seek(SeekFrom::End(0))?;
+                file.write(&to_allocvec(&msg)?)?;
+            }
+            MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
         }
     }
     Ok(())
