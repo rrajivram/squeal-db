@@ -34,7 +34,7 @@ where
 
 impl<T> Deref for ArcLockGuard<T>
 where
-    T: Sized + Clone + Debug,
+    T: Clone + Debug,
 {
     type Target = T;
 
@@ -43,9 +43,9 @@ where
     }
 }
 
-impl<T: Sized> Clone for ArcLockGuard<T>
+impl<T> Clone for ArcLockGuard<T>
 where
-    T: Sized + Clone + Debug,
+    T: Clone + Debug,
 {
     fn clone(&self) -> Self {
         Self {
@@ -90,7 +90,7 @@ where
 
 impl<T> ArcLock<T>
 where
-    T: Eq + Hash + Copy + Default + Debug + Clone,
+    T: Eq + Hash + Default + Debug + Clone,
 {
     pub fn new() -> Self {
         Self {
@@ -149,7 +149,7 @@ where
         } else {
             drop(map);
             let mut map = self.locks.write().unwrap();
-            let v = ArcLockGuard::new(val);
+            let v = ArcLockGuard::new(val.clone());
             map.insert(val, v.clone());
             return Some(v);
         }
@@ -160,7 +160,7 @@ where
         let unused = map
             .iter()
             .filter(|&(_, v)| v.lock_count() == 1)
-            .map(|(k, _)| *k)
+            .map(|(k, _)| k.clone())
             .collect::<Vec<_>>();
         for u in unused {
             map.remove(&u);

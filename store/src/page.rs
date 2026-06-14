@@ -7,12 +7,15 @@ use std::{
 };
 
 use bitflags::bitflags;
+use portable_atomic::AtomicU128;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    constant::timestamp,
     db::DBSizeType,
     error::StoreError,
+    logger::LsnId,
     tuple::{DBIdType, Tuple},
 };
 
@@ -26,24 +29,24 @@ struct PageDto {
     data_size: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     capacity: DBSizeType,
-    lsn: Option<DBSizeType>,
+    lsn: Option<LsnId>,
     flags: PageFlags,
 }
 
 bitflags! {
-    #[derive(Debug,Serialize,Deserialize,Clone, Copy,PartialEq)]
+    #[derive(Debug,Serialize,Deserialize,Clone, Copy,PartialEq,Default)]
     struct PageFlags: u8 {
         const NONE=0;
         const PINNED = 1;
     }
 }
 
-const PAGE_OVERHEAD: usize = size_of::<Page>() - size_of::<Arc<u64>>();
+const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Arc<u64>>();
 
 ///Page Invariants
 /// when written lsn = non-zero
 /// Rows added must have txn id and undo id set
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(into = "PageDto", from = "PageDto")]
 pub(crate) struct Page {
     data: Arc<BTreeMap<DBIdType, Arc<Tuple>>>,
@@ -51,8 +54,11 @@ pub(crate) struct Page {
     dirty: AtomicBool,
     data_size: DBSizeType,
     capacity: DBSizeType,
-    lsn: Option<DBSizeType>,
+    lsn: Option<LsnId>,
     flags: PageFlags,
+    accessed: AtomicU128,
+    saved: AtomicU128,
+    written: AtomicU128,
 }
 
 #[derive(Debug)]
@@ -71,6 +77,7 @@ impl Page {
             capacity: ds,
             lsn: None,
             flags: PageFlags::NONE,
+            ..Default::default()
         }
     }
 
@@ -84,7 +91,16 @@ impl Page {
             capacity: ds,
             lsn: None,
             flags: PageFlags::PINNED,
+            ..Default::default()
         }
+    }
+
+    pub(crate) fn lsn_id(&self) -> Option<LsnId> {
+        self.lsn
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.flags.contains(PageFlags::PINNED)
     }
 
     pub(crate) fn get_next_page(&self) -> DBSizeType {
@@ -134,6 +150,19 @@ impl Page {
         }
     }
 
+    pub(crate) fn written(&self) {
+        self.written
+            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn accessed(&self) {
+        self.accessed
+            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(crate) fn saved(&self) {
+        self.saved
+            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn contains(&self, id: DBIdType) -> bool {
         self.data.contains_key(&id)
     }
@@ -180,6 +209,9 @@ impl From<PageDto> for Page {
             capacity: value.capacity,
             flags: value.flags,
             lsn: value.lsn,
+            accessed: AtomicU128::new(timestamp()),
+            written: AtomicU128::new(timestamp()),
+            saved: AtomicU128::new(timestamp()),
         }
     }
 }
@@ -207,6 +239,9 @@ impl Clone for Page {
             capacity: self.capacity,
             flags: self.flags,
             lsn: self.lsn,
+            accessed: AtomicU128::new(self.accessed.load(std::sync::atomic::Ordering::Relaxed)),
+            written: AtomicU128::new(self.written.load(std::sync::atomic::Ordering::Relaxed)),
+            saved: AtomicU128::new(self.saved.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 }

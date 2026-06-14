@@ -369,6 +369,7 @@ dependencies = [
  "bitflags",
  "env_logger",
  "log",
+ "portable-atomic",
  "postcard",
  "serde",
  "thiserror",

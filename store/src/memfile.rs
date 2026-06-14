@@ -35,6 +35,10 @@ impl Opener for MemFile {
             len: self.data.len() as u64,
         })
     }
+
+    fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
+        Ok(())
+    }
 }
 
 impl Opener for std::fs::File {
@@ -54,6 +58,10 @@ impl Opener for std::fs::File {
     fn get_metadata(&self) -> std::io::Result<Meta> {
         let m = self.metadata()?;
         Ok(Meta { len: m.len() })
+    }
+
+    fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
+        self.try_lock()
     }
 }
 

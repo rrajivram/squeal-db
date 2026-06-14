@@ -2,12 +2,11 @@ use std::{
     collections::HashMap,
     io::SeekFrom,
     sync::{
-        RwLock,
+        Arc, RwLock,
         atomic::AtomicU64,
         mpsc::{Receiver, Sender, channel},
     },
     thread::{self, JoinHandle},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use log::error;
@@ -15,6 +14,7 @@ use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    constant::timestamp,
     db::{DBFile, DBSizeType},
     error::StoreError,
     tuple::Tuple,
@@ -22,9 +22,13 @@ use crate::{
 };
 
 static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
+static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct LsnId(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct UndoId(u16);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum MsgType {
@@ -41,7 +45,7 @@ pub(crate) struct RedoOperation {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct UndoOperation {
-    undo_id: Option<u16>,
+    undo_id: Option<UndoId>,
     operation: Operation,
 }
 
@@ -58,7 +62,7 @@ pub(crate) enum Operation {
 pub(crate) struct Record {
     table_id: DBSizeType,
     timestamp: u128,
-    tuple: Tuple,
+    tuple: Arc<Tuple>,
     txn_id: TransactionId,
 }
 
@@ -68,7 +72,7 @@ pub(crate) struct Logger {
     undo_handle: Option<JoinHandle<Result<(), StoreError>>>,
     undo_tx: Option<Sender<MsgType>>,
     redo_tx: Option<Sender<MsgType>>,
-    undo_txns: RwLock<HashMap<TransactionId, u16>>,
+    undo_txns: RwLock<HashMap<TransactionId, Vec<Operation>>>,
 }
 
 impl Logger {
@@ -104,10 +108,10 @@ impl Logger {
                             .txn_id
                             .ok_or(StoreError::UnknownError("Missing transaction".into()))?,
                     )
-                    .and_modify(|v| *v += 1)
-                    .or_insert(0);
+                    .and_modify(|v| v.push(op.clone()))
+                    .or_insert(vec![op.clone()]);
                 MsgType::Undo(UndoOperation {
-                    undo_id: Some(*id),
+                    undo_id: Some(UndoId(id.len() as u16)),
                     operation: op,
                 })
             }
@@ -122,6 +126,10 @@ impl Logger {
             // Now store record if available
         }
         Ok(())
+    }
+
+    pub(crate) fn last_lsn() -> LsnId {
+        LsnId(LAST_WRITTEN_LSN.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub(crate) fn log_redo(&self, op: Operation) -> Result<LsnId, StoreError> {
@@ -175,15 +183,12 @@ impl Logger {
 }
 
 impl Record {
-    pub(crate) fn new(table_id: DBSizeType, tuple: Tuple, txn_id: TransactionId) -> Self {
+    pub(crate) fn new(table_id: DBSizeType, tuple: Arc<Tuple>, txn_id: TransactionId) -> Self {
         Self {
             table_id,
             tuple,
             txn_id,
-            timestamp: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
+            timestamp: timestamp(),
         }
     }
 }
@@ -202,23 +207,11 @@ impl Operation {
     }
 
     pub(crate) fn new_commit(tx_id: TransactionId) -> Self {
-        Self::Commit(
-            tx_id,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        )
+        Self::Commit(tx_id, timestamp())
     }
 
     pub(crate) fn new_rollback(tx_id: TransactionId) -> Self {
-        Self::Rollback(
-            tx_id,
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos(),
-        )
+        Self::Rollback(tx_id, timestamp())
     }
 }
 
@@ -232,6 +225,17 @@ impl MsgType {
     }
 }
 
+impl PartialOrd<u64> for LsnId {
+    fn partial_cmp(&self, other: &u64) -> Option<std::cmp::Ordering> {
+        Some(self.0.cmp(other))
+    }
+}
+
+impl PartialEq<u64> for LsnId {
+    fn eq(&self, other: &u64) -> bool {
+        self.0 == *other
+    }
+}
 fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), StoreError> {
     let mut file = file;
     loop {
@@ -265,6 +269,7 @@ fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
             MsgType::Redo(msg) => {
                 file.seek(SeekFrom::End(0))?;
                 file.write(&to_allocvec(&msg)?)?;
+                LAST_WRITTEN_LSN.store(msg.lsn_id.0, std::sync::atomic::Ordering::Relaxed);
             }
             MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
         }

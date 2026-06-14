@@ -3,7 +3,7 @@ use std::fmt::Display;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
-use crate::{db::DBSizeType, error::StoreError, txn::TransactionId};
+use crate::{db::DBSizeType, error::StoreError, logger::UndoId, txn::TransactionId};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum DBIdType {
@@ -15,7 +15,7 @@ pub enum DBIdType {
 pub(crate) struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
-    pub(crate) undo_id: Option<u16>,
+    pub(crate) undo_id: Option<UndoId>,
     pub(crate) data: Vec<u8>,
 }
 
@@ -28,7 +28,7 @@ impl Tuple {
         }
     }
 
-    pub fn new_in_txn(id: DBIdType, data: &[u8], txn_id: TransactionId, undo_id: u16) -> Self {
+    pub fn new_in_txn(id: DBIdType, data: &[u8], txn_id: TransactionId, undo_id: UndoId) -> Self {
         Self {
             id,
             data: data.to_vec(),
@@ -41,7 +41,7 @@ impl Tuple {
         self.txn_id = Some(id)
     }
 
-    pub fn set_undo_id(&mut self, id: u16) {
+    pub fn set_undo_id(&mut self, id: UndoId) {
         self.undo_id = Some(id)
     }
 

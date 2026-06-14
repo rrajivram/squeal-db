@@ -16,6 +16,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::fs::TryLockError;
 use std::fs::remove_file;
 use std::io::SeekFrom;
 use std::io::Write;
@@ -40,6 +41,7 @@ pub(crate) trait Opener {
     fn do_sync(&mut self) -> std::io::Result<()>;
     fn do_clone(&self) -> std::io::Result<Self::Item>;
     fn get_metadata(&self) -> std::io::Result<Meta>;
+    fn do_lock(&self) -> Result<(), TryLockError>;
 }
 
 pub(crate) trait DBFile:
@@ -63,11 +65,11 @@ pub enum TableType {
 pub(crate) struct Header {
     magic: [u8; 2],
     #[serde(with = "postcard::fixint::le")]
-    first_page_offset: DBSizeType,
+    pub(crate) first_page_offset: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     page_count: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
-    page_size: DBSizeType,
+    pub(crate) page_size: DBSizeType,
 }
 
 #[derive(Debug)]
@@ -127,6 +129,9 @@ where
         if header.magic != MAGIC {
             return Err(StoreError::FileError);
         }
+        f.do_lock()?;
+        undo_file.do_lock()?;
+        redo_file.do_lock()?;
         let sf = Self {
             page_count: AtomicU64::new(header.page_count),
             header: header,
@@ -196,7 +201,9 @@ where
             .write(true)
             .clone();
         let redo_file = F::open(redo_file, rf_name)?;
-
+        f.do_lock()?;
+        undo_file.do_lock()?;
+        redo_file.do_lock()?;
         let header = Header {
             magic: MAGIC,
             first_page_offset: ZERO_PAGE_SIZE,
@@ -447,6 +454,6 @@ mod tests {
         assert_eq!(t[0].name, "table_1");
         let r = db.create_table("table_1".to_string());
         assert!(matches!(r, Err(StoreError::DuplicateName(_))));
-        //Db::delete(DB_NAME).unwrap_or_default()
+        FileDB::delete(DB_NAME).unwrap_or_default()
     }
 }

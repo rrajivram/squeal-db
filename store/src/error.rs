@@ -1,4 +1,10 @@
-use std::sync::PoisonError;
+use std::{
+    fs::TryLockError,
+    sync::{
+        PoisonError,
+        mpsc::{RecvError, SendError, TryRecvError},
+    },
+};
 
 use thiserror::Error;
 
@@ -34,6 +40,24 @@ pub enum StoreError {
 
 impl<T> From<PoisonError<T>> for StoreError {
     fn from(value: PoisonError<T>) -> Self {
+        StoreError::UnknownError(value.to_string())
+    }
+}
+
+impl From<TryLockError> for StoreError {
+    fn from(value: TryLockError) -> Self {
+        StoreError::UnknownError(value.to_string())
+    }
+}
+
+impl From<RecvError> for StoreError {
+    fn from(value: RecvError) -> Self {
+        StoreError::UnknownError(value.to_string())
+    }
+}
+
+impl From<TryRecvError> for StoreError {
+    fn from(value: TryRecvError) -> Self {
         StoreError::UnknownError(value.to_string())
     }
 }

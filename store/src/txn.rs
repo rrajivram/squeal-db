@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::StoreError, generator::Generator};
+use crate::{constant::timestamp, error::StoreError, generator::Generator};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
 pub struct TransactionId(pub u64);
@@ -44,11 +43,7 @@ impl TransactionManager {
     pub(crate) fn create_transaction(&self) -> Result<TransactionId, StoreError> {
         let txn = TransactionId(self.gens.gen_key(TXN_GENERATOR_NANE)?);
         // Safe to unwrap here as call only fails if earlies is less than self.
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        self.active_transactions.write()?.insert(txn, now);
+        self.active_transactions.write()?.insert(txn, timestamp());
         Ok(txn)
     }
 
