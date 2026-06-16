@@ -1,12 +1,17 @@
 #![allow(private_bounds)]
+use crate::buffer::PageBuffer;
+use crate::constant::FIRST_USER_PAGE;
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::error::StoreError;
 use crate::generator::Generator;
+use crate::logger::Logger;
 use crate::page::Page;
 use crate::table::Table;
 use crate::tuple::Tuple;
+use crate::txn::TransactionId;
+use crate::txn::TransactionManager;
 use log::LevelFilter;
 use log::info;
 use postcard::from_bytes;
@@ -73,18 +78,27 @@ pub(crate) struct Header {
 }
 
 #[derive(Debug)]
-pub struct Db<F: DBFile> {
+pub struct Db<F: DBFile + 'static> {
     name: String,
-    pub(crate) header: Header,
+    pub(crate) header: Arc<Header>,
     file: F,
     pub(crate) undo_file: F,
     pub(crate) redo_file: F,
-    page_count: AtomicU64,
+    page_count: Arc<AtomicU64>,
     tables: Arc<RwLock<HashMap<String, Table>>>,
-    generator: Generator,
+    generator: Arc<Generator>,
+    logger: Arc<Logger>,
+    tx_mgr: Arc<TransactionManager>,
+    buffer: Arc<PageBuffer<F>>,
 }
 
-impl<F: DBFile> Db<F>
+struct NeededObjects<F: DBFile + 'static> {
+    logger: Arc<Logger>,
+    txn_mgr: Arc<TransactionManager>,
+    buffer: Arc<PageBuffer<F>>,
+}
+
+impl<F: DBFile + 'static> Db<F>
 where
     F: DBFile<Item = F>,
 {
@@ -101,6 +115,50 @@ where
         Ok(sf)
     }
 
+    pub fn open_using<S: AsRef<str>>(
+        name: S,
+        file: F,
+        undo_file: F,
+        redo_file: F,
+    ) -> Result<Self, StoreError> {
+        let mut bytes = vec![0u8; size_of::<Header>()];
+        let mut file = file;
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut bytes)?;
+        let header = Arc::new(from_bytes::<Header>(&bytes)?);
+        if header.magic != MAGIC {
+            return Err(StoreError::FileError);
+        }
+        file.do_lock()?;
+        undo_file.do_lock()?;
+        redo_file.do_lock()?;
+        let gens = Arc::new(Generator::new());
+        let page_count = Arc::new(AtomicU64::new(header.page_count));
+        let nm = Self::setup_needed_modules(
+            header.clone(),
+            gens.clone(),
+            page_count.clone(),
+            file.do_clone()?,
+            undo_file.do_clone()?,
+            redo_file.do_clone()?,
+        )?;
+        let sf = Self {
+            page_count: page_count,
+            header: header,
+            file: file,
+            undo_file,
+            redo_file,
+            name: name.as_ref().to_string(),
+            tables: Arc::new(RwLock::new(HashMap::new())),
+            generator: Arc::new(Generator::new()),
+            logger: nm.logger,
+            tx_mgr: nm.txn_mgr,
+            buffer: nm.buffer,
+        };
+        sf.load_system_tables()?;
+        Ok(sf)
+    }
+
     pub fn open<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
         let uf_name = name.as_ref().to_string() + ".undo";
         let rf_name = name.as_ref().to_string() + ".redo";
@@ -109,7 +167,7 @@ where
             .read(true)
             .write(true)
             .clone();
-        let mut f = F::open(f, name.as_ref())?;
+        let f = F::open(f, name.as_ref())?;
         let undo_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -122,36 +180,15 @@ where
             .write(true)
             .clone();
         let redo_file = F::open(redo_file, rf_name)?;
-
-        let mut bytes = vec![0u8; size_of::<Header>()];
-        f.read_exact(&mut bytes)?;
-        let header: Header = from_bytes(&bytes)?;
-        if header.magic != MAGIC {
-            return Err(StoreError::FileError);
-        }
-        f.do_lock()?;
-        undo_file.do_lock()?;
-        redo_file.do_lock()?;
-        let sf = Self {
-            page_count: AtomicU64::new(header.page_count),
-            header: header,
-            file: f,
-            undo_file,
-            redo_file,
-            name: name.as_ref().to_string(),
-            tables: Arc::new(RwLock::new(HashMap::new())),
-            generator: Generator::new(),
-        };
-        sf.load_system_tables()?;
-        Ok(sf)
+        Self::open_using(name, f, undo_file, redo_file)
     }
 
-    pub fn close(mut self) -> Result<(), StoreError> {
+    pub fn close(mut self) -> Result<(F, F, F), StoreError> {
         self.closeup()?;
         self.undo_file.do_sync()?;
         self.redo_file.do_sync()?;
         self.file.do_sync()?;
-        Ok(())
+        Ok((self.file, self.undo_file, self.redo_file))
     }
 
     pub fn page_count(&self) -> DBSizeType {
@@ -178,6 +215,30 @@ where
         };
         self.write_system_table()?;
         Ok(table)
+    }
+
+    fn setup_needed_modules(
+        header: Arc<Header>,
+        gens: Arc<Generator>,
+        page_counter: Arc<AtomicU64>,
+        file: F,
+        undo_file: F,
+        redo_file: F,
+    ) -> Result<NeededObjects<F>, StoreError> {
+        let mut logger = Logger::new();
+        logger.set_db(undo_file, redo_file)?;
+        let nm = NeededObjects {
+            buffer: Arc::new(PageBuffer::new(
+                header.page_size,
+                page_counter,
+                file,
+                header,
+                1024,
+            )?),
+            logger: Arc::new(logger),
+            txn_mgr: Arc::new(TransactionManager::new(gens, TransactionId::default())?),
+        };
+        Ok(nm)
     }
 
     fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
@@ -212,24 +273,33 @@ where
         };
         let bytes = to_allocvec(&header)?;
         f.write(&bytes)?;
+        let header = Arc::new(header);
         let gens = Generator::new();
         gens.create_generator(&SYSTEM_TABLE_NAME.to_owned(), None)?;
+        let gens = Arc::new(gens);
+        let page_count = Arc::new(AtomicU64::new(0));
+        let nm = Self::setup_needed_modules(
+            header.clone(),
+            gens.clone(),
+            page_count.clone(),
+            f.do_clone()?,
+            undo_file.do_clone()?,
+            redo_file.do_clone()?,
+        )?;
+
         Ok(Self {
             name: name,
             header: header,
             file: f,
             undo_file,
             redo_file,
-            page_count: AtomicU64::new(0),
+            page_count: page_count,
             tables: Arc::new(RwLock::new(HashMap::new())),
             generator: gens,
+            logger: nm.logger,
+            tx_mgr: nm.txn_mgr,
+            buffer: nm.buffer,
         })
-    }
-
-    fn create_system_table(&self, name: String) -> Result<Table, StoreError> {
-        let table_page = self.alloc_page(true)?;
-        let table = Table::new(0, name, TableType::Table, table_page)?;
-        Ok(table)
     }
 
     fn validate_table_name(&self, name: &String) -> Result<(), StoreError> {
@@ -262,18 +332,27 @@ where
         Ok(())
     }
 
+    fn create_system_tables(&self) -> Result<(), StoreError> {
+        let t = self.alloc_page(true)?; // system
+        assert!(t == 0);
+        let t = self.alloc_page(true)?; // generators
+        assert!(t == 1);
+        let t = self.alloc_page(true)?; // free pages
+        assert!(t == 2);
+        Ok(())
+    }
+
     fn load_system_tables(&self) -> Result<(), StoreError> {
-        if self.header.page_count > 0 {
-            let v = self.read_page(SYSTEM_TABLE_PAGE)?;
-            let p = Page::from_bytes(&v)?;
-            let mut tables = self
-                .tables
-                .write()
-                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-            for t in p.iter() {
-                let t: Table = from_bytes(&t.data)?;
-                tables.insert(t.name.clone(), t);
-            }
+        if self.page_count() < FIRST_USER_PAGE {
+            return Err(StoreError::UnknownError(
+                "Unable to load system tables".into(),
+            ));
+        }
+        let page = self.buffer.get_page(SYSTEM_TABLE_PAGE)?;
+        let mut tables = self.tables.write()?;
+        for t in page.iter() {
+            let t: Table = from_bytes(&t.data)?;
+            tables.insert(t.name.clone(), t);
         }
         Ok(())
     }
@@ -281,17 +360,10 @@ where
     fn get_tables(&self) -> Result<Vec<Table>, StoreError> {
         Ok(self
             .tables
-            .read()
-            .map_err(|e| StoreError::UnknownError(e.to_string()))?
+            .read()?
             .values()
             .map(|t| t.clone())
             .collect::<Vec<_>>())
-    }
-
-    fn create_system_tables(&self) -> Result<(), StoreError> {
-        self.create_system_table(SYSTEM_TABLE_NAME.to_string())?;
-
-        Ok(())
     }
 
     fn closeup(&mut self) -> Result<(), StoreError> {
@@ -305,7 +377,7 @@ where
         if n != 0 {
             return Err(StoreError::FileError);
         }
-        let mut header = self.header.clone();
+        let mut header = (*self.header).clone();
         header.page_count = self.page_count.load(std::sync::atomic::Ordering::Relaxed);
         let bytes = to_allocvec(&header)?;
         self.file.write(&bytes)?;
@@ -398,26 +470,26 @@ mod tests {
     #[test]
     fn test_create() {
         const DB_NAME: &str = "test1.db";
-        FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = FileDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE);
+        //FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = TestDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.first_page_offset, ZERO_PAGE_SIZE);
         assert_eq!(db.header.page_count, 0);
-        db.close().unwrap();
-        let db = FileDB::open(DB_NAME);
+        let (f, u, r) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME, f, u, r);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.page_count, 0);
         assert_eq!(db.header.page_size, DEFAULT_PAGE_SIZE);
-        FileDB::delete(DB_NAME).unwrap_or_default();
+        //FileDB::delete(DB_NAME).unwrap_or_default();
     }
 
     #[test]
     fn test_simple_alloc_page() {
         const DB_NAME: &str = "test2.db";
-        FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = FileDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE).unwrap();
+        //FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = TestDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE).unwrap();
         let page = db.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
@@ -429,8 +501,8 @@ mod tests {
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, ZERO_PAGE_SIZE + 2 * DEFAULT_PAGE_SIZE);
         assert_eq!(db.page_count(), 2);
-        db.close().unwrap();
-        let db = FileDB::open(DB_NAME).unwrap();
+        let (f, u, r) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME, f, u, r).unwrap();
         assert_eq!(db.page_count(), 2);
         FileDB::delete(DB_NAME).unwrap_or_default();
     }
@@ -438,8 +510,8 @@ mod tests {
     #[test]
     fn test_create_table() {
         const DB_NAME: &str = "test3.db";
-        FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = FileDB::create(DB_NAME.to_string());
+        //FileDB::delete(DB_NAME).unwrap_or_default();
+        let db = TestDB::create(DB_NAME.to_string());
         assert!(db.is_ok());
         let db = db.unwrap();
         let r = db.create_table("table_1".to_string());
@@ -447,13 +519,13 @@ mod tests {
         let r = r.unwrap();
         assert_eq!(r.name, "table_1");
         assert_eq!(db.get_tables().unwrap().len(), 1);
-        db.close().unwrap();
-        let db = FileDB::open(DB_NAME.to_string()).unwrap();
+        let (f, u, r) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME.to_string(), f, u, r).unwrap();
         let t = db.get_tables().unwrap();
         assert!(t.len() == 1);
         assert_eq!(t[0].name, "table_1");
         let r = db.create_table("table_1".to_string());
         assert!(matches!(r, Err(StoreError::DuplicateName(_))));
-        FileDB::delete(DB_NAME).unwrap_or_default()
+        //FileDB::delete(DB_NAME).unwrap_or_default()
     }
 }

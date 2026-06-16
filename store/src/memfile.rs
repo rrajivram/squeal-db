@@ -1,10 +1,14 @@
-use std::{fs::OpenOptions, path::Path};
+use std::{
+    fs::OpenOptions,
+    path::Path,
+    sync::{Arc, RwLock},
+};
 
 use crate::db::{Meta, Opener};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MemFile {
-    data: Vec<u8>,
+    data: Arc<RwLock<Vec<u8>>>,
     seek_pos: usize,
 }
 
@@ -32,7 +36,7 @@ impl Opener for MemFile {
 
     fn get_metadata(&self) -> std::io::Result<Meta> {
         Ok(Meta {
-            len: self.data.len() as u64,
+            len: self.data.read().unwrap().len() as u64,
         })
     }
 
@@ -67,11 +71,12 @@ impl Opener for std::fs::File {
 
 impl std::io::Write for MemFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let c_size = self.data.len();
+        let mut data = self.data.write().unwrap();
+        let c_size = data.len();
         if self.seek_pos + buf.len() > c_size {
-            self.data.resize(self.seek_pos + buf.len(), 0);
+            data.resize(self.seek_pos + buf.len(), 0);
         }
-        self.data[self.seek_pos..].copy_from_slice(buf);
+        data[self.seek_pos..self.seek_pos + buf.len()].copy_from_slice(buf);
         self.seek_pos += buf.len();
         Ok(buf.len())
     }
@@ -84,10 +89,11 @@ impl std::io::Write for MemFile {
 impl std::io::Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut len = buf.len();
-        if self.seek_pos + len > self.data.len() {
-            len = self.data.len() - self.seek_pos;
+        let data = self.data.read().unwrap();
+        if self.seek_pos + len > data.len() {
+            len = data.len() - self.seek_pos;
         }
-        buf[0..len].copy_from_slice(&self.data[self.seek_pos..self.seek_pos + len]);
+        buf[0..len].copy_from_slice(&data[self.seek_pos..self.seek_pos + len]);
         self.seek_pos += len;
         Ok(len)
     }
@@ -97,7 +103,9 @@ impl std::io::Seek for MemFile {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match pos {
             std::io::SeekFrom::Current(c) => self.seek_pos += c as usize,
-            std::io::SeekFrom::End(e) => self.seek_pos = self.data.len() - e as usize,
+            std::io::SeekFrom::End(e) => {
+                self.seek_pos = self.data.read().unwrap().len() - e as usize
+            }
             std::io::SeekFrom::Start(s) => self.seek_pos = s as usize,
         }
         Ok(self.seek_pos as u64)

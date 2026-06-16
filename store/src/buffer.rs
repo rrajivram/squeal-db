@@ -1,9 +1,9 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    marker::PhantomData,
     sync::{
         Arc, RwLock,
+        atomic::AtomicU64,
         mpsc::{self, Receiver, SendError, Sender},
     },
     thread::{self, JoinHandle},
@@ -11,8 +11,11 @@ use std::{
 };
 
 use log::info;
+use postcard::to_allocvec;
+use priority_queue::PriorityQueue;
 
 use crate::{
+    constant::timestamp,
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::Logger,
@@ -21,7 +24,8 @@ use crate::{
 
 #[derive(Debug, Clone)]
 enum BufMsg {
-    Write(WriteMsg),
+    WritePage(WriteMsg),
+    WriteHeader(Header),
     Shutdowm,
 }
 
@@ -32,13 +36,15 @@ struct WriteMsg {
 }
 
 #[derive(Debug)]
-pub(crate) struct PageBuffer<F: DBFile> {
-    buffer: RwLock<HashMap<DBSizeType, Page>>,
+pub(crate) struct PageBuffer<F: DBFile + 'static> {
+    buffer: RwLock<HashMap<DBSizeType, Arc<Page>>>,
+    page_counter: Arc<AtomicU64>,
     page_size: DBSizeType,
     max_entries: usize,
     write_tx: Sender<BufMsg>,
     write_handle: JoinHandle<Result<(), StoreError>>,
     read_file: RwLock<F>,
+    access_map: RwLock<PriorityQueue<DBSizeType, u128>>,
 }
 
 impl<F: DBFile> PageBuffer<F>
@@ -47,6 +53,7 @@ where
 {
     pub(crate) fn new(
         page_size: DBSizeType,
+        page_counter: Arc<AtomicU64>,
         db_file: F,
         header: Arc<Header>,
         max_entries: usize,
@@ -62,12 +69,88 @@ where
             write_tx,
             read_file: RwLock::new(read_file),
             write_handle,
+            access_map: RwLock::new(PriorityQueue::new()),
+            page_counter,
         })
+    }
+
+    pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
+        Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
+    }
+
+    pub(crate) fn write_page(
+        &self,
+        page_num: DBSizeType,
+        page: Arc<Page>,
+    ) -> Result<(), StoreError> {
+        {
+            self.update_page_access(page_num)?;
+            let (contains, count) = {
+                let buffer = self.buffer.read()?;
+                (buffer.contains_key(&page_num), buffer.len())
+            };
+            if contains {
+                self.buffer.write()?.insert(page_num, page.clone());
+            } else {
+                if count == self.max_entries {
+                    self.replace_oldest(page_num, &page)?;
+                }
+            }
+        }
+        Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
+            page_num,
+            page: (*page).clone(),
+        }))?)
+    }
+
+    pub(crate) fn get_page(&self, page_num: DBSizeType) -> Result<Arc<Page>, StoreError> {
+        let valid = page_num < self.page_counter.load(std::sync::atomic::Ordering::Relaxed);
+        if !valid {
+            return Err(StoreError::UnknownError(format!(
+                "Invalid page number : {}",
+                page_num
+            )));
+        }
+        if let Some(page) = self.buffer.read()?.get(&page_num) {
+            self.update_page_access(page_num)?;
+            return Ok(page.clone());
+        }
+        let mut bytes = vec![0u8; self.page_size as usize];
+        self.read_file.write()?.read(&mut bytes)?;
+        let page = Arc::new(Page::from_bytes(&bytes)?);
+        let count = { self.buffer.read()?.len() };
+        if count == self.max_entries {
+            self.replace_oldest(page_num, &page)?;
+        } else {
+            self.buffer.write()?.insert(page_num, page.clone());
+        }
+        Ok(page)
+    }
+
+    fn replace_oldest(&self, page_num: DBSizeType, page: &Arc<Page>) -> Result<(), StoreError> {
+        if let Some(last_used_page) = { self.access_map.write()?.pop() } {
+            let mut buffer = self.buffer.write()?;
+            buffer.remove(&last_used_page.0);
+            buffer.insert(page_num, page.clone());
+        } else {
+            panic!("Could not find any pages in access mao!");
+        }
+        Ok(())
+    }
+
+    fn update_page_access(&self, page_num: DBSizeType) -> Result<(), StoreError> {
+        let mut pq = self.access_map.write()?;
+        if !pq.contains(&page_num) {
+            pq.push(page_num, timestamp());
+        } else {
+            pq.change_priority(&page_num, timestamp());
+        }
+        Ok(())
     }
 }
 
-impl From<SendError<WriteMsg>> for StoreError {
-    fn from(value: SendError<WriteMsg>) -> Self {
+impl From<SendError<BufMsg>> for StoreError {
+    fn from(value: SendError<BufMsg>) -> Self {
         StoreError::UnknownError(value.to_string())
     }
 }
@@ -94,9 +177,9 @@ fn writer<F: DBFile>(
                 BufMsg::Shutdowm => {
                     break;
                 }
-                BufMsg::Write(msg) => {
+                BufMsg::WritePage(msg) => {
                     if let Some(lsn) = msg.page.lsn_id() {
-                        if lsn < Logger::last_lsn() {
+                        if msg.page.is_pinned() || lsn < Logger::last_lsn() {
                             seek_to_page(
                                 msg.page_num,
                                 &mut file,
@@ -114,6 +197,15 @@ fn writer<F: DBFile>(
                         }
                     } else {
                         return Err(StoreError::UnknownError("Page does not have LSN".into()));
+                    }
+                }
+                BufMsg::WriteHeader(header) => {
+                    file.seek(SeekFrom::Start(0))?;
+                    let bytes = to_allocvec(&header)?;
+                    file.write(&to_allocvec(&header)?)?;
+                    if bytes.len() < size_of::<Header>() {
+                        let b = vec![0u8; size_of::<Header>() - bytes.len()];
+                        file.write(&b)?;
                     }
                 }
             }
@@ -147,3 +239,6 @@ fn seek_to_page(
     file.seek(SeekFrom::Start(pos))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {}

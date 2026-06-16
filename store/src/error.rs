@@ -2,7 +2,7 @@ use std::{
     fs::TryLockError,
     sync::{
         PoisonError,
-        mpsc::{RecvError, SendError, TryRecvError},
+        mpsc::{RecvError, TryRecvError},
     },
 };
 

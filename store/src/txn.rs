@@ -7,19 +7,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{constant::timestamp, error::StoreError, generator::Generator};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq, Hash, Default)]
 pub struct TransactionId(pub u64);
 
 const TXN_GENERATOR_NANE: &str = "__system.transactions";
 
 #[derive(Debug, Default)]
 pub(crate) struct TransactionManager {
-    gens: Generator,
+    gens: Arc<Generator>,
     active_transactions: Arc<RwLock<HashMap<TransactionId, u128>>>,
 }
 
 impl TransactionManager {
-    pub(crate) fn new(gens: Generator, last_id: TransactionId) -> Result<Self, StoreError> {
+    pub(crate) fn new(gens: Arc<Generator>, last_id: TransactionId) -> Result<Self, StoreError> {
         gens.create_generator(TXN_GENERATOR_NANE, Some(last_id.0))?;
         Ok(Self {
             gens,
