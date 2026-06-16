@@ -25,10 +25,10 @@ static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct LsnId(u64);
+pub(crate) struct LsnId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct UndoId(u16);
+pub(crate) struct UndoId(pub(crate) u16);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum MsgType {
@@ -275,4 +275,115 @@ fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::UndoId;
+    use crate::{
+        logger::{Logger, Operation, Record},
+        memfile::MemFile,
+        tuple::Tuple,
+        txn::TransactionId,
+    };
+
+    #[test]
+    fn test_log_redo_returns_incrementing_lsn() {
+        let logger = Logger::new();
+        let op = Operation::new_commit(TransactionId(1));
+        let lsn1 = logger.log_redo(op.clone()).unwrap();
+        let lsn2 = logger.log_redo(op).unwrap();
+        assert!(lsn2 > lsn1);
+    }
+
+    #[test]
+    fn test_log_redo_unique_lsns() {
+        let logger = Logger::new();
+        let mut lsns = Vec::new();
+        for i in 0..5 {
+            let op = Operation::new_commit(TransactionId(i));
+            lsns.push(logger.log_redo(op).unwrap());
+        }
+        let unique: std::collections::HashSet<_> = lsns.iter().cloned().collect();
+        assert_eq!(unique.len(), 5);
+    }
+
+    #[test]
+    fn test_log_undo_commit_op_no_db() {
+        // Without set_db, log_undo should succeed (undo_tx is None, msg is silently dropped)
+        let logger = Logger::new();
+        let op = Operation::new_commit(TransactionId(1));
+        assert!(logger.log_undo(op).is_ok());
+    }
+
+    #[test]
+    fn test_log_undo_rollback_op_no_db() {
+        let logger = Logger::new();
+        let op = Operation::new_rollback(TransactionId(2));
+        assert!(logger.log_undo(op).is_ok());
+    }
+
+    #[test]
+    fn test_log_undo_add_op_with_txn_id() {
+        let logger = Logger::new();
+        let txn_id = TransactionId(10);
+        let mut tuple = Tuple::new(1, b"hello");
+        tuple.set_txn_id(txn_id);
+        let record = Record::new(0, Arc::new(tuple), txn_id);
+        let op = Operation::new_add(txn_id, record);
+        assert!(logger.log_undo(op).is_ok());
+    }
+
+    #[test]
+    fn test_log_undo_add_missing_txn_id_returns_err() {
+        // Tuple without txn_id set → log_undo should return an error
+        let logger = Logger::new();
+        let txn_id = TransactionId(10);
+        let tuple = Tuple::new(1, b"hello"); // txn_id not set
+        let record = Record::new(0, Arc::new(tuple), txn_id);
+        let op = Operation::new_add(txn_id, record);
+        assert!(logger.log_undo(op).is_err());
+    }
+
+    #[test]
+    fn test_logger_with_memfile_shutdown() {
+        let mut logger = Logger::new();
+        logger.set_db(MemFile::new(), MemFile::new()).unwrap();
+        let txn_id = TransactionId(99);
+        let op = Operation::new_commit(txn_id);
+        logger.log_redo(op.clone()).unwrap();
+        logger.log_undo(op).unwrap();
+        assert!(logger.shutdown().is_ok());
+    }
+
+    #[test]
+    fn test_logger_undo_add_with_db() {
+        let mut logger = Logger::new();
+        logger.set_db(MemFile::new(), MemFile::new()).unwrap();
+        let txn_id = TransactionId(5);
+        let mut tuple = Tuple::new(42, b"data");
+        tuple.set_txn_id(txn_id);
+        let record = Record::new(0, Arc::new(tuple), txn_id);
+        let op = Operation::new_add(txn_id, record);
+        assert!(logger.log_undo(op).is_ok());
+        assert!(logger.shutdown().is_ok());
+    }
+
+    #[test]
+    fn test_tuple_new_in_txn() {
+        use crate::tuple::Tuple;
+        // UndoId is only constructable from within logger module
+        let txn = TransactionId(42);
+        let undo = UndoId(7);
+        let t = Tuple::new_in_txn(crate::tuple::DBIdType::Int(1), b"hello", txn, undo);
+        assert_eq!(t.txn_id, Some(txn));
+        assert_eq!(t.undo_id, Some(undo));
+        assert_eq!(t.data, b"hello");
+        let b = t.to();
+        let t2 = Tuple::from(&b).unwrap();
+        assert_eq!(t2.txn_id, Some(txn));
+        assert_eq!(t2.data, b"hello");
+    }
 }

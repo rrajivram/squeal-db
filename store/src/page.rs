@@ -89,7 +89,7 @@ impl Page {
             dirty: AtomicBool::new(true),
             data_size: ds,
             capacity: ds,
-            lsn: None,
+            lsn: Some(LsnId(0)), //pinned  pages are for system use, so written immediate;y
             flags: PageFlags::PINNED,
             ..Default::default()
         }
@@ -323,5 +323,82 @@ mod tests {
         assert_eq!(b.len(), 1024);
         let p1 = Page::from_bytes(&b).unwrap();
         assert_eq!(p, p1);
+    }
+
+    #[test]
+    fn page_test_get_existing_and_missing() {
+        use crate::tuple::DBIdType;
+        let mut p = Page::new(2000);
+        p.add_tuple(Tuple::new(7, b"payload")).unwrap();
+        let found = p.get(DBIdType::Int(7));
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().data, b"payload");
+        let missing = p.get(DBIdType::Int(99));
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn page_test_contains() {
+        use crate::tuple::DBIdType;
+        let mut p = Page::new(2000);
+        p.add_tuple(Tuple::new(3, b"x")).unwrap();
+        assert!(p.contains(DBIdType::Int(3)));
+        assert!(!p.contains(DBIdType::Int(4)));
+    }
+
+    #[test]
+    fn page_test_iter_yields_all_tuples() {
+        let mut p = Page::new(4000);
+        for i in 0..5u64 {
+            p.add_tuple(Tuple::new(i, b"data")).unwrap();
+        }
+        let count = p.iter().count();
+        assert_eq!(count, 5);
+    }
+
+    #[test]
+    fn page_test_next_page() {
+        let p = Page::new(1024);
+        assert_eq!(p.get_next_page(), 0);
+        p.set_next_page(42);
+        assert_eq!(p.get_next_page(), 42);
+    }
+
+    #[test]
+    fn page_test_pinned_flag() {
+        let p = Page::new(1024);
+        assert!(!p.is_pinned());
+        let p_pinned = Page::new_pinned(1024);
+        assert!(p_pinned.is_pinned());
+    }
+
+    #[test]
+    fn page_test_lsn_initially_none() {
+        let p = Page::new(1024);
+        assert!(p.lsn_id().is_none());
+    }
+
+    #[test]
+    fn page_test_dirty_state() {
+        let p = Page::new(1024);
+        assert!(p.is_dirty());
+        p.set_dirty(false);
+        assert!(!p.is_dirty());
+        p.set_dirty(true);
+        assert!(p.is_dirty());
+    }
+
+    #[test]
+    fn page_test_roundtrip_preserves_tuples() {
+        let mut p = Page::new(2000);
+        p.add_tuple(Tuple::new(1, b"first")).unwrap();
+        p.add_tuple(Tuple::new(2, b"second")).unwrap();
+        let bytes = p.to_bytes();
+        let p2 = Page::from_bytes(&bytes).unwrap();
+        use crate::tuple::DBIdType;
+        assert!(p2.contains(DBIdType::Int(1)));
+        assert!(p2.contains(DBIdType::Int(2)));
+        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().data, b"first");
+        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().data, b"second");
     }
 }

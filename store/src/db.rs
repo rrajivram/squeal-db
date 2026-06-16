@@ -1,6 +1,7 @@
 #![allow(private_bounds)]
 use crate::buffer::PageBuffer;
 use crate::constant::FIRST_USER_PAGE;
+use crate::constant::GENERATOR_TABLE_PAGE;
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
@@ -9,6 +10,7 @@ use crate::generator::Generator;
 use crate::logger::Logger;
 use crate::page::Page;
 use crate::table::Table;
+use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
 use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
@@ -183,11 +185,16 @@ where
         Self::open_using(name, f, undo_file, redo_file)
     }
 
-    pub fn close(mut self) -> Result<(F, F, F), StoreError> {
-        self.closeup()?;
-        self.undo_file.do_sync()?;
-        self.redo_file.do_sync()?;
-        self.file.do_sync()?;
+    pub fn close(self) -> Result<(F, F, F), StoreError> {
+        self.write_system_tables()?;
+        let mut header = (*self.header).clone();
+        header.page_count = self.page_count();
+        let buffer = Arc::into_inner(self.buffer).unwrap();
+        buffer.write_header(header)?;
+        buffer.shutdown()?;
+        // Unwrapping here as the expectation is there is only this thread accessing logger
+        let logger = Arc::into_inner(self.logger).unwrap();
+        logger.shutdown()?;
         Ok((self.file, self.undo_file, self.redo_file))
     }
 
@@ -213,7 +220,7 @@ where
             tables.insert(table.name.clone(), table.clone());
             table
         };
-        self.write_system_table()?;
+        self.write_system_tables()?;
         Ok(table)
     }
 
@@ -316,8 +323,8 @@ where
         Ok(())
     }
 
-    fn write_system_table(&self) -> Result<(), StoreError> {
-        let mut page = Page::new(self.header.page_size);
+    fn write_system_tables(&self) -> Result<(), StoreError> {
+        let mut page = Page::new_pinned(self.header.page_size);
         let tables = self
             .tables
             .read()
@@ -327,8 +334,13 @@ where
             // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
-        let bytes = page.to_bytes();
-        self.write_page(0, &bytes)?;
+        self.buffer.write_page(0, Arc::new(page))?;
+        let gens = self.generator.get_values()?;
+        let mut page = Page::new_pinned(self.header.page_size);
+        page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
+        self.buffer.write_page(1, Arc::new(page))?;
+        // TODO : Handle page overflows correctly
+        // TODO: Handle empty pages
         Ok(())
     }
 
@@ -339,6 +351,7 @@ where
         assert!(t == 1);
         let t = self.alloc_page(true)?; // free pages
         assert!(t == 2);
+        assert!(self.page_count() == 3);
         Ok(())
     }
 
@@ -354,6 +367,10 @@ where
             let t: Table = from_bytes(&t.data)?;
             tables.insert(t.name.clone(), t);
         }
+        let page = self.buffer.get_page(GENERATOR_TABLE_PAGE)?;
+        let tuple = page.get(DBIdType::Int(0)).unwrap_or_default();
+        let gens = from_bytes(&tuple.data)?;
+        self.generator.set_values(gens)?;
         Ok(())
     }
 
@@ -364,29 +381,6 @@ where
             .values()
             .map(|t| t.clone())
             .collect::<Vec<_>>())
-    }
-
-    fn closeup(&mut self) -> Result<(), StoreError> {
-        self.write_system_table()?;
-        self.write_header()?;
-        Ok(())
-    }
-
-    fn write_header(&mut self) -> Result<(), StoreError> {
-        let n = self.file.seek(SeekFrom::Start(0))?;
-        if n != 0 {
-            return Err(StoreError::FileError);
-        }
-        let mut header = (*self.header).clone();
-        header.page_count = self.page_count.load(std::sync::atomic::Ordering::Relaxed);
-        let bytes = to_allocvec(&header)?;
-        self.file.write(&bytes)?;
-        if bytes.len() < size_of::<Header>() {
-            let b = vec![0u8; size_of::<Header>() - bytes.len()];
-            self.file.write(&b)?;
-        }
-
-        Ok(())
     }
 
     pub fn delete<S: AsRef<str>>(name: S) -> Result<(), StoreError> {
@@ -471,16 +465,16 @@ mod tests {
     fn test_create() {
         const DB_NAME: &str = "test1.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = TestDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE);
+        let db = TestDB::create(DB_NAME.to_string());
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.first_page_offset, ZERO_PAGE_SIZE);
-        assert_eq!(db.header.page_count, 0);
+        assert_eq!(db.page_count(), 3);
         let (f, u, r) = db.close().unwrap();
         let db = TestDB::open_using(DB_NAME, f, u, r);
         assert!(db.is_ok());
         let db = db.unwrap();
-        assert_eq!(db.header.page_count, 0);
+        assert_eq!(db.header.page_count, 3);
         assert_eq!(db.header.page_size, DEFAULT_PAGE_SIZE);
         //FileDB::delete(DB_NAME).unwrap_or_default();
     }
@@ -489,22 +483,22 @@ mod tests {
     fn test_simple_alloc_page() {
         const DB_NAME: &str = "test2.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = TestDB::create_core_db(DB_NAME.to_string(), DEFAULT_PAGE_SIZE).unwrap();
+        let db = TestDB::create(DB_NAME.to_string()).unwrap();
         let page = db.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
-        assert_eq!(page, 0);
+        assert_eq!(page, 3);
         let m = db.file.get_metadata().unwrap();
-        assert_eq!(m.len, DEFAULT_PAGE_SIZE + ZERO_PAGE_SIZE);
+        assert_eq!(m.len, DEFAULT_PAGE_SIZE * 4 + ZERO_PAGE_SIZE);
         let page = db.alloc_page(false).unwrap_or(0);
-        assert_eq!(page, 1);
+        assert_eq!(page, 4);
         let m = db.file.get_metadata().unwrap();
-        assert_eq!(m.len, ZERO_PAGE_SIZE + 2 * DEFAULT_PAGE_SIZE);
-        assert_eq!(db.page_count(), 2);
+        assert_eq!(m.len, ZERO_PAGE_SIZE + 5 * DEFAULT_PAGE_SIZE);
+        assert_eq!(db.page_count(), 5);
         let (f, u, r) = db.close().unwrap();
         let db = TestDB::open_using(DB_NAME, f, u, r).unwrap();
-        assert_eq!(db.page_count(), 2);
-        FileDB::delete(DB_NAME).unwrap_or_default();
+        assert_eq!(db.page_count(), 5);
+        //FileDB::delete(DB_NAME).unwrap_or_default();
     }
 
     #[test]

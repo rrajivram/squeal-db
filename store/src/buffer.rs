@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use log::info;
+use log::{error, info};
 use postcard::to_allocvec;
 use priority_queue::PriorityQueue;
 
@@ -38,6 +38,7 @@ struct WriteMsg {
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
     buffer: RwLock<HashMap<DBSizeType, Arc<Page>>>,
+    header: Arc<Header>,
     page_counter: Arc<AtomicU64>,
     page_size: DBSizeType,
     max_entries: usize,
@@ -61,7 +62,8 @@ where
         let read_file = db_file.do_clone()?;
         let write_file = db_file.do_clone()?;
         let (write_tx, write_rx) = mpsc::channel();
-        let write_handle = thread::spawn(move || writer(write_file, header.clone(), write_rx));
+        let w_header = header.clone();
+        let write_handle = thread::spawn(move || writer(write_file, w_header, write_rx));
         Ok(Self {
             page_size,
             max_entries,
@@ -71,7 +73,23 @@ where
             write_handle,
             access_map: RwLock::new(PriorityQueue::new()),
             page_counter,
+            header,
         })
+    }
+
+    pub(crate) fn shutdown(self) -> Result<(), StoreError> {
+        self.write_tx.send(BufMsg::Shutdowm)?;
+        let res = self.write_handle.join();
+        match res {
+            Ok(_) => {}
+            Err(e) => {
+                error!(
+                    "Unknown error joining redo.Thread panic! {}",
+                    e.downcast::<String>().unwrap_or_default()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
@@ -116,6 +134,8 @@ where
             return Ok(page.clone());
         }
         let mut bytes = vec![0u8; self.page_size as usize];
+        let offset = self.header.first_page_offset + self.header.page_size * page_num;
+        self.read_file.write()?.seek(SeekFrom::Start(offset))?;
         self.read_file.write()?.read(&mut bytes)?;
         let page = Arc::new(Page::from_bytes(&bytes)?);
         let count = { self.buffer.read()?.len() };
@@ -241,4 +261,107 @@ fn seek_to_page(
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+    use std::sync::{Arc, atomic::AtomicU64};
+
+    use postcard::from_bytes;
+
+    use crate::{buffer::PageBuffer, db::Header, memfile::MemFile, page::Page};
+
+    const PAGE_SIZE: u64 = 1000;
+
+    // Construct a Header by deserializing raw bytes (same path as Db::open).
+    // Layout: 2-byte magic, then three little-endian u64s (first_page_offset, page_count, page_size).
+    fn make_header_bytes(first_page_offset: u64, page_count: u64, page_size: u64) -> Vec<u8> {
+        let mut v = vec![0x53u8, 0x65]; // MAGIC
+        v.extend_from_slice(&first_page_offset.to_le_bytes());
+        v.extend_from_slice(&page_count.to_le_bytes());
+        v.extend_from_slice(&page_size.to_le_bytes());
+        v
+    }
+
+    fn make_header() -> Arc<Header> {
+        let bytes = make_header_bytes(0, 0, PAGE_SIZE);
+        Arc::new(from_bytes::<Header>(&bytes).unwrap())
+    }
+
+    // Builds a MemFile pre-populated with `num_pages` serialized pages starting at offset 0,
+    // then resets the seek position so the buffer's read_file clone starts at 0.
+    fn make_buffer(num_pages: u64, max_entries: usize) -> (PageBuffer<MemFile>, Arc<AtomicU64>) {
+        let mut mem = MemFile::new();
+        for _ in 0..num_pages {
+            let page = Page::new(PAGE_SIZE);
+            mem.write_all(&page.to_bytes()).unwrap();
+        }
+        mem.seek(SeekFrom::Start(0)).unwrap();
+        let page_counter = Arc::new(AtomicU64::new(num_pages));
+        let buf = PageBuffer::new(
+            PAGE_SIZE,
+            page_counter.clone(),
+            mem,
+            make_header(),
+            max_entries,
+        )
+        .unwrap();
+        (buf, page_counter)
+    }
+
+    #[test]
+    fn test_buffer_new_and_shutdown() {
+        let (buf, _) = make_buffer(0, 10);
+        assert!(buf.shutdown().is_ok());
+    }
+
+    #[test]
+    fn test_get_page_invalid_num_returns_err() {
+        let (buf, _) = make_buffer(0, 10);
+        let r = buf.get_page(0);
+        assert!(r.is_err());
+        buf.shutdown().unwrap();
+    }
+
+    #[test]
+    fn test_get_page_reads_from_file() {
+        let (buf, _) = make_buffer(1, 10);
+        // page 0 is valid (page_counter = 1) and its bytes are at offset 0 in MemFile
+        let r = buf.get_page(0);
+        assert!(r.is_ok());
+        let _ = buf.shutdown();
+    }
+
+    #[test]
+    fn test_get_page_cached_after_first_read() {
+        let (buf, _) = make_buffer(1, 10);
+        let p1 = buf.get_page(0).unwrap();
+        let p2 = buf.get_page(0).unwrap();
+        assert_eq!(*p1, *p2);
+        let _ = buf.shutdown();
+    }
+
+    #[test]
+    fn test_write_page_updates_in_memory_cache() {
+        let (buf, _) = make_buffer(1, 10);
+        // Populate cache with the initial (non-pinned) page
+        let p = buf.get_page(0).unwrap();
+        assert!(!p.is_pinned());
+        // Write a pinned page into the cache slot for page 0
+        let new_page = Arc::new(Page::new_pinned(PAGE_SIZE));
+        assert!(buf.write_page(0, new_page).is_ok());
+        // Cache must now hold the updated page
+        let p2 = buf.get_page(0).unwrap();
+        assert!(p2.is_pinned());
+        // Note: shutdown may fail if the writer exited due to the page having no LSN —
+        // that is expected here since we only test cache behaviour.
+        let _ = buf.shutdown();
+    }
+
+    #[test]
+    fn test_write_header_sends_without_error() {
+        let (buf, _) = make_buffer(0, 10);
+        // Create an updated header via the same deserialization path
+        let header = from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE)).unwrap();
+        assert!(buf.write_header(header).is_ok());
+        assert!(buf.shutdown().is_ok());
+    }
+}

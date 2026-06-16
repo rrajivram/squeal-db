@@ -65,3 +65,88 @@ impl TransactionManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::{
+        generator::Generator,
+        txn::{TransactionId, TransactionManager},
+    };
+
+    fn make_mgr() -> TransactionManager {
+        let gens = Arc::new(Generator::new());
+        TransactionManager::new(gens, TransactionId::default()).unwrap()
+    }
+
+    #[test]
+    fn test_create_unique_transactions() {
+        let mgr = make_mgr();
+        let t1 = mgr.create_transaction().unwrap();
+        let t2 = mgr.create_transaction().unwrap();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn test_is_transaction_active() {
+        let mgr = make_mgr();
+        let t = mgr.create_transaction().unwrap();
+        assert!(mgr.is_transaction_active(t));
+        assert!(!mgr.is_transaction_active(TransactionId(99999)));
+    }
+
+    #[test]
+    fn test_commit_removes_transaction() {
+        let mgr = make_mgr();
+        let t = mgr.create_transaction().unwrap();
+        assert!(mgr.is_transaction_active(t));
+        mgr.commit(t).unwrap();
+        assert!(!mgr.is_transaction_active(t));
+    }
+
+    #[test]
+    fn test_rollback_removes_transaction() {
+        let mgr = make_mgr();
+        let t = mgr.create_transaction().unwrap();
+        assert!(mgr.is_transaction_active(t));
+        mgr.rollback(t).unwrap();
+        assert!(!mgr.is_transaction_active(t));
+    }
+
+    #[test]
+    fn test_active_count_tracks_lifecycle() {
+        let mgr = make_mgr();
+        assert_eq!(mgr.active_count(), 0);
+        let t1 = mgr.create_transaction().unwrap();
+        assert_eq!(mgr.active_count(), 1);
+        let _t2 = mgr.create_transaction().unwrap();
+        assert_eq!(mgr.active_count(), 2);
+        mgr.commit(t1).unwrap();
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[test]
+    fn test_get_active_transactions_contains_all() {
+        let mgr = make_mgr();
+        let t1 = mgr.create_transaction().unwrap();
+        let t2 = mgr.create_transaction().unwrap();
+        let active = mgr.get_active_transactions().unwrap();
+        assert_eq!(active.len(), 2);
+        let ids: Vec<_> = active.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&t1));
+        assert!(ids.contains(&t2));
+    }
+
+    #[test]
+    fn test_committed_not_in_active_list() {
+        let mgr = make_mgr();
+        let t1 = mgr.create_transaction().unwrap();
+        let t2 = mgr.create_transaction().unwrap();
+        mgr.commit(t1).unwrap();
+        let active = mgr.get_active_transactions().unwrap();
+        let ids: Vec<_> = active.iter().map(|(id, _)| *id).collect();
+        assert!(!ids.contains(&t1));
+        assert!(ids.contains(&t2));
+    }
+}
