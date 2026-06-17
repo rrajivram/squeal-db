@@ -38,6 +38,7 @@ bitflags! {
     struct PageFlags: u8 {
         const NONE=0;
         const PINNED = 1;
+        const INDEX_PAGE = 0b10;
     }
 }
 
@@ -67,21 +68,19 @@ pub(crate) struct PageIterator<'a> {
 }
 
 impl Page {
-    pub(crate) fn new(size: DBSizeType) -> Self {
-        let ds = size - PAGE_OVERHEAD as DBSizeType;
-        Self {
-            data: Arc::new(BTreeMap::new()),
-            next_page: AtomicU64::new(0),
-            dirty: AtomicBool::new(true),
-            data_size: ds,
-            capacity: ds,
-            lsn: None,
-            flags: PageFlags::NONE,
-            ..Default::default()
-        }
+    pub(crate) fn new_data(size: DBSizeType) -> Self {
+        Self::new(size, None, PageFlags::NONE)
     }
 
     pub(crate) fn new_pinned(size: DBSizeType) -> Self {
+        Self::new(size, Some(LsnId(0)), PageFlags::PINNED)
+    }
+
+    pub(crate) fn new_indexed(size: DBSizeType) -> Self {
+        Self::new(size, None, PageFlags::INDEX_PAGE)
+    }
+
+    fn new(size: DBSizeType, lsn_id: Option<LsnId>, flags: PageFlags) -> Self {
         let ds = size - PAGE_OVERHEAD as DBSizeType;
         Self {
             data: Arc::new(BTreeMap::new()),
@@ -89,8 +88,8 @@ impl Page {
             dirty: AtomicBool::new(true),
             data_size: ds,
             capacity: ds,
-            lsn: Some(LsnId(0)), //pinned  pages are for system use, so written immediate;y
-            flags: PageFlags::PINNED,
+            lsn: lsn_id, //pinned  pages are for system use, so written immediate;y
+            flags: flags,
             ..Default::default()
         }
     }
@@ -101,6 +100,10 @@ impl Page {
 
     pub(crate) fn is_pinned(&self) -> bool {
         self.flags.contains(PageFlags::PINNED)
+    }
+
+    pub(crate) fn is_index_page(&self) -> bool {
+        self.flags.contains(PageFlags::INDEX_PAGE)
     }
 
     pub(crate) fn get_next_page(&self) -> DBSizeType {
@@ -274,7 +277,7 @@ mod tests {
 
     #[test]
     fn page_test_unique_id() {
-        let mut p = Page::new(2000);
+        let mut p = Page::new_data(2000);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert!(matches!(
@@ -288,7 +291,7 @@ mod tests {
     #[test]
     fn page_test_capacity() {
         let size = Tuple::new(1, b"abcdefabcd").size() * 2 + PAGE_OVERHEAD as u64;
-        let mut p = Page::new(size + 1);
+        let mut p = Page::new_data(size + 1);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert_eq!(p.capacity, 1);
@@ -300,7 +303,7 @@ mod tests {
 
     #[test]
     fn page_test_accurate_page_bytes() {
-        let mut p = Page::new(1000);
+        let mut p = Page::new_data(1000);
         // 1000 - 24 = 976 avaolable - at 46 b/tuple  = 21 max
         for i in 0..10 {
             assert!(
@@ -318,7 +321,7 @@ mod tests {
 
     #[test]
     fn page_test_4() {
-        let p = Page::new(1024);
+        let p = Page::new_data(1024);
         let b = p.to_bytes();
         assert_eq!(b.len(), 1024);
         let p1 = Page::from_bytes(&b).unwrap();
@@ -328,7 +331,7 @@ mod tests {
     #[test]
     fn page_test_get_existing_and_missing() {
         use crate::tuple::DBIdType;
-        let mut p = Page::new(2000);
+        let mut p = Page::new_data(2000);
         p.add_tuple(Tuple::new(7, b"payload")).unwrap();
         let found = p.get(DBIdType::Int(7));
         assert!(found.is_some());
@@ -340,7 +343,7 @@ mod tests {
     #[test]
     fn page_test_contains() {
         use crate::tuple::DBIdType;
-        let mut p = Page::new(2000);
+        let mut p = Page::new_data(2000);
         p.add_tuple(Tuple::new(3, b"x")).unwrap();
         assert!(p.contains(DBIdType::Int(3)));
         assert!(!p.contains(DBIdType::Int(4)));
@@ -348,7 +351,7 @@ mod tests {
 
     #[test]
     fn page_test_iter_yields_all_tuples() {
-        let mut p = Page::new(4000);
+        let mut p = Page::new_data(4000);
         for i in 0..5u64 {
             p.add_tuple(Tuple::new(i, b"data")).unwrap();
         }
@@ -358,7 +361,7 @@ mod tests {
 
     #[test]
     fn page_test_next_page() {
-        let p = Page::new(1024);
+        let p = Page::new_data(1024);
         assert_eq!(p.get_next_page(), 0);
         p.set_next_page(42);
         assert_eq!(p.get_next_page(), 42);
@@ -366,7 +369,7 @@ mod tests {
 
     #[test]
     fn page_test_pinned_flag() {
-        let p = Page::new(1024);
+        let p = Page::new_data(1024);
         assert!(!p.is_pinned());
         let p_pinned = Page::new_pinned(1024);
         assert!(p_pinned.is_pinned());
@@ -374,13 +377,13 @@ mod tests {
 
     #[test]
     fn page_test_lsn_initially_none() {
-        let p = Page::new(1024);
+        let p = Page::new_data(1024);
         assert!(p.lsn_id().is_none());
     }
 
     #[test]
     fn page_test_dirty_state() {
-        let p = Page::new(1024);
+        let p = Page::new_data(1024);
         assert!(p.is_dirty());
         p.set_dirty(false);
         assert!(!p.is_dirty());
@@ -390,7 +393,7 @@ mod tests {
 
     #[test]
     fn page_test_roundtrip_preserves_tuples() {
-        let mut p = Page::new(2000);
+        let mut p = Page::new_data(2000);
         p.add_tuple(Tuple::new(1, b"first")).unwrap();
         p.add_tuple(Tuple::new(2, b"second")).unwrap();
         let bytes = p.to_bytes();

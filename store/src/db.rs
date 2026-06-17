@@ -185,6 +185,10 @@ where
         Self::open_using(name, f, undo_file, redo_file)
     }
 
+    /*
+     * Close only return files used so this can be used with MemFile for testing,
+     * as MemFile does not survive recreating. Similarly with open_using.
+     */
     pub fn close(self) -> Result<(F, F, F), StoreError> {
         self.write_system_tables()?;
         let mut header = (*self.header).clone();
@@ -211,7 +215,7 @@ where
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             self.generator.create_generator(&name, None)?;
             let table_page = self.alloc_page(false)?;
-            let table = Table::new(
+            let table = Table::new_with_id(
                 self.generator.gen_key(SYSTEM_TABLE_NAME)?,
                 name,
                 TableType::Table,
@@ -404,7 +408,7 @@ where
         let p = if should_pin {
             Page::new_pinned(self.header.page_size)
         } else {
-            Page::new(self.header.page_size)
+            Page::new_data(self.header.page_size)
         };
         let bytes = p.to_bytes();
         self.write_page(page_num, &bytes)?;
@@ -455,7 +459,7 @@ fn init_logger() {
 #[cfg(test)]
 mod tests {
     use crate::{
-        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
+        db::{DEFAULT_PAGE_SIZE, Db, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
         memfile::MemFile,
     };

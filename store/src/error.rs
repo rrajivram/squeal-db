@@ -36,6 +36,8 @@ pub enum StoreError {
     DuplicateName(String),
     #[error("Missing key {0}")]
     MissingKey(String),
+    #[error("Tuple too large. {0}: Max : {1}")]
+    TupleTooLarge(DBSizeType, usize),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

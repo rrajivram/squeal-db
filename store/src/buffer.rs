@@ -216,7 +216,7 @@ fn writer<F: DBFile>(
                             pending.push(msg);
                         }
                     } else {
-                        return Err(StoreError::UnknownError("Page does not have LSN".into()));
+                        panic!("Page does not have LSN");
                     }
                 }
                 BufMsg::WriteHeader(header) => {
@@ -291,7 +291,7 @@ mod tests {
     fn make_buffer(num_pages: u64, max_entries: usize) -> (PageBuffer<MemFile>, Arc<AtomicU64>) {
         let mut mem = MemFile::new();
         for _ in 0..num_pages {
-            let page = Page::new(PAGE_SIZE);
+            let page = Page::new_data(PAGE_SIZE);
             mem.write_all(&page.to_bytes()).unwrap();
         }
         mem.seek(SeekFrom::Start(0)).unwrap();

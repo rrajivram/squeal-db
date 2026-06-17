@@ -1,9 +1,18 @@
 use std::fmt::Display;
 
+use bitflags::bitflags;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{db::DBSizeType, error::StoreError, logger::UndoId, txn::TransactionId};
+
+bitflags! {
+    #[derive(Debug,Serialize,Deserialize,Clone, Copy,PartialEq,Default)]
+    struct TupleFlags: u8 {
+        const NONE=0;
+        const INDEXED = 1;
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum DBIdType {
@@ -12,29 +21,42 @@ pub enum DBIdType {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
-pub(crate) struct Tuple {
+pub struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
     pub(crate) undo_id: Option<UndoId>,
     pub(crate) data: Vec<u8>,
+    flags: TupleFlags,
 }
 
 impl Tuple {
     pub fn new(id: DBSizeType, data: &[u8]) -> Self {
+        Self::new_with(DBIdType::Int(id), data, None, None)
+    }
+
+    pub fn new_indexed(id: DBIdType, data: &[u8], txn_id: Option<TransactionId>) -> Self {
+        let mut s = Self::new_with(id, data, txn_id, None);
+        s.flags.set(TupleFlags::INDEXED, true);
+        s
+    }
+
+    pub fn new_with(
+        id: DBIdType,
+        data: &[u8],
+        txn_id: Option<TransactionId>,
+        undo_id: Option<UndoId>,
+    ) -> Self {
         Self {
-            id: DBIdType::Int(id),
+            id,
             data: data.to_vec(),
+            txn_id: txn_id,
+            undo_id: undo_id,
             ..Default::default()
         }
     }
 
-    pub fn new_in_txn(id: DBIdType, data: &[u8], txn_id: TransactionId, undo_id: UndoId) -> Self {
-        Self {
-            id,
-            data: data.to_vec(),
-            txn_id: Some(txn_id),
-            undo_id: Some(undo_id),
-        }
+    pub fn is_index(&self) -> bool {
+        self.flags.contains(TupleFlags::INDEXED)
     }
 
     pub fn set_txn_id(&mut self, id: TransactionId) {
@@ -86,6 +108,7 @@ mod tests {
             data: vec![b'h', b'e', b'l', b'l', b'o'],
             txn_id: None,
             undo_id: None,
+            ..Default::default()
         };
         let b = t.to();
         let t1 = Tuple::from(&b).unwrap();
@@ -101,6 +124,7 @@ mod tests {
             data: b"value".to_vec(),
             txn_id: None,
             undo_id: None,
+            ..Default::default()
         };
         let b = t.to();
         let t1 = Tuple::from(&b).unwrap();

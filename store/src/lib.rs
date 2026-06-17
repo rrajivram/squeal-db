@@ -25,6 +25,7 @@ mod memfile;
 ///  select from table [id[]]
 ///  delete from table [id[]]
 mod page;
+pub mod pages;
 pub mod table;
 pub mod tuple;
 pub mod txn;

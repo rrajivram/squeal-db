@@ -25,10 +25,10 @@ static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct LsnId(pub(crate) u64);
+pub struct LsnId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct UndoId(pub(crate) u16);
+pub struct UndoId(pub(crate) u16);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum MsgType {
@@ -377,7 +377,12 @@ mod tests {
         // UndoId is only constructable from within logger module
         let txn = TransactionId(42);
         let undo = UndoId(7);
-        let t = Tuple::new_in_txn(crate::tuple::DBIdType::Int(1), b"hello", txn, undo);
+        let t = Tuple::new_with(
+            crate::tuple::DBIdType::Int(1),
+            b"hello",
+            Some(txn),
+            Some(undo),
+        );
         assert_eq!(t.txn_id, Some(txn));
         assert_eq!(t.undo_id, Some(undo));
         assert_eq!(t.data, b"hello");
