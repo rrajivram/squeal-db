@@ -1,12 +1,8 @@
-use std::{
-    collections::{BTreeMap, btree_map::Values},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64},
-    },
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, AtomicU16, AtomicU64},
 };
 
-use bitflags::bitflags;
 use portable_atomic::AtomicU128;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
@@ -15,95 +11,122 @@ use crate::{
     constant::timestamp,
     db::DBSizeType,
     error::StoreError,
-    logger::LsnId,
+    logger::{Logger, LsnId},
+    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage},
     tuple::{DBIdType, Tuple},
 };
-
-// Note: LSN is not an option here as it needs to be set to write a page
+use atomic_bitfield::AtomicBitField as _;
 #[derive(Debug, Serialize, Deserialize)]
 struct PageDto {
-    data: Arc<BTreeMap<DBIdType, Arc<Tuple>>>,
+    data: Vec<u8>,
     #[serde(with = "postcard::fixint::le")]
     next_page: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     data_size: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     capacity: DBSizeType,
-    lsn: Option<LsnId>,
-    flags: PageFlags,
+    record_size: Option<usize>,
+    lsn: LsnId,
+    flags: u16,
 }
 
-bitflags! {
-    #[derive(Debug,Serialize,Deserialize,Clone, Copy,PartialEq,Default)]
-    struct PageFlags: u8 {
-        const NONE=0;
-        const PINNED = 1;
-        const INDEX_PAGE = 0b10;
-    }
-}
+#[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub struct PageId(DBSizeType);
 
-const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Arc<u64>>();
+const NONE: u16 = 0;
+const PINNED: u16 = 1;
+const INDEX_PAGE: u16 = 2;
+const RESERVED_FLAGS: u16 = 0x0f;
+
+const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Vec<u8>>();
+
+// PageType bundles all the constraints Page<PT> needs on its data field.
+// Baking `Item = Self` in here means every impl block just needs `PT: PageType`.
+pub(crate) trait PageType: PageTuple + Clone + PartialEq + std::fmt::Debug {}
+impl<T> PageType for T where T: PageTuple + Clone + PartialEq + std::fmt::Debug {}
+
+//pub(crate) type DataPage = Page<AnyTuplePage>;
+//pub(crate) type IndexPage = Page<FixedTuplePage>;
+
+impl Eq for PageId {}
 
 ///Page Invariants
 /// when written lsn = non-zero
 /// Rows added must have txn id and undo id set
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(into = "PageDto", from = "PageDto")]
+// PT doesn't need Serialize/Deserialize — PageDto handles that via to_bytes/from_bytes.
+//#[serde(bound = "PT: PageType")]
 pub(crate) struct Page {
-    data: Arc<BTreeMap<DBIdType, Arc<Tuple>>>,
+    data: Arc<dyn PageTuple>,
     next_page: AtomicU64,
     dirty: AtomicBool,
     data_size: DBSizeType,
     capacity: DBSizeType,
-    lsn: Option<LsnId>,
-    flags: PageFlags,
+    record_size: Option<usize>,
+    lsn: RwLock<LsnId>,
+    flags: AtomicU16,
     accessed: AtomicU128,
     saved: AtomicU128,
     written: AtomicU128,
 }
 
-#[derive(Debug)]
-pub(crate) struct PageIterator<'a> {
-    iter: Values<'a, DBIdType, Arc<Tuple>>,
+pub(crate) struct PageIterator {
+    data: std::vec::IntoIter<Arc<Tuple>>,
 }
 
 impl Page {
     pub(crate) fn new_data(size: DBSizeType) -> Self {
-        Self::new(size, None, PageFlags::NONE)
+        Self::new(size, NONE, None)
     }
 
     pub(crate) fn new_pinned(size: DBSizeType) -> Self {
-        Self::new(size, Some(LsnId(0)), PageFlags::PINNED)
+        Self::new(size, PINNED, None)
     }
 
-    pub(crate) fn new_indexed(size: DBSizeType) -> Self {
-        Self::new(size, None, PageFlags::INDEX_PAGE)
+    pub(crate) fn new_indexed(size: DBSizeType, record_size: usize) -> Self {
+        Self::new(size, INDEX_PAGE, Some(record_size))
     }
 
-    fn new(size: DBSizeType, lsn_id: Option<LsnId>, flags: PageFlags) -> Self {
+    fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
         let ds = size - PAGE_OVERHEAD as DBSizeType;
+        let ts = timestamp();
+        let pt: Arc<dyn PageTuple> = if let Some(record_size) = record_size {
+            Arc::new(FixedTuplePage::new(record_size))
+        } else {
+            Arc::new(AnyTuplePage::new())
+        };
         Self {
-            data: Arc::new(BTreeMap::new()),
+            data: pt,
             next_page: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
             data_size: ds,
             capacity: ds,
-            lsn: lsn_id, //pinned  pages are for system use, so written immediate;y
-            flags: flags,
-            ..Default::default()
+            record_size,
+            lsn: RwLock::new(LsnId(0)),
+            flags: AtomicU16::new(flags),
+            accessed: AtomicU128::new(ts),
+            saved: AtomicU128::new(ts),
+            written: AtomicU128::new(ts),
         }
     }
 
-    pub(crate) fn lsn_id(&self) -> Option<LsnId> {
-        self.lsn
+    pub(crate) fn get_data_size(&self) -> DBSizeType {
+        self.data_size
+    }
+
+    pub(crate) fn lsn_id(&self) -> Result<LsnId, StoreError> {
+        Ok(self.lsn.read()?.clone())
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
-        self.flags.contains(PageFlags::PINNED)
+        self.flags
+            .get_bit(PINNED as usize, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn is_index_page(&self) -> bool {
-        self.flags.contains(PageFlags::INDEX_PAGE)
+        self.flags
+            .get_bit(INDEX_PAGE as usize, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn get_next_page(&self) -> DBSizeType {
@@ -114,20 +137,25 @@ impl Page {
         self.dirty.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn set_next_page(&self, next_page: DBSizeType) {
+    pub(crate) fn set_next_page(&self, next_page: DBSizeType) -> Result<(), StoreError> {
         self.next_page
             .store(next_page, std::sync::atomic::Ordering::Relaxed);
-        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.set_dirty(true)?;
+        Ok(())
     }
 
-    pub(crate) fn set_dirty(&self, dirty: bool) {
+    pub(crate) fn set_dirty(&self, dirty: bool) -> Result<(), StoreError> {
         self.dirty
             .store(dirty, std::sync::atomic::Ordering::Relaxed);
+        if dirty {
+            *self.lsn.write()? = Logger::last_lsn();
+        }
+        Ok(())
     }
 
-    pub(crate) fn iter<'a>(&'a self) -> PageIterator<'a> {
+    pub(crate) fn iter(&self) -> PageIterator {
         PageIterator {
-            iter: self.data.values(),
+            data: self.data.values().unwrap_or_default().into_iter(),
         }
     }
 
@@ -139,18 +167,15 @@ impl Page {
         if !self.can_store(&tuple) {
             return Err(StoreError::PageCapacityError);
         }
-        if let Some(data) = Arc::get_mut(&mut self.data) {
-            if data.contains_key(&tuple.id) {
-                return Err(StoreError::DuplicateKey(tuple.id));
-            }
-            let sz = tuple.size();
-            data.insert(tuple.id.clone(), Arc::new(tuple));
-            self.capacity -= sz;
-            self.set_dirty(true);
-            Ok(())
-        } else {
-            return Err(StoreError::LockContentionError);
-        }
+        let sz = tuple.size();
+        self.data.add(tuple)?;
+        self.capacity -= sz;
+        self.set_dirty(true)?;
+        Ok(())
+    }
+
+    pub(crate) fn count(&self) -> Result<usize, StoreError> {
+        Ok(self.data.count()?)
     }
 
     pub(crate) fn written(&self) {
@@ -166,16 +191,12 @@ impl Page {
             .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub(crate) fn contains(&self, id: DBIdType) -> bool {
-        self.data.contains_key(&id)
+    pub(crate) fn contains(&self, id: DBIdType) -> Result<bool, StoreError> {
+        self.data.contains(&id)
     }
 
-    pub(crate) fn get(&self, id: DBIdType) -> Option<Arc<Tuple>> {
-        if let Some(v) = self.data.get(&id) {
-            Some(v.clone())
-        } else {
-            None
-        }
+    pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Arc<Tuple>>, StoreError> {
+        self.data.get(&id)
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
@@ -186,32 +207,53 @@ impl Page {
                 (self.data_size as usize + PAGE_OVERHEAD) - v.len()
             ]);
         }
-        return v;
+        v
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Page, StoreError> {
-        let p: Page = from_bytes(bytes)?;
-        Ok(p)
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        Ok(from_bytes(bytes)?)
+    }
+
+    pub(crate) fn set_page_flags(&self, flag: usize) {
+        if flag & RESERVED_FLAGS as usize != 0 {
+            panic!("Reserved bits cannot be set : {flag}");
+        }
+        self.flags
+            .set_bit(flag, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn clear_page_flag(&self, flag: usize) {
+        if flag & RESERVED_FLAGS as usize != 0 {
+            panic!("Reserved bits cannot be set: {flag}");
+        }
+        self.flags
+            .clear_bit(flag, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
-impl<'a> Iterator for PageIterator<'a> {
-    type Item = &'a Arc<Tuple>;
+impl Iterator for PageIterator {
+    type Item = Arc<Tuple>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next()
+        self.data.next()
     }
 }
 
 impl From<PageDto> for Page {
     fn from(value: PageDto) -> Self {
+        let pt: Arc<dyn PageTuple> = if let Some(_record_size) = value.record_size {
+            Arc::new(FixedTuplePage::from_bytes(&value.data).unwrap())
+        } else {
+            Arc::new(AnyTuplePage::from_bytes(&value.data).unwrap())
+        };
         Self {
-            data: value.data.clone(),
+            data: pt,
             next_page: AtomicU64::new(value.next_page),
             dirty: AtomicBool::new(false),
             data_size: value.data_size,
             capacity: value.capacity,
-            flags: value.flags,
-            lsn: value.lsn,
+            record_size: value.record_size,
+            flags: AtomicU16::new(value.flags),
+            lsn: RwLock::new(value.lsn),
             accessed: AtomicU128::new(timestamp()),
             written: AtomicU128::new(timestamp()),
             saved: AtomicU128::new(timestamp()),
@@ -222,12 +264,13 @@ impl From<PageDto> for Page {
 impl From<Page> for PageDto {
     fn from(value: Page) -> Self {
         Self {
-            data: value.data.clone(),
+            data: value.data.to_bytes().unwrap(),
             next_page: value.next_page.load(std::sync::atomic::Ordering::Relaxed),
             data_size: value.data_size,
             capacity: value.capacity,
-            flags: value.flags,
-            lsn: value.lsn.or(None),
+            flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
+            lsn: value.lsn.read().unwrap().clone(),
+            record_size: value.record_size,
         }
     }
 }
@@ -240,8 +283,9 @@ impl Clone for Page {
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
             data_size: self.data_size,
             capacity: self.capacity,
-            flags: self.flags,
-            lsn: self.lsn,
+            record_size: self.record_size,
+            flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
+            lsn: RwLock::new(self.lsn.read().unwrap().clone()),
             accessed: AtomicU128::new(self.accessed.load(std::sync::atomic::Ordering::Relaxed)),
             written: AtomicU128::new(self.written.load(std::sync::atomic::Ordering::Relaxed)),
             saved: AtomicU128::new(self.saved.load(std::sync::atomic::Ordering::Relaxed)),
@@ -251,16 +295,31 @@ impl Clone for Page {
 
 impl PartialEq for Page {
     fn eq(&self, rhs: &Self) -> bool {
-        if self.capacity != rhs.capacity
-            || self.data_size != rhs.data_size
-            || self.next_page.load(std::sync::atomic::Ordering::Relaxed)
-                != rhs.next_page.load(std::sync::atomic::Ordering::Relaxed)
-            || self.flags != rhs.flags
-            || self.data != rhs.data
-        {
-            return false;
-        }
-        return true;
+        self.capacity == rhs.capacity
+            && self.data_size == rhs.data_size
+            && self.next_page.load(std::sync::atomic::Ordering::Relaxed)
+                == rhs.next_page.load(std::sync::atomic::Ordering::Relaxed)
+            && self.flags.load(std::sync::atomic::Ordering::Relaxed)
+                == rhs.flags.load(std::sync::atomic::Ordering::Relaxed)
+            && self.record_size == rhs.record_size
+    }
+}
+
+impl From<DBSizeType> for PageId {
+    fn from(value: DBSizeType) -> Self {
+        Self(value)
+    }
+}
+
+impl From<PageId> for DBSizeType {
+    fn from(value: PageId) -> Self {
+        value.0
+    }
+}
+
+impl std::fmt::Debug for dyn PageTuple + 'static {
+    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Ok(())
     }
 }
 
@@ -269,11 +328,14 @@ unsafe impl Send for Page {}
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
         error::StoreError,
         page::{PAGE_OVERHEAD, Page},
-        tuple::Tuple,
+        tuple::{DBIdType, Tuple},
     };
+
+    type FixedPage = Page;
 
     #[test]
     fn page_test_unique_id() {
@@ -303,8 +365,9 @@ mod tests {
 
     #[test]
     fn page_test_accurate_page_bytes() {
-        let mut p = Page::new_data(1000);
-        // 1000 - 24 = 976 avaolable - at 46 b/tuple  = 21 max
+        let tuple_sz = Tuple::new(0, b"abcdef").size();
+        let page_size = tuple_sz * 10 + PAGE_OVERHEAD as u64 + 1;
+        let mut p = Page::new_data(page_size);
         for i in 0..10 {
             assert!(
                 p.add_tuple(Tuple::new(i, b"abcdef")).is_ok(),
@@ -312,7 +375,7 @@ mod tests {
             );
         }
         let b = p.to_bytes();
-        assert!(b.len() == 1000);
+        assert_eq!(b.len(), page_size as usize);
         let p1 = Page::from_bytes(&b);
         assert!(p1.is_ok());
         let p1 = p1.unwrap();
@@ -330,23 +393,21 @@ mod tests {
 
     #[test]
     fn page_test_get_existing_and_missing() {
-        use crate::tuple::DBIdType;
         let mut p = Page::new_data(2000);
         p.add_tuple(Tuple::new(7, b"payload")).unwrap();
-        let found = p.get(DBIdType::Int(7));
+        let found = p.get(DBIdType::Int(7)).unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().data, b"payload");
-        let missing = p.get(DBIdType::Int(99));
+        let missing = p.get(DBIdType::Int(99)).unwrap();
         assert!(missing.is_none());
     }
 
     #[test]
     fn page_test_contains() {
-        use crate::tuple::DBIdType;
         let mut p = Page::new_data(2000);
         p.add_tuple(Tuple::new(3, b"x")).unwrap();
-        assert!(p.contains(DBIdType::Int(3)));
-        assert!(!p.contains(DBIdType::Int(4)));
+        assert!(p.contains(DBIdType::Int(3)).unwrap());
+        assert!(!p.contains(DBIdType::Int(4)).unwrap());
     }
 
     #[test]
@@ -363,7 +424,7 @@ mod tests {
     fn page_test_next_page() {
         let p = Page::new_data(1024);
         assert_eq!(p.get_next_page(), 0);
-        p.set_next_page(42);
+        p.set_next_page(42).unwrap();
         assert_eq!(p.get_next_page(), 42);
     }
 
@@ -376,18 +437,12 @@ mod tests {
     }
 
     #[test]
-    fn page_test_lsn_initially_none() {
-        let p = Page::new_data(1024);
-        assert!(p.lsn_id().is_none());
-    }
-
-    #[test]
     fn page_test_dirty_state() {
         let p = Page::new_data(1024);
         assert!(p.is_dirty());
-        p.set_dirty(false);
+        p.set_dirty(false).unwrap();
         assert!(!p.is_dirty());
-        p.set_dirty(true);
+        p.set_dirty(true).unwrap();
         assert!(p.is_dirty());
     }
 
@@ -398,10 +453,94 @@ mod tests {
         p.add_tuple(Tuple::new(2, b"second")).unwrap();
         let bytes = p.to_bytes();
         let p2 = Page::from_bytes(&bytes).unwrap();
-        use crate::tuple::DBIdType;
-        assert!(p2.contains(DBIdType::Int(1)));
-        assert!(p2.contains(DBIdType::Int(2)));
-        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().data, b"first");
-        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().data, b"second");
+        assert!(p2.contains(DBIdType::Int(1)).unwrap());
+        assert!(p2.contains(DBIdType::Int(2)).unwrap());
+        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().unwrap().data, b"first");
+        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().unwrap().data, b"second");
+    }
+
+    // --- PageIterator: AnyTuplePage ---
+
+    #[test]
+    fn page_iter_any_empty() {
+        let p = Page::new_data(1024);
+        assert_eq!(p.iter().count(), 0);
+    }
+
+    #[test]
+    fn page_iter_any_correct_data() {
+        let mut p = Page::new_data(4000);
+        p.add_tuple(Tuple::new(1, b"alpha")).unwrap();
+        p.add_tuple(Tuple::new(2, b"beta")).unwrap();
+        p.add_tuple(Tuple::new(3, b"gamma")).unwrap();
+        assert_eq!(p.iter().count(), 3);
+        assert!(p.iter().any(|t| t.data == b"alpha"));
+        assert!(p.iter().any(|t| t.data == b"beta"));
+        assert!(p.iter().any(|t| t.data == b"gamma"));
+    }
+
+    #[test]
+    fn page_iter_any_after_roundtrip() {
+        let mut p = Page::new_data(2000);
+        p.add_tuple(Tuple::new(10, b"x")).unwrap();
+        p.add_tuple(Tuple::new(20, b"y")).unwrap();
+        let p2 = Page::from_bytes(&p.to_bytes()).unwrap();
+        assert_eq!(p2.iter().count(), 2);
+    }
+
+    // --- PageIterator: FixedTuplePage (new_indexed) ---
+
+    #[test]
+    fn page_iter_fixed_empty() {
+        let record_size = Tuple::new(0, b"xxxx").size() as usize;
+        let p = FixedPage::new_indexed(1024, record_size);
+        assert_eq!(p.iter().count(), 0);
+    }
+
+    #[test]
+    fn page_iter_fixed_correct_count() {
+        let record_size = Tuple::new(0, b"data").size() as usize;
+        let mut p = FixedPage::new_indexed(4000, record_size);
+        for i in 0..4u64 {
+            p.add_tuple(Tuple::new(i, b"data")).unwrap();
+        }
+        assert_eq!(p.iter().count(), 4);
+    }
+
+    #[test]
+    fn page_iter_fixed_correct_data() {
+        let record_size = Tuple::new(0, b"hello").size() as usize;
+        let mut p = FixedPage::new_indexed(4000, record_size);
+        p.add_tuple(Tuple::new(10, b"hello")).unwrap();
+        p.add_tuple(Tuple::new(20, b"hello")).unwrap();
+        assert!(p.iter().all(|t| t.data == b"hello"));
+        let mut ids: Vec<u64> = p
+            .iter()
+            .map(|t| match t.id {
+                DBIdType::Int(n) => n,
+                _ => panic!("unexpected id type"),
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec![10, 20]);
+    }
+
+    #[test]
+    fn page_iter_fixed_oversized_rejected_iter_stays_empty() {
+        let record_size = Tuple::new(0, b"hi").size() as usize;
+        let mut p = FixedPage::new_indexed(4000, record_size);
+        assert!(p.add_tuple(Tuple::new(1, b"way_too_long_payload")).is_err());
+        assert_eq!(p.iter().count(), 0);
+    }
+
+    #[test]
+    fn page_iter_fixed_after_roundtrip() {
+        let record_size = Tuple::new(0, b"abc").size() as usize;
+        let mut p = FixedPage::new_indexed(2000, record_size);
+        p.add_tuple(Tuple::new(1, b"abc")).unwrap();
+        p.add_tuple(Tuple::new(2, b"abc")).unwrap();
+        let p2 = FixedPage::from_bytes(&p.to_bytes()).unwrap();
+        assert_eq!(p2.iter().count(), 2);
+        assert!(p2.iter().all(|t| t.data == b"abc"));
     }
 }

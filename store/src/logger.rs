@@ -22,7 +22,8 @@ use crate::{
 };
 
 static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
-static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(0);
+// We make this very high at start so new pages will get written
+static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
 pub struct LsnId(pub(crate) u64);
@@ -106,6 +107,7 @@ impl Logger {
                         record
                             .tuple
                             .txn_id
+                            .clone()
                             .ok_or(StoreError::UnknownError("Missing transaction".into()))?,
                     )
                     .and_modify(|v| v.push(op.clone()))
@@ -292,7 +294,7 @@ mod tests {
     #[test]
     fn test_log_redo_returns_incrementing_lsn() {
         let logger = Logger::new();
-        let op = Operation::new_commit(TransactionId(1));
+        let op = Operation::new_commit(TransactionId::from(1));
         let lsn1 = logger.log_redo(op.clone()).unwrap();
         let lsn2 = logger.log_redo(op).unwrap();
         assert!(lsn2 > lsn1);
@@ -303,7 +305,7 @@ mod tests {
         let logger = Logger::new();
         let mut lsns = Vec::new();
         for i in 0..5 {
-            let op = Operation::new_commit(TransactionId(i));
+            let op = Operation::new_commit(TransactionId::from(i));
             lsns.push(logger.log_redo(op).unwrap());
         }
         let unique: std::collections::HashSet<_> = lsns.iter().cloned().collect();
@@ -314,24 +316,24 @@ mod tests {
     fn test_log_undo_commit_op_no_db() {
         // Without set_db, log_undo should succeed (undo_tx is None, msg is silently dropped)
         let logger = Logger::new();
-        let op = Operation::new_commit(TransactionId(1));
+        let op = Operation::new_commit(TransactionId::from(1));
         assert!(logger.log_undo(op).is_ok());
     }
 
     #[test]
     fn test_log_undo_rollback_op_no_db() {
         let logger = Logger::new();
-        let op = Operation::new_rollback(TransactionId(2));
+        let op = Operation::new_rollback(TransactionId::from(2));
         assert!(logger.log_undo(op).is_ok());
     }
 
     #[test]
     fn test_log_undo_add_op_with_txn_id() {
         let logger = Logger::new();
-        let txn_id = TransactionId(10);
+        let txn_id = TransactionId::from(10);
         let mut tuple = Tuple::new(1, b"hello");
-        tuple.set_txn_id(txn_id);
-        let record = Record::new(0, Arc::new(tuple), txn_id);
+        tuple.set_txn_id(txn_id.clone());
+        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
     }
@@ -340,9 +342,9 @@ mod tests {
     fn test_log_undo_add_missing_txn_id_returns_err() {
         // Tuple without txn_id set → log_undo should return an error
         let logger = Logger::new();
-        let txn_id = TransactionId(10);
+        let txn_id = TransactionId::from(10);
         let tuple = Tuple::new(1, b"hello"); // txn_id not set
-        let record = Record::new(0, Arc::new(tuple), txn_id);
+        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_err());
     }
@@ -351,7 +353,7 @@ mod tests {
     fn test_logger_with_memfile_shutdown() {
         let mut logger = Logger::new();
         logger.set_db(MemFile::new(), MemFile::new()).unwrap();
-        let txn_id = TransactionId(99);
+        let txn_id = TransactionId::from(99);
         let op = Operation::new_commit(txn_id);
         logger.log_redo(op.clone()).unwrap();
         logger.log_undo(op).unwrap();
@@ -362,10 +364,10 @@ mod tests {
     fn test_logger_undo_add_with_db() {
         let mut logger = Logger::new();
         logger.set_db(MemFile::new(), MemFile::new()).unwrap();
-        let txn_id = TransactionId(5);
+        let txn_id = TransactionId::from(5);
         let mut tuple = Tuple::new(42, b"data");
-        tuple.set_txn_id(txn_id);
-        let record = Record::new(0, Arc::new(tuple), txn_id);
+        tuple.set_txn_id(txn_id.clone());
+        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
         assert!(logger.shutdown().is_ok());
@@ -375,15 +377,15 @@ mod tests {
     fn test_tuple_new_in_txn() {
         use crate::tuple::Tuple;
         // UndoId is only constructable from within logger module
-        let txn = TransactionId(42);
+        let txn = TransactionId::from(42);
         let undo = UndoId(7);
         let t = Tuple::new_with(
             crate::tuple::DBIdType::Int(1),
             b"hello",
-            Some(txn),
+            Some(txn.clone()),
             Some(undo),
         );
-        assert_eq!(t.txn_id, Some(txn));
+        assert_eq!(t.txn_id, Some(txn.clone()));
         assert_eq!(t.undo_id, Some(undo));
         assert_eq!(t.data, b"hello");
         let b = t.to();

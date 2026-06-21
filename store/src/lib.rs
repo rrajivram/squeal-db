@@ -27,5 +27,6 @@ mod memfile;
 mod page;
 pub mod pages;
 pub mod table;
+pub mod tables;
 pub mod tuple;
 pub mod txn;

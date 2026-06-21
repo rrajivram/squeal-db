@@ -1,9 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    db::{DBSizeType, TableType},
-    error::StoreError,
-};
+use crate::{db::DBSizeType, error::StoreError, page::PageId};
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum TableType {
+    Table,
+    Index,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TableIdType(DBSizeType);
@@ -13,8 +16,7 @@ pub struct Table {
     pub(crate) id: TableIdType,
     pub(crate) name: String,
     pub(crate) table_type: TableType,
-    #[serde(with = "postcard::fixint::le")]
-    pub(crate) first_page: DBSizeType,
+    pub(crate) first_page: Option<PageId>,
 }
 
 impl Table {
@@ -22,7 +24,7 @@ impl Table {
         id: DBSizeType,
         name: String,
         table_type: TableType,
-        first_page: DBSizeType,
+        first_page: Option<PageId>,
     ) -> Result<Self, StoreError> {
         Ok(Self {
             id: TableIdType(id),
@@ -30,5 +32,11 @@ impl Table {
             table_type,
             first_page,
         })
+    }
+}
+
+impl From<DBSizeType> for TableIdType {
+    fn from(value: DBSizeType) -> Self {
+        TableIdType(value)
     }
 }

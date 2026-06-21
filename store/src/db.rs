@@ -9,7 +9,7 @@ use crate::error::StoreError;
 use crate::generator::Generator;
 use crate::logger::Logger;
 use crate::page::Page;
-use crate::table::Table;
+use crate::table::{Table, TableType};
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
 use crate::txn::TransactionId;
@@ -60,12 +60,6 @@ pub(crate) type DBSizeType = u64;
 impl<T> DBFile for T where
     T: std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
 {
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum TableType {
-    Table,
-    Index,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -214,12 +208,12 @@ where
                 .write()
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             self.generator.create_generator(&name, None)?;
-            let table_page = self.alloc_page(false)?;
+            //let table_page = self.buffer.alloc_page(false)?;
             let table = Table::new_with_id(
                 self.generator.gen_key(SYSTEM_TABLE_NAME)?,
                 name,
                 TableType::Table,
-                table_page,
+                None,
             )?;
             tables.insert(table.name.clone(), table.clone());
             table
@@ -338,23 +332,23 @@ where
             // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
-        self.buffer.write_page(0, Arc::new(page))?;
+        self.buffer.write_page(0.into(), Arc::new(page))?;
         let gens = self.generator.get_values()?;
         let mut page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
-        self.buffer.write_page(1, Arc::new(page))?;
+        self.buffer.write_page(1.into(), Arc::new(page))?;
         // TODO : Handle page overflows correctly
         // TODO: Handle empty pages
         Ok(())
     }
 
     fn create_system_tables(&self) -> Result<(), StoreError> {
-        let t = self.alloc_page(true)?; // system
-        assert!(t == 0);
-        let t = self.alloc_page(true)?; // generators
-        assert!(t == 1);
-        let t = self.alloc_page(true)?; // free pages
-        assert!(t == 2);
+        let t = self.buffer.alloc_page(true)?; // system
+        assert!(t == 0.into());
+        let t = self.buffer.alloc_page(true)?; // generators
+        assert!(t == 1.into());
+        let t = self.buffer.alloc_page(true)?; // free pages
+        assert!(t == 2.into());
         assert!(self.page_count() == 3);
         Ok(())
     }
@@ -365,14 +359,14 @@ where
                 "Unable to load system tables".into(),
             ));
         }
-        let page = self.buffer.get_page(SYSTEM_TABLE_PAGE)?;
+        let page = self.buffer.get_page(SYSTEM_TABLE_PAGE.into())?;
         let mut tables = self.tables.write()?;
         for t in page.iter() {
             let t: Table = from_bytes(&t.data)?;
             tables.insert(t.name.clone(), t);
         }
-        let page = self.buffer.get_page(GENERATOR_TABLE_PAGE)?;
-        let tuple = page.get(DBIdType::Int(0)).unwrap_or_default();
+        let page = self.buffer.get_page(GENERATOR_TABLE_PAGE.into())?;
+        let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
         let gens = from_bytes(&tuple.data)?;
         self.generator.set_values(gens)?;
         Ok(())
@@ -395,42 +389,15 @@ where
         remove_file(rf_name)?;
         Ok(())
     }
+}
 
-    fn alloc_page(&self, should_pin: bool) -> Result<DBSizeType, StoreError> {
-        let next_page = self
-            .page_count
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        self.init_page(next_page, should_pin)?;
-        Ok(next_page)
+pub(crate) fn db_hash(bytes: &[u8]) -> u64 {
+    let mut h = 0x811C9DC5;
+    for b in bytes {
+        h = h ^ *b as u64;
+        h = (h * 0x01000193) & 0xFFFFFFFF;
     }
-
-    fn init_page(&self, page_num: DBSizeType, should_pin: bool) -> Result<(), StoreError> {
-        let p = if should_pin {
-            Page::new_pinned(self.header.page_size)
-        } else {
-            Page::new_data(self.header.page_size)
-        };
-        let bytes = p.to_bytes();
-        self.write_page(page_num, &bytes)?;
-        Ok(())
-    }
-
-    fn write_page(&self, page_num: DBSizeType, bytes: &[u8]) -> Result<(), StoreError> {
-        let offset = self.header.first_page_offset + page_num * self.header.page_size;
-        let mut file = self.file.do_clone()?;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write(&bytes)?;
-        Ok(())
-    }
-
-    fn read_page(&self, page_num: DBSizeType) -> Result<Vec<u8>, StoreError> {
-        let offset = self.header.first_page_offset + page_num * self.header.page_size;
-        let mut file = self.file.do_clone()?;
-        file.seek(SeekFrom::Start(offset))?;
-        let mut v = vec![0u8; self.header.page_size as usize];
-        file.read_exact(&mut v)?;
-        Ok(v)
-    }
+    h
 }
 
 fn init_logger() {
@@ -458,6 +425,8 @@ fn init_logger() {
 
 #[cfg(test)]
 mod tests {
+    use std::{thread, time::Duration};
+
     use crate::{
         db::{DEFAULT_PAGE_SIZE, Db, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
@@ -488,14 +457,16 @@ mod tests {
         const DB_NAME: &str = "test2.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
         let db = TestDB::create(DB_NAME.to_string()).unwrap();
-        let page = db.alloc_page(false);
+        let page = db.buffer.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
-        assert_eq!(page, 3);
+        assert_eq!(page, 3.into());
+        thread::sleep(Duration::from_millis(100));
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, DEFAULT_PAGE_SIZE * 4 + ZERO_PAGE_SIZE);
-        let page = db.alloc_page(false).unwrap_or(0);
-        assert_eq!(page, 4);
+        let page = db.buffer.alloc_page(false).unwrap_or(0.into());
+        assert_eq!(page, 4.into());
+        thread::sleep(Duration::from_millis(100));
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, ZERO_PAGE_SIZE + 5 * DEFAULT_PAGE_SIZE);
         assert_eq!(db.page_count(), 5);

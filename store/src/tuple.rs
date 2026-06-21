@@ -1,18 +1,17 @@
 use std::fmt::Display;
 
-use bitflags::bitflags;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
-use crate::{db::DBSizeType, error::StoreError, logger::UndoId, txn::TransactionId};
+use crate::{
+    db::{DBSizeType, db_hash},
+    error::StoreError,
+    logger::UndoId,
+    txn::TransactionId,
+};
 
-bitflags! {
-    #[derive(Debug,Serialize,Deserialize,Clone, Copy,PartialEq,Default)]
-    struct TupleFlags: u8 {
-        const NONE=0;
-        const INDEXED = 1;
-    }
-}
+const NONE: u8 = 0;
+const INDEXED: u8 = 1;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
 pub enum DBIdType {
@@ -20,13 +19,13 @@ pub enum DBIdType {
     Vec(Vec<u8>),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Hash)]
 pub struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
     pub(crate) undo_id: Option<UndoId>,
     pub(crate) data: Vec<u8>,
-    flags: TupleFlags,
+    flags: u8,
 }
 
 impl Tuple {
@@ -36,7 +35,7 @@ impl Tuple {
 
     pub fn new_indexed(id: DBIdType, data: &[u8], txn_id: Option<TransactionId>) -> Self {
         let mut s = Self::new_with(id, data, txn_id, None);
-        s.flags.set(TupleFlags::INDEXED, true);
+        s.flags |= INDEXED;
         s
     }
 
@@ -56,7 +55,7 @@ impl Tuple {
     }
 
     pub fn is_index(&self) -> bool {
-        self.flags.contains(TupleFlags::INDEXED)
+        self.flags & INDEXED == INDEXED
     }
 
     pub fn set_txn_id(&mut self, id: TransactionId) {
@@ -92,6 +91,27 @@ impl Display for DBIdType {
         match &self {
             DBIdType::Int(i) => write!(f, "{}", i),
             DBIdType::Vec(v) => write!(f, "{:?}", v),
+        }
+    }
+}
+
+impl From<String> for DBIdType {
+    fn from(value: String) -> Self {
+        Self::Vec(value.as_bytes().to_vec())
+    }
+}
+
+impl From<u64> for DBIdType {
+    fn from(value: u64) -> Self {
+        Self::Int(value)
+    }
+}
+
+impl DBIdType {
+    pub(crate) fn hashed(&self) -> u64 {
+        match self {
+            Self::Int(i) => db_hash(&i.to_ne_bytes()),
+            Self::Vec(v) => db_hash(&v),
         }
     }
 }
@@ -138,8 +158,8 @@ mod tests {
         let mut t = Tuple::new(5, b"hello");
         assert!(t.txn_id.is_none());
         assert!(t.undo_id.is_none());
-        t.set_txn_id(TransactionId(99));
-        assert_eq!(t.txn_id, Some(TransactionId(99)));
+        t.set_txn_id(TransactionId::from(99));
+        assert_eq!(t.txn_id, Some(TransactionId::from(99)));
         assert!(t.undo_id.is_none());
     }
 
@@ -165,11 +185,11 @@ mod tests {
     fn test_tuple_roundtrip_with_txn_id() {
         use crate::txn::TransactionId;
         let mut t = Tuple::new(10, b"payload");
-        t.set_txn_id(TransactionId(1));
+        t.set_txn_id(TransactionId::from(1));
         let b = t.to();
         let t2 = Tuple::from(&b).unwrap();
         assert_eq!(t2.id, DBIdType::Int(10));
         assert_eq!(t2.data, b"payload");
-        assert_eq!(t2.txn_id, Some(TransactionId(1)));
+        assert_eq!(t2.txn_id, Some(TransactionId::from(1)));
     }
 }

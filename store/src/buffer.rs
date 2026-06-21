@@ -19,7 +19,7 @@ use crate::{
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::Logger,
-    page::Page,
+    page::{Page, PageId},
 };
 
 #[derive(Debug, Clone)]
@@ -29,23 +29,23 @@ enum BufMsg {
     Shutdowm,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 struct WriteMsg {
-    page_num: DBSizeType,
+    page_num: PageId,
     page: Page,
 }
 
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
-    buffer: RwLock<HashMap<DBSizeType, Arc<Page>>>,
+    buffer: RwLock<HashMap<PageId, Arc<Page>>>,
     header: Arc<Header>,
-    page_counter: Arc<AtomicU64>,
     page_size: DBSizeType,
+    page_count: Arc<AtomicU64>,
     max_entries: usize,
     write_tx: Sender<BufMsg>,
     write_handle: JoinHandle<Result<(), StoreError>>,
     read_file: RwLock<F>,
-    access_map: RwLock<PriorityQueue<DBSizeType, u128>>,
+    access_map: RwLock<PriorityQueue<PageId, u128>>,
 }
 
 impl<F: DBFile> PageBuffer<F>
@@ -72,7 +72,7 @@ where
             read_file: RwLock::new(read_file),
             write_handle,
             access_map: RwLock::new(PriorityQueue::new()),
-            page_counter,
+            page_count: page_counter,
             header,
         })
     }
@@ -92,15 +92,15 @@ where
         Ok(())
     }
 
+    pub(crate) fn page_size(&self) -> DBSizeType {
+        self.page_size
+    }
+
     pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
         Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
     }
 
-    pub(crate) fn write_page(
-        &self,
-        page_num: DBSizeType,
-        page: Arc<Page>,
-    ) -> Result<(), StoreError> {
+    pub(crate) fn write_page(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
         {
             self.update_page_access(page_num)?;
             let (contains, count) = {
@@ -121,11 +121,24 @@ where
         }))?)
     }
 
-    pub(crate) fn get_page(&self, page_num: DBSizeType) -> Result<Arc<Page>, StoreError> {
-        let valid = page_num < self.page_counter.load(std::sync::atomic::Ordering::Relaxed);
+    pub(crate) fn alloc_page(&self, should_pin: bool) -> Result<PageId, StoreError> {
+        let next_page = self
+            .page_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let pg: PageId = next_page.into();
+        self.init_page(pg.clone(), should_pin)?;
+        Ok(next_page.into())
+    }
+
+    pub(crate) fn get_page(&self, page_num: PageId) -> Result<Arc<Page>, StoreError> {
+        let valid = page_num
+            < self
+                .page_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .into();
         if !valid {
             return Err(StoreError::UnknownError(format!(
-                "Invalid page number : {}",
+                "Invalid page number : {:?}",
                 page_num
             )));
         }
@@ -134,7 +147,7 @@ where
             return Ok(page.clone());
         }
         let mut bytes = vec![0u8; self.page_size as usize];
-        let offset = self.header.first_page_offset + self.header.page_size * page_num;
+        let offset = self.header.first_page_offset + self.header.page_size * u64::from(page_num);
         self.read_file.write()?.seek(SeekFrom::Start(offset))?;
         self.read_file.write()?.read(&mut bytes)?;
         let page = Arc::new(Page::from_bytes(&bytes)?);
@@ -147,7 +160,7 @@ where
         Ok(page)
     }
 
-    fn replace_oldest(&self, page_num: DBSizeType, page: &Arc<Page>) -> Result<(), StoreError> {
+    fn replace_oldest(&self, page_num: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
         if let Some(last_used_page) = { self.access_map.write()?.pop() } {
             let mut buffer = self.buffer.write()?;
             buffer.remove(&last_used_page.0);
@@ -158,13 +171,23 @@ where
         Ok(())
     }
 
-    fn update_page_access(&self, page_num: DBSizeType) -> Result<(), StoreError> {
+    fn update_page_access(&self, page_num: PageId) -> Result<(), StoreError> {
         let mut pq = self.access_map.write()?;
         if !pq.contains(&page_num) {
             pq.push(page_num, timestamp());
         } else {
             pq.change_priority(&page_num, timestamp());
         }
+        Ok(())
+    }
+
+    fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
+        let p = if should_pin {
+            Page::new_pinned(self.header.page_size)
+        } else {
+            Page::new_data(self.header.page_size)
+        };
+        self.write_page(page_num, Arc::new(p))?;
         Ok(())
     }
 }
@@ -198,25 +221,21 @@ fn writer<F: DBFile>(
                     break;
                 }
                 BufMsg::WritePage(msg) => {
-                    if let Some(lsn) = msg.page.lsn_id() {
-                        if msg.page.is_pinned() || lsn < Logger::last_lsn() {
-                            seek_to_page(
-                                msg.page_num,
-                                &mut file,
-                                header.page_size,
-                                header.first_page_offset,
-                            )?;
-                            file.write(&msg.page.to_bytes())?;
-                        } else {
-                            info!(
-                                "Waiting for lsn : page lsn: {:?}, last_lsn: {:?}",
-                                msg.page.lsn_id(),
-                                lsn
-                            );
-                            pending.push(msg);
-                        }
+                    if msg.page.is_pinned() || msg.page.lsn_id()? < Logger::last_lsn() {
+                        seek_to_page(
+                            msg.page_num.into(),
+                            &mut file,
+                            header.page_size,
+                            header.first_page_offset,
+                        )?;
+                        file.write(&msg.page.to_bytes())?;
                     } else {
-                        panic!("Page does not have LSN");
+                        info!(
+                            "Waiting for lsn : page lsn: {:?}, last_lsn: {:?}",
+                            msg.page.lsn_id(),
+                            Logger::last_lsn()
+                        );
+                        pending.push(msg);
                     }
                 }
                 BufMsg::WriteHeader(header) => {
@@ -232,9 +251,9 @@ fn writer<F: DBFile>(
         } else {
             for i in (0..pending.len()).rev() {
                 let m = &pending[i];
-                if let Some(_) = m.page.lsn_id().filter(|m| *m < Logger::last_lsn()) {
+                if m.page.lsn_id()? < Logger::last_lsn() {
                     seek_to_page(
-                        m.page_num,
+                        m.page_num.into(),
                         &mut file,
                         header.page_size,
                         header.first_page_offset,
@@ -267,7 +286,8 @@ mod tests {
 
     use postcard::from_bytes;
 
-    use crate::{buffer::PageBuffer, db::Header, memfile::MemFile, page::Page};
+    use crate::page::Page;
+    use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
 
     const PAGE_SIZE: u64 = 1000;
 
@@ -316,7 +336,7 @@ mod tests {
     #[test]
     fn test_get_page_invalid_num_returns_err() {
         let (buf, _) = make_buffer(0, 10);
-        let r = buf.get_page(0);
+        let r = buf.get_page(0.into());
         assert!(r.is_err());
         buf.shutdown().unwrap();
     }
@@ -325,7 +345,7 @@ mod tests {
     fn test_get_page_reads_from_file() {
         let (buf, _) = make_buffer(1, 10);
         // page 0 is valid (page_counter = 1) and its bytes are at offset 0 in MemFile
-        let r = buf.get_page(0);
+        let r = buf.get_page(0.into());
         assert!(r.is_ok());
         let _ = buf.shutdown();
     }
@@ -333,8 +353,8 @@ mod tests {
     #[test]
     fn test_get_page_cached_after_first_read() {
         let (buf, _) = make_buffer(1, 10);
-        let p1 = buf.get_page(0).unwrap();
-        let p2 = buf.get_page(0).unwrap();
+        let p1 = buf.get_page(0.into()).unwrap();
+        let p2 = buf.get_page(0.into()).unwrap();
         assert_eq!(*p1, *p2);
         let _ = buf.shutdown();
     }
@@ -343,13 +363,13 @@ mod tests {
     fn test_write_page_updates_in_memory_cache() {
         let (buf, _) = make_buffer(1, 10);
         // Populate cache with the initial (non-pinned) page
-        let p = buf.get_page(0).unwrap();
+        let p = buf.get_page(0.into()).unwrap();
         assert!(!p.is_pinned());
         // Write a pinned page into the cache slot for page 0
         let new_page = Arc::new(Page::new_pinned(PAGE_SIZE));
-        assert!(buf.write_page(0, new_page).is_ok());
+        assert!(buf.write_page(0.into(), new_page).is_ok());
         // Cache must now hold the updated page
-        let p2 = buf.get_page(0).unwrap();
+        let p2 = buf.get_page(0.into()).unwrap();
         assert!(p2.is_pinned());
         // Note: shutdown may fail if the writer exited due to the page having no LSN —
         // that is expected here since we only test cache behaviour.
