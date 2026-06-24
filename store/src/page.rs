@@ -148,8 +148,9 @@ impl Page {
         Ok(())
     }
 
-    pub(crate) fn clear(&self) -> Result<(), StoreError> {
+    pub(crate) fn clear(&mut self) -> Result<(), StoreError> {
         self.data.clear()?;
+        self.capacity = self.data_size;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -216,7 +217,7 @@ impl Page {
     }
 
     pub(crate) fn set_page_flags(&self, flag: usize) -> Result<(), StoreError> {
-        if flag & RESERVED_FLAGS as usize != 0 {
+        if (1usize << flag) & RESERVED_FLAGS as usize != 0 {
             panic!("Reserved bits cannot be set : {flag}");
         }
         self.flags
@@ -225,7 +226,7 @@ impl Page {
     }
 
     pub(crate) fn clear_page_flag(&self, flag: usize) -> Result<(), StoreError> {
-        if flag & RESERVED_FLAGS as usize != 0 {
+        if (1usize << flag) & RESERVED_FLAGS as usize != 0 {
             panic!("Reserved bits cannot be set: {flag}");
         }
         self.flags

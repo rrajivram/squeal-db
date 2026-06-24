@@ -118,12 +118,10 @@ where
             let buffer = self.buffer.read()?;
             (buffer.contains_key(&page_num), buffer.len())
         };
-        if contains {
+        if contains || count < self.max_entries {
             self.buffer.write()?.insert(page_num, page.clone());
         } else {
-            if count == self.max_entries {
-                self.replace_oldest(page_num, &page)?;
-            }
+            self.replace_oldest(page_num, &page)?;
         }
         Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
             page_num,
