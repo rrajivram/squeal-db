@@ -6,4 +6,6 @@ writeHandle in page neds to be updated to handle large pages
 arclock needs a thread to monitor how long locks have been kept and kill lock if too long
 leaf_node should support external storage
 page iterator really needs to return refs. This means no use of Box
-transaction+id should become Copy
+
+
+done: transaction+id should become Copy

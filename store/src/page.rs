@@ -176,6 +176,23 @@ impl Page {
         Ok(())
     }
 
+    pub(crate) fn replace_tuple(
+        &mut self,
+        id: &DBIdType,
+        tuple: Tuple,
+    ) -> Result<Tuple, StoreError> {
+        let new_size = tuple.size();
+        let old = self.data.replace(id, tuple)?;
+        let old_size = old.size();
+        if new_size >= old_size {
+            self.capacity -= new_size - old_size;
+        } else {
+            self.capacity += old_size - new_size;
+        }
+        self.set_dirty(true)?;
+        Ok(old)
+    }
+
     pub(crate) fn count(&self) -> Result<usize, StoreError> {
         Ok(self.data.count()?)
     }

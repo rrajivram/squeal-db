@@ -13,10 +13,35 @@ use crate::{
 const NONE: u8 = 0;
 const INDEXED: u8 = 1;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq, Ord, PartialOrd)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq)]
 pub enum DBIdType {
     Int(u64),
     Vec(Vec<u8>),
+}
+
+// Ordered by `hashed()` rather than structurally, so that comparisons here
+// agree with `AnyTuplePage`'s hash-bucketed iteration/storage order — the
+// B+ tree's navigation and split logic rely on `<`/`>` matching iteration
+// order, and for `Vec` ids the derived (lexical) order would not.
+//
+// RISK: this intentionally diverges from `Eq`/`PartialEq`, which stay exact.
+// Two distinct ids whose hashes collide will compare as `Ordering::Equal`
+// here while still being `!=` under `PartialEq`/`Hash`. That's fine for the
+// current use (the B+ tree only ever compares hashed keys), but it means
+// `DBIdType` must NOT be used directly as a key in a `BTreeMap`/`BTreeSet`
+// — colliding-but-distinct ids would silently collapse into one slot.
+// Key by `.hashed()` (a plain `u64`) for that purpose instead, as
+// `AnyTuplePage` already does.
+impl PartialOrd for DBIdType {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DBIdType {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.hashed().cmp(&other.hashed())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Hash)]
@@ -98,6 +123,15 @@ impl Display for DBIdType {
 impl From<String> for DBIdType {
     fn from(value: String) -> Self {
         Self::Vec(value.as_bytes().to_vec())
+    }
+}
+
+impl From<DBIdType> for String {
+    fn from(value: DBIdType) -> Self {
+        match value {
+            DBIdType::Int(i) => i.to_string(),
+            DBIdType::Vec(v) => String::from_utf8(v).unwrap_or_default(),
+        }
     }
 }
 
