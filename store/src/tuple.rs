@@ -110,7 +110,7 @@ impl From<u64> for DBIdType {
 impl DBIdType {
     pub(crate) fn hashed(&self) -> u64 {
         match self {
-            Self::Int(i) => db_hash(&i.to_ne_bytes()),
+            Self::Int(i) => *i,
             Self::Vec(v) => db_hash(&v),
         }
     }

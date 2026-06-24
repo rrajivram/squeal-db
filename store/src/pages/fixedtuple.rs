@@ -8,8 +8,6 @@ use crate::{
     tuple::{DBIdType, Tuple},
 };
 
-use std::sync::Arc;
-
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct FixedTuplePage {
     tuple_size: usize,
@@ -70,7 +68,7 @@ impl PageTuple for FixedTuplePage {
         self.data.contains(id)
     }
 
-    fn get(&self, id: &DBIdType) -> Result<Option<std::sync::Arc<Tuple>>, StoreError> {
+    fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         self.data.get(id)
     }
 
@@ -85,8 +83,12 @@ impl PageTuple for FixedTuplePage {
         self.data.remove(id)
     }
 
-    fn values(&self) -> Result<Vec<Arc<Tuple>>, StoreError> {
+    fn values(&self) -> Result<Vec<Tuple>, StoreError> {
         self.data.values()
+    }
+
+    fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
+        self.data.keys()
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
@@ -97,12 +99,15 @@ impl PageTuple for FixedTuplePage {
         };
         Ok(to_allocvec(&dto)?)
     }
+    fn clear(&self) -> Result<(), StoreError> {
+        self.data.clear()
+    }
 
-    fn first(&self) -> Result<Option<Arc<Tuple>>, StoreError> {
+    fn first(&self) -> Result<Option<Tuple>, StoreError> {
         self.data.first()
     }
 
-    fn last(&self) -> Result<Option<Arc<Tuple>>, StoreError> {
+    fn last(&self) -> Result<Option<Tuple>, StoreError> {
         self.data.last()
     }
 }

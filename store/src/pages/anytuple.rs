@@ -1,10 +1,7 @@
-use std::{
-    collections::{BTreeMap, hash_map::Iter},
-    sync::{Arc, RwLock},
-};
-
+use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{
     db::DBSizeType,
@@ -15,13 +12,13 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AnyTuplePage {
-    data: RwLock<BTreeMap<DBSizeType, Vec<Arc<Tuple>>>>,
+    data: RwLock<BTreeMap<DBSizeType, Vec<Tuple>>>,
 }
 
 impl Clone for AnyTuplePage {
     fn clone(&self) -> Self {
         Self {
-            data: RwLock::new(self.data.read().unwrap().clone()),
+            data: RwLock::new(self.data.read().clone()),
             ..Default::default()
         }
     }
@@ -29,12 +26,8 @@ impl Clone for AnyTuplePage {
 
 impl PartialEq for AnyTuplePage {
     fn eq(&self, other: &Self) -> bool {
-        *self.data.read().unwrap() == *other.data.read().unwrap()
+        *self.data.read() == *other.data.read()
     }
-}
-
-pub struct TupleIter<'a> {
-    iter: Iter<'a, DBIdType, Arc<Tuple>>,
 }
 
 impl AnyTuplePage {
@@ -45,12 +38,12 @@ impl AnyTuplePage {
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<AnyTuplePage, StoreError> {
-        let mut vec: Vec<Arc<Tuple>> = from_bytes(bytes)?;
+        let mut vec: Vec<Tuple> = from_bytes(bytes)?;
         let data = vec
             .drain(..)
             .map(|t| (t.id.hashed(), t))
             .collect::<Vec<_>>();
-        let mut map: BTreeMap<u64, Vec<Arc<Tuple>>> = BTreeMap::new();
+        let mut map: BTreeMap<u64, Vec<Tuple>> = BTreeMap::new();
         for (id, t) in data {
             map.entry(id)
                 .and_modify(|f| f.push(t.clone()))
@@ -65,16 +58,15 @@ impl AnyTuplePage {
 
 impl PageTuple for AnyTuplePage {
     fn count(&self) -> Result<usize, StoreError> {
-        Ok(self.data.read()?.len())
+        Ok(self.data.read().len())
     }
 
     fn add(&self, tuple: Tuple) -> Result<(), StoreError> {
         if self.contains(&tuple.id)? {
             return Err(StoreError::DuplicateKey(tuple.id));
         }
-        let tuple = Arc::new(tuple);
         self.data
-            .write()?
+            .write()
             .entry(tuple.id.hashed())
             .and_modify(|v| v.push(tuple.clone()))
             .or_insert(vec![tuple]);
@@ -84,16 +76,16 @@ impl PageTuple for AnyTuplePage {
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
         Ok(self
             .data
-            .read()?
+            .read()
             .get(&id.hashed())
             .map(|v| is_present(v, id))
             .unwrap_or_default())
     }
 
-    fn get(&self, id: &DBIdType) -> Result<Option<Arc<Tuple>>, StoreError> {
+    fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()?
+            .read()
             .get(&id.hashed())
             .map(|t| extract(t, id))
             .flatten())
@@ -102,7 +94,7 @@ impl PageTuple for AnyTuplePage {
     fn replace(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         Ok(self
             .data
-            .write()?
+            .write()
             .get_mut(&id.hashed())
             .map(|v| replace(v, id, tuple))
             .flatten()
@@ -112,36 +104,43 @@ impl PageTuple for AnyTuplePage {
     fn remove(&self, id: DBIdType) -> Result<Tuple, StoreError> {
         Ok(self
             .data
-            .write()?
+            .write()
             .get_mut(&id.hashed())
             .map(|t| remove(t, &id))
             .flatten()
-            .map(|t| t.as_ref().clone())
             .ok_or(StoreError::KeyNotFound(id))?)
     }
 
-    fn values(&self) -> Result<Vec<Arc<Tuple>>, StoreError> {
-        Ok(self.data.read()?.values().flatten().cloned().collect())
+    fn values(&self) -> Result<Vec<Tuple>, StoreError> {
+        Ok(self.data.read().values().flatten().cloned().collect())
+    }
+
+    fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
+        Ok(self.data.read().keys().copied().collect())
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
         Ok(to_allocvec(&self.values()?)?)
     }
 
-    fn first(&self) -> Result<Option<Arc<Tuple>>, StoreError> {
+    fn clear(&self) -> Result<(), StoreError> {
+        Ok(self.data.write().clear())
+    }
+
+    fn first(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()?
+            .read()
             .first_key_value()
             .map(|(_k, v)| v.first())
             .flatten()
             .cloned())
     }
 
-    fn last(&self) -> Result<Option<Arc<Tuple>>, StoreError> {
+    fn last(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()?
+            .read()
             .last_key_value()
             .map(|(_k, v)| v.last())
             .flatten()
@@ -150,28 +149,29 @@ impl PageTuple for AnyTuplePage {
 }
 
 #[inline(always)]
-fn is_present(items: &Vec<Arc<Tuple>>, id: &DBIdType) -> bool {
+fn is_present(items: &Vec<Tuple>, id: &DBIdType) -> bool {
     items.iter().any(|i| i.id == *id)
 }
 
 #[inline(always)]
-fn extract(items: &Vec<Arc<Tuple>>, id: &DBIdType) -> Option<Arc<Tuple>> {
+fn extract(items: &Vec<Tuple>, id: &DBIdType) -> Option<Tuple> {
     items.iter().find(|i| i.id == *id).map(|v| v.clone())
 }
 
 #[inline(always)]
-fn remove(items: &mut Vec<Arc<Tuple>>, id: &DBIdType) -> Option<Arc<Tuple>> {
+fn remove(items: &mut Vec<Tuple>, id: &DBIdType) -> Option<Tuple> {
     items.extract_if(.., |f| f.id == *id).next()
 }
 
 #[inline(always)]
-fn replace(items: &mut Vec<Arc<Tuple>>, id: &DBIdType, tuple: Tuple) -> Option<Tuple> {
+fn replace(items: &mut Vec<Tuple>, id: &DBIdType, tuple: Tuple) -> Option<Tuple> {
     items
         .iter_mut()
         .try_for_each(|t| {
             if t.id == *id {
-                *t = Arc::new(tuple.clone());
-                return std::ops::ControlFlow::Break(Some(t.as_ref().clone()));
+                let ret = t.clone();
+                *t = tuple.clone();
+                return std::ops::ControlFlow::Break(Some(ret));
             }
             std::ops::ControlFlow::Continue(())
         })

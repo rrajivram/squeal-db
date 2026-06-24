@@ -15,6 +15,7 @@ use postcard::to_allocvec;
 use priority_queue::PriorityQueue;
 
 use crate::{
+    arclock::{ArcLock, ArcLockGuard},
     constant::timestamp,
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
@@ -35,6 +36,13 @@ struct WriteMsg {
     page: Page,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct WritePageHandle {
+    pub(crate) page_num: PageId,
+    lock: ArcLockGuard<PageId>,
+    pub(crate) page: Arc<Page>,
+}
+
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
     buffer: RwLock<HashMap<PageId, Arc<Page>>>,
@@ -46,6 +54,7 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     write_handle: JoinHandle<Result<(), StoreError>>,
     read_file: RwLock<F>,
     access_map: RwLock<PriorityQueue<PageId, u128>>,
+    locks: ArcLock<PageId>,
 }
 
 impl<F: DBFile> PageBuffer<F>
@@ -74,6 +83,7 @@ where
             access_map: RwLock::new(PriorityQueue::new()),
             page_count: page_counter,
             header,
+            locks: ArcLock::new(),
         })
     }
 
@@ -100,25 +110,29 @@ where
         Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
     }
 
-    pub(crate) fn write_page(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
-        {
-            self.update_page_access(page_num)?;
-            let (contains, count) = {
-                let buffer = self.buffer.read()?;
-                (buffer.contains_key(&page_num), buffer.len())
-            };
-            if contains {
-                self.buffer.write()?.insert(page_num, page.clone());
-            } else {
-                if count == self.max_entries {
-                    self.replace_oldest(page_num, &page)?;
-                }
+    pub(crate) fn write_page(&self, page_num: PageId, page: &Page) -> Result<(), StoreError> {
+        let page_to_write = page.clone();
+        let page = Arc::new(page.clone());
+        self.update_page_access(page_num)?;
+        let (contains, count) = {
+            let buffer = self.buffer.read()?;
+            (buffer.contains_key(&page_num), buffer.len())
+        };
+        if contains {
+            self.buffer.write()?.insert(page_num, page.clone());
+        } else {
+            if count == self.max_entries {
+                self.replace_oldest(page_num, &page)?;
             }
         }
         Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
             page_num,
-            page: (*page).clone(),
+            page: page_to_write,
         }))?)
+    }
+
+    pub(crate) fn write_locked_page(&self, handle: WritePageHandle) -> Result<(), StoreError> {
+        Ok(self.write_page(handle.page_num, handle.page.as_ref())?)
     }
 
     pub(crate) fn alloc_page(&self, should_pin: bool) -> Result<PageId, StoreError> {
@@ -160,6 +174,20 @@ where
         Ok(page)
     }
 
+    pub(crate) fn get_page_mut(&self, page_num: PageId) -> Result<WritePageHandle, StoreError> {
+        let page = self.get_page(page_num)?;
+        let lock = self
+            .locks
+            .lock(page_num, 500)
+            .ok_or(StoreError::LockContentionError)?;
+        let handle = WritePageHandle {
+            lock: lock,
+            page_num: page_num,
+            page: page,
+        };
+        Ok(handle)
+    }
+
     fn replace_oldest(&self, page_num: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
         if let Some(last_used_page) = { self.access_map.write()?.pop() } {
             let mut buffer = self.buffer.write()?;
@@ -187,7 +215,7 @@ where
         } else {
             Page::new_data(self.header.page_size)
         };
-        self.write_page(page_num, Arc::new(p))?;
+        self.write_page(page_num, &p)?;
         Ok(())
     }
 }
@@ -366,8 +394,8 @@ mod tests {
         let p = buf.get_page(0.into()).unwrap();
         assert!(!p.is_pinned());
         // Write a pinned page into the cache slot for page 0
-        let new_page = Arc::new(Page::new_pinned(PAGE_SIZE));
-        assert!(buf.write_page(0.into(), new_page).is_ok());
+        let new_page = Page::new_pinned(PAGE_SIZE);
+        assert!(buf.write_page(0.into(), &new_page).is_ok());
         // Cache must now hold the updated page
         let p2 = buf.get_page(0.into()).unwrap();
         assert!(p2.is_pinned());

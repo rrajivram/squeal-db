@@ -12,7 +12,7 @@ use crate::{constant::timestamp, error::StoreError, generator::Generator};
 pub struct TransactionId {
     id: u64,
     ts: u128,
-    snapshot: Arc<Vec<u64>>,
+    snapshot: Vec<u64>,
 }
 
 const TXN_GENERATOR_NANE: &str = "__system.transactions";
@@ -50,7 +50,6 @@ impl TransactionManager {
             self.gens.gen_key(TXN_GENERATOR_NANE)?,
             self.get_active_transactions()?,
         );
-        // Safe to unwrap here as call only fails if earlies is less than self.
         self.active_transactions.write()?.insert(txn.clone());
         Ok(txn)
     }
@@ -74,7 +73,7 @@ impl TransactionId {
     pub fn new(id: u64, snapshot: Vec<u64>) -> Self {
         Self {
             id,
-            snapshot: Arc::new(snapshot),
+            snapshot,
             ts: timestamp(),
         }
     }
@@ -97,7 +96,7 @@ impl Default for TransactionId {
         Self {
             id: 0,
             ts: timestamp(),
-            snapshot: Arc::new(vec![]),
+            snapshot: vec![],
         }
     }
 }
@@ -109,7 +108,7 @@ impl From<u64> for TransactionId {
         Self {
             id: value,
             ts: timestamp(),
-            snapshot: Arc::new(vec![]),
+            snapshot: vec![],
         }
     }
 }

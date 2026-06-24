@@ -45,9 +45,6 @@ const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Vec<u8>>();
 pub(crate) trait PageType: PageTuple + Clone + PartialEq + std::fmt::Debug {}
 impl<T> PageType for T where T: PageTuple + Clone + PartialEq + std::fmt::Debug {}
 
-//pub(crate) type DataPage = Page<AnyTuplePage>;
-//pub(crate) type IndexPage = Page<FixedTuplePage>;
-
 impl Eq for PageId {}
 
 ///Page Invariants
@@ -71,8 +68,8 @@ pub(crate) struct Page {
     written: AtomicU128,
 }
 
-pub(crate) struct PageIterator {
-    data: std::vec::IntoIter<Arc<Tuple>>,
+pub(crate) struct PageTupleIterator {
+    data: std::vec::IntoIter<Tuple>,
 }
 
 impl Page {
@@ -120,26 +117,24 @@ impl Page {
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
-        self.flags
-            .get_bit(PINNED as usize, std::sync::atomic::Ordering::Relaxed)
+        self.flags.load(std::sync::atomic::Ordering::Relaxed) & PINNED != 0
     }
 
     pub(crate) fn is_index_page(&self) -> bool {
-        self.flags
-            .get_bit(INDEX_PAGE as usize, std::sync::atomic::Ordering::Relaxed)
+        self.flags.load(std::sync::atomic::Ordering::Relaxed) & INDEX_PAGE != 0
     }
 
-    pub(crate) fn get_next_page(&self) -> DBSizeType {
-        self.next_page.load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn get_next_page(&self) -> PageId {
+        PageId(self.next_page.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
         self.dirty.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub(crate) fn set_next_page(&self, next_page: DBSizeType) -> Result<(), StoreError> {
+    pub(crate) fn set_next_page(&self, next_page: PageId) -> Result<(), StoreError> {
         self.next_page
-            .store(next_page, std::sync::atomic::Ordering::Relaxed);
+            .store(next_page.0, std::sync::atomic::Ordering::Relaxed);
         self.set_dirty(true)?;
         Ok(())
     }
@@ -153,8 +148,14 @@ impl Page {
         Ok(())
     }
 
-    pub(crate) fn iter(&self) -> PageIterator {
-        PageIterator {
+    pub(crate) fn clear(&self) -> Result<(), StoreError> {
+        self.data.clear()?;
+        self.set_dirty(true)?;
+        Ok(())
+    }
+
+    pub(crate) fn iter(&self) -> PageTupleIterator {
+        PageTupleIterator {
             data: self.data.values().unwrap_or_default().into_iter(),
         }
     }
@@ -195,7 +196,7 @@ impl Page {
         self.data.contains(&id)
     }
 
-    pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Arc<Tuple>>, StoreError> {
+    pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
         self.data.get(&id)
     }
 
@@ -214,25 +215,32 @@ impl Page {
         Ok(from_bytes(bytes)?)
     }
 
-    pub(crate) fn set_page_flags(&self, flag: usize) {
+    pub(crate) fn set_page_flags(&self, flag: usize) -> Result<(), StoreError> {
         if flag & RESERVED_FLAGS as usize != 0 {
             panic!("Reserved bits cannot be set : {flag}");
         }
         self.flags
             .set_bit(flag, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.set_dirty(true)?)
     }
 
-    pub(crate) fn clear_page_flag(&self, flag: usize) {
+    pub(crate) fn clear_page_flag(&self, flag: usize) -> Result<(), StoreError> {
         if flag & RESERVED_FLAGS as usize != 0 {
             panic!("Reserved bits cannot be set: {flag}");
         }
         self.flags
             .clear_bit(flag, std::sync::atomic::Ordering::Relaxed);
+        Ok(self.set_dirty(true)?)
+    }
+
+    pub(crate) fn is_flag_set(&self, flag: usize) -> bool {
+        self.flags
+            .get_bit(flag, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-impl Iterator for PageIterator {
-    type Item = Arc<Tuple>;
+impl Iterator for PageTupleIterator {
+    type Item = Tuple;
     fn next(&mut self) -> Option<Self::Item> {
         self.data.next()
     }
@@ -320,6 +328,20 @@ impl From<PageId> for DBSizeType {
 impl std::fmt::Debug for dyn PageTuple + 'static {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
+    }
+}
+
+impl PageId {
+    pub(crate) fn is_valid_next_page(&self) -> bool {
+        self.0 != 0
+    }
+
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        Ok(to_allocvec(&self)?)
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        Ok(from_bytes::<PageId>(bytes)?)
     }
 }
 
@@ -423,9 +445,9 @@ mod tests {
     #[test]
     fn page_test_next_page() {
         let p = Page::new_data(1024);
-        assert_eq!(p.get_next_page(), 0);
-        p.set_next_page(42).unwrap();
-        assert_eq!(p.get_next_page(), 42);
+        assert_eq!(p.get_next_page(), 0.into());
+        p.set_next_page(42.into()).unwrap();
+        assert_eq!(p.get_next_page(), 42.into());
     }
 
     #[test]

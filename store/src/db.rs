@@ -332,11 +332,11 @@ where
             // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
-        self.buffer.write_page(0.into(), Arc::new(page))?;
+        self.buffer.write_page(0.into(), &page)?;
         let gens = self.generator.get_values()?;
         let mut page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
-        self.buffer.write_page(1.into(), Arc::new(page))?;
+        self.buffer.write_page(1.into(), &page)?;
         // TODO : Handle page overflows correctly
         // TODO: Handle empty pages
         Ok(())
