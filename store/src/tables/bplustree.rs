@@ -7,6 +7,7 @@ use crate::{
     buffer::{PageBuffer, WritePageHandle},
     db::{DBFile, DBSizeType},
     error::StoreError,
+    logger::{Logger, Operation, Record},
     page::{Page, PageId},
     table::Table,
     tuple::{DBIdType, Tuple},
@@ -27,6 +28,7 @@ struct BPlusTree<F: DBFile + 'static> {
     table: Arc<Table>,
     buffer: Arc<PageBuffer<F>>,
     txn_mgr: Arc<TransactionManager>,
+    logger: Arc<Logger>,
     first_index_page: PageId,
     first_data_page: PageId,
     nodes_per_page: usize,
@@ -40,6 +42,7 @@ where
         table: Arc<Table>,
         buffer: Arc<PageBuffer<F>>,
         txn_mgr: Arc<TransactionManager>,
+        logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
         let size = Tuple::new_with(
@@ -70,6 +73,7 @@ where
             first_data_page,
             first_index_page,
             nodes_per_page: count as usize,
+            logger,
         })
     }
 
@@ -79,7 +83,7 @@ where
         let tuple_id = tuple.id.clone();
         loop {
             if page.can_store(&tuple) {
-                self.write_page(self.buffer.get_page_mut(data_page_id)?, tuple)?;
+                self.write_page(self.buffer.get_page_mut(data_page_id)?, tuple.clone())?;
                 break;
             }
             let next_page_id = page.get_next_page();
@@ -110,6 +114,8 @@ where
         }
 
         self.insert_recursive(id_tuple, txn, self.first_index_page)?;
+        self.logger
+            .log_redo(Operation::Add(txn, Record::new(self.table.id, tuple)))?;
         Ok(())
     }
 
@@ -119,6 +125,32 @@ where
             .map(|p| self.buffer.get_page(p).and_then(|p| p.get(id)))
             .transpose()?
             .flatten())
+    }
+
+    pub fn update(&self, tuple: Tuple, txn_id: TransactionId) -> Result<Tuple, StoreError> {
+        let id = tuple.id.clone();
+        let pid = self
+            .find_page(id.clone(), self.first_index_page)?
+            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+        let mut h = self.buffer.get_page_mut(pid)?;
+        let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
+        self.buffer.write_locked_page(h)?;
+        self.logger
+            .log_undo(Operation::Mod(txn_id, Record::new(self.table.id, old.clone())))?;
+        Ok(old)
+    }
+
+    pub fn remove(&self, id: DBIdType, txn_id: TransactionId) -> Result<Tuple, StoreError> {
+        let pid = self
+            .find_page(id.clone(), self.first_index_page)?
+            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+        let mut h = self.buffer.get_page_mut(pid)?;
+        let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+        self.buffer.write_locked_page(h)?;
+        self.remove_index_entry(id, self.first_index_page)?;
+        self.logger
+            .log_undo(Operation::Del(txn_id, Record::new(self.table.id, old.clone())))?;
+        Ok(old)
     }
 
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
@@ -151,6 +183,28 @@ where
                 })
                 .flatten()
                 .transpose()?)
+        }
+    }
+
+    fn remove_index_entry(&self, id: DBIdType, start: PageId) -> Result<(), StoreError> {
+        let page = self.buffer.get_page(start)?;
+        if page.is_flag_set(INNER_NODE) {
+            for row in page.iter() {
+                if id < row.id {
+                    let node = from_bytes::<Node>(&row.data)?;
+                    if let Node::Inner(page_num) = node {
+                        return self.remove_index_entry(id, page_num);
+                    } else {
+                        panic!("Expected Inner. Found leaf! {:?}", row.id);
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            let mut handle = self.buffer.get_page_mut(start)?;
+            Arc::make_mut(&mut handle.page).remove_tuple(id)?;
+            self.buffer.write_locked_page(handle)?;
+            Ok(())
         }
     }
 
@@ -379,6 +433,7 @@ mod tests {
         db::Header,
         error::StoreError,
         generator::Generator,
+        logger::Logger,
         memfile::MemFile,
         page::Page,
         table::{Table, TableType},
@@ -415,13 +470,27 @@ mod tests {
         Arc::new(Table::new_with_id(1, "t".into(), TableType::Table, None).unwrap())
     }
 
+    fn make_logger() -> Arc<Logger> {
+        let mut logger = Logger::new();
+        logger.set_db(MemFile::new(), MemFile::new()).unwrap();
+        Arc::new(logger)
+    }
+
     fn make_tree(page_size: u64) -> BPlusTree<MemFile> {
         let buf = make_buffer(page_size);
-        BPlusTree::new(make_table(), buf, make_txn_mgr()).unwrap()
+        BPlusTree::new(make_table(), buf, make_txn_mgr(), make_logger()).unwrap()
     }
 
     fn txn() -> TransactionId {
         TransactionId::new(1)
+    }
+
+    // update()/remove() log an undo record keyed off the *stored* tuple's own
+    // txn_id field — Tuple::new() always leaves that None, which makes
+    // log_undo fail with "Missing transaction". Tests that update/remove a
+    // row need to insert it with an explicit txn_id via this helper instead.
+    fn tuple_with_txn(id: DBIdType, data: &[u8]) -> Tuple {
+        Tuple::new_with(id, data, Some(txn()), None)
     }
 
     // Large page — no splits during basic tests.
@@ -840,7 +909,10 @@ mod tests {
                     let barrier = barrier.clone();
                     thread::spawn(move || {
                         barrier.wait();
-                        tree.insert(Tuple::new(id, format!("v{id}").as_bytes()), TransactionId::new(id))
+                        tree.insert(
+                            Tuple::new(id, format!("v{id}").as_bytes()),
+                            TransactionId::new(id),
+                        )
                     })
                 })
                 .collect();
@@ -885,11 +957,164 @@ mod tests {
     // misroute the very next insert into the wrong leaf. 400 sequential inserts
     // on a small-ish page forces several rounds of root and child splits.
     #[test]
+    fn test_update_existing_tuple_returns_old_and_replaces_value() {
+        let tree = make_tree(BIG);
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
+
+        let old = tree
+            .update(tuple_with_txn(1.into(), b"world"), txn())
+            .unwrap();
+        assert_eq!(old.data, b"hello", "update must return the previous value");
+
+        let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
+        assert_eq!(found.data, b"world", "update must replace the stored value");
+    }
+
+    #[test]
+    fn test_update_preserves_other_tuples() {
+        let tree = make_tree(BIG);
+        for i in 1u64..=5 {
+            tree.insert(tuple_with_txn(i.into(), format!("v{i}").as_bytes()), txn())
+                .unwrap();
+        }
+        tree.update(tuple_with_txn(3.into(), b"updated"), txn())
+            .unwrap();
+
+        for i in 1u64..=5 {
+            let found = tree.find(DBIdType::Int(i)).unwrap().unwrap();
+            if i == 3 {
+                assert_eq!(found.data, b"updated");
+            } else {
+                assert_eq!(found.data, format!("v{i}").into_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn test_update_with_string_id() {
+        let tree = make_tree(BIG);
+        let id = DBIdType::from("alpha".to_string());
+        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn())
+            .unwrap();
+
+        let old = tree
+            .update(tuple_with_txn(id.clone(), b"a-data-2"), txn())
+            .unwrap();
+        assert_eq!(old.data, b"a-data");
+        assert_eq!(tree.find(id).unwrap().unwrap().data, b"a-data-2");
+    }
+
+    #[test]
+    fn test_update_does_not_change_entry_counts() {
+        let tree = make_tree(BIG);
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
+        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        assert_eq!(dp.count().unwrap(), 1);
+        assert_eq!(ip.count().unwrap(), 1);
+
+        tree.update(tuple_with_txn(1.into(), b"world"), txn())
+            .unwrap();
+
+        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        assert_eq!(dp.count().unwrap(), 1, "update must not add or remove data rows");
+        assert_eq!(ip.count().unwrap(), 1, "update must not add or remove index entries");
+    }
+
+    #[test]
+    fn test_update_nonexistent_id_returns_err() {
+        let tree = make_tree(BIG);
+        let result = tree.update(tuple_with_txn(999.into(), b"x"), txn());
+        assert!(
+            matches!(result, Err(StoreError::KeyNotFound(_))),
+            "update on a never-inserted id must return KeyNotFound, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_remove_existing_tuple_returns_value_and_deletes_it() {
+        let tree = make_tree(BIG);
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
+
+        let removed = tree.remove(DBIdType::Int(1), txn()).unwrap();
+        assert_eq!(removed.data, b"hello");
+
+        assert!(
+            tree.find(DBIdType::Int(1)).unwrap().is_none(),
+            "removed id must no longer be findable"
+        );
+        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        assert!(!dp.contains(DBIdType::Int(1)).unwrap());
+    }
+
+    #[test]
+    fn test_remove_preserves_other_tuples() {
+        let tree = make_tree(BIG);
+        for i in 1u64..=5 {
+            tree.insert(tuple_with_txn(i.into(), format!("v{i}").as_bytes()), txn())
+                .unwrap();
+        }
+        tree.remove(DBIdType::Int(3), txn()).unwrap();
+
+        assert!(tree.find(DBIdType::Int(3)).unwrap().is_none());
+        for i in [1u64, 2, 4, 5] {
+            let found = tree.find(DBIdType::Int(i)).unwrap().unwrap();
+            assert_eq!(found.data, format!("v{i}").into_bytes());
+        }
+    }
+
+    #[test]
+    fn test_remove_with_string_id() {
+        let tree = make_tree(BIG);
+        let id = DBIdType::from("alpha".to_string());
+        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn())
+            .unwrap();
+
+        let removed = tree.remove(id.clone(), txn()).unwrap();
+        assert_eq!(removed.data, b"a-data");
+        assert!(tree.find(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_remove_nonexistent_id_returns_err() {
+        let tree = make_tree(BIG);
+        let result = tree.remove(DBIdType::Int(999), txn());
+        assert!(
+            matches!(result, Err(StoreError::KeyNotFound(_))),
+            "remove on a never-inserted id must return KeyNotFound, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_remove_cleans_up_index_entry() {
+        let tree = make_tree(BIG);
+        tree.insert(tuple_with_txn(1.into(), b"first"), txn()).unwrap();
+        tree.remove(DBIdType::Int(1), txn()).unwrap();
+
+        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        assert!(
+            !ip.contains(DBIdType::Int(1)).unwrap(),
+            "index entry must be removed alongside the data row"
+        );
+
+        // Re-inserting the same id must succeed once the index entry is gone.
+        tree.insert(Tuple::new(1, b"second"), txn()).unwrap();
+        let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
+        assert_eq!(found.data, b"second");
+    }
+
+    #[test]
     fn test_many_sequential_inserts_remain_findable_across_splits() {
         let tree = make_tree(BIG);
         for i in 0u64..400 {
-            tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), TransactionId::new(i))
-                .unwrap();
+            tree.insert(
+                Tuple::new(i, format!("v{i}").as_bytes()),
+                TransactionId::new(i),
+            )
+            .unwrap();
         }
         for i in 0u64..400 {
             let found = tree.find(DBIdType::Int(i)).unwrap();

@@ -13,5 +13,6 @@ portable-atomic = "1.13.1"
 priority-queue = "2.7.0"
 atomic_bitfield = "0.1.0"
 parking_lot = {version="0.12.5", features=["send_guard","serde"]}
+crossbeam = "0.8.4"
 
 [dev.dependencies]

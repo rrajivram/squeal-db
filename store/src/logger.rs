@@ -1,23 +1,17 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    sync::{
-        Arc, RwLock,
-        atomic::AtomicU64,
-        mpsc::{Receiver, Sender, channel},
-    },
+    sync::{RwLock, atomic::AtomicU64},
     thread::{self, JoinHandle},
 };
 
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use log::error;
 use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    constant::timestamp,
-    db::{DBFile, DBSizeType},
-    error::StoreError,
-    tuple::Tuple,
+    constant::timestamp, db::DBFile, error::StoreError, table::TableIdType, tuple::Tuple,
     txn::TransactionId,
 };
 
@@ -61,10 +55,9 @@ pub(crate) enum Operation {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Record {
-    table_id: DBSizeType,
+    table_id: TableIdType,
     timestamp: u128,
-    tuple: Arc<Tuple>,
-    txn_id: TransactionId,
+    tuple: Tuple,
 }
 
 #[derive(Debug, Default)]
@@ -88,8 +81,8 @@ impl Logger {
         undo_file: impl DBFile + 'static,
         redo_file: impl DBFile + 'static,
     ) -> Result<(), StoreError> {
-        let (redo_tx, redo_rx) = channel();
-        let (undo_tx, undo_rx) = channel();
+        let (redo_tx, redo_rx) = unbounded();
+        let (undo_tx, undo_rx) = unbounded();
         self.undo_tx = Some(undo_tx);
         self.redo_tx = Some(redo_tx);
 
@@ -185,11 +178,10 @@ impl Logger {
 }
 
 impl Record {
-    pub(crate) fn new(table_id: DBSizeType, tuple: Arc<Tuple>, txn_id: TransactionId) -> Self {
+    pub(crate) fn new(table_id: TableIdType, tuple: Tuple) -> Self {
         Self {
             table_id,
             tuple,
-            txn_id,
             timestamp: timestamp(),
         }
     }
@@ -281,7 +273,6 @@ fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::UndoId;
     use crate::{
@@ -333,7 +324,7 @@ mod tests {
         let txn_id = TransactionId::from(10);
         let mut tuple = Tuple::new(1, b"hello");
         tuple.set_txn_id(txn_id.clone());
-        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
+        let record = Record::new(0.into(), tuple);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
     }
@@ -344,7 +335,7 @@ mod tests {
         let logger = Logger::new();
         let txn_id = TransactionId::from(10);
         let tuple = Tuple::new(1, b"hello"); // txn_id not set
-        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
+        let record = Record::new(0.into(), tuple);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_err());
     }
@@ -367,7 +358,7 @@ mod tests {
         let txn_id = TransactionId::from(5);
         let mut tuple = Tuple::new(42, b"data");
         tuple.set_txn_id(txn_id.clone());
-        let record = Record::new(0, Arc::new(tuple), txn_id.clone());
+        let record = Record::new(0.into(), tuple);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
         assert!(logger.shutdown().is_ok());

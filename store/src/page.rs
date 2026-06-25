@@ -176,6 +176,13 @@ impl Page {
         Ok(())
     }
 
+    pub(crate) fn remove_tuple(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
+        let old = self.data.remove(id)?;
+        self.capacity += old.size();
+        self.set_dirty(true)?;
+        Ok(old)
+    }
+
     pub(crate) fn replace_tuple(
         &mut self,
         id: &DBIdType,

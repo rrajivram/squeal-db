@@ -1,15 +1,12 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    sync::{
-        Arc, RwLock,
-        atomic::AtomicU64,
-        mpsc::{self, Receiver, SendError, Sender},
-    },
+    sync::{Arc, RwLock, atomic::AtomicU64},
     thread::{self, JoinHandle},
     time::Duration,
 };
 
+use crossbeam::channel::{Receiver, Sender, unbounded};
 use log::{error, info};
 use postcard::to_allocvec;
 use priority_queue::PriorityQueue;
@@ -51,7 +48,9 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     page_count: Arc<AtomicU64>,
     max_entries: usize,
     write_tx: Sender<BufMsg>,
-    write_handle: JoinHandle<Result<(), StoreError>>,
+    // None once shutdown() has taken it to join the thread — Drop uses that
+    // to tell "shut down properly" apart from "dropped without shutdown".
+    write_handle: Option<JoinHandle<Result<(), StoreError>>>,
     read_file: RwLock<F>,
     access_map: RwLock<PriorityQueue<PageId, u128>>,
     locks: ArcLock<PageId>,
@@ -70,7 +69,7 @@ where
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let write_file = db_file.do_clone()?;
-        let (write_tx, write_rx) = mpsc::channel();
+        let (write_tx, write_rx) = unbounded();
         let w_header = header.clone();
         let write_handle = thread::spawn(move || writer(write_file, w_header, write_rx));
         Ok(Self {
@@ -79,7 +78,7 @@ where
             buffer: RwLock::new(HashMap::new()),
             write_tx,
             read_file: RwLock::new(read_file),
-            write_handle,
+            write_handle: Some(write_handle),
             access_map: RwLock::new(PriorityQueue::new()),
             page_count: page_counter,
             header,
@@ -87,16 +86,18 @@ where
         })
     }
 
-    pub(crate) fn shutdown(self) -> Result<(), StoreError> {
+    pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {
         self.write_tx.send(BufMsg::Shutdowm)?;
-        let res = self.write_handle.join();
-        match res {
-            Ok(_) => {}
-            Err(e) => {
-                error!(
-                    "Unknown error joining redo.Thread panic! {}",
-                    e.downcast::<String>().unwrap_or_default()
-                );
+        if let Some(handle) = self.write_handle.take() {
+            let res = handle.join();
+            match res {
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        "Unknown error joining redo.Thread panic! {}",
+                        e.downcast::<String>().unwrap_or_default()
+                    );
+                }
             }
         }
         Ok(())
@@ -222,8 +223,27 @@ where
     }
 }
 
-impl From<SendError<BufMsg>> for StoreError {
-    fn from(value: SendError<BufMsg>) -> Self {
+impl<F: DBFile + 'static> Drop for PageBuffer<F> {
+    fn drop(&mut self) {
+        // shutdown() always takes write_handle before self is dropped, leaving
+        // None. If it's still Some here, this PageBuffer was dropped without
+        // an explicit shutdown() — flag it, since that's the one case we
+        // actually want to know about (as opposed to the writer thread's own
+        // channel disconnecting, which is just a normal consequence of this
+        // and not worth a panic on its own).
+        if self.write_handle.is_some() {
+            error!(
+                "PageBuffer dropped without calling shutdown() first \
+                 (page_size={:?}) — the writer thread is being abandoned \
+                 uncleanly instead of flushed and joined.",
+                self.page_size
+            );
+        }
+    }
+}
+
+impl From<crossbeam::channel::SendError<BufMsg>> for StoreError {
+    fn from(value: crossbeam::channel::SendError<BufMsg>) -> Self {
         StoreError::UnknownError(value.to_string())
     }
 }
@@ -239,10 +259,15 @@ fn writer<F: DBFile>(
         let msg = recv.try_recv();
         if msg.is_err() {
             match msg.err().unwrap() {
-                mpsc::TryRecvError::Disconnected => {
-                    panic!("Writer disconnected");
+                crossbeam::channel::TryRecvError::Disconnected => {
+                    // The sending PageBuffer was dropped without an explicit
+                    // shutdown() (flagged separately by PageBuffer's Drop
+                    // impl). Either way, there's no one left to send us
+                    // anything — exit the same way an explicit Shutdowm does.
+                    info!("Writer exiting: channel disconnected");
+                    break;
                 }
-                mpsc::TryRecvError::Empty => {}
+                crossbeam::channel::TryRecvError::Empty => {}
             }
         } else if msg.is_ok() {
             let msg = msg.unwrap();
