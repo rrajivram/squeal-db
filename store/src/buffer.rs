@@ -173,15 +173,19 @@ where
     }
 
     pub(crate) fn get_page_mut(&self, page_num: PageId) -> Result<WritePageHandle, StoreError> {
-        let page = self.get_page(page_num)?;
+        // Acquire the per-page lock *before* reading: a writer holds this lock
+        // for its entire read-modify-write cycle (see write_locked_page), so
+        // reading only after we hold it guarantees we see the latest committed
+        // write rather than a snapshot from before some other writer's update.
         let lock = self
             .locks
             .lock(page_num, 500)
             .ok_or(StoreError::LockContentionError)?;
+        let page = self.get_page(page_num)?;
         let handle = WritePageHandle {
-            lock: lock,
-            page_num: page_num,
-            page: page,
+            lock,
+            page_num,
+            page,
         };
         Ok(handle)
     }

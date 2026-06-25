@@ -178,16 +178,17 @@ where
             if handle.page.count()? == 0 {
                 panic!("Inner Page cannot be empty {:?}", handle.page_num);
             }
+            // Rows are in ascending id order; find the first one whose id exceeds
+            // the search key (mirrors find_page's matching logic). The previous
+            // version broke out of the scan on the first row that *didn't*
+            // match, instead of continuing to the next row — so with 3+ entries
+            // it could get stuck on an early row and route to the wrong child.
             let mut rows = handle.page.iter();
             let mut row_id = rows.next().unwrap();
-            if tuple.id >= row_id.id {
-                for row in rows {
-                    if tuple.id < row.id {
-                        row_id = row;
-                    } else {
-                        break;
-                    }
-                }
+            while tuple.id >= row_id.id {
+                row_id = rows
+                    .next()
+                    .expect("inner node must have a row covering every key");
             }
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
@@ -787,5 +788,116 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // PageBuffer::get_page_mut reads the page via get_page() *before* acquiring
+    // the per-page lock (see buffer.rs). That means two threads can both snapshot
+    // the page pre-lock, then each build their write from that stale snapshot —
+    // the second writer's version wouldn't include the first writer's row. This
+    // hammers that window with many iterations to get an empirical answer.
+    //
+    // To make the race window wide enough to actually hit under normal thread
+    // scheduling, the page is pre-populated so each write's clone-and-overwrite
+    // critical section (in PageBuffer::write_page) takes measurably longer, and
+    // several threads race concurrently rather than just two.
+    //
+    // Note: a thread can legitimately fail with LockContentionError (the
+    // per-page lock in get_page_mut has a tight 500us timeout, unrelated to the
+    // race under test) — that's tracked separately and NOT retried, because
+    // insert() writes the data row and index entry as two non-atomic steps, so
+    // blindly retrying a failed insert can re-attempt an already-written data
+    // row and fail with a confusing DuplicateKey instead. We only care here
+    // about: of the inserts that returned Ok, was every single one of them
+    // actually findable afterwards?
+    #[test]
+    fn test_concurrent_inserts_to_same_page_do_not_lose_updates() {
+        use std::sync::Barrier;
+        use std::thread;
+
+        const ITERATIONS: usize = 100;
+        const RACERS: u64 = 12;
+        const PREPOPULATE: u64 = 200;
+        let mut lost_update_iterations = vec![];
+        let mut total_contention_errors = 0usize;
+
+        for iteration in 0..ITERATIONS {
+            let tree = make_tree(BIG);
+            for i in 0..PREPOPULATE {
+                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i))
+                    .unwrap();
+            }
+            let tree = Arc::new(tree);
+            let barrier = Arc::new(Barrier::new(RACERS as usize));
+
+            let racer_ids: Vec<u64> = (0..RACERS)
+                .map(|i| PREPOPULATE + iteration as u64 * RACERS + i)
+                .collect();
+
+            let handles: Vec<_> = racer_ids
+                .iter()
+                .map(|&id| {
+                    let tree = tree.clone();
+                    let barrier = barrier.clone();
+                    thread::spawn(move || {
+                        barrier.wait();
+                        tree.insert(Tuple::new(id, format!("v{id}").as_bytes()), TransactionId::new(id))
+                    })
+                })
+                .collect();
+
+            let results: Vec<Result<(), StoreError>> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+            for (&id, result) in racer_ids.iter().zip(results.iter()) {
+                match result {
+                    Ok(()) => {
+                        if tree.find(DBIdType::Int(id)).unwrap().is_none() {
+                            lost_update_iterations.push((iteration, id));
+                        }
+                    }
+                    // Both are legitimate, *explicit* failures under heavy contention,
+                    // not silent lost updates: LockContentionError means the 500us
+                    // lock timeout tripped; PageCapacityError means another racer
+                    // filled the page first and this insert correctly saw that
+                    // fresh (not stale) state and refused to write, rather than
+                    // silently overwriting.
+                    Err(StoreError::LockContentionError) | Err(StoreError::PageCapacityError) => {
+                        total_contention_errors += 1
+                    }
+                    Err(e) => panic!("unexpected insert error: {e:?}"),
+                }
+            }
+        }
+
+        assert!(
+            lost_update_iterations.is_empty(),
+            "an insert reported Ok but its row was unfindable afterwards (silent lost update) \
+             in {} cases: {:?} ({total_contention_errors} unrelated lock-contention errors observed)",
+            lost_update_iterations.len(),
+            lost_update_iterations
+        );
+    }
+
+    // Regression test for a routing bug in insert_recursive's row-matching loop:
+    // once the root has 3+ entries (i.e. after a second, non-root split), the
+    // old loop broke out of the scan on the first row that didn't match instead
+    // of continuing to the next one, so it could get stuck on an early row and
+    // misroute the very next insert into the wrong leaf. 400 sequential inserts
+    // on a small-ish page forces several rounds of root and child splits.
+    #[test]
+    fn test_many_sequential_inserts_remain_findable_across_splits() {
+        let tree = make_tree(BIG);
+        for i in 0u64..400 {
+            tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), TransactionId::new(i))
+                .unwrap();
+        }
+        for i in 0u64..400 {
+            let found = tree.find(DBIdType::Int(i)).unwrap();
+            assert_eq!(
+                found.map(|t| t.data),
+                Some(format!("v{i}").into_bytes()),
+                "id {i} must remain findable after 400 inserts across multiple splits"
+            );
+        }
     }
 }

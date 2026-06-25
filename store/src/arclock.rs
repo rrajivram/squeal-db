@@ -50,10 +50,15 @@ where
     T: Clone + Debug,
 {
     fn clone(&self) -> Self {
+        // Preserve the recorded owner's thread_id rather than stamping it to
+        // whichever thread happens to call clone() — this field identifies
+        // who *owns* the lock, not who is merely holding a reference to the
+        // guard right now. Re-stamping it here previously let ownership
+        // silently "drift" to the cloning thread.
         Self {
             lock: self.lock.clone(),
             value: self.value.clone(),
-            thread_id: current().id(),
+            thread_id: self.thread_id,
         }
     }
 }
@@ -102,58 +107,90 @@ where
 
     pub fn lock(&self, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
         let now = Instant::now();
-        let map = self.locks.write().unwrap();
+        let mut map = self.locks.write().unwrap();
         trace!(
             "Thread:{:?} : write lock on {:?} after {} usecs.",
             thread::current().id(),
             val,
             now.elapsed().as_micros()
         );
-        let v = map.get(&val);
-        if let Some(value) = v {
-            if value.lock_count() == 1 || value.thread_id == current().id() {
+        if let Some(existing) = map.get(&val) {
+            let count = existing.lock_count();
+            let owner = existing.thread_id;
+            if count == 1 {
+                // Free right now (no live guards besides the map's own copy):
+                // claim it under OUR identity by *replacing* the entry, not
+                // cloning the old one. Cloning would keep whichever thread_id
+                // was recorded when this entry was first created — letting
+                // that original thread bypass the lock later via the
+                // reentrancy check below, even after ownership has moved on.
+                let fresh = ArcLockGuard::new(val.clone());
+                map.insert(val, fresh.clone());
+                trace!(
+                    "Thread:{:?} : Locked on {:?} within {} usecs.",
+                    thread::current().id(),
+                    fresh.value,
+                    now.elapsed().as_micros()
+                );
+                return Some(fresh);
+            }
+            if owner == current().id() {
+                // Actively held (count > 1) by this same thread: genuine
+                // reentrancy. Clone to share the existing Arc chain so
+                // lock_count() still reflects every outstanding guard.
+                let value = map.get(&val).unwrap().clone();
                 trace!(
                     "Thread:{:?} : Locked on {:?} within {} usecs.",
                     thread::current().id(),
                     val,
                     now.elapsed().as_micros()
                 );
-                return Some(value.clone());
+                return Some(value);
             }
+            // Actively held by a different thread: wait for it.
             drop(map);
-            let mut checked = 0;
-            let now = Instant::now();
-            loop {
-                if now.elapsed().as_micros() > timeout as u128 {
-                    trace!(
-                        "Thread: {:?}: Timed out on {:?} after {:?} usecs and {checked} tries.",
-                        thread::current().id(),
-                        val,
-                        now.elapsed().as_micros()
-                    );
-                    return None;
-                }
-                checked += 1;
-                let map = self.locks.read().unwrap();
-                let value = map.get(&val).unwrap();
-                if value.lock_count() == 1 {
-                    trace!(
-                        "Thread:{:?} : Lock on {:?} released after {} usecs.",
-                        thread::current().id(),
-                        val,
-                        now.elapsed().as_micros()
-                    );
-                    return Some(value.clone());
-                }
-                drop(map);
-                thread::sleep(Duration::from_micros(100));
+            return self.wait_for_lock(val, timeout);
+        }
+        let fresh = ArcLockGuard::new(val.clone());
+        map.insert(val, fresh.clone());
+        Some(fresh)
+    }
+
+    fn wait_for_lock(&self, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
+        let now = Instant::now();
+        let mut checked = 0;
+        loop {
+            if now.elapsed().as_micros() > timeout as u128 {
+                trace!(
+                    "Thread: {:?}: Timed out on {:?} after {:?} usecs and {checked} tries.",
+                    thread::current().id(),
+                    val,
+                    now.elapsed().as_micros()
+                );
+                return None;
             }
-        } else {
-            drop(map);
+            checked += 1;
+            // Needs the write lock (not just read): deciding "it's free" and
+            // claiming it must be atomic, or two waiters could both observe
+            // count == 1 and both think they won.
             let mut map = self.locks.write().unwrap();
-            let v = ArcLockGuard::new(val.clone());
-            map.insert(val, v.clone());
-            return Some(v);
+            // Treat a missing entry (e.g. removed by cleanup() racing with
+            // this poll) the same as "free", instead of unwrapping into a
+            // panic.
+            let free = map.get(&val).map(|v| v.lock_count() == 1).unwrap_or(true);
+            if free {
+                let fresh = ArcLockGuard::new(val.clone());
+                map.insert(val.clone(), fresh.clone());
+                trace!(
+                    "Thread:{:?} : Lock on {:?} released after {} usecs.",
+                    thread::current().id(),
+                    val,
+                    now.elapsed().as_micros()
+                );
+                return Some(fresh);
+            }
+            drop(map);
+            thread::sleep(Duration::from_micros(100));
         }
     }
 
@@ -319,6 +356,82 @@ mod arclock_tests {
         drop(l3);
         lock.cleanup();
         assert_eq!(lock.locks.read().unwrap().len(), 0);
+    }
+
+    // ArcLock::lock() never updates the map entry's recorded thread_id once a
+    // *different* thread re-acquires a released key via the lock_count()==1
+    // path. That means the original creating thread is permanently (falsely)
+    // treated as "reentrant owner" for that key, even after someone else has
+    // legitimately taken it. This test forces that exact sequence
+    // deterministically (via channels, no timing luck) and shows the original
+    // thread is wrongly granted the lock while another thread still holds it.
+    #[test]
+    fn test_stale_thread_id_lets_old_owner_bypass_current_holder() {
+        use std::sync::mpsc;
+
+        let lock = ArcLock::new();
+
+        // This (main/test) thread creates the entry for key=1, then releases it.
+        let g1 = lock.lock(1, 0).unwrap();
+        drop(g1);
+
+        // A different thread now legitimately acquires key=1 and holds it open.
+        let (acquired_tx, acquired_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let lock2 = lock.clone();
+        let other = thread::spawn(move || {
+            let _g2 = lock2.lock(1, 0).unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap(); // keep holding until told to stop
+        });
+        acquired_rx.recv().unwrap();
+
+        // This thread (the ORIGINAL creator, who already released) tries to
+        // lock key=1 again while the other thread demonstrably still holds it.
+        // A correct implementation must block/timeout here.
+        let result = lock.lock(1, 1000); // 1ms timeout
+
+        release_tx.send(()).unwrap();
+        other.join().unwrap();
+
+        assert!(
+            result.is_none(),
+            "a thread that previously released this lock must not bypass \
+             another thread's current hold, but it did — ArcLock's map entry \
+             never updates thread_id when a different thread re-acquires, so \
+             the original creator is permanently misidentified as the owner"
+        );
+    }
+
+    // The wait-loop in lock() does `map.get(&val).unwrap()` on every poll.
+    // cleanup() removes any entry whose lock_count() == 1 — which is exactly
+    // the state right after a holder releases and before a waiter's next
+    // poll. If cleanup() runs in that window, the waiter's next `.unwrap()`
+    // panics instead of cleanly timing out or acquiring. cleanup() isn't
+    // wired into production code today (grep confirms), so this is latent —
+    // but it WILL panic a waiting thread the moment something calls it
+    // concurrently with contended locks, which is exactly what cleanup() is
+    // for.
+    #[test]
+    fn test_cleanup_racing_with_waiter_panics() {
+        let lock = ArcLock::new();
+        let holder = lock.lock(1, 0).unwrap();
+
+        let tlock = lock.clone();
+        let waiter = thread::spawn(move || {
+            tlock.lock(1, 50_000) // 50ms: long enough to land in the wait loop
+        });
+
+        thread::sleep(std::time::Duration::from_millis(2)); // let it enter the loop
+        drop(holder); // lock_count drops to 1 (map entry only)
+        lock.cleanup(); // races the waiter's next `map.get(&val).unwrap()`
+
+        let result = waiter.join();
+        assert!(
+            result.is_ok(),
+            "waiting thread panicked instead of returning cleanly: {:?}",
+            result
+        );
     }
 
     #[test]
