@@ -38,6 +38,10 @@ pub enum StoreError {
     MissingKey(String),
     #[error("Tuple too large. {0}: Max : {1}")]
     TupleTooLarge(DBSizeType, usize),
+    #[error("Undo log error : {0}")]
+    UndoLogError(String),
+    #[error("Table not found : {0}")]
+    TableNotFound(String),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

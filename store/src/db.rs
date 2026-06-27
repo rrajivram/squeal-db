@@ -9,17 +9,22 @@ use crate::error::StoreError;
 use crate::generator::Generator;
 use crate::logger::Logger;
 use crate::page::Page;
-use crate::table::{Table, TableType};
+use crate::table::Table;
+use crate::table::TableIdType;
+use crate::tables::bplustree::BPlusTree;
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
+use crate::txn::Transaction;
 use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
 use log::LevelFilter;
 use log::info;
+use parking_lot::RwLock;
 use postcard::from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -29,7 +34,6 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::RwLock;
 use std::sync::atomic::AtomicU64;
 
 const RDB_MAGIC: u16 = 0x5365;
@@ -73,7 +77,6 @@ pub(crate) struct Header {
     pub(crate) page_size: DBSizeType,
 }
 
-#[derive(Debug)]
 pub struct Db<F: DBFile + 'static> {
     name: String,
     pub(crate) header: Arc<Header>,
@@ -81,7 +84,7 @@ pub struct Db<F: DBFile + 'static> {
     pub(crate) undo_file: F,
     pub(crate) redo_file: F,
     page_count: Arc<AtomicU64>,
-    tables: Arc<RwLock<HashMap<String, Table>>>,
+    tables: Arc<RwLock<HashMap<TableIdType, Arc<BPlusTree<F>>>>>,
     generator: Arc<Generator>,
     logger: Arc<Logger>,
     tx_mgr: Arc<TransactionManager>,
@@ -185,41 +188,185 @@ where
      */
     pub fn close(self) -> Result<(F, F, F), StoreError> {
         self.write_system_tables()?;
-        let mut header = (*self.header).clone();
-        header.page_count = self.page_count();
-        let buffer = Arc::into_inner(self.buffer).unwrap();
-        buffer.write_header(header)?;
+        let mut hdr = (*self.header).clone();
+        hdr.page_count = self.page_count();
+        // Each BPlusTree in tables holds Arc<PageBuffer>, Arc<Logger>, and
+        // Arc<TransactionManager>. Drop them before Arc::into_inner so the
+        // reference counts reach 1 and into_inner succeeds.
+        let Db {
+            buffer,
+            logger,
+            tables,
+            file,
+            undo_file,
+            redo_file,
+            ..
+        } = self;
+        drop(tables);
+        let buffer = Arc::into_inner(buffer).unwrap();
+        buffer.write_header(hdr)?;
         buffer.shutdown()?;
         // Unwrapping here as the expectation is there is only this thread accessing logger
-        let logger = Arc::into_inner(self.logger).unwrap();
+        let logger = Arc::into_inner(logger).unwrap();
         logger.shutdown()?;
-        Ok((self.file, self.undo_file, self.redo_file))
+        Ok((file, undo_file, redo_file))
     }
 
     pub fn page_count(&self) -> DBSizeType {
         self.page_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn create_table(&self, name: String) -> Result<Table, StoreError> {
-        let table = {
+    pub fn begin(&self) -> Result<Transaction, StoreError> {
+        Ok(self.tx_mgr.begin()?)
+    }
+
+    pub fn commit(&self, txn: Transaction) -> Result<(), StoreError> {
+        todo!()
+    }
+
+    pub fn rollback(&self, txn: Transaction) -> Result<(), StoreError> {
+        todo!()
+    }
+
+    pub(crate) fn table_by_id(&self, id: TableIdType) -> Result<Arc<BPlusTree<F>>, StoreError> {
+        Ok(self
+            .tables
+            .read()
+            .get(&id)
+            .map(|t| Arc::clone(t))
+            .ok_or(StoreError::TableNotFound(id.to_string()))?)
+    }
+
+    pub(crate) fn insert(
+        &self,
+        id: TableIdType,
+        tuple: Tuple,
+        txn: Transaction,
+    ) -> Result<(), StoreError> {
+        let tx_id = txn.id();
+        let mut tuple = tuple;
+        tuple.set_txn_id(tx_id.clone());
+        self.table_by_id(id)?.insert(tuple, tx_id.clone())?;
+        Ok(())
+    }
+
+    pub(crate) fn find(
+        &self,
+        tid: TableIdType,
+        id: DBIdType,
+        txn: Transaction,
+    ) -> Result<Option<Tuple>, StoreError> {
+        let _txn_id = txn.id();
+        let table = self.table_by_id(tid)?;
+        let tuple = table.find(id.clone())?;
+        if let Some(tuple) = tuple {
+            let tuple = self.find_last_committed(&tuple).map(|t| t.into_owned());
+            return Ok(tuple);
+        } else {
+            return Ok(None);
+        }
+    }
+
+    pub(crate) fn update(
+        &self,
+        tid: TableIdType,
+        new_tuple: Tuple,
+        txn_id: Transaction,
+    ) -> Result<(), StoreError> {
+        let txn = txn_id.id();
+        let table = self.table_by_id(tid)?;
+        let tuple = table.find(new_tuple.id.clone())?;
+        if let Some(tuple) = tuple {
+            let tuple = self
+                .find_last_committed(&tuple)
+                .ok_or(StoreError::KeyNotFound(new_tuple.id.clone()))?;
+            let mut tuple = tuple.into_owned();
+            tuple.set_txn_id(txn.clone());
+            tuple.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            tuple.set_data(&new_tuple.data);
+            table.update(tuple.clone(), txn.clone())?;
+            return Ok(());
+        } else {
+            return Err(StoreError::KeyNotFound(new_tuple.id));
+        }
+    }
+
+    pub(crate) fn remove(
+        &self,
+        tid: TableIdType,
+        id: DBIdType,
+        txn_id: Transaction,
+    ) -> Result<Tuple, StoreError> {
+        let txn = txn_id.id();
+        let table = self.table_by_id(tid)?;
+        let tuple = table.find(id.clone())?;
+        if let Some(tuple) = tuple {
+            let tuple = self
+                .find_last_committed(&tuple)
+                .ok_or(StoreError::KeyNotFound(tuple.id.clone()))?;
+            let mut tuple = tuple.into_owned();
+            tuple.set_txn_id(txn.clone());
+            tuple.tombstone();
+            tuple.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            table.update(tuple.clone(), txn.clone())?;
+            return Ok(tuple);
+        } else {
+            return Err(StoreError::KeyNotFound(id));
+        }
+    }
+
+    fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
+        if let Some(txn) = tuple.txn_id.clone() {
+            if !self.tx_mgr.is_transaction_active(&txn) {
+                Some(Cow::Borrowed(tuple))
+            } else {
+                let mut tuple = tuple.clone();
+                let mut txn = txn;
+                loop {
+                    if tuple.undo_id.is_none() {
+                        return None;
+                    }
+                    let undo_id = tuple.undo_id.unwrap();
+
+                    let t = self.logger.find_undo_tuple(txn.clone(), undo_id);
+                    let next_tuple = t.expect(
+                        format!("Could not find undo record for {:?},{:?}", txn, undo_id).as_str(),
+                    );
+                    let next_txn = next_tuple
+                        .txn_id
+                        .clone()
+                        .expect(format!("Could not find txn id for {}", tuple.id).as_str());
+                    if !self.tx_mgr.is_transaction_active(&next_txn) {
+                        return Some(Cow::Owned(tuple));
+                    }
+                    tuple = next_tuple;
+                    txn = next_txn;
+                }
+            }
+        } else {
+            panic!("Tuple does NOT have txn! {:?}", tuple.id);
+        }
+    }
+
+    pub fn create_table(&self, name: String) -> Result<TableIdType, StoreError> {
+        let table_id = {
             self.validate_table_name(&name)?;
-            let mut tables = self
-                .tables
-                .write()
-                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            let mut tables = self.tables.write();
             self.generator.create_generator(&name, None)?;
             //let table_page = self.buffer.alloc_page(false)?;
-            let table = Table::new_with_id(
-                self.generator.gen_key(SYSTEM_TABLE_NAME)?,
-                name,
-                TableType::Table,
-                None,
+            let table = BPlusTree::new(
+                self.generator.gen_key(SYSTEM_TABLE_NAME)?.into(),
+                name.clone(),
+                self.buffer.clone(),
+                self.tx_mgr.clone(),
+                self.logger.clone(),
             )?;
-            tables.insert(table.name.clone(), table.clone());
-            table
+            let id = table.id();
+            tables.insert(id, Arc::new(table));
+            id
         };
         self.write_system_tables()?;
-        Ok(table)
+        Ok(table_id)
     }
 
     fn setup_needed_modules(
@@ -311,11 +458,12 @@ where
         if name.len() > MAX_TABLE_NAME_LEN {
             return Err(StoreError::TableNameInvalid(MAX_TABLE_NAME_LEN, name.len()));
         }
-        let tables = self
-            .tables
-            .read()
-            .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        if tables.contains_key(name) {
+        let tables = self.tables.read();
+        let present = tables
+            .values()
+            .map(|t| &t.table.name)
+            .position(|n| n == name);
+        if present.is_some() {
             return Err(StoreError::DuplicateName(name.to_string()));
         }
         Ok(())
@@ -323,12 +471,9 @@ where
 
     fn write_system_tables(&self) -> Result<(), StoreError> {
         let mut page = Page::new_pinned(self.header.page_size);
-        let tables = self
-            .tables
-            .read()
-            .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        let tables = self.tables.read();
         for (i, t) in tables.values().enumerate() {
-            let bytes = to_allocvec(&t)?;
+            let bytes = to_allocvec(&t.table)?;
             // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
@@ -360,10 +505,15 @@ where
             ));
         }
         let page = self.buffer.get_page(SYSTEM_TABLE_PAGE.into())?;
-        let mut tables = self.tables.write()?;
+        let mut tables = self.tables.write();
         for t in page.iter() {
-            let t: Table = from_bytes(&t.data)?;
-            tables.insert(t.name.clone(), t);
+            let t: BPlusTree<F> = BPlusTree::from_bytes(
+                &t.data,
+                self.buffer.clone(),
+                self.tx_mgr.clone(),
+                self.logger.clone(),
+            )?;
+            tables.insert(t.table.id, Arc::new(t));
         }
         let page = self.buffer.get_page(GENERATOR_TABLE_PAGE.into())?;
         let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
@@ -375,9 +525,9 @@ where
     fn get_tables(&self) -> Result<Vec<Table>, StoreError> {
         Ok(self
             .tables
-            .read()?
+            .read()
             .values()
-            .map(|t| t.clone())
+            .map(|t| t.table.clone())
             .collect::<Vec<_>>())
     }
 
@@ -485,8 +635,6 @@ mod tests {
         let db = db.unwrap();
         let r = db.create_table("table_1".to_string());
         assert!(r.is_ok());
-        let r = r.unwrap();
-        assert_eq!(r.name, "table_1");
         assert_eq!(db.get_tables().unwrap().len(), 1);
         let (f, u, r) = db.close().unwrap();
         let db = TestDB::open_using(DB_NAME.to_string(), f, u, r).unwrap();

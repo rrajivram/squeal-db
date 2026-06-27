@@ -12,6 +12,7 @@ use crate::{
 
 const NONE: u8 = 0;
 const INDEXED: u8 = 1;
+const TOMBSTONED: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq)]
 pub enum DBIdType {
@@ -91,9 +92,21 @@ impl Tuple {
         self.undo_id = Some(id)
     }
 
+    pub fn tombstone(&mut self) {
+        self.flags |= 1 << TOMBSTONED
+    }
+
+    pub fn is_tombstoned(&self) -> bool {
+        self.flags & 1 << TOMBSTONED != 0
+    }
+
     pub fn from(bytes: &[u8]) -> Result<Self, StoreError> {
         let t: Tuple = from_bytes(bytes)?;
         Ok(t)
+    }
+
+    pub fn set_data(&mut self, data: &[u8]) {
+        self.data = data.to_vec()
     }
 
     pub fn size(&self) -> DBSizeType {

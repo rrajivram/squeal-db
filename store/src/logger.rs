@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    sync::{RwLock, atomic::AtomicU64},
+    sync::atomic::AtomicU64,
     thread::{self, JoinHandle},
 };
 
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use log::error;
+use parking_lot::RwLock;
 use postcard::to_allocvec;
 use serde::{Deserialize, Serialize};
 
@@ -94,7 +95,7 @@ impl Logger {
     pub(crate) fn log_undo(&self, op: Operation) -> Result<(), StoreError> {
         let msg = match &op {
             Operation::Add(_, record) | Operation::Del(_, record) | Operation::Mod(_, record) => {
-                let mut undo_txns = self.undo_txns.write()?;
+                let mut undo_txns = self.undo_txns.write();
                 let id = undo_txns
                     .entry(
                         record
@@ -121,6 +122,31 @@ impl Logger {
             // Now store record if available
         }
         Ok(())
+    }
+
+    pub(crate) fn next_undo_id(&self, id: TransactionId) -> Result<UndoId, StoreError> {
+        Ok(self
+            .undo_txns
+            .read()
+            .get(&id)
+            .map(|m| m.len().into())
+            .unwrap_or(0.into()))
+    }
+
+    pub(crate) fn find_undo_tuple<'a>(&self, id: TransactionId, undo_id: UndoId) -> Option<Tuple> {
+        let map = self.undo_txns.read();
+
+        let o = map.get(&id).map(|v| v.get(undo_id.0 as usize)).flatten();
+        if let Some(op) = o {
+            let tuple = match op {
+                Operation::Add(_, r) | Operation::Del(_, r) | Operation::Mod(_, r) => {
+                    Some(r.tuple.clone())
+                }
+                _ => None,
+            };
+            return tuple;
+        }
+        None
     }
 
     pub(crate) fn last_lsn() -> LsnId {
@@ -269,6 +295,12 @@ fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
         }
     }
     Ok(())
+}
+
+impl From<usize> for UndoId {
+    fn from(value: usize) -> Self {
+        Self { 0: value as u16 }
+    }
 }
 
 #[cfg(test)]

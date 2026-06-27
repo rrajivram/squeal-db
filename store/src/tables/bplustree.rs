@@ -9,7 +9,7 @@ use crate::{
     error::StoreError,
     logger::{Logger, Operation, Record},
     page::{Page, PageId},
-    table::Table,
+    table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple},
     txn::{TransactionId, TransactionManager},
 };
@@ -24,14 +24,11 @@ enum Node {
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
 
-struct BPlusTree<F: DBFile + 'static> {
-    table: Arc<Table>,
+pub(crate) struct BPlusTree<F: DBFile + 'static> {
+    pub(crate) table: Table,
     buffer: Arc<PageBuffer<F>>,
     txn_mgr: Arc<TransactionManager>,
     logger: Arc<Logger>,
-    first_index_page: PageId,
-    first_data_page: PageId,
-    nodes_per_page: usize,
 }
 
 impl<F: DBFile> BPlusTree<F>
@@ -39,7 +36,8 @@ where
     F: DBFile<Item = F> + 'static,
 {
     pub fn new(
-        table: Arc<Table>,
+        id: TableIdType,
+        name: String,
         buffer: Arc<PageBuffer<F>>,
         txn_mgr: Arc<TransactionManager>,
         logger: Arc<Logger>,
@@ -66,20 +64,44 @@ where
         let mut handle = buffer.get_page_mut(first_index_page)?;
         handle.page = Arc::new(index_page);
         buffer.write_locked_page(handle)?;
+        let table = Table {
+            id,
+            name,
+            table_type: TableType::BtreeTable,
+            first_index_page,
+            first_data_page,
+            nodes_per_page: count as usize,
+        };
         Ok(Self {
             table,
             buffer,
             txn_mgr,
-            first_data_page,
-            first_index_page,
-            nodes_per_page: count as usize,
             logger,
         })
     }
 
+    pub fn from_bytes(
+        bytes: &[u8],
+        buffer: Arc<PageBuffer<F>>,
+        txn_mgr: Arc<TransactionManager>,
+        logger: Arc<Logger>,
+    ) -> Result<Self, StoreError> {
+        let t: Table = from_bytes(bytes)?;
+        Ok(Self {
+            table: t,
+            buffer,
+            txn_mgr,
+            logger,
+        })
+    }
+
+    pub fn id(&self) -> TableIdType {
+        self.table.id
+    }
+
     pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<(), StoreError> {
-        let mut page = self.buffer.get_page(self.first_data_page)?;
-        let mut data_page_id = self.first_data_page;
+        let mut page = self.buffer.get_page(self.table.first_data_page)?;
+        let mut data_page_id = self.table.first_data_page;
         let tuple_id = tuple.id.clone();
         loop {
             if page.can_store(&tuple) {
@@ -105,15 +127,15 @@ where
             Some(txn.clone()),
             None,
         );
-        let page = self.buffer.get_page(self.first_index_page)?;
-        if page.count()? == self.nodes_per_page - 1 {
+        let page = self.buffer.get_page(self.table.first_index_page)?;
+        if page.count()? == self.table.nodes_per_page - 1 {
             self.split_root_page(
-                self.buffer.get_page_mut(self.first_index_page)?,
+                self.buffer.get_page_mut(self.table.first_index_page)?,
                 txn.clone(),
             )?;
         }
 
-        self.insert_recursive(id_tuple, txn, self.first_index_page)?;
+        self.insert_recursive(id_tuple, txn.clone(), self.table.first_index_page)?;
         self.logger
             .log_redo(Operation::Add(txn, Record::new(self.table.id, tuple)))?;
         Ok(())
@@ -121,7 +143,7 @@ where
 
     pub fn find(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
         Ok(self
-            .find_page(id.clone(), self.first_index_page)?
+            .find_page(id.clone(), self.table.first_index_page)?
             .map(|p| self.buffer.get_page(p).and_then(|p| p.get(id)))
             .transpose()?
             .flatten())
@@ -130,26 +152,28 @@ where
     pub fn update(&self, tuple: Tuple, txn_id: TransactionId) -> Result<Tuple, StoreError> {
         let id = tuple.id.clone();
         let pid = self
-            .find_page(id.clone(), self.first_index_page)?
+            .find_page(id.clone(), self.table.first_index_page)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
         let mut h = self.buffer.get_page_mut(pid)?;
         let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
         self.buffer.write_locked_page(h)?;
-        self.logger
-            .log_undo(Operation::Mod(txn_id, Record::new(self.table.id, old.clone())))?;
+        let op = Operation::Mod(txn_id, Record::new(self.table.id, old.clone()));
+        self.logger.log_undo(op.clone())?;
+        self.logger.log_redo(op)?;
         Ok(old)
     }
 
     pub fn remove(&self, id: DBIdType, txn_id: TransactionId) -> Result<Tuple, StoreError> {
         let pid = self
-            .find_page(id.clone(), self.first_index_page)?
+            .find_page(id.clone(), self.table.first_index_page)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
         let mut h = self.buffer.get_page_mut(pid)?;
         let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
         self.buffer.write_locked_page(h)?;
-        self.remove_index_entry(id, self.first_index_page)?;
-        self.logger
-            .log_undo(Operation::Del(txn_id, Record::new(self.table.id, old.clone())))?;
+        self.remove_index_entry(id, self.table.first_index_page)?;
+        let op = Operation::Del(txn_id, Record::new(self.table.id, old.clone()));
+        self.logger.log_undo(op.clone())?;
+        self.logger.log_redo(op)?;
         Ok(old)
     }
 
@@ -217,9 +241,11 @@ where
         let mut handle = self.buffer.get_page_mut(start)?;
         if handle.page.is_flag_set(LEAF_NODE) {
             let count = handle.page.count()?;
-            if count == self.nodes_per_page - 1 {
+            if count == self.table.nodes_per_page - 1 {
                 panic!("Count means split not done! {count}, {:?}", start);
-            } else if handle.page.count()? < self.nodes_per_page && handle.page.can_store(&tuple) {
+            } else if handle.page.count()? < self.table.nodes_per_page
+                && handle.page.can_store(&tuple)
+            {
                 self.write_page(handle, tuple)?;
             } else {
                 panic!(
@@ -288,7 +314,7 @@ where
         txn_id: TransactionId,
     ) -> Result<Option<(DBIdType, PageId)>, StoreError> {
         let handle = self.buffer.get_page_mut(page_id)?;
-        if handle.page.count()? == self.nodes_per_page - 1 {
+        if handle.page.count()? == self.table.nodes_per_page - 1 {
             if self.is_root_page(page_id) {
                 panic!("Trying to split root in the wrong place");
             } else {
@@ -300,7 +326,7 @@ where
     }
 
     fn is_root_page(&self, page_id: PageId) -> bool {
-        self.first_index_page == page_id
+        self.table.first_index_page == page_id
     }
 
     fn split_non_root_page(
@@ -347,7 +373,7 @@ where
         right_page: PageId,
         txn_id: TransactionId,
     ) -> Result<(), StoreError> {
-        let mut handle = self.buffer.get_page_mut(self.first_index_page)?;
+        let mut handle = self.buffer.get_page_mut(self.table.first_index_page)?;
         handle.page.clear_page_flag(LEAF_NODE)?;
         handle.page.set_page_flags(INNER_NODE)?;
         let page = Arc::make_mut(&mut handle.page);
@@ -436,7 +462,6 @@ mod tests {
         logger::Logger,
         memfile::MemFile,
         page::Page,
-        table::{Table, TableType},
         tuple::{DBIdType, Tuple},
         txn::{TransactionId, TransactionManager},
     };
@@ -466,10 +491,6 @@ mod tests {
             .into()
     }
 
-    fn make_table() -> Arc<Table> {
-        Arc::new(Table::new_with_id(1, "t".into(), TableType::Table, None).unwrap())
-    }
-
     fn make_logger() -> Arc<Logger> {
         let mut logger = Logger::new();
         logger.set_db(MemFile::new(), MemFile::new()).unwrap();
@@ -478,7 +499,7 @@ mod tests {
 
     fn make_tree(page_size: u64) -> BPlusTree<MemFile> {
         let buf = make_buffer(page_size);
-        BPlusTree::new(make_table(), buf, make_txn_mgr(), make_logger()).unwrap()
+        BPlusTree::new(1.into(), "t".into(), buf, make_txn_mgr(), make_logger()).unwrap()
     }
 
     fn txn() -> TransactionId {
@@ -501,11 +522,11 @@ mod tests {
         let tree = make_tree(BIG);
         tree.insert(Tuple::new(1, b"hello"), txn()).unwrap();
 
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
         assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data, b"hello");
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 1);
     }
 
@@ -515,12 +536,12 @@ mod tests {
         for i in 1u64..=5 {
             tree.insert(Tuple::new(i, b"val"), txn()).unwrap();
         }
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 5);
         for i in 1u64..=5 {
             assert!(dp.contains(DBIdType::Int(i)).unwrap(), "missing id {i}");
         }
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 5);
     }
 
@@ -530,7 +551,7 @@ mod tests {
         for &id in &[5u64, 3, 8, 1, 7, 2, 6, 4] {
             tree.insert(Tuple::new(id, b"d"), txn()).unwrap();
         }
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 8);
         for id in 1u64..=8 {
             assert!(dp.contains(DBIdType::Int(id)).unwrap(), "missing id {id}");
@@ -539,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_data_page_overflow_links_next_page() {
-        // BIG (8192 B) page gives nodes_per_page >> 3, so no index split fires.
+        // BIG (8192 B) page gives table.nodes_per_page >> 3, so no index split fires.
         // Use 3 KB data payloads: each tuple occupies ~3100 B in the data page.
         // data_size ≈ 8192 - overhead (~56) ≈ 8136 B → fits 2 before overflow.
         let tree = make_tree(BIG);
@@ -548,7 +569,7 @@ mod tests {
         tree.insert(Tuple::new(1, &large), txn()).unwrap();
         tree.insert(Tuple::new(2, &large), txn()).unwrap();
 
-        let dp1 = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(
             dp1.count().unwrap(),
             2,
@@ -557,7 +578,7 @@ mod tests {
 
         tree.insert(Tuple::new(3, &large), txn()).unwrap();
 
-        let dp1 = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         let next = dp1.get_next_page();
         assert!(
             next.is_valid_next_page(),
@@ -575,18 +596,18 @@ mod tests {
         // Compute the size of one index entry (same formula as BPlusTree::new).
         let node_bytes = to_allocvec(&Node::Inner(FIRST_USER_PAGE.into())).unwrap();
         let node_tuple_sz = Tuple::new_with(0.into(), &node_bytes, Some(txn()), None).size();
-        // nodes_per_page = page_size / node_tuple_sz.
-        // Choose page_size so nodes_per_page = 4; split fires after 3 inserts.
+        // table.nodes_per_page = page_size / node_tuple_sz.
+        // Choose page_size so table.nodes_per_page = 4; split fires after 3 inserts.
         let probe = 4096u64;
         let page_size = node_tuple_sz * 4 + page_overhead(probe) + 1;
         let tree = make_tree(page_size);
 
-        // nodes_per_page = 4; split fires after 3 index entries, so 5 inserts exercises post-split.
+        // table.nodes_per_page = 4; split fires after 3 index entries, so 5 inserts exercises post-split.
         for i in 1u64..=5 {
             tree.insert(Tuple::new(i, b"x"), txn()).unwrap();
         }
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(
             ip.is_flag_set(INNER_NODE),
             "root must become an inner node after split"
@@ -613,7 +634,7 @@ mod tests {
             tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
         }
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         let entries: Vec<_> = ip.iter().collect();
         assert_eq!(entries.len(), 2);
         for entry in &entries {
@@ -641,12 +662,12 @@ mod tests {
         tree.insert(Tuple::new_with(id2.clone(), b"b-data", None, None), txn())
             .unwrap();
 
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 2);
         assert_eq!(dp.get(id1.clone()).unwrap().unwrap().data, b"a-data");
         assert_eq!(dp.get(id2.clone()).unwrap().unwrap().data, b"b-data");
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 2);
         assert!(ip.contains(id1).unwrap());
         assert!(ip.contains(id2).unwrap());
@@ -667,7 +688,7 @@ mod tests {
         )
         .unwrap();
 
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 2);
         assert!(dp.contains(DBIdType::Int(1)).unwrap());
         assert!(dp.contains(DBIdType::from("str-key".to_string())).unwrap());
@@ -685,7 +706,7 @@ mod tests {
         );
 
         // Original value must be untouched, and no second entry was added.
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
         assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data, b"first");
     }
@@ -703,7 +724,7 @@ mod tests {
             result
         );
 
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
         assert_eq!(dp.get(id).unwrap().unwrap().data, b"first");
     }
@@ -795,13 +816,13 @@ mod tests {
         let page_size = node_tuple_sz * 4 + page_overhead(4096) + 1;
         let tree = make_tree(page_size);
 
-        // nodes_per_page = 4; split fires after 3 inserts (see test_root_splits_into_inner_node).
+        // table.nodes_per_page = 4; split fires after 3 inserts (see test_root_splits_into_inner_node).
         for i in 1u64..=5 {
             tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), txn())
                 .unwrap();
         }
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(ip.is_flag_set(INNER_NODE), "sanity: root must have split");
 
         for i in 1u64..=5 {
@@ -827,7 +848,7 @@ mod tests {
         let page_size = node_tuple_sz * 4 + page_overhead(4096) + 1;
         let tree = make_tree(page_size);
 
-        // nodes_per_page = 4; 5 string-keyed inserts exercise both a root split
+        // table.nodes_per_page = 4; 5 string-keyed inserts exercise both a root split
         // and a child split, exactly the scenario broken before DBIdType::Ord
         // was made hash-consistent with AnyTuplePage's iteration order.
         let keys = ["alpha", "bravo", "charlie", "delta", "echo"];
@@ -837,7 +858,7 @@ mod tests {
                 .unwrap();
         }
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(
             ip.is_flag_set(INNER_NODE),
             "root must split with string ids too"
@@ -950,16 +971,11 @@ mod tests {
         );
     }
 
-    // Regression test for a routing bug in insert_recursive's row-matching loop:
-    // once the root has 3+ entries (i.e. after a second, non-root split), the
-    // old loop broke out of the scan on the first row that didn't match instead
-    // of continuing to the next one, so it could get stuck on an early row and
-    // misroute the very next insert into the wrong leaf. 400 sequential inserts
-    // on a small-ish page forces several rounds of root and child splits.
     #[test]
     fn test_update_existing_tuple_returns_old_and_replaces_value() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+            .unwrap();
 
         let old = tree
             .update(tuple_with_txn(1.into(), b"world"), txn())
@@ -1007,19 +1023,28 @@ mod tests {
     #[test]
     fn test_update_does_not_change_entry_counts() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+            .unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
         assert_eq!(ip.count().unwrap(), 1);
 
         tree.update(tuple_with_txn(1.into(), b"world"), txn())
             .unwrap();
 
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
-        assert_eq!(dp.count().unwrap(), 1, "update must not add or remove data rows");
-        assert_eq!(ip.count().unwrap(), 1, "update must not add or remove index entries");
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
+        assert_eq!(
+            dp.count().unwrap(),
+            1,
+            "update must not add or remove data rows"
+        );
+        assert_eq!(
+            ip.count().unwrap(),
+            1,
+            "update must not add or remove index entries"
+        );
     }
 
     #[test]
@@ -1036,7 +1061,8 @@ mod tests {
     #[test]
     fn test_remove_existing_tuple_returns_value_and_deletes_it() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn()).unwrap();
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+            .unwrap();
 
         let removed = tree.remove(DBIdType::Int(1), txn()).unwrap();
         assert_eq!(removed.data, b"hello");
@@ -1045,7 +1071,7 @@ mod tests {
             tree.find(DBIdType::Int(1)).unwrap().is_none(),
             "removed id must no longer be findable"
         );
-        let dp = tree.buffer.get_page(tree.first_data_page).unwrap();
+        let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert!(!dp.contains(DBIdType::Int(1)).unwrap());
     }
 
@@ -1091,10 +1117,11 @@ mod tests {
     #[test]
     fn test_remove_cleans_up_index_entry() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"first"), txn()).unwrap();
+        tree.insert(tuple_with_txn(1.into(), b"first"), txn())
+            .unwrap();
         tree.remove(DBIdType::Int(1), txn()).unwrap();
 
-        let ip = tree.buffer.get_page(tree.first_index_page).unwrap();
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(
             !ip.contains(DBIdType::Int(1)).unwrap(),
             "index entry must be removed alongside the data row"
