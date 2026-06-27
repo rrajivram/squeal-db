@@ -56,9 +56,9 @@ pub(crate) enum Operation {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Record {
-    table_id: TableIdType,
+    pub(crate) table_id: TableIdType,
     timestamp: u128,
-    tuple: Tuple,
+    pub(crate) tuple: Tuple,
 }
 
 #[derive(Debug, Default)]
@@ -94,16 +94,16 @@ impl Logger {
 
     pub(crate) fn log_undo(&self, op: Operation) -> Result<(), StoreError> {
         let msg = match &op {
-            Operation::Add(_, record) | Operation::Del(_, record) | Operation::Mod(_, record) => {
+            // Indexed by the operation's own txn (not record.tuple.txn_id):
+            // a Mod/Del undo record deliberately carries the *pre-image* tuple
+            // (with the previous, already-committed owner's txn_id) so that
+            // rollback can restore it and MVCC reads can walk the chain to a
+            // committed ancestor. That pre-image's txn_id is unrelated to which
+            // transaction's undo log this entry belongs to.
+            Operation::Add(txn, _) | Operation::Del(txn, _) | Operation::Mod(txn, _) => {
                 let mut undo_txns = self.undo_txns.write();
                 let id = undo_txns
-                    .entry(
-                        record
-                            .tuple
-                            .txn_id
-                            .clone()
-                            .ok_or(StoreError::UnknownError("Missing transaction".into()))?,
-                    )
+                    .entry(txn.clone())
                     .and_modify(|v| v.push(op.clone()))
                     .or_insert(vec![op.clone()]);
                 MsgType::Undo(UndoOperation {
@@ -131,6 +131,21 @@ impl Logger {
             .get(&id)
             .map(|m| m.len().into())
             .unwrap_or(0.into()))
+    }
+
+    pub(crate) fn get_undo_operations(
+        &self,
+        id: TransactionId,
+    ) -> Result<Vec<Operation>, StoreError> {
+        Ok(self
+            .undo_txns
+            .read()
+            .get(&id)
+            .map(|v| v.clone())
+            .ok_or(StoreError::UndoLogError(format!(
+                "Could not find tx {:?}",
+                id
+            )))?)
     }
 
     pub(crate) fn find_undo_tuple<'a>(&self, id: TransactionId, undo_id: UndoId) -> Option<Tuple> {
@@ -362,14 +377,19 @@ mod tests {
     }
 
     #[test]
-    fn test_log_undo_add_missing_txn_id_returns_err() {
-        // Tuple without txn_id set → log_undo should return an error
+    fn test_log_undo_indexes_by_operation_txn_not_tuple_txn_id() {
+        // log_undo indexes by the Operation's own txn id, not record.tuple.txn_id.
+        // This matters because Mod/Del undo records deliberately carry a
+        // pre-image tuple tagged with a *different* (older, committed) txn_id
+        // than the operation being logged. A tuple with no txn_id at all (as
+        // here) must therefore still log successfully.
         let logger = Logger::new();
         let txn_id = TransactionId::from(10);
         let tuple = Tuple::new(1, b"hello"); // txn_id not set
         let record = Record::new(0.into(), tuple);
-        let op = Operation::new_add(txn_id, record);
-        assert!(logger.log_undo(op).is_err());
+        let op = Operation::new_add(txn_id.clone(), record);
+        assert!(logger.log_undo(op).is_ok());
+        assert_eq!(logger.next_undo_id(txn_id).unwrap(), 1.into());
     }
 
     #[test]

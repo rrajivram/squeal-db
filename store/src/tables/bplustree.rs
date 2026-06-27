@@ -99,7 +99,12 @@ where
         self.table.id
     }
 
-    pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<(), StoreError> {
+    pub fn insert(
+        &self,
+        tuple: Tuple,
+        txn: TransactionId,
+        _should_log: bool,
+    ) -> Result<(), StoreError> {
         let mut page = self.buffer.get_page(self.table.first_data_page)?;
         let mut data_page_id = self.table.first_data_page;
         let tuple_id = tuple.id.clone();
@@ -136,8 +141,11 @@ where
         }
 
         self.insert_recursive(id_tuple, txn.clone(), self.table.first_index_page)?;
-        self.logger
-            .log_redo(Operation::Add(txn, Record::new(self.table.id, tuple)))?;
+        /*         if should_log {
+                   self.logger
+                       .log_redo(Operation::Add(txn, Record::new(self.table.id, tuple)))?;
+               }
+        */
         Ok(())
     }
 
@@ -149,7 +157,12 @@ where
             .flatten())
     }
 
-    pub fn update(&self, tuple: Tuple, txn_id: TransactionId) -> Result<Tuple, StoreError> {
+    pub fn update(
+        &self,
+        tuple: Tuple,
+        txn_id: TransactionId,
+        _should_log: bool,
+    ) -> Result<Tuple, StoreError> {
         let id = tuple.id.clone();
         let pid = self
             .find_page(id.clone(), self.table.first_index_page)?
@@ -157,13 +170,21 @@ where
         let mut h = self.buffer.get_page_mut(pid)?;
         let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
         self.buffer.write_locked_page(h)?;
-        let op = Operation::Mod(txn_id, Record::new(self.table.id, old.clone()));
-        self.logger.log_undo(op.clone())?;
-        self.logger.log_redo(op)?;
+        /*         let op = Operation::Mod(txn_id, Record::new(self.table.id, old.clone()));
+               if should_log {
+                   self.logger.log_undo(op.clone())?;
+                   self.logger.log_redo(op)?;
+               }
+        */
         Ok(old)
     }
 
-    pub fn remove(&self, id: DBIdType, txn_id: TransactionId) -> Result<Tuple, StoreError> {
+    pub fn remove(
+        &self,
+        id: DBIdType,
+        txn_id: TransactionId,
+        _should_log: bool,
+    ) -> Result<Tuple, StoreError> {
         let pid = self
             .find_page(id.clone(), self.table.first_index_page)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
@@ -171,9 +192,12 @@ where
         let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
         self.buffer.write_locked_page(h)?;
         self.remove_index_entry(id, self.table.first_index_page)?;
-        let op = Operation::Del(txn_id, Record::new(self.table.id, old.clone()));
-        self.logger.log_undo(op.clone())?;
-        self.logger.log_redo(op)?;
+        /*         let op = Operation::Del(txn_id, Record::new(self.table.id, old.clone()));
+               if should_log {
+                   self.logger.log_undo(op.clone())?;
+                   self.logger.log_redo(op)?;
+               }
+        */
         Ok(old)
     }
 
@@ -520,7 +544,7 @@ mod tests {
     #[test]
     fn test_insert_single_data_and_index() {
         let tree = make_tree(BIG);
-        tree.insert(Tuple::new(1, b"hello"), txn()).unwrap();
+        tree.insert(Tuple::new(1, b"hello"), txn(), true).unwrap();
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
@@ -534,7 +558,7 @@ mod tests {
     fn test_insert_multiple_same_page() {
         let tree = make_tree(BIG);
         for i in 1u64..=5 {
-            tree.insert(Tuple::new(i, b"val"), txn()).unwrap();
+            tree.insert(Tuple::new(i, b"val"), txn(), true).unwrap();
         }
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 5);
@@ -549,7 +573,7 @@ mod tests {
     fn test_insert_out_of_order() {
         let tree = make_tree(BIG);
         for &id in &[5u64, 3, 8, 1, 7, 2, 6, 4] {
-            tree.insert(Tuple::new(id, b"d"), txn()).unwrap();
+            tree.insert(Tuple::new(id, b"d"), txn(), true).unwrap();
         }
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 8);
@@ -566,8 +590,8 @@ mod tests {
         let tree = make_tree(BIG);
         let large = vec![b'x'; 3000];
 
-        tree.insert(Tuple::new(1, &large), txn()).unwrap();
-        tree.insert(Tuple::new(2, &large), txn()).unwrap();
+        tree.insert(Tuple::new(1, &large), txn(), true).unwrap();
+        tree.insert(Tuple::new(2, &large), txn(), true).unwrap();
 
         let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(
@@ -576,7 +600,7 @@ mod tests {
             "first data page should hold 2 large tuples"
         );
 
-        tree.insert(Tuple::new(3, &large), txn()).unwrap();
+        tree.insert(Tuple::new(3, &large), txn(), true).unwrap();
 
         let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         let next = dp1.get_next_page();
@@ -604,7 +628,7 @@ mod tests {
 
         // table.nodes_per_page = 4; split fires after 3 index entries, so 5 inserts exercises post-split.
         for i in 1u64..=5 {
-            tree.insert(Tuple::new(i, b"x"), txn()).unwrap();
+            tree.insert(Tuple::new(i, b"x"), txn(), true).unwrap();
         }
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
@@ -631,7 +655,7 @@ mod tests {
         let tree = make_tree(page_size);
 
         for i in 1u64..=4 {
-            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
+            tree.insert(Tuple::new(i, b"y"), txn(), true).unwrap();
         }
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
@@ -657,10 +681,18 @@ mod tests {
         let tree = make_tree(BIG);
         let id1 = DBIdType::from("alpha".to_string());
         let id2 = DBIdType::from("beta".to_string());
-        tree.insert(Tuple::new_with(id1.clone(), b"a-data", None, None), txn())
-            .unwrap();
-        tree.insert(Tuple::new_with(id2.clone(), b"b-data", None, None), txn())
-            .unwrap();
+        tree.insert(
+            Tuple::new_with(id1.clone(), b"a-data", None, None),
+            txn(),
+            true,
+        )
+        .unwrap();
+        tree.insert(
+            Tuple::new_with(id2.clone(), b"b-data", None, None),
+            txn(),
+            true,
+        )
+        .unwrap();
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 2);
@@ -676,7 +708,7 @@ mod tests {
     #[test]
     fn test_insert_mixed_int_and_string_ids() {
         let tree = make_tree(BIG);
-        tree.insert(Tuple::new(1, b"int-1"), txn()).unwrap();
+        tree.insert(Tuple::new(1, b"int-1"), txn(), true).unwrap();
         tree.insert(
             Tuple::new_with(
                 DBIdType::from("str-key".to_string()),
@@ -685,6 +717,7 @@ mod tests {
                 None,
             ),
             txn(),
+            true,
         )
         .unwrap();
 
@@ -697,8 +730,8 @@ mod tests {
     #[test]
     fn test_insert_duplicate_int_id_returns_error() {
         let tree = make_tree(BIG);
-        tree.insert(Tuple::new(1, b"first"), txn()).unwrap();
-        let result = tree.insert(Tuple::new(1, b"second"), txn());
+        tree.insert(Tuple::new(1, b"first"), txn(), true).unwrap();
+        let result = tree.insert(Tuple::new(1, b"second"), txn(), true);
         assert!(
             matches!(result, Err(StoreError::DuplicateKey(_))),
             "expected DuplicateKey error, got {:?}",
@@ -715,9 +748,17 @@ mod tests {
     fn test_insert_duplicate_string_id_returns_error() {
         let tree = make_tree(BIG);
         let id = DBIdType::from("dup-key".to_string());
-        tree.insert(Tuple::new_with(id.clone(), b"first", None, None), txn())
-            .unwrap();
-        let result = tree.insert(Tuple::new_with(id.clone(), b"second", None, None), txn());
+        tree.insert(
+            Tuple::new_with(id.clone(), b"first", None, None),
+            txn(),
+            true,
+        )
+        .unwrap();
+        let result = tree.insert(
+            Tuple::new_with(id.clone(), b"second", None, None),
+            txn(),
+            true,
+        );
         assert!(
             matches!(result, Err(StoreError::DuplicateKey(_))),
             "expected DuplicateKey error, got {:?}",
@@ -732,7 +773,7 @@ mod tests {
     #[test]
     fn test_find_returns_inserted_tuple() {
         let tree = make_tree(BIG);
-        tree.insert(Tuple::new(1, b"hello"), txn()).unwrap();
+        tree.insert(Tuple::new(1, b"hello"), txn(), true).unwrap();
         let found = tree.find(DBIdType::Int(1)).unwrap();
         assert_eq!(found.unwrap().data, b"hello");
     }
@@ -746,7 +787,7 @@ mod tests {
     #[test]
     fn test_find_missing_id_returns_none() {
         let tree = make_tree(BIG);
-        tree.insert(Tuple::new(1, b"hello"), txn()).unwrap();
+        tree.insert(Tuple::new(1, b"hello"), txn(), true).unwrap();
         assert!(tree.find(DBIdType::Int(42)).unwrap().is_none());
     }
 
@@ -754,7 +795,7 @@ mod tests {
     fn test_find_multiple_in_same_page() {
         let tree = make_tree(BIG);
         for i in 1u64..=5 {
-            tree.insert(Tuple::new(i, format!("val-{i}").as_bytes()), txn())
+            tree.insert(Tuple::new(i, format!("val-{i}").as_bytes()), txn(), true)
                 .unwrap();
         }
         for i in 1u64..=5 {
@@ -768,7 +809,7 @@ mod tests {
     fn test_find_out_of_order_inserts() {
         let tree = make_tree(BIG);
         for &id in &[5u64, 3, 8, 1, 7, 2, 6, 4] {
-            tree.insert(Tuple::new(id, format!("v{id}").as_bytes()), txn())
+            tree.insert(Tuple::new(id, format!("v{id}").as_bytes()), txn(), true)
                 .unwrap();
         }
         for id in 1u64..=8 {
@@ -781,8 +822,12 @@ mod tests {
     fn test_find_with_string_id() {
         let tree = make_tree(BIG);
         let id = DBIdType::from("alpha".to_string());
-        tree.insert(Tuple::new_with(id.clone(), b"a-data", None, None), txn())
-            .unwrap();
+        tree.insert(
+            Tuple::new_with(id.clone(), b"a-data", None, None),
+            txn(),
+            true,
+        )
+        .unwrap();
         let found = tree.find(id).unwrap().unwrap();
         assert_eq!(found.data, b"a-data");
         assert!(
@@ -796,10 +841,10 @@ mod tests {
     fn test_find_resolves_through_data_page_overflow() {
         let tree = make_tree(BIG);
         let large = vec![b'x'; 3000];
-        tree.insert(Tuple::new(1, &large), txn()).unwrap();
-        tree.insert(Tuple::new(2, &large), txn()).unwrap();
+        tree.insert(Tuple::new(1, &large), txn(), true).unwrap();
+        tree.insert(Tuple::new(2, &large), txn(), true).unwrap();
         // Overflows onto a second data page (see test_data_page_overflow_links_next_page).
-        tree.insert(Tuple::new(3, &large), txn()).unwrap();
+        tree.insert(Tuple::new(3, &large), txn(), true).unwrap();
 
         // id 3 lives on the second (overflow) data page; find() must follow the
         // index's Node::Leaf pointer there rather than only checking the first page.
@@ -818,7 +863,7 @@ mod tests {
 
         // table.nodes_per_page = 4; split fires after 3 inserts (see test_root_splits_into_inner_node).
         for i in 1u64..=5 {
-            tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), txn())
+            tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), txn(), true)
                 .unwrap();
         }
 
@@ -854,7 +899,7 @@ mod tests {
         let keys = ["alpha", "bravo", "charlie", "delta", "echo"];
         for k in &keys {
             let id = DBIdType::from(k.to_string());
-            tree.insert(Tuple::new_with(id, k.as_bytes(), None, None), txn())
+            tree.insert(Tuple::new_with(id, k.as_bytes(), None, None), txn(), true)
                 .unwrap();
         }
 
@@ -913,7 +958,7 @@ mod tests {
         for iteration in 0..ITERATIONS {
             let tree = make_tree(BIG);
             for i in 0..PREPOPULATE {
-                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i))
+                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i), true)
                     .unwrap();
             }
             let tree = Arc::new(tree);
@@ -933,6 +978,7 @@ mod tests {
                         tree.insert(
                             Tuple::new(id, format!("v{id}").as_bytes()),
                             TransactionId::new(id),
+                            true,
                         )
                     })
                 })
@@ -974,11 +1020,11 @@ mod tests {
     #[test]
     fn test_update_existing_tuple_returns_old_and_replaces_value() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn(), true)
             .unwrap();
 
         let old = tree
-            .update(tuple_with_txn(1.into(), b"world"), txn())
+            .update(tuple_with_txn(1.into(), b"world"), txn(), true)
             .unwrap();
         assert_eq!(old.data, b"hello", "update must return the previous value");
 
@@ -990,10 +1036,14 @@ mod tests {
     fn test_update_preserves_other_tuples() {
         let tree = make_tree(BIG);
         for i in 1u64..=5 {
-            tree.insert(tuple_with_txn(i.into(), format!("v{i}").as_bytes()), txn())
-                .unwrap();
+            tree.insert(
+                tuple_with_txn(i.into(), format!("v{i}").as_bytes()),
+                txn(),
+                true,
+            )
+            .unwrap();
         }
-        tree.update(tuple_with_txn(3.into(), b"updated"), txn())
+        tree.update(tuple_with_txn(3.into(), b"updated"), txn(), true)
             .unwrap();
 
         for i in 1u64..=5 {
@@ -1010,11 +1060,11 @@ mod tests {
     fn test_update_with_string_id() {
         let tree = make_tree(BIG);
         let id = DBIdType::from("alpha".to_string());
-        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn())
+        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn(), true)
             .unwrap();
 
         let old = tree
-            .update(tuple_with_txn(id.clone(), b"a-data-2"), txn())
+            .update(tuple_with_txn(id.clone(), b"a-data-2"), txn(), true)
             .unwrap();
         assert_eq!(old.data, b"a-data");
         assert_eq!(tree.find(id).unwrap().unwrap().data, b"a-data-2");
@@ -1023,14 +1073,14 @@ mod tests {
     #[test]
     fn test_update_does_not_change_entry_counts() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn(), true)
             .unwrap();
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
         assert_eq!(ip.count().unwrap(), 1);
 
-        tree.update(tuple_with_txn(1.into(), b"world"), txn())
+        tree.update(tuple_with_txn(1.into(), b"world"), txn(), true)
             .unwrap();
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
@@ -1050,7 +1100,7 @@ mod tests {
     #[test]
     fn test_update_nonexistent_id_returns_err() {
         let tree = make_tree(BIG);
-        let result = tree.update(tuple_with_txn(999.into(), b"x"), txn());
+        let result = tree.update(tuple_with_txn(999.into(), b"x"), txn(), true);
         assert!(
             matches!(result, Err(StoreError::KeyNotFound(_))),
             "update on a never-inserted id must return KeyNotFound, got {:?}",
@@ -1061,10 +1111,10 @@ mod tests {
     #[test]
     fn test_remove_existing_tuple_returns_value_and_deletes_it() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
+        tree.insert(tuple_with_txn(1.into(), b"hello"), txn(), true)
             .unwrap();
 
-        let removed = tree.remove(DBIdType::Int(1), txn()).unwrap();
+        let removed = tree.remove(DBIdType::Int(1), txn(), true).unwrap();
         assert_eq!(removed.data, b"hello");
 
         assert!(
@@ -1079,10 +1129,14 @@ mod tests {
     fn test_remove_preserves_other_tuples() {
         let tree = make_tree(BIG);
         for i in 1u64..=5 {
-            tree.insert(tuple_with_txn(i.into(), format!("v{i}").as_bytes()), txn())
-                .unwrap();
+            tree.insert(
+                tuple_with_txn(i.into(), format!("v{i}").as_bytes()),
+                txn(),
+                true,
+            )
+            .unwrap();
         }
-        tree.remove(DBIdType::Int(3), txn()).unwrap();
+        tree.remove(DBIdType::Int(3), txn(), true).unwrap();
 
         assert!(tree.find(DBIdType::Int(3)).unwrap().is_none());
         for i in [1u64, 2, 4, 5] {
@@ -1095,10 +1149,10 @@ mod tests {
     fn test_remove_with_string_id() {
         let tree = make_tree(BIG);
         let id = DBIdType::from("alpha".to_string());
-        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn())
+        tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn(), true)
             .unwrap();
 
-        let removed = tree.remove(id.clone(), txn()).unwrap();
+        let removed = tree.remove(id.clone(), txn(), true).unwrap();
         assert_eq!(removed.data, b"a-data");
         assert!(tree.find(id).unwrap().is_none());
     }
@@ -1106,7 +1160,7 @@ mod tests {
     #[test]
     fn test_remove_nonexistent_id_returns_err() {
         let tree = make_tree(BIG);
-        let result = tree.remove(DBIdType::Int(999), txn());
+        let result = tree.remove(DBIdType::Int(999), txn(), true);
         assert!(
             matches!(result, Err(StoreError::KeyNotFound(_))),
             "remove on a never-inserted id must return KeyNotFound, got {:?}",
@@ -1117,9 +1171,9 @@ mod tests {
     #[test]
     fn test_remove_cleans_up_index_entry() {
         let tree = make_tree(BIG);
-        tree.insert(tuple_with_txn(1.into(), b"first"), txn())
+        tree.insert(tuple_with_txn(1.into(), b"first"), txn(), true)
             .unwrap();
-        tree.remove(DBIdType::Int(1), txn()).unwrap();
+        tree.remove(DBIdType::Int(1), txn(), true).unwrap();
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(
@@ -1128,7 +1182,7 @@ mod tests {
         );
 
         // Re-inserting the same id must succeed once the index entry is gone.
-        tree.insert(Tuple::new(1, b"second"), txn()).unwrap();
+        tree.insert(Tuple::new(1, b"second"), txn(), true).unwrap();
         let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
         assert_eq!(found.data, b"second");
     }
@@ -1140,6 +1194,7 @@ mod tests {
             tree.insert(
                 Tuple::new(i, format!("v{i}").as_bytes()),
                 TransactionId::new(i),
+                true,
             )
             .unwrap();
         }

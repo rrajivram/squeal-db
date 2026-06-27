@@ -267,12 +267,42 @@ fn writer<F: DBFile>(
                     info!("Writer exiting: channel disconnected");
                     break;
                 }
-                crossbeam::channel::TryRecvError::Empty => {}
+                crossbeam::channel::TryRecvError::Empty => {
+                    // Retry pages that were deferred because the redo log
+                    // hadn't caught up yet. The else-branch below is
+                    // unreachable (try_recv only returns Ok or Err), so this
+                    // is the only place the pending queue can drain.
+                    for i in (0..pending.len()).rev() {
+                        let m: &WriteMsg = &pending[i];
+                        if m.page.is_pinned() || m.page.lsn_id()? < Logger::last_lsn() {
+                            seek_to_page(
+                                m.page_num.into(),
+                                &mut file,
+                                header.page_size,
+                                header.first_page_offset,
+                            )?;
+                            file.write(&m.page.to_bytes())?;
+                            pending.swap_remove(i);
+                        }
+                    }
+                }
             }
         } else if msg.is_ok() {
             let msg = msg.unwrap();
             match msg {
                 BufMsg::Shutdowm => {
+                    // Flush any pages still waiting before exit — the redo log
+                    // has already been written for all committed operations, so
+                    // it's safe to write everything unconditionally here.
+                    for m in pending.drain(..) {
+                        seek_to_page(
+                            m.page_num.into(),
+                            &mut file,
+                            header.page_size,
+                            header.first_page_offset,
+                        )?;
+                        file.write(&m.page.to_bytes())?;
+                    }
                     break;
                 }
                 BufMsg::WritePage(msg) => {
@@ -301,20 +331,6 @@ fn writer<F: DBFile>(
                         let b = vec![0u8; size_of::<Header>() - bytes.len()];
                         file.write(&b)?;
                     }
-                }
-            }
-        } else {
-            for i in (0..pending.len()).rev() {
-                let m = &pending[i];
-                if m.page.lsn_id()? < Logger::last_lsn() {
-                    seek_to_page(
-                        m.page_num.into(),
-                        &mut file,
-                        header.page_size,
-                        header.first_page_offset,
-                    )?;
-                    file.write(&m.page.to_bytes())?;
-                    pending.swap_remove(i);
                 }
             }
         }
