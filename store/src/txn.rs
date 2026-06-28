@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     hash::Hash,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU64},
 };
 
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
@@ -98,6 +98,8 @@ impl Drop for Transaction {
         }
     }
 }
+
+static TX_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl TransactionManager {
     pub(crate) fn new(gens: Arc<Generator>, last_id: TransactionId) -> Result<Self, StoreError> {

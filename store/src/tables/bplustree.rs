@@ -43,13 +43,7 @@ where
         logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
-        let size = Tuple::new_with(
-            DBIdType::Int(DBSizeType::MAX),
-            &to_allocvec(&Node::Inner(DBSizeType::MAX.into()))?,
-            Some(TransactionId::new(DBSizeType::MAX)),
-            None,
-        )
-        .size();
+        let size = Self::max_entry_size()?;
         let count = pg / size;
 
         if count < 2 {
@@ -146,7 +140,15 @@ where
         } else {
             drop(handle);
         }
-        Ok(self.insert_recursive(id_tuple, txn, self.table.first_index_page)?)
+        let inserted_id = id_tuple.id.clone();
+        self.insert_recursive(id_tuple, txn, self.table.first_index_page)?;
+        // TEMPORARY DIAGNOSTIC: catch orphaning the instant it happens, with a
+        // full backtrace, instead of finding out 50,000 finds later in a
+        // separate verification pass.
+        if self.find(inserted_id.clone())?.is_none() {
+            panic!("DIAGNOSTIC: just-inserted id {:?} is unreachable immediately after insert_recursive returned Ok", inserted_id);
+        }
+        Ok(())
         /*         let mut retries = 0u32;
                loop {
                    let page = self.buffer.get_page(self.table.first_index_page)?;
@@ -378,6 +380,20 @@ where
             panic!("Unknown page {:?}", start);
         }
         Ok(())
+    }
+
+    // The worst-case size of a single index entry — the same template used to
+    // size `nodes_per_page` in `new()`. Real entries (smaller ids/page
+    // numbers) are never larger, since postcard's varint encoding is
+    // monotonic in the encoded value.
+    fn max_entry_size() -> Result<DBSizeType, StoreError> {
+        Ok(Tuple::new_with(
+            DBIdType::Int(DBSizeType::MAX),
+            &to_allocvec(&Node::Inner(DBSizeType::MAX.into()))?,
+            Some(TransactionId::new(DBSizeType::MAX)),
+            None,
+        )
+        .size())
     }
 
     fn split_if_needed(

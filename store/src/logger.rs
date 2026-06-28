@@ -137,15 +137,18 @@ impl Logger {
         &self,
         id: TransactionId,
     ) -> Result<Vec<Operation>, StoreError> {
+        // A transaction that never wrote anything (e.g. read-only — only
+        // `find()` calls) has no entry here at all. That's not an error: it
+        // just means there's nothing to undo/cleanup. Db::commit/Db::rollback
+        // rely on this returning `Ok` so they can reach their final
+        // tx_mgr.commit/rollback call and actually deactivate the
+        // transaction — see Transaction::into_id.
         Ok(self
             .undo_txns
             .read()
             .get(&id)
             .map(|v| v.clone())
-            .ok_or(StoreError::UndoLogError(format!(
-                "Could not find tx {:?}",
-                id
-            )))?)
+            .unwrap_or_default())
     }
 
     pub(crate) fn find_undo_tuple<'a>(&self, id: TransactionId, undo_id: UndoId) -> Option<Tuple> {

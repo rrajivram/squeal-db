@@ -285,6 +285,16 @@ fn writer<F: DBFile>(
                             pending.swap_remove(i);
                         }
                     }
+                    // Nothing arrived this pass — only now is it safe to idle.
+                    // Sleeping unconditionally on every iteration (the old
+                    // behavior) capped this thread at ~1000 messages/sec no
+                    // matter how fast producers sent them: under load the
+                    // channel backs up for the entire run, and a later
+                    // Shutdowm message has to wait behind that whole backlog,
+                    // making PageBuffer::shutdown() (and thus Db::close())
+                    // hang for minutes. Only sleep when idle so a backlog
+                    // drains as fast as the disk/memory can take it.
+                    thread::sleep(Duration::from_millis(1));
                 }
             }
         } else if msg.is_ok() {
@@ -334,7 +344,6 @@ fn writer<F: DBFile>(
                 }
             }
         }
-        thread::sleep(Duration::from_millis(1));
     }
     Ok(())
 }

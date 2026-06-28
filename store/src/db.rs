@@ -927,9 +927,9 @@ mod tests {
             matches!(r, Err(StoreError::KeyNotFound(_))),
             "updating missing row must return KeyNotFound, got {r:?}"
         );
-        // No writes were logged for this txn, so db.rollback() would fail with
-        // UndoLogError. Dropping the guard calls mgr.rollback() which is sufficient
-        // to remove it from the active set.
+        // No writes were logged for this txn; dropping the guard rolls it
+        // back at the manager level, which is sufficient to remove it from
+        // the active set.
         drop(txn);
     }
 
@@ -986,7 +986,7 @@ mod tests {
             matches!(r, Err(StoreError::KeyNotFound(_))),
             "removing missing row must return KeyNotFound, got {r:?}"
         );
-        drop(txn); // no writes logged → db.rollback() would error; drop cleans up the active set
+        drop(txn); // no writes logged → drop cleans up the active set
     }
 
     // ── multiple operations in a single transaction ───────────────────────────
