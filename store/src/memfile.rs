@@ -7,13 +7,13 @@ use std::{
 use crate::db::{Meta, Opener};
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct MemFile {
+pub struct MemFile {
     data: Arc<RwLock<Vec<u8>>>,
     seek_pos: usize,
 }
 
 impl MemFile {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             ..Default::default()
         }

@@ -45,11 +45,11 @@ const ZERO_PAGE_SIZE: DBSizeType = 8 * 1024;
 const DEFAULT_PAGE_SIZE: DBSizeType = 16 * 1024;
 
 pub type FileDB = Db<File>;
-pub(crate) struct Meta {
-    pub(crate) len: u64,
+pub struct Meta {
+    pub len: u64,
 }
 
-pub(crate) trait Opener {
+pub trait Opener {
     type Item;
     fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<Self::Item>;
     fn do_sync(&mut self) -> std::io::Result<()>;
@@ -58,7 +58,7 @@ pub(crate) trait Opener {
     fn do_lock(&self) -> Result<(), TryLockError>;
 }
 
-pub(crate) trait DBFile:
+pub trait DBFile:
     std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
 {
 }
@@ -152,7 +152,14 @@ where
             redo_file,
             name: name.as_ref().to_string(),
             tables: Arc::new(RwLock::new(HashMap::new())),
-            generator: Arc::new(Generator::new()),
+            // Must be the same Arc<Generator> passed to setup_needed_modules:
+            // TransactionManager holds its own clone of `gens` and calls
+            // gen_key(TXN_GENERATOR_NANE) on it directly. If `generator` were a
+            // separate instance, load_system_tables()'s restore below would
+            // never reach the generator tx_mgr actually uses, so the txn id
+            // sequence would silently restart at 0 on every reopen — colliding
+            // with transaction ids from the prior session.
+            generator: gens,
             logger: nm.logger,
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
@@ -224,38 +231,50 @@ where
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<(), StoreError> {
-        let ops = self.logger.get_undo_operations(txn.id())?;
+        // Detach the id before doing any fallible work below. If that work
+        // fails partway, returning the `?` here must NOT fall back to
+        // `Transaction::drop`'s default rollback — see `Transaction::into_id`.
+        // The transaction simply stays active (and correctly invisible) until
+        // a retried commit completes successfully.
+        let id = txn.into_id();
+        let ops = self.logger.get_undo_operations(id.clone())?;
         for o in ops {
             match o {
                 Operation::Del(_, r) => {
                     let table = self.table_by_id(r.table_id)?;
                     let t = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = t {
-                        if tuple.is_tombstoned() && tuple.is_same_txn(txn.id()) {
-                            table.remove(tuple.id, txn.id(), false)?;
+                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
+                            retry_on_contention(|| {
+                                table.remove(tuple.id.clone(), id.clone(), false)
+                            })?;
                         }
                     }
                 }
                 _ => {}
             }
         }
-        let op = Operation::Commit(txn.id(), timestamp());
+        let op = Operation::Commit(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
-        txn.commit()?;
+        self.tx_mgr.commit(id)?;
         Ok(())
     }
 
     pub fn rollback(&self, txn: Transaction) -> Result<(), StoreError> {
-        let ops = self.logger.get_undo_operations(txn.id())?;
+        // See the comment in `commit` above — same reasoning applies here.
+        let id = txn.into_id();
+        let ops = self.logger.get_undo_operations(id.clone())?;
         for o in ops {
             match o {
                 Operation::Add(_, r) => {
                     let table = self.table_by_id(r.table_id)?;
                     let tuple = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = tuple {
-                        if tuple.is_same_txn(txn.id()) {
-                            table.remove(r.tuple.id, txn.id(), false)?;
+                        if tuple.is_same_txn(id.clone()) {
+                            retry_on_contention(|| {
+                                table.remove(r.tuple.id.clone(), id.clone(), false)
+                            })?;
                         }
                     }
                 }
@@ -263,18 +282,20 @@ where
                     let table = self.table_by_id(r.table_id)?;
                     let tuple = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = tuple {
-                        if tuple.is_same_txn(txn.id()) {
-                            table.update(r.tuple, txn.id(), false)?;
+                        if tuple.is_same_txn(id.clone()) {
+                            retry_on_contention(|| {
+                                table.update(r.tuple.clone(), id.clone(), false)
+                            })?;
                         }
                     }
                 }
                 _ => {}
             }
         }
-        let op = Operation::Rollback(txn.id(), timestamp());
+        let op = Operation::Rollback(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
-        self.logger.log_undo(op)?;test_txn_close_reopen_data_persists
-        txn.rollback()?;
+        self.logger.log_undo(op)?;
+        self.tx_mgr.rollback(id)?;
         Ok(())
     }
 
@@ -287,7 +308,7 @@ where
             .ok_or(StoreError::TableNotFound(id.to_string()))?)
     }
 
-    pub(crate) fn insert(
+    pub fn insert(
         &self,
         id: TableIdType,
         tuple: Tuple,
@@ -304,7 +325,7 @@ where
         Ok(())
     }
 
-    pub(crate) fn find(
+    pub fn find(
         &self,
         tid: TableIdType,
         id: DBIdType,
@@ -321,7 +342,7 @@ where
         }
     }
 
-    pub(crate) fn update(
+    pub fn update(
         &self,
         tid: TableIdType,
         new_tuple: Tuple,
@@ -331,24 +352,36 @@ where
         let table = self.table_by_id(tid)?;
         let tuple = table.find(new_tuple.id.clone())?;
         if let Some(tuple) = tuple {
-            let tuple = self
+            // old_tuple is the pre-update, already-committed version. It's kept
+            // (with its original txn_id) as the undo record's content, so a
+            // rollback restores the exact prior state and concurrent readers
+            // can walk the undo chain back to a value that's actually visible.
+            let old_tuple = self
                 .find_last_committed(&tuple)
-                .ok_or(StoreError::KeyNotFound(new_tuple.id.clone()))?;
-            let mut tuple = tuple.into_owned();
-            tuple.set_txn_id(txn.clone());
-            tuple.set_undo_id(self.logger.next_undo_id(txn.clone())?);
-            tuple.set_data(&new_tuple.data);
-            table.update(tuple.clone(), txn.clone(), true)?;
-            let op = Operation::Mod(txn, Record::new(tid, tuple));
-            self.logger.log_redo(op.clone())?;
-            self.logger.log_undo(op)?;
+                .ok_or(StoreError::KeyNotFound(new_tuple.id.clone()))?
+                .into_owned();
+            let mut updated = old_tuple.clone();
+            updated.set_txn_id(txn.clone());
+            updated.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            updated.set_data(&new_tuple.data);
+            // Undo log must be written BEFORE the tree is mutated: once
+            // `updated` (carrying undo_id) lands in the tree, a concurrent
+            // reader on another thread can observe it immediately and try to
+            // resolve that undo_id via find_last_committed. If the undo entry
+            // doesn't exist yet, that lookup panics (find_undo_tuple returns
+            // None where the code expects Some).
+            let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone()));
+            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple));
+            self.logger.log_redo(redo_op)?;
+            self.logger.log_undo(undo_op)?;
+            table.update(updated, txn, true)?;
             return Ok(());
         } else {
             return Err(StoreError::KeyNotFound(new_tuple.id));
         }
     }
 
-    pub(crate) fn remove(
+    pub fn remove(
         &self,
         tid: TableIdType,
         id: DBIdType,
@@ -358,18 +391,27 @@ where
         let table = self.table_by_id(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
-            let tuple = self
+            // old_tuple is the pre-remove, already-committed (non-tombstoned)
+            // version, kept as the undo record's content so a rollback restores
+            // the row exactly (including clearing the tombstone flag) and
+            // concurrent readers see it instead of the in-flight tombstone.
+            let old_tuple = self
                 .find_last_committed(&tuple)
-                .ok_or(StoreError::KeyNotFound(tuple.id.clone()))?;
-            let mut tuple = tuple.into_owned();
-            tuple.set_txn_id(txn.clone());
-            tuple.tombstone();
-            tuple.set_undo_id(self.logger.next_undo_id(txn.clone())?);
-            table.update(tuple.clone(), txn.clone(), true)?;
-            let op = Operation::Del(txn, Record::new(tid, tuple.clone()));
-            self.logger.log_redo(op.clone())?;
-            self.logger.log_undo(op)?;
-            return Ok(tuple);
+                .ok_or(StoreError::KeyNotFound(tuple.id.clone()))?
+                .into_owned();
+            let mut tombstoned = old_tuple.clone();
+            tombstoned.set_txn_id(txn.clone());
+            tombstoned.tombstone();
+            tombstoned.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            // Same ordering requirement as update(): log undo/redo before the
+            // tombstoned tuple becomes visible in the tree, so a concurrent
+            // reader can never observe an undo_id that doesn't resolve yet.
+            let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone()));
+            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple));
+            self.logger.log_redo(redo_op)?;
+            self.logger.log_undo(undo_op)?;
+            table.update(tombstoned.clone(), txn, true)?;
+            return Ok(tombstoned);
         } else {
             return Err(StoreError::KeyNotFound(id));
         }
@@ -397,7 +439,11 @@ where
                         .clone()
                         .expect(format!("Could not find txn id for {}", tuple.id).as_str());
                     if !self.tx_mgr.is_transaction_active(&next_txn) {
-                        return Some(Cow::Owned(tuple));
+                        // next_tuple is the committed ancestor we walked back
+                        // to — return it, not the in-flight `tuple` we started
+                        // from (which belongs to the still-active txn and must
+                        // stay invisible to other readers).
+                        return Some(Cow::Owned(next_tuple));
                     }
                     tuple = next_tuple;
                     txn = next_txn;
@@ -601,6 +647,24 @@ where
     }
 }
 
+/// Retries `f` on `LockContentionError` with a short linear backoff. Used by
+/// `Db::commit`/`Db::rollback`'s per-record cleanup loops: those calls race
+/// against the same per-page locks every other concurrent operation uses, and
+/// under load a single transient lock timeout shouldn't abort the whole
+/// commit/rollback (see `Transaction::into_id`).
+fn retry_on_contention<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Err(StoreError::LockContentionError) if attempt < 8 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_micros(100 * attempt as u64));
+            }
+            other => return other,
+        }
+    }
+}
+
 pub(crate) fn db_hash(bytes: &[u8]) -> u64 {
     let mut h = 0x811C9DC5;
     for b in bytes {
@@ -650,6 +714,13 @@ mod tests {
         let db = TestDB::create("txn_test.db").unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         (db, tid)
+    }
+
+    fn make_db_with_two_tables() -> (TestDB, TableIdType, TableIdType) {
+        let db = TestDB::create("txn_test_multi.db").unwrap();
+        let ta = db.create_table("table_a".to_string()).unwrap();
+        let tb = db.create_table("table_b".to_string()).unwrap();
+        (db, ta, tb)
     }
 
     fn row(id: u64, data: &[u8]) -> Tuple {
@@ -827,10 +898,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_last_committed loops infinitely when the undo log entry for an \
-                in-flight Mod/Del contains the same (txn_id, undo_id) as the in-tree \
-                tuple; fix: store the pre-update tuple in the undo record so the \
-                chain terminates at a different (committed) txn"]
     fn test_txn_uncommitted_update_not_visible_to_concurrent_reader() {
         let (db, tid) = make_db_with_table();
 
@@ -887,9 +954,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "find_last_committed loops infinitely when the undo log entry for an \
-                in-flight Del contains the same (txn_id, undo_id) as the in-tree \
-                tombstone; same root cause as the uncommitted-update test above"]
     fn test_txn_uncommitted_remove_row_still_visible_to_concurrent_reader() {
         let (db, tid) = make_db_with_table();
 
@@ -994,6 +1058,31 @@ mod tests {
     }
 
     #[test]
+    fn test_txn_close_reopen_new_txn_id_does_not_collide_with_prior_session() {
+        // Regression test for the generator-restoration bug: open_using() used to
+        // assign a fresh Generator to self.generator instead of reusing the Arc
+        // passed to TransactionManager, so the txn id sequence silently restarted
+        // at 0 after every reopen and collided with ids from the prior session.
+        let (db, tid) = make_db_with_table();
+
+        let txn = db.begin().unwrap();
+        let first_txn_id = txn.id();
+        db.insert(tid, row(1, b"v1"), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let txn2 = db2.begin().unwrap();
+        assert_ne!(
+            txn2.id(),
+            first_txn_id,
+            "txn id sequence must not restart after reopen"
+        );
+        drop(txn2);
+    }
+
+    #[test]
     fn test_txn_close_reopen_removed_row_stays_gone() {
         let (db, tid) = make_db_with_table();
 
@@ -1068,11 +1157,9 @@ mod tests {
         assert_eq!(db.tx_mgr.active_count(), 0, "dropped txn must be removed from active set");
     }
 
-    // ── known-broken rollback paths (enable when undo log stores old version) ─
+    // ── rollback of Mod/Del restores the pre-image ────────────────────────────
 
     #[test]
-    #[ignore = "rollback of Mod currently restores the new value instead of the old one; \
-                fix: store the pre-update tuple in the undo log entry"]
     fn test_txn_update_rollback_sees_original_data() {
         let (db, tid) = make_db_with_table();
 
@@ -1091,8 +1178,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "rollback of Del currently leaves a tombstone visible after rollback; \
-                fix: store the pre-tombstone tuple in the undo log entry"]
     fn test_txn_remove_rollback_row_still_visible() {
         let (db, tid) = make_db_with_table();
 
@@ -1108,5 +1193,116 @@ mod tests {
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
         assert_eq!(found.expect("row must survive a rolled-back remove").data, b"alive");
+    }
+
+    // ── multi-table transactions ───────────────────────────────────────────────
+
+    #[test]
+    fn test_txn_insert_across_two_tables_commit_both_visible() {
+        let (db, ta, tb) = make_db_with_two_tables();
+
+        let txn = db.begin().unwrap();
+        db.insert(ta, row(1, b"a1"), &txn).unwrap();
+        db.insert(tb, row(1, b"b1"), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data, b"a1");
+        assert_eq!(db.find(tb, id(1), &txn2).unwrap().unwrap().data, b"b1");
+        drop(txn2);
+    }
+
+    #[test]
+    fn test_txn_insert_across_two_tables_rollback_neither_visible() {
+        let (db, ta, tb) = make_db_with_two_tables();
+
+        let txn = db.begin().unwrap();
+        db.insert(ta, row(1, b"a1"), &txn).unwrap();
+        db.insert(tb, row(1, b"b1"), &txn).unwrap();
+        db.rollback(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        assert!(db.find(ta, id(1), &txn2).unwrap().is_none());
+        assert!(db.find(tb, id(1), &txn2).unwrap().is_none());
+        drop(txn2);
+    }
+
+    #[test]
+    fn test_txn_update_and_remove_across_two_tables_commit() {
+        let (db, ta, tb) = make_db_with_two_tables();
+
+        let setup = db.begin().unwrap();
+        db.insert(ta, row(1, b"a_v1"), &setup).unwrap();
+        db.insert(tb, row(1, b"b_v1"), &setup).unwrap();
+        db.commit(setup).unwrap();
+
+        let txn = db.begin().unwrap();
+        db.update(ta, row(1, b"a_v2"), &txn).unwrap();
+        db.remove(tb, id(1), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data, b"a_v2");
+        assert!(db.find(tb, id(1), &txn2).unwrap().is_none());
+        drop(txn2);
+    }
+
+    #[test]
+    fn test_txn_update_and_remove_across_two_tables_rollback_restores_both() {
+        let (db, ta, tb) = make_db_with_two_tables();
+
+        let setup = db.begin().unwrap();
+        db.insert(ta, row(1, b"a_v1"), &setup).unwrap();
+        db.insert(tb, row(1, b"b_v1"), &setup).unwrap();
+        db.commit(setup).unwrap();
+
+        let txn = db.begin().unwrap();
+        db.update(ta, row(1, b"a_v2"), &txn).unwrap();
+        db.remove(tb, id(1), &txn).unwrap();
+        db.rollback(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        assert_eq!(
+            db.find(ta, id(1), &txn2).unwrap().unwrap().data,
+            b"a_v1",
+            "table A update must be rolled back"
+        );
+        assert_eq!(
+            db.find(tb, id(1), &txn2).unwrap().unwrap().data,
+            b"b_v1",
+            "table B remove must be rolled back"
+        );
+        drop(txn2);
+    }
+
+    #[test]
+    fn test_txn_partial_failure_across_tables_rollback_undoes_successful_table() {
+        // Table A's insert succeeds; table B's insert fails (duplicate key
+        // already present, inserted by an earlier committed txn). Rolling back
+        // the failed txn must undo table A's insert even though table B's
+        // write never got logged in the first place.
+        let (db, ta, tb) = make_db_with_two_tables();
+
+        let setup = db.begin().unwrap();
+        db.insert(tb, row(1, b"existing"), &setup).unwrap();
+        db.commit(setup).unwrap();
+
+        let txn = db.begin().unwrap();
+        db.insert(ta, row(1, b"a_new"), &txn).unwrap();
+        let r = db.insert(tb, row(1, b"dup"), &txn);
+        assert!(matches!(r, Err(StoreError::DuplicateKey(_))), "expected DuplicateKey, got {r:?}");
+        db.rollback(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        assert!(
+            db.find(ta, id(1), &txn2).unwrap().is_none(),
+            "table A's successful insert must be undone by the txn-wide rollback"
+        );
+        assert_eq!(
+            db.find(tb, id(1), &txn2).unwrap().unwrap().data,
+            b"existing",
+            "table B must be unaffected by the failed duplicate insert"
+        );
+        drop(txn2);
     }
 }

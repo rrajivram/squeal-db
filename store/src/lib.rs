@@ -6,7 +6,7 @@ pub mod db;
 pub mod error;
 mod generator;
 mod logger;
-mod memfile;
+pub mod memfile;
 ///
 /// Core storage library.
 /// Does the following:

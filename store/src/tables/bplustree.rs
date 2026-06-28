@@ -7,7 +7,7 @@ use crate::{
     buffer::{PageBuffer, WritePageHandle},
     db::{DBFile, DBSizeType},
     error::StoreError,
-    logger::{Logger, Operation, Record},
+    logger::Logger,
     page::{Page, PageId},
     table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple},
@@ -44,9 +44,9 @@ where
     ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
         let size = Tuple::new_with(
-            0.into(),
-            &to_allocvec(&Node::Inner(0.into()))?,
-            Some(0.into()),
+            DBIdType::Int(DBSizeType::MAX),
+            &to_allocvec(&Node::Inner(DBSizeType::MAX.into()))?,
+            Some(TransactionId::new(DBSizeType::MAX)),
             None,
         )
         .size();
@@ -132,21 +132,39 @@ where
             Some(txn.clone()),
             None,
         );
-        let page = self.buffer.get_page(self.table.first_index_page)?;
-        if page.count()? == self.table.nodes_per_page - 1 {
-            self.split_root_page(
-                self.buffer.get_page_mut(self.table.first_index_page)?,
-                txn.clone(),
-            )?;
-        }
 
-        self.insert_recursive(id_tuple, txn.clone(), self.table.first_index_page)?;
-        /*         if should_log {
-                   self.logger
-                       .log_redo(Operation::Add(txn, Record::new(self.table.id, tuple)))?;
+        // The root-split pre-check uses an unlocked read, so by the time
+        // insert_recursive holds the root lock, another thread may have filled
+        // the root leaf. The retry loop below catches PageCapacityError
+        // (returned by insert_recursive when it finds a leaf already full) and
+        // re-tries: on the next pass, split_if_needed (or split_root_page
+        // inside insert_recursive itself) will detect and split the full page.
+
+        let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
+        if handle.page.count()? == self.table.nodes_per_page - 1 {
+            self.split_root_page(handle, txn.clone())?;
+        } else {
+            drop(handle);
+        }
+        Ok(self.insert_recursive(id_tuple, txn, self.table.first_index_page)?)
+        /*         let mut retries = 0u32;
+               loop {
+                   let page = self.buffer.get_page(self.table.first_index_page)?;
+                   if page.count()? == self.table.nodes_per_page - 1 {
+                       self.split_root_page(
+                           self.buffer.get_page_mut(self.table.first_index_page)?,
+                           txn.clone(),
+                       )?;
+                   }
+                   match self.insert_recursive(id_tuple.clone(), txn.clone(), self.table.first_index_page) {
+                       Err(StoreError::PageCapacityError) if retries < 16 => {
+                           retries += 1;
+                           std::thread::sleep(std::time::Duration::from_micros(50));
+                       }
+                       other => return other,
+                   }
                }
         */
-        Ok(())
     }
 
     pub fn find(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
@@ -266,7 +284,20 @@ where
         if handle.page.is_flag_set(LEAF_NODE) {
             let count = handle.page.count()?;
             if count == self.table.nodes_per_page - 1 {
-                panic!("Count means split not done! {count}, {:?}", start);
+                if self.is_root_page(start) {
+                    // Root leaf was filled by a concurrent insert between the
+                    // unlocked pre-check in insert() and this locked arrival.
+                    // We hold the lock here, so split it now and retry.
+                    panic!("Root page split should not happen here");
+                    /*                     self.split_root_page(handle, txn_id.clone())?;
+                                       return self.insert_recursive(tuple, txn_id, start);
+                    */
+                }
+                panic!("count == nodes- should not happen");
+                // A non-root leaf was concurrently filled to capacity after its
+                // parent's split_if_needed released the parent lock. Signal the
+                // caller to retry so the parent re-detects the full page.
+                //return Err(StoreError::PageCapacityError);
             } else if handle.page.count()? < self.table.nodes_per_page
                 && handle.page.can_store(&tuple)
             {
@@ -282,6 +313,14 @@ where
             if handle.page.count()? == 0 {
                 panic!("Inner Page cannot be empty {:?}", handle.page_num);
             }
+            // If this node is already at capacity, a child split would need to
+            // add a separator here — but there's no room. Return early so the
+            // retry loop in insert() re-enters: on the next pass, the caller
+            // one level up will call split_if_needed() on this node first, then
+            // descend into a half-full copy that can accept the new separator.
+            if handle.page.count()? == self.table.nodes_per_page - 1 {
+                return Err(StoreError::PageCapacityError);
+            }
             // Rows are in ascending id order; find the first one whose id exceeds
             // the search key (mirrors find_page's matching logic). The previous
             // version broke out of the scan on the first row that *didn't*
@@ -296,7 +335,9 @@ where
             }
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
-                if let Some((separator, sibling)) = self.split_if_needed(p, txn_id.clone())? {
+                if let Some((separator, sibling)) =
+                    self.split_if_needed(p, txn_id.clone(), &tuple)?
+                {
                     let page = Arc::make_mut(&mut handle.page);
                     // `p` kept the smaller half (keys < separator); the larger half
                     // (up to the old upper bound, row_id.id) moved to `sibling`. The
@@ -317,11 +358,18 @@ where
                         Some(txn_id.clone()),
                         None,
                     ))?;
+                    // Must persist before recursing — handle.page was a
+                    // detached COW copy (the buffer's cache still held the
+                    // pre-split version), so without this write-back the
+                    // updated routing entries are silently dropped when
+                    // `handle` goes out of scope, corrupting the index.
+                    self.buffer.write_locked_page(handle)?;
                     if tuple.id < separator {
                         return Ok(self.insert_recursive(tuple, txn_id, p)?);
                     }
                     return Ok(self.insert_recursive(tuple, txn_id, sibling)?);
                 }
+                drop(handle);
                 return Ok(self.insert_recursive(tuple, txn_id, p)?);
             } else {
                 panic!("Expected inner - found leaf : {:?}", start);
@@ -336,9 +384,10 @@ where
         &self,
         page_id: PageId,
         txn_id: TransactionId,
+        tuple: &Tuple,
     ) -> Result<Option<(DBIdType, PageId)>, StoreError> {
         let handle = self.buffer.get_page_mut(page_id)?;
-        if handle.page.count()? == self.table.nodes_per_page - 1 {
+        if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
                 panic!("Trying to split root in the wrong place");
             } else {
@@ -426,7 +475,18 @@ where
         &self,
         handle: WritePageHandle,
         txn_id: TransactionId,
-    ) -> Result<(DBIdType, PageId, PageId), StoreError> {
+    ) -> Result<(), StoreError> {
+        // insert()'s caller decides whether to call this based on an
+        // *unlocked* read of the root's count — by the time we actually hold
+        // the lock (this `handle`), another thread may have already split the
+        // root (it's now an inner node) or otherwise changed its count. Treat
+        // that as "nothing to do" rather than blindly re-splitting, which
+        // would corrupt the index (double-wrapping an already-split root).
+        if handle.page.is_flag_set(INNER_NODE)
+            || handle.page.count()? != self.table.nodes_per_page - 1
+        {
+            return Ok(());
+        }
         let values = handle.page.iter().collect::<Vec<_>>();
         let flags = if handle.page.is_flag_set(INNER_NODE) {
             INNER_NODE
@@ -455,8 +515,8 @@ where
             .try_for_each(|t| right_page.add_tuple(t.clone()))?;
         self.buffer.write_locked_page(left_handle)?;
         self.buffer.write_locked_page(right_handle)?;
-        self.update_root_page(separator_id.clone(), left_page_id, right_page_id, txn_id)?;
-        Ok((separator_id, left_page_id, right_page_id))
+        self.update_root_page(separator_id, left_page_id, right_page_id, txn_id)?;
+        Ok(())
     }
 
     fn write_page(&self, handle: WritePageHandle, tuple: Tuple) -> Result<(), StoreError> {

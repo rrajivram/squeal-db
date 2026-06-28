@@ -73,6 +73,22 @@ impl Transaction {
         let id = self.id.take().expect("transaction already finished");
         self.mgr.rollback(id)
     }
+
+    /// Detaches the raw id from this guard without marking the transaction
+    /// committed or rolled back, and without triggering `Drop`'s auto-rollback.
+    ///
+    /// `Db::commit`/`Db::rollback` need this: they do their own post-processing
+    /// (replaying undo records, cleaning up tombstones) after taking ownership
+    /// of the guard, and that work can fail partway through (e.g. on
+    /// `LockContentionError`). If `Drop` ran its default rollback in that case,
+    /// the transaction would be marked inactive — and therefore "committed" as
+    /// far as `find_last_committed` is concerned — even though its data was
+    /// never actually committed or undone. Detaching up front means an early
+    /// return on failure just leaves the transaction active (and so correctly
+    /// invisible to readers) instead of silently mislabeling it.
+    pub(crate) fn into_id(mut self) -> TransactionId {
+        self.id.take().expect("transaction already finished")
+    }
 }
 
 impl Drop for Transaction {

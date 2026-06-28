@@ -1,11 +1,12 @@
 Todo:
-Table id needs to be persistent across saves
 Redo log should support add/drop table ( so replication can happen)
 next_page in Page should be option to be idiomatic
 writeHandle in page neds to be updated to handle large pages
 arclock needs a thread to monitor how long locks have been kept and kill lock if too long
 leaf_node should support external storage
 page iterator really needs to return refs. This means no use of Box
+nit: remove any vestige of txn from bplustree - its entirely handled by Db now
 
 
 done: transaction+id should become Copy
+done: Table id needs to be persistent across saves

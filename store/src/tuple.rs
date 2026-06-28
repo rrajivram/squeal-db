@@ -116,6 +116,10 @@ impl Tuple {
         self.data = data.to_vec()
     }
 
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn size(&self) -> DBSizeType {
         (self.data.len() + size_of_val(self)) as DBSizeType
     }

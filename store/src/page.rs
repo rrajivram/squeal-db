@@ -189,6 +189,16 @@ impl Page {
         tuple: Tuple,
     ) -> Result<Tuple, StoreError> {
         let new_size = tuple.size();
+        let old = self
+            .data
+            .get(id)?
+            .ok_or(StoreError::KeyNotFound(id.clone()))?;
+        let old_size = old.size();
+        if new_size > old_size {
+            if new_size - old_size > self.capacity {
+                return Err(StoreError::PageCapacityError);
+            }
+        }
         let old = self.data.replace(id, tuple)?;
         let old_size = old.size();
         if new_size >= old_size {
