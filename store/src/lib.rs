@@ -30,3 +30,4 @@ pub mod table;
 pub mod tables;
 pub mod tuple;
 pub mod txn;
+mod utils;

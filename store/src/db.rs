@@ -583,11 +583,11 @@ where
             // We dont care what the tables id is or if it is consistent across saves.
             page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
         }
-        self.buffer.write_page(0.into(), &page)?;
+        self.buffer.write_page(0usize.into(), &page)?;
         let gens = self.generator.get_values()?;
         let mut page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
-        self.buffer.write_page(1.into(), &page)?;
+        self.buffer.write_page(1usize.into(), &page)?;
         // TODO : Handle page overflows correctly
         // TODO: Handle empty pages
         Ok(())
@@ -595,11 +595,11 @@ where
 
     fn create_system_tables(&self) -> Result<(), StoreError> {
         let t = self.buffer.alloc_page(true)?; // system
-        assert!(t == 0.into());
+        assert!(t == 0usize.into());
         let t = self.buffer.alloc_page(true)?; // generators
-        assert!(t == 1.into());
+        assert!(t == 1usize.into());
         let t = self.buffer.alloc_page(true)?; // free pages
-        assert!(t == 2.into());
+        assert!(t == 2usize.into());
         assert!(self.page_count() == 3);
         Ok(())
     }
@@ -757,12 +757,12 @@ mod tests {
         let page = db.buffer.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
-        assert_eq!(page, 3.into());
+        assert_eq!(page, 3usize.into());
         thread::sleep(Duration::from_millis(100));
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, DEFAULT_PAGE_SIZE * 4 + ZERO_PAGE_SIZE);
-        let page = db.buffer.alloc_page(false).unwrap_or(0.into());
-        assert_eq!(page, 4.into());
+        let page = db.buffer.alloc_page(false).unwrap_or(0usize.into());
+        assert_eq!(page, 4usize.into());
         thread::sleep(Duration::from_millis(100));
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, ZERO_PAGE_SIZE + 5 * DEFAULT_PAGE_SIZE);
@@ -867,14 +867,20 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(42), &txn2).unwrap();
         drop(txn2);
-        assert!(found.is_none(), "uncommitted insert must be invisible to other txns");
+        assert!(
+            found.is_none(),
+            "uncommitted insert must be invisible to other txns"
+        );
 
         // After T1 commits, T3 should see it
         db.commit(txn1).unwrap();
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(42), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("committed row must be visible").data, b"secret");
+        assert_eq!(
+            found.expect("committed row must be visible").data,
+            b"secret"
+        );
     }
 
     // ── update ────────────────────────────────────────────────────────────────
@@ -970,7 +976,9 @@ mod tests {
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
         assert_eq!(
-            found.expect("row must still be visible before remove commits").data,
+            found
+                .expect("row must still be visible before remove commits")
+                .data,
             b"alive"
         );
 
@@ -1011,7 +1019,10 @@ mod tests {
         let txn3 = db.begin().unwrap();
         assert_eq!(db.find(tid, id(1), &txn3).unwrap().unwrap().data, b"A_v2");
         assert_eq!(db.find(tid, id(2), &txn3).unwrap().unwrap().data, b"B");
-        assert!(db.find(tid, id(3), &txn3).unwrap().is_none(), "removed row must be gone");
+        assert!(
+            db.find(tid, id(3), &txn3).unwrap().is_none(),
+            "removed row must be gone"
+        );
         drop(txn3);
     }
 
@@ -1022,7 +1033,8 @@ mod tests {
 
         let txn = db.begin().unwrap();
         for i in 0..N {
-            db.insert(tid, row(i, format!("val_{i}").as_bytes()), &txn).unwrap();
+            db.insert(tid, row(i, format!("val_{i}").as_bytes()), &txn)
+                .unwrap();
         }
         db.commit(txn).unwrap();
 
@@ -1054,7 +1066,10 @@ mod tests {
         let txn2 = db2.begin().unwrap();
         let found = db2.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("data must survive close/reopen").data, b"persistent");
+        assert_eq!(
+            found.expect("data must survive close/reopen").data,
+            b"persistent"
+        );
     }
 
     #[test]
@@ -1154,7 +1169,11 @@ mod tests {
         // physically present — but the guard-level test is that the txn is no
         // longer active (so it can't block readers). Use Db::rollback for full
         // application-level undo.
-        assert_eq!(db.tx_mgr.active_count(), 0, "dropped txn must be removed from active set");
+        assert_eq!(
+            db.tx_mgr.active_count(),
+            0,
+            "dropped txn must be removed from active set"
+        );
     }
 
     // ── rollback of Mod/Del restores the pre-image ────────────────────────────
@@ -1192,7 +1211,10 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("row must survive a rolled-back remove").data, b"alive");
+        assert_eq!(
+            found.expect("row must survive a rolled-back remove").data,
+            b"alive"
+        );
     }
 
     // ── multi-table transactions ───────────────────────────────────────────────
@@ -1290,7 +1312,10 @@ mod tests {
         let txn = db.begin().unwrap();
         db.insert(ta, row(1, b"a_new"), &txn).unwrap();
         let r = db.insert(tb, row(1, b"dup"), &txn);
-        assert!(matches!(r, Err(StoreError::DuplicateKey(_))), "expected DuplicateKey, got {r:?}");
+        assert!(
+            matches!(r, Err(StoreError::DuplicateKey(_))),
+            "expected DuplicateKey, got {r:?}"
+        );
         db.rollback(txn).unwrap();
 
         let txn2 = db.begin().unwrap();

@@ -1,3 +1,7 @@
+/*
+ * Page is a logical construct. It does nbot care about actual disk page size ,  though it is bound by it. i.e. capacity =0
+ * if HAS_Overflow is set, next_page will point to continuation. This contunation logic is fully handled by PageBuffer
+ */
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, AtomicU16, AtomicU64},
@@ -31,11 +35,12 @@ struct PageDto {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
-pub struct PageId(DBSizeType);
+pub struct PageId(pub(crate) DBSizeType);
 
 const NONE: u16 = 0;
 const PINNED: u16 = 1;
-const INDEX_PAGE: u16 = 2;
+const INDEX_PAGE: u16 = 1 << 1;
+const HAS_OVERFLOW: u16 = 1 << 2;
 const RESERVED_FLAGS: u16 = 0x0f;
 
 const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Vec<u8>>();
@@ -122,6 +127,21 @@ impl Page {
 
     pub(crate) fn is_index_page(&self) -> bool {
         self.flags.load(std::sync::atomic::Ordering::Relaxed) & INDEX_PAGE != 0
+    }
+
+    pub(crate) fn has_overflow(&self) -> bool {
+        self.flags.load(std::sync::atomic::Ordering::Relaxed) & HAS_OVERFLOW != 0
+    }
+
+    pub(crate) fn set_overflow(&self, of: bool) {
+        let mut flags = self.flags.load(std::sync::atomic::Ordering::Relaxed);
+        if of {
+            flags |= HAS_OVERFLOW;
+        } else {
+            flags &= !HAS_OVERFLOW;
+        }
+        self.flags
+            .store(flags, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn get_next_page(&self) -> PageId {
@@ -360,6 +380,12 @@ impl From<PageId> for DBSizeType {
     }
 }
 
+impl From<usize> for PageId {
+    fn from(value: usize) -> Self {
+        Self { 0: value as u64 }
+    }
+}
+
 impl std::fmt::Debug for dyn PageTuple + 'static {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         Ok(())
@@ -480,9 +506,9 @@ mod tests {
     #[test]
     fn page_test_next_page() {
         let p = Page::new_data(1024);
-        assert_eq!(p.get_next_page(), 0.into());
-        p.set_next_page(42.into()).unwrap();
-        assert_eq!(p.get_next_page(), 42.into());
+        assert_eq!(p.get_next_page(), 0usize.into());
+        p.set_next_page(42usize.into()).unwrap();
+        assert_eq!(p.get_next_page(), 42usize.into());
     }
 
     #[test]

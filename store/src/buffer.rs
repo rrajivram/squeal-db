@@ -1,7 +1,8 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    sync::{Arc, RwLock, atomic::AtomicU64},
+    ops::Rem,
+    sync::{Arc, RwLock, Weak, atomic::AtomicU64, atomic::AtomicUsize},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -9,7 +10,6 @@ use std::{
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use log::{error, info};
 use postcard::to_allocvec;
-use priority_queue::PriorityQueue;
 
 use crate::{
     arclock::{ArcLock, ArcLockGuard},
@@ -18,6 +18,7 @@ use crate::{
     error::StoreError,
     logger::Logger,
     page::{Page, PageId},
+    utils::shardedpq::ShardedPQ,
 };
 
 #[derive(Debug, Clone)]
@@ -30,7 +31,7 @@ enum BufMsg {
 #[derive(Debug, Clone)]
 struct WriteMsg {
     page_num: PageId,
-    page: Page,
+    page: Arc<Page>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,19 +41,40 @@ pub(crate) struct WritePageHandle {
     pub(crate) page: Arc<Page>,
 }
 
+// A cached page is either live (Strong) or has been evicted to make room
+// (Weak). Evicting never actually drops the page's data — it just gives up
+// the cache's own claim on it. If a write is still in flight when a page
+// gets evicted, the writer thread's queued WriteMsg holds its own Arc clone,
+// so the page stays alive and upgrade() still succeeds; a get_page() for it
+// reuses that exact in-flight copy instead of racing the writer thread to
+// read a backing file that may not reflect it yet. upgrade() only fails once
+// the writer thread has dropped its copy, which only happens after the
+// actual file write completes — so a failed upgrade is the signal that it's
+// now safe to read from disk.
+#[derive(Debug, Clone)]
+enum PageEntry {
+    Strong(Arc<Page>),
+    Weak(Weak<Page>),
+}
+
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
-    buffer: RwLock<HashMap<PageId, Arc<Page>>>,
+    buffer: RwLock<HashMap<PageId, PageEntry>>,
     header: Arc<Header>,
     page_size: DBSizeType,
     page_count: Arc<AtomicU64>,
     max_entries: usize,
+    // Count of currently-Strong residents — what max_entries actually bounds.
+    // The buffer map itself can grow past max_entries with Weak tombstones
+    // for pages that were evicted but not yet dropped (and gets pruned
+    // lazily, on the next failed upgrade() for that page in get_page).
+    strong_count: AtomicUsize,
     write_tx: Sender<BufMsg>,
     // None once shutdown() has taken it to join the thread — Drop uses that
     // to tell "shut down properly" apart from "dropped without shutdown".
     write_handle: Option<JoinHandle<Result<(), StoreError>>>,
     read_file: RwLock<F>,
-    access_map: RwLock<PriorityQueue<PageId, u128>>,
+    access_map: ShardedPQ<PageId, u128>,
     locks: ArcLock<PageId>,
 }
 
@@ -75,11 +97,12 @@ where
         Ok(Self {
             page_size,
             max_entries,
+            strong_count: AtomicUsize::new(0),
             buffer: RwLock::new(HashMap::new()),
             write_tx,
             read_file: RwLock::new(read_file),
             write_handle: Some(write_handle),
-            access_map: RwLock::new(PriorityQueue::new()),
+            access_map: ShardedPQ::new(max_entries / 10),
             page_count: page_counter,
             header,
             locks: ArcLock::new(),
@@ -112,26 +135,35 @@ where
     }
 
     pub(crate) fn write_page(&self, page_num: PageId, page: &Page) -> Result<(), StoreError> {
-        let page_to_write = page.clone();
         let page = Arc::new(page.clone());
-        self.update_page_access(page_num)?;
-        let (contains, count) = {
-            let buffer = self.buffer.read()?;
-            (buffer.contains_key(&page_num), buffer.len())
-        };
-        if contains || count < self.max_entries {
-            self.buffer.write()?.insert(page_num, page.clone());
-        } else {
-            self.replace_oldest(page_num, &page)?;
-        }
-        Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
-            page_num,
-            page: page_to_write,
-        }))?)
+        page.written();
+        self.cache_strong(page_num, page.clone())?;
+        // Sending an Arc clone (not an owned copy) is what makes the Weak
+        // eviction scheme correct: as long as this message is in flight (or
+        // sitting in the writer thread's LSN-deferred queue), the strong
+        // count never drops to zero, so a concurrent get_page() for this
+        // page after eviction will see it via upgrade() instead of racing
+        // the writer thread to the backing file.
+        Ok(self
+            .write_tx
+            .send(BufMsg::WritePage(WriteMsg { page_num, page }))?)
     }
 
     pub(crate) fn write_locked_page(&self, handle: WritePageHandle) -> Result<(), StoreError> {
-        Ok(self.write_page(handle.page_num, handle.page.as_ref())?)
+        // Use the handle's existing Arc directly rather than converting to &Page
+        // and back. The Arc identity must be preserved: the same allocation goes
+        // into the cache (Strong) and the writer channel, so a Weak evicted from
+        // the cache can be upgraded as long as the write is in flight. Creating a
+        // new Arc here (as write_page does for &Page callers) would break that
+        // chain — and more critically, if Arc::make_mut gave the caller in-place
+        // mutation it simultaneously dissociates Weaks on that allocation; the only
+        // way to close the resulting stale-disk-read window is to get the new
+        // Strong back into the cache as fast as possible using the same Arc.
+        let WritePageHandle { page_num, page, lock: _lock } = handle;
+        page.written();
+        self.cache_strong(page_num, page.clone())?;
+        // _lock drops here, releasing the per-page lock after cache is updated.
+        Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg { page_num, page }))?)
     }
 
     pub(crate) fn alloc_page(&self, should_pin: bool) -> Result<PageId, StoreError> {
@@ -155,21 +187,48 @@ where
                 page_num
             )));
         }
-        if let Some(page) = self.buffer.read()?.get(&page_num) {
-            self.update_page_access(page_num)?;
-            return Ok(page.clone());
+        // Bound to a let, not matched on directly: a match scrutinee's
+        // temporaries stay alive for the whole arm body, so matching
+        // straight on `self.buffer.read()?...` would keep this read guard
+        // held while the arms below try to re-acquire the same lock via
+        // cache_strong/write() — a self-deadlock with no other thread
+        // involved.
+        let existing = self.buffer.read()?.get(&page_num).cloned();
+        match existing {
+            Some(PageEntry::Strong(arc)) => {
+                // Pure LRU timestamp refresh — page is already resident and
+                // counted; no eviction or count change needed here.
+                self.update_page_access(page_num)?;
+                return Ok(arc);
+            }
+            Some(PageEntry::Weak(weak)) => {
+                if let Some(arc) = weak.upgrade() {
+                    // Still alive — either the writer hasn't flushed the
+                    // write that evicted it yet, or another reader is
+                    // holding it. Either way, reuse it directly.
+                    // cache_strong updates access_map atomically with the
+                    // buffer insert, avoiding the race in the standalone
+                    // update_page_access + cache_strong two-step.
+                    self.cache_strong(page_num, arc.clone())?;
+                    return Ok(arc);
+                }
+                // Dead: the writer already dropped its copy, which only
+                // happens after the file write completed, so the backing
+                // file is now guaranteed current. Prune the stale tombstone
+                // while we're here rather than leaving it around forever.
+                self.buffer.write()?.remove(&page_num);
+            }
+            None => {}
         }
         let mut bytes = vec![0u8; self.page_size as usize];
         let offset = self.header.first_page_offset + self.header.page_size * u64::from(page_num);
         self.read_file.write()?.seek(SeekFrom::Start(offset))?;
         self.read_file.write()?.read(&mut bytes)?;
         let page = Arc::new(Page::from_bytes(&bytes)?);
-        let count = { self.buffer.read()?.len() };
-        if count == self.max_entries {
-            self.replace_oldest(page_num, &page)?;
-        } else {
-            self.buffer.write()?.insert(page_num, page.clone());
-        }
+        // cache_strong handles both the access_map update and the buffer
+        // insert under one write lock — the old two-step was racy.
+        self.cache_strong(page_num, page.clone())?;
+        page.accessed();
         Ok(page)
     }
 
@@ -183,6 +242,7 @@ where
             .lock(page_num, 500)
             .ok_or(StoreError::LockContentionError)?;
         let page = self.get_page(page_num)?;
+        page.accessed();
         let handle = WritePageHandle {
             lock,
             page_num,
@@ -191,23 +251,79 @@ where
         Ok(handle)
     }
 
-    fn replace_oldest(&self, page_num: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
-        if let Some(last_used_page) = { self.access_map.write()?.pop() } {
-            let mut buffer = self.buffer.write()?;
-            buffer.remove(&last_used_page.0);
-            buffer.insert(page_num, page.clone());
-        } else {
-            panic!("Could not find any pages in access mao!");
+    // Inserts/refreshes page_num as the live (Strong) resident. Holds the
+    // buffer write lock for the entire operation so that:
+    //   1. The already_strong check and the insert are atomic — two threads
+    //      cannot both see Weak/None for the same page and both increment
+    //      strong_count (which was the source of the "access map empty" panic).
+    //   2. The access_map update happens under the same lock, so evict_lru
+    //      cannot pop a page that is in access_map but not yet in the buffer.
+    fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
+        let mut buffer = self.buffer.write()?;
+        let already_strong = matches!(buffer.get(&page_num), Some(PageEntry::Strong(_)));
+        if !already_strong {
+            if self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries {
+                self.evict_lru_locked(&mut buffer);
+            }
+            self.strong_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // Update LRU position under the same write lock so evict_lru_locked
+        // always sees a consistent (buffer entry, access_map entry) pair.
+        let priority = u128::MAX - timestamp();
+        if !self.access_map.contains(&page_num) {
+            self.access_map.push(page_num, priority);
+        } else {
+            self.access_map.change_priority(&page_num, priority);
+        }
+        buffer.insert(page_num, PageEntry::Strong(page));
         Ok(())
     }
 
+    // Downgrades the LRU resident to Weak. Takes the caller's already-held
+    // write lock to avoid the evict/insert race (see cache_strong). Loops
+    // past stale access_map entries (those whose victims are no longer Strong
+    // in the buffer — can happen if update_page_access ran for a page that
+    // was concurrently evicted by another thread's LRU-refresh call).
+    fn evict_lru_locked(&self, buffer: &mut HashMap<PageId, PageEntry>) {
+        loop {
+            match self.access_map.pop() {
+                None => {
+                    // access_map is empty. Under correct accounting this
+                    // shouldn't happen, but if strong_count drifted (e.g. due
+                    // to a crash recovery path) don't panic — just allow the
+                    // buffer to temporarily exceed max_entries.
+                    return;
+                }
+                Some((victim, _)) => {
+                    if let Some(PageEntry::Strong(arc)) = buffer.get(&victim) {
+                        let weak = Arc::downgrade(arc);
+                        buffer.insert(victim, PageEntry::Weak(weak));
+                        self.strong_count
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                    // Stale entry: victim is already Weak or absent in the
+                    // buffer (e.g. update_page_access ran after eviction).
+                    // Keep looping to find the next LRU Strong candidate.
+                }
+            }
+        }
+    }
+
+    // LRU timestamp refresh for pages that are already Strong residents.
+    // Called on the hot read path (Strong hit in get_page) without acquiring
+    // the buffer lock — it only touches access_map, which has its own
+    // fine-grained locks via ShardedPQ.
     fn update_page_access(&self, page_num: PageId) -> Result<(), StoreError> {
-        let mut pq = self.access_map.write()?;
-        if !pq.contains(&page_num) {
-            pq.push(page_num, timestamp());
+        // pop() is max-first; invert the timestamp so the least-recently
+        // touched page (smallest raw timestamp) ends up with the largest
+        // priority and gets evicted first.
+        let priority = u128::MAX - timestamp();
+        if !self.access_map.contains(&page_num) {
+            self.access_map.push(page_num, priority);
         } else {
-            pq.change_priority(&page_num, timestamp());
+            self.access_map.change_priority(&page_num, priority);
         }
         Ok(())
     }
@@ -245,6 +361,27 @@ impl<F: DBFile + 'static> Drop for PageBuffer<F> {
 impl From<crossbeam::channel::SendError<BufMsg>> for StoreError {
     fn from(value: crossbeam::channel::SendError<BufMsg>) -> Self {
         StoreError::UnknownError(value.to_string())
+    }
+}
+
+impl Rem<usize> for PageId {
+    type Output = usize;
+    fn rem(self, rhs: usize) -> Self::Output {
+        self.0 as usize % rhs
+    }
+}
+
+impl Rem<PageId> for usize {
+    type Output = usize;
+    fn rem(self, rhs: PageId) -> Self::Output {
+        self % rhs.0 as usize
+    }
+}
+
+impl Rem<PageId> for PageId {
+    type Output = usize;
+    fn rem(self, rhs: PageId) -> Self::Output {
+        (self.0 % rhs.0) as usize
     }
 }
 
@@ -416,7 +553,7 @@ mod tests {
     #[test]
     fn test_get_page_invalid_num_returns_err() {
         let (buf, _) = make_buffer(0, 10);
-        let r = buf.get_page(0.into());
+        let r = buf.get_page(0usize.into());
         assert!(r.is_err());
         buf.shutdown().unwrap();
     }
@@ -425,7 +562,7 @@ mod tests {
     fn test_get_page_reads_from_file() {
         let (buf, _) = make_buffer(1, 10);
         // page 0 is valid (page_counter = 1) and its bytes are at offset 0 in MemFile
-        let r = buf.get_page(0.into());
+        let r = buf.get_page(0usize.into());
         assert!(r.is_ok());
         let _ = buf.shutdown();
     }
@@ -433,8 +570,8 @@ mod tests {
     #[test]
     fn test_get_page_cached_after_first_read() {
         let (buf, _) = make_buffer(1, 10);
-        let p1 = buf.get_page(0.into()).unwrap();
-        let p2 = buf.get_page(0.into()).unwrap();
+        let p1 = buf.get_page(0usize.into()).unwrap();
+        let p2 = buf.get_page(0usize.into()).unwrap();
         assert_eq!(*p1, *p2);
         let _ = buf.shutdown();
     }
@@ -443,13 +580,13 @@ mod tests {
     fn test_write_page_updates_in_memory_cache() {
         let (buf, _) = make_buffer(1, 10);
         // Populate cache with the initial (non-pinned) page
-        let p = buf.get_page(0.into()).unwrap();
+        let p = buf.get_page(0usize.into()).unwrap();
         assert!(!p.is_pinned());
         // Write a pinned page into the cache slot for page 0
         let new_page = Page::new_pinned(PAGE_SIZE);
-        assert!(buf.write_page(0.into(), &new_page).is_ok());
+        assert!(buf.write_page(0usize.into(), &new_page).is_ok());
         // Cache must now hold the updated page
-        let p2 = buf.get_page(0.into()).unwrap();
+        let p2 = buf.get_page(0usize.into()).unwrap();
         assert!(p2.is_pinned());
         // Note: shutdown may fail if the writer exited due to the page having no LSN —
         // that is expected here since we only test cache behaviour.
