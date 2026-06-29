@@ -245,9 +245,7 @@ where
                     let t = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = t {
                         if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| {
-                                table.remove(tuple.id.clone(), id.clone(), false)
-                            })?;
+                            retry_on_contention(|| table.remove(tuple.id.clone()))?;
                         }
                     }
                 }
@@ -272,9 +270,7 @@ where
                     let tuple = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = tuple {
                         if tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| {
-                                table.remove(r.tuple.id.clone(), id.clone(), false)
-                            })?;
+                            retry_on_contention(|| table.remove(r.tuple.id.clone()))?;
                         }
                     }
                 }
@@ -283,9 +279,7 @@ where
                     let tuple = table.find(r.tuple.id.clone())?;
                     if let Some(tuple) = tuple {
                         if tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| {
-                                table.update(r.tuple.clone(), id.clone(), false)
-                            })?;
+                            retry_on_contention(|| table.update(r.tuple.clone()))?;
                         }
                     }
                 }
@@ -317,8 +311,7 @@ where
         let tx_id = txn.id();
         let mut tuple = tuple;
         tuple.set_txn_id(tx_id.clone());
-        self.table_by_id(id)?
-            .insert(tuple.clone(), tx_id.clone(), true)?;
+        self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
         let op = Operation::Add(tx_id, Record::new(id, tuple));
         self.logger.log_undo(op.clone())?;
         self.logger.log_redo(op)?;
@@ -374,7 +367,7 @@ where
             let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
-            table.update(updated, txn, true)?;
+            table.update(updated)?;
             return Ok(());
         } else {
             return Err(StoreError::KeyNotFound(new_tuple.id));
@@ -410,7 +403,7 @@ where
             let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
-            table.update(tombstoned.clone(), txn, true)?;
+            table.update(tombstoned.clone())?;
             return Ok(tombstoned);
         } else {
             return Err(StoreError::KeyNotFound(id));
