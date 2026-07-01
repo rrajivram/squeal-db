@@ -90,6 +90,9 @@ impl std::io::Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut len = buf.len();
         let data = self.data.read().unwrap();
+        if self.seek_pos >= data.len() {
+            return Ok(0); // at or past EOF
+        }
         if self.seek_pos + len > data.len() {
             len = data.len() - self.seek_pos;
         }

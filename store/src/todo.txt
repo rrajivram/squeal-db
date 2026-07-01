@@ -5,8 +5,9 @@ writeHandle in page neds to be updated to handle large pages
 arclock needs a thread to monitor how long locks have been kept and kill lock if too long
 leaf_node should support external storage
 page iterator really needs to return refs. This means no use of Box
-nit: remove any vestige of txn from bplustree - its entirely handled by Db now
-
+I think buffer::alloc_page has a subtle race condition. alloc_page calls init_page which in turn schedules a write_header msg. Its unclear what happens if the db is dropped before the write_header message is received adn written.
+IGNORE: This is done by page.set_dirty IMPORTANT: LSN is not updated. log_redo should return LSN and db should store that in page
 
 done: transaction+id should become Copy
 done: Table id needs to be persistent across saves
+Done: nit: remove any vestige of txn from bplustree - its entirely handled by Db now

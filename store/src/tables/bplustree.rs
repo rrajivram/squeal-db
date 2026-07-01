@@ -24,6 +24,15 @@ enum Node {
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
 
+// Postcard varint upper bounds per field:
+//   DBIdType::Int(u64::MAX)  → 1 (variant) + 10 (varint) = 11 B
+//   Option<TransactionId>    → 1 (Some) + 10 (u64 id) + 10 (u128 ts) = 21 B
+//   Option<UndoId>           → 1 (None)
+//   data Node::Inner(u64::MAX) as Vec<u8> → 1 (len) + 1 (variant) + 10 (varint) = 12 B
+//   flags                    → 1 B
+//   Total ≈ 46 B; 64 B gives comfortable headroom for any realistic payload.
+const MAX_ENTRY_BYTES: u64 = 64;
+
 pub(crate) struct BPlusTree<F: DBFile + 'static> {
     pub(crate) table: Table,
     buffer: Arc<PageBuffer<F>>,
@@ -43,8 +52,7 @@ where
         logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
-        let size = Self::max_entry_size()?;
-        let count = pg / size;
+        let count = pg / MAX_ENTRY_BYTES;
 
         if count < 2 {
             return Err(StoreError::UnknownError(
@@ -53,7 +61,7 @@ where
         }
         let first_index_page = buffer.alloc_page(false)?;
         let first_data_page = buffer.alloc_page(false)?;
-        let index_page = Page::new_indexed(pg, size as usize);
+        let index_page = Page::new_indexed(pg, MAX_ENTRY_BYTES as usize);
         index_page.set_page_flags(LEAF_NODE)?;
         let mut handle = buffer.get_page_mut(first_index_page)?;
         handle.page = Arc::new(index_page);
@@ -102,16 +110,17 @@ where
                 self.write_page(self.buffer.get_page_mut(data_page_id)?, tuple.clone())?;
                 break;
             }
-            let next_page_id = page.get_next_page();
+            // data_chain_next skips overflow chains: if this page has overflow, it reads
+            // the terminator's next_page (the real data-chain link) instead of the
+            // overflow pointer stored in page.next_page.
+            let next_page_id = self.buffer.data_chain_next(&page, data_page_id)?;
             if next_page_id.is_valid_next_page() {
                 data_page_id = next_page_id;
                 page = self.buffer.get_page(data_page_id)?;
             } else {
                 let current_page_id = data_page_id;
                 data_page_id = self.buffer.alloc_page(false)?;
-                let handle = self.buffer.get_page_mut(current_page_id)?;
-                handle.page.set_next_page(data_page_id)?;
-                self.buffer.write_locked_page(handle)?;
+                self.buffer.set_data_chain_next(current_page_id, data_page_id)?;
                 page = self.buffer.get_page(data_page_id)?;
             }
         }
@@ -136,7 +145,7 @@ where
             drop(handle);
         }
         let inserted_id = id_tuple.id.clone();
-        self.insert_recursive(id_tuple, txn, self.table.first_index_page)?;
+        self.insert_recursive(id_tuple, txn, self.table.first_index_page, None)?;
         // TEMPORARY DIAGNOSTIC: catch orphaning the instant it happens, with a
         // full backtrace, instead of finding out 50,000 finds later in a
         // separate verification pass.
@@ -201,6 +210,7 @@ where
         let page = self.buffer.get_page(start)?;
         if page.is_flag_set(INNER_NODE) {
             let rows_iter = page.iter();
+            let mut last_child: Option<PageId> = None;
             for row in rows_iter {
                 if id < row.id {
                     let page_id = from_bytes::<Node>(&row.data)?;
@@ -210,6 +220,16 @@ where
                         panic!("Expected Inner. Found leaf ! {:?}", row.id);
                     }
                 }
+                let node = from_bytes::<Node>(&row.data)?;
+                if let Node::Inner(page_num) = node {
+                    last_child = Some(page_num);
+                }
+            }
+            // id >= all entry bounds: route to the last child.
+            // Non-root inner nodes have no u64::MAX sentinel; the last child
+            // covers all keys from its separator up to the parent's upper bound.
+            if let Some(child) = last_child {
+                return Ok(self.find_page(id, child)?);
             }
             return Ok(None);
         } else {
@@ -257,8 +277,15 @@ where
         tuple: Tuple,
         txn_id: TransactionId,
         start: PageId,
+        parent: Option<WritePageHandle>,
     ) -> Result<(), StoreError> {
         let mut handle = self.buffer.get_page_mut(start)?;
+        // Hand-over-hand (crabbing): now that we hold this node's lock, release
+        // the parent's. Acquiring the child lock *before* releasing the parent
+        // guarantees the routing decision that led us here cannot be invalidated
+        // by a concurrent split of this node between the parent's routing read
+        // and our arrival — the source of the "just-inserted id unreachable" bug.
+        drop(parent);
         if handle.page.is_flag_set(LEAF_NODE) {
             let count = handle.page.count()?;
             if count == self.table.nodes_per_page - 1 {
@@ -334,19 +361,26 @@ where
                         Some(txn_id.clone()),
                         None,
                     ))?;
+                    // Crab into the destination child: lock it *before* the
+                    // parent is written/released below, so no other thread can
+                    // re-split it out from under the routing decision we just
+                    // made. write_locked_page must still run (it persists the
+                    // new separator entries and releases the parent lock); the
+                    // pre-acquired child lock is reentrantly re-taken by the
+                    // recursive get_page_mut and dropped when `child` does.
+                    let target = if tuple.id < separator { p } else { sibling };
+                    let child = self.buffer.get_page_mut(target)?;
                     // Must persist before recursing — handle.page was a
                     // detached COW copy (the buffer's cache still held the
                     // pre-split version), so without this write-back the
                     // updated routing entries are silently dropped when
                     // `handle` goes out of scope, corrupting the index.
                     self.buffer.write_locked_page(handle)?;
-                    if tuple.id < separator {
-                        return Ok(self.insert_recursive(tuple, txn_id, p)?);
-                    }
-                    return Ok(self.insert_recursive(tuple, txn_id, sibling)?);
+                    return self.insert_recursive(tuple, txn_id, target, Some(child));
                 }
-                drop(handle);
-                return Ok(self.insert_recursive(tuple, txn_id, p)?);
+                // Crab into the child: pass our still-held parent lock down so
+                // it is only released once the child lock has been acquired.
+                return self.insert_recursive(tuple, txn_id, p, Some(handle));
             } else {
                 panic!("Expected inner - found leaf : {:?}", start);
             }
@@ -356,19 +390,6 @@ where
         Ok(())
     }
 
-    // The worst-case size of a single index entry — the same template used to
-    // size `nodes_per_page` in `new()`. Real entries (smaller ids/page
-    // numbers) are never larger, since postcard's varint encoding is
-    // monotonic in the encoded value.
-    fn max_entry_size() -> Result<DBSizeType, StoreError> {
-        Ok(Tuple::new_with(
-            DBIdType::Int(DBSizeType::MAX),
-            &to_allocvec(&Node::Inner(DBSizeType::MAX.into()))?,
-            Some(TransactionId::new(DBSizeType::MAX)),
-            None,
-        )
-        .size())
-    }
 
     fn split_if_needed(
         &self,
@@ -405,16 +426,20 @@ where
         let current_vals = &values[..mid];
         let new_vals = &values[mid..];
         let separator_id = new_vals[0].id.clone();
+        let is_inner = current_handle.page.is_flag_set(INNER_NODE);
         let new_page_id = self.buffer.alloc_page(false)?;
         let mut new_handle = self.buffer.get_page_mut(new_page_id)?;
-        if current_handle.page.is_flag_set(INNER_NODE) {
-            new_handle.page.set_page_flags(INNER_NODE)?;
-        } else {
-            new_handle.page.set_page_flags(LEAF_NODE)?;
-        }
 
         let current_page = Arc::make_mut(&mut current_handle.page);
         let new_page = Arc::make_mut(&mut new_handle.page);
+        // Set flags on the COW copy, never on the shared cached Arc: flags is an
+        // AtomicU16 mutated through &self, so flipping it before make_mut would
+        // be visible to concurrent readers while the page's data is still stale.
+        if is_inner {
+            new_page.set_page_flags(INNER_NODE)?;
+        } else {
+            new_page.set_page_flags(LEAF_NODE)?;
+        }
         current_page.clear()?;
         current_vals
             .iter()
@@ -435,9 +460,13 @@ where
         txn_id: TransactionId,
     ) -> Result<(), StoreError> {
         let mut handle = self.buffer.get_page_mut(self.table.first_index_page)?;
-        handle.page.clear_page_flag(LEAF_NODE)?;
-        handle.page.set_page_flags(INNER_NODE)?;
+        // Mutate flags and data together on the COW copy. Flipping LEAF→INNER on
+        // the shared cached Arc before rewriting the entries would let a
+        // concurrent find_page see INNER_NODE set while the entries are still the
+        // old leaf tuples → "Expected Inner. Found leaf!".
         let page = Arc::make_mut(&mut handle.page);
+        page.clear_page_flag(LEAF_NODE)?;
+        page.set_page_flags(INNER_NODE)?;
         page.clear()?;
         let left_node = Node::Inner(left_page);
         let right_node = Node::Inner(right_page);
@@ -491,10 +520,11 @@ where
         let right_page_id = self.buffer.alloc_page(false)?;
         let mut left_handle = self.buffer.get_page_mut(left_page_id)?;
         let mut right_handle = self.buffer.get_page_mut(right_page_id)?;
-        left_handle.page.set_page_flags(flags)?;
-        right_handle.page.set_page_flags(flags)?;
+        // Flags on the COW copy, not the shared cached Arc (see update_root_page).
         let left_page = Arc::make_mut(&mut left_handle.page);
         let right_page = Arc::make_mut(&mut right_handle.page);
+        left_page.set_page_flags(flags)?;
+        right_page.set_page_flags(flags)?;
         left_vals
             .iter()
             .try_for_each(|t| left_page.add_tuple(t.clone()))?;
@@ -524,7 +554,7 @@ mod tests {
 
     use postcard::from_bytes;
 
-    use super::{BPlusTree, INNER_NODE, LEAF_NODE, Node};
+    use super::{BPlusTree, INNER_NODE, LEAF_NODE, MAX_ENTRY_BYTES, Node};
     use crate::{
         buffer::PageBuffer,
         constant::FIRST_USER_PAGE,
@@ -631,47 +661,44 @@ mod tests {
     }
 
     #[test]
-    fn test_data_page_overflow_links_next_page() {
-        // BIG (8192 B) page gives table.nodes_per_page >> 3, so no index split fires.
-        // Use 3 KB data payloads: each tuple occupies ~3100 B in the data page.
-        // data_size ≈ 8192 - overhead (~56) ≈ 8136 B → fits 2 before overflow.
+    fn test_data_page_chains_to_next_page_when_full() {
+        // BIG (8192 B) page, 3 KB payloads (~3007 B serialized each).
+        // data_size = 8192 - PAGE_OVERHEAD = 8112 B.
+        // can_store = empty || used + tuple <= data_size (tuple must FIT):
+        //   insert 1: empty page accepts        → dp1 used≈3007
+        //   insert 2: 3007+3007=6014 <= 8112    → dp1 used≈6014
+        //   insert 3: 6014+3007=9021 > 8112     → does NOT fit dp1 → chains to dp2
+        // Overflow is NOT used here: a data page that can't fit a tuple links to
+        // the next data page instead of spilling into an overflow chain.
         let tree = make_tree(BIG);
         let large = vec![b'x'; 3000];
 
-        tree.insert(Tuple::new(1, &large), txn()).unwrap();
-        tree.insert(Tuple::new(2, &large), txn()).unwrap();
+        for i in 1u64..=3 {
+            tree.insert(Tuple::new(i, &large), txn()).unwrap();
+        }
 
         let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
-        assert_eq!(
-            dp1.count().unwrap(),
-            2,
-            "first data page should hold 2 large tuples"
-        );
+        assert_eq!(dp1.count().unwrap(), 2, "dp1 holds the 2 tuples that fit");
+        assert!(!dp1.has_overflow(), "dp1 must NOT overflow — it chains instead");
 
-        tree.insert(Tuple::new(3, &large), txn()).unwrap();
+        // dp1 links to dp2 via the normal data-chain pointer (no overflow).
+        let dp2_id = tree.buffer.data_chain_next(&dp1, tree.table.first_data_page).unwrap();
+        assert!(dp2_id.is_valid_next_page(), "dp1 must link to dp2");
 
-        let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
-        let next = dp1.get_next_page();
-        assert!(
-            next.is_valid_next_page(),
-            "first data page must link to a second page"
-        );
-
-        let dp2 = tree.buffer.get_page(next).unwrap();
-        assert_eq!(dp2.count().unwrap(), 1);
+        let dp2 = tree.buffer.get_page(dp2_id).unwrap();
+        assert_eq!(dp2.count().unwrap(), 1, "dp2 holds the 3rd tuple");
         assert!(dp2.contains(DBIdType::Int(3)).unwrap());
+
+        // All three remain findable through the index.
+        for i in 1u64..=3 {
+            assert_eq!(tree.find(DBIdType::Int(i)).unwrap().unwrap().data, large);
+        }
     }
 
     #[test]
     fn test_root_splits_into_inner_node() {
-        use postcard::to_allocvec;
-        // Compute the size of one index entry (same formula as BPlusTree::new).
-        let node_bytes = to_allocvec(&Node::Inner(FIRST_USER_PAGE.into())).unwrap();
-        let node_tuple_sz = Tuple::new_with(0.into(), &node_bytes, Some(txn()), None).size();
-        // table.nodes_per_page = page_size / node_tuple_sz.
-        // Choose page_size so table.nodes_per_page = 4; split fires after 3 inserts.
-        let probe = 4096u64;
-        let page_size = node_tuple_sz * 4 + page_overhead(probe) + 1;
+        // page_size = MAX_ENTRY_BYTES * 4 → nodes_per_page = 4; split fires after 3 index entries.
+        let page_size = MAX_ENTRY_BYTES * 4;
         let tree = make_tree(page_size);
 
         // table.nodes_per_page = 4; split fires after 3 index entries, so 5 inserts exercises post-split.
@@ -696,10 +723,7 @@ mod tests {
 
     #[test]
     fn test_root_split_both_children_are_leaves() {
-        use postcard::to_allocvec;
-        let node_bytes = to_allocvec(&Node::Inner(FIRST_USER_PAGE.into())).unwrap();
-        let node_tuple_sz = Tuple::new_with(0.into(), &node_bytes, Some(txn()), None).size();
-        let page_size = node_tuple_sz * 4 + page_overhead(4096) + 1;
+        let page_size = MAX_ENTRY_BYTES * 4;
         let tree = make_tree(page_size);
 
         for i in 1u64..=4 {
@@ -882,10 +906,7 @@ mod tests {
 
     #[test]
     fn test_find_after_root_split_left_and_right_subtrees() {
-        use postcard::to_allocvec;
-        let node_bytes = to_allocvec(&Node::Inner(FIRST_USER_PAGE.into())).unwrap();
-        let node_tuple_sz = Tuple::new_with(0.into(), &node_bytes, Some(txn()), None).size();
-        let page_size = node_tuple_sz * 4 + page_overhead(4096) + 1;
+        let page_size = MAX_ENTRY_BYTES * 4;
         let tree = make_tree(page_size);
 
         // table.nodes_per_page = 4; split fires after 3 inserts (see test_root_splits_into_inner_node).
@@ -910,14 +931,8 @@ mod tests {
 
     #[test]
     fn test_find_after_root_split_with_string_ids() {
-        use postcard::to_allocvec;
-        // Same sizing as test_find_after_root_split_left_and_right_subtrees: the
-        // template tuple uses an Int id, but Tuple::size() only counts the `data`
-        // payload length plus the fixed in-memory Tuple size, not the id's own
-        // heap bytes — so this sizing is valid for Vec/string ids too.
-        let node_bytes = to_allocvec(&Node::Inner(FIRST_USER_PAGE.into())).unwrap();
-        let node_tuple_sz = Tuple::new_with(0.into(), &node_bytes, Some(txn()), None).size();
-        let page_size = node_tuple_sz * 4 + page_overhead(4096) + 1;
+        // MAX_ENTRY_BYTES * 4 → nodes_per_page = 4 regardless of id type.
+        let page_size = MAX_ENTRY_BYTES * 4;
         let tree = make_tree(page_size);
 
         // table.nodes_per_page = 4; 5 string-keyed inserts exercise both a root split

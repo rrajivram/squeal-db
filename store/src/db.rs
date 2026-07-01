@@ -59,13 +59,13 @@ pub trait Opener {
 }
 
 pub trait DBFile:
-    std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
+    std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + std::marker::Sync + Opener
 {
 }
 pub(crate) type DBSizeType = u64;
 
 impl<T> DBFile for T where
-    T: std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + Opener
+    T: std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + std::marker::Sync + Opener
 {
 }
 
@@ -1322,5 +1322,118 @@ mod tests {
             "table B must be unaffected by the failed duplicate insert"
         );
         drop(txn2);
+    }
+
+    // ── large-object (multi-page overflow) ───────────────────────────────────
+    // DEFAULT_PAGE_SIZE=16384, page_data_size=16304.
+    // A payload of N bytes → serialized tuple ≈ N+20 bytes.
+    // Spans: 2 pages ≈ 20 KB payload, 4 pages ≈ 50 KB, 5 pages ≈ 70 KB.
+
+    #[test]
+    fn test_large_object_commit_is_findable() {
+        let (db, tid) = make_db_with_table();
+        // 50 KB payload → serialized ≈ 50 020 B → 4 overflow pages
+        let big = vec![b'A'; 50_000];
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, &big), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn2).unwrap();
+        drop(txn2);
+        assert_eq!(found.expect("large object must be visible after commit").data, big);
+    }
+
+    #[test]
+    fn test_large_object_rollback_not_visible() {
+        let (db, tid) = make_db_with_table();
+        let big = vec![b'B'; 50_000];
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, &big), &txn).unwrap();
+        db.rollback(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn2).unwrap();
+        drop(txn2);
+        assert!(found.is_none(), "rolled-back large object must not be visible");
+    }
+
+    #[test]
+    fn test_very_large_object_five_pages_commit() {
+        let (db, tid) = make_db_with_table();
+        // 70 KB payload → serialized ≈ 70 020 B → 5 overflow pages
+        let big = vec![b'C'; 70_000];
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(42, &big), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        let found = db.find(tid, id(42), &txn2).unwrap();
+        drop(txn2);
+        assert_eq!(found.expect("5-page object must survive commit").data, big);
+    }
+
+    #[test]
+    fn test_large_objects_persist_across_close_reopen() {
+        let (db, tid) = make_db_with_table();
+        let big = vec![b'D'; 50_000];
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(99, &big), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        // Close and reopen — overflow pages must be readable from disk
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let txn2 = db2.begin().unwrap();
+        let found = db2.find(tid, id(99), &txn2).unwrap();
+        drop(txn2);
+        assert_eq!(
+            found.expect("large object must survive close/reopen").data,
+            big
+        );
+    }
+
+    #[test]
+    fn test_multiple_large_objects_same_txn_commit() {
+        let (db, tid) = make_db_with_table();
+        // Three objects that collectively span many overflow pages
+        let small = vec![b'E'; 20_000];  // 2 pages each
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, &small), &txn).unwrap();
+        db.insert(tid, row(2, &small), &txn).unwrap();
+        db.insert(tid, row(3, &small), &txn).unwrap();
+        db.commit(txn).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        for i in 1u64..=3 {
+            let found = db.find(tid, id(i), &txn2).unwrap();
+            assert_eq!(
+                found.unwrap_or_else(|| panic!("row {i} missing")).data,
+                small
+            );
+        }
+        drop(txn2);
+    }
+
+    #[test]
+    fn test_large_object_rollback_then_reinsert_succeeds() {
+        let (db, tid) = make_db_with_table();
+        let big = vec![b'F'; 50_000];
+
+        // Insert + rollback
+        let txn1 = db.begin().unwrap();
+        db.insert(tid, row(7, &big), &txn1).unwrap();
+        db.rollback(txn1).unwrap();
+
+        // Re-insert the same key + commit
+        let txn2 = db.begin().unwrap();
+        db.insert(tid, row(7, &big), &txn2).unwrap();
+        db.commit(txn2).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        let found = db.find(tid, id(7), &txn3).unwrap();
+        drop(txn3);
+        assert_eq!(found.expect("re-inserted large object must be visible").data, big);
     }
 }

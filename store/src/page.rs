@@ -20,18 +20,46 @@ use crate::{
     tuple::{DBIdType, Tuple},
 };
 use atomic_bitfield::AtomicBitField as _;
+// Header fields are serialized before the data payload so the header can be
+// read from the start of a page's bytes without needing to know the data length.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub(crate) struct PageHeader {
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) next_page: DBSizeType,
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) page_data_size: DBSizeType,
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) page_used_size: DBSizeType,
+    pub(crate) record_size: Option<usize>,
+    pub(crate) lsn: LsnId,
+    pub(crate) flags: u16,
+}
+
+impl PageHeader {
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+        Ok(to_allocvec(self)?)
+    }
+
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        Ok(from_bytes(bytes)?)
+    }
+}
+
+// Internal serde shim — header first, data last.
+// postcard does not support #[serde(flatten)] so PageHeader fields are
+// mirrored here in the same order; the From impls below keep them in sync.
 #[derive(Debug, Serialize, Deserialize)]
 struct PageDto {
-    data: Vec<u8>,
     #[serde(with = "postcard::fixint::le")]
     next_page: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
-    data_size: DBSizeType,
+    page_data_size: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
-    capacity: DBSizeType,
+    page_used_size: DBSizeType,
     record_size: Option<usize>,
     lsn: LsnId,
     flags: u16,
+    data: Vec<u8>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -41,9 +69,10 @@ const NONE: u16 = 0;
 const PINNED: u16 = 1;
 const INDEX_PAGE: u16 = 1 << 1;
 const HAS_OVERFLOW: u16 = 1 << 2;
+const IS_OVERFLOW: u16 = 1 << 3;
 const RESERVED_FLAGS: u16 = 0x0f;
 
-const PAGE_OVERHEAD: usize = size_of::<PageDto>() - size_of::<Vec<u8>>();
+pub(crate) const PAGE_OVERHEAD: usize = size_of::<PageDto>();
 
 // PageType bundles all the constraints Page<PT> needs on its data field.
 // Baking `Item = Self` in here means every impl block just needs `PT: PageType`.
@@ -63,8 +92,8 @@ pub(crate) struct Page {
     data: Arc<dyn PageTuple>,
     next_page: AtomicU64,
     dirty: AtomicBool,
-    data_size: DBSizeType,
-    capacity: DBSizeType,
+    page_data_size: DBSizeType,
+    page_used_size: DBSizeType,
     record_size: Option<usize>,
     lsn: RwLock<LsnId>,
     flags: AtomicU16,
@@ -102,8 +131,8 @@ impl Page {
             data: pt,
             next_page: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
-            data_size: ds,
-            capacity: ds,
+            page_data_size: ds,
+            page_used_size: 0,
             record_size,
             lsn: RwLock::new(LsnId(0)),
             flags: AtomicU16::new(flags),
@@ -113,8 +142,19 @@ impl Page {
         }
     }
 
+    pub(crate) fn header(&self) -> PageHeader {
+        PageHeader {
+            next_page: self.next_page.load(std::sync::atomic::Ordering::Relaxed),
+            page_data_size: self.page_data_size,
+            page_used_size: self.page_used_size,
+            record_size: self.record_size,
+            lsn: self.lsn.read().unwrap().clone(),
+            flags: self.flags.load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn get_data_size(&self) -> DBSizeType {
-        self.data_size
+        self.page_data_size
     }
 
     pub(crate) fn lsn_id(&self) -> Result<LsnId, StoreError> {
@@ -170,7 +210,7 @@ impl Page {
 
     pub(crate) fn clear(&mut self) -> Result<(), StoreError> {
         self.data.clear()?;
-        self.capacity = self.data_size;
+        self.page_used_size = 0;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -182,7 +222,13 @@ impl Page {
     }
 
     pub(crate) fn can_store(&self, tuple: &Tuple) -> bool {
-        tuple.size() < self.capacity
+        // Accept a tuple only if it actually fits. Exception: an empty page
+        // always accepts, so a single tuple larger than a whole page still has
+        // a home — PageBuffer then spills that one tuple across an overflow
+        // chain. This keeps overflow off the common path: ordinary pages fill to
+        // capacity and link to the next data page instead of every near-full
+        // page spilling into (and rewriting) an overflow chain on each write.
+        self.page_used_size == 0 || self.page_used_size + tuple.size() <= self.page_data_size
     }
 
     pub(crate) fn add_tuple(&mut self, tuple: Tuple) -> Result<(), StoreError> {
@@ -191,14 +237,23 @@ impl Page {
         }
         let sz = tuple.size();
         self.data.add(tuple)?;
-        self.capacity -= sz;
+        self.page_used_size += sz;
         self.set_dirty(true)?;
         Ok(())
     }
 
     pub(crate) fn remove_tuple(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
         let old = self.data.remove(id)?;
-        self.capacity += old.size();
+        // checked_sub: an underflow here would wrap page_used_size to ~u64::MAX,
+        // which then drives handle_large_page_size to allocate a giant overflow
+        // chain (observed: 21 GB file / OOM). Surface it as an error instead.
+        self.page_used_size = self.page_used_size.checked_sub(old.size()).ok_or_else(|| {
+            StoreError::UnknownError(format!(
+                "remove_tuple used_size underflow: used={} old={}",
+                self.page_used_size,
+                old.size()
+            ))
+        })?;
         self.set_dirty(true)?;
         Ok(old)
     }
@@ -209,23 +264,15 @@ impl Page {
         tuple: Tuple,
     ) -> Result<Tuple, StoreError> {
         let new_size = tuple.size();
-        let old = self
-            .data
-            .get(id)?
-            .ok_or(StoreError::KeyNotFound(id.clone()))?;
-        let old_size = old.size();
-        if new_size > old_size {
-            if new_size - old_size > self.capacity {
-                return Err(StoreError::PageCapacityError);
-            }
-        }
         let old = self.data.replace(id, tuple)?;
         let old_size = old.size();
-        if new_size >= old_size {
-            self.capacity -= new_size - old_size;
-        } else {
-            self.capacity += old_size - new_size;
-        }
+        self.page_used_size = self.page_used_size.checked_sub(old_size).ok_or_else(|| {
+            StoreError::UnknownError(format!(
+                "replace_tuple used_size underflow: used={} old={}",
+                self.page_used_size, old_size
+            ))
+        })?;
+        self.page_used_size += new_size;
         self.set_dirty(true)?;
         Ok(old)
     }
@@ -256,18 +303,63 @@ impl Page {
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut v = to_allocvec(&self).unwrap_or_default();
-        if v.len() < self.data_size as usize + PAGE_OVERHEAD {
+        /*         let mut v = to_allocvec(&self).unwrap_or_default();
+               if v.len() < self.data_size as usize + PAGE_OVERHEAD {
+                   v.append(&mut vec![
+                       0u8;
+                       (self.data_size as usize + PAGE_OVERHEAD) - v.len()
+                   ]);
+               }
+               v
+        */
+        let mut v = to_allocvec(&self.header()).unwrap_or_default();
+        if v.len() < PAGE_OVERHEAD {
+            v.append(&mut vec![0u8; PAGE_OVERHEAD - v.len()]);
+        }
+        v.extend_from_slice(&self.data.to_bytes().unwrap_or_default());
+        if v.len() < self.page_data_size as usize + PAGE_OVERHEAD {
             v.append(&mut vec![
                 0u8;
-                (self.data_size as usize + PAGE_OVERHEAD) - v.len()
+                (self.page_data_size as usize + PAGE_OVERHEAD)
+                    - v.len()
             ]);
         }
         v
     }
 
+    pub(crate) fn to_data_bytes(&self) -> Vec<u8> {
+        let mut v = self.data.to_bytes().unwrap_or_default();
+        if v.len() < self.page_data_size as usize {
+            v.append(&mut vec![0u8; self.page_data_size as usize - v.len()]);
+        }
+        v
+    }
+
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
-        Ok(from_bytes(bytes)?)
+        let header = &bytes[..PAGE_OVERHEAD];
+        let header = from_bytes::<PageHeader>(&header)?;
+        let data = &bytes[PAGE_OVERHEAD..];
+        // Deserialize the tuple payload with `?` rather than routing through the
+        // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
+        // read into a panic instead of a recoverable StoreError.
+        let pt: Arc<dyn PageTuple> = if header.record_size.is_some() {
+            Arc::new(FixedTuplePage::from_bytes(data)?)
+        } else {
+            Arc::new(AnyTuplePage::from_bytes(data)?)
+        };
+        Ok(Self {
+            data: pt,
+            next_page: AtomicU64::new(header.next_page),
+            dirty: AtomicBool::new(false),
+            page_data_size: header.page_data_size,
+            page_used_size: header.page_used_size,
+            record_size: header.record_size,
+            flags: AtomicU16::new(header.flags),
+            lsn: RwLock::new(header.lsn),
+            accessed: AtomicU128::new(timestamp()),
+            written: AtomicU128::new(timestamp()),
+            saved: AtomicU128::new(timestamp()),
+        })
     }
 
     pub(crate) fn set_page_flags(&self, flag: usize) -> Result<(), StoreError> {
@@ -294,6 +386,58 @@ impl Page {
     }
 }
 
+impl PageHeader {
+    pub(crate) fn next_page(&self) -> PageId {
+        self.next_page.into()
+    }
+
+    pub(crate) fn set_next_page(&mut self, id: PageId) {
+        self.next_page = id.into();
+    }
+
+    pub(crate) fn is_overflow(&self) -> bool {
+        self.flags & IS_OVERFLOW == IS_OVERFLOW
+    }
+
+    pub(crate) fn set_is_overflow(&mut self) {
+        self.flags |= IS_OVERFLOW;
+        self.clear_has_overflow();
+    }
+
+    pub(crate) fn clear_is_overflow(&mut self) {
+        self.flags &= !IS_OVERFLOW
+    }
+
+    pub(crate) fn has_overflow(&self) -> bool {
+        self.flags & HAS_OVERFLOW == HAS_OVERFLOW
+    }
+
+    pub(crate) fn set_has_overflow(&mut self) {
+        self.flags |= HAS_OVERFLOW;
+        self.clear_is_overflow();
+    }
+
+    pub(crate) fn clear_has_overflow(&mut self) {
+        self.flags &= !HAS_OVERFLOW;
+    }
+
+    pub(crate) fn header_size() -> usize {
+        PAGE_OVERHEAD
+    }
+
+    pub(crate) fn used_size(&self) -> DBSizeType {
+        self.page_used_size
+    }
+
+    pub(crate) fn usable_data_size(&self) -> DBSizeType {
+        self.page_data_size
+    }
+
+    pub(crate) fn total_page_size(&self) -> usize {
+        self.page_used_size as usize + Self::header_size()
+    }
+}
+
 impl Iterator for PageTupleIterator {
     type Item = Tuple;
     fn next(&mut self) -> Option<Self::Item> {
@@ -312,8 +456,8 @@ impl From<PageDto> for Page {
             data: pt,
             next_page: AtomicU64::new(value.next_page),
             dirty: AtomicBool::new(false),
-            data_size: value.data_size,
-            capacity: value.capacity,
+            page_data_size: value.page_data_size,
+            page_used_size: value.page_used_size,
             record_size: value.record_size,
             flags: AtomicU16::new(value.flags),
             lsn: RwLock::new(value.lsn),
@@ -327,13 +471,13 @@ impl From<PageDto> for Page {
 impl From<Page> for PageDto {
     fn from(value: Page) -> Self {
         Self {
-            data: value.data.to_bytes().unwrap(),
             next_page: value.next_page.load(std::sync::atomic::Ordering::Relaxed),
-            data_size: value.data_size,
-            capacity: value.capacity,
-            flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
-            lsn: value.lsn.read().unwrap().clone(),
+            page_data_size: value.page_data_size,
+            page_used_size: value.page_used_size,
             record_size: value.record_size,
+            lsn: value.lsn.read().unwrap().clone(),
+            flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
+            data: value.data.to_bytes().unwrap(),
         }
     }
 }
@@ -341,11 +485,16 @@ impl From<Page> for PageDto {
 impl Clone for Page {
     fn clone(&self) -> Self {
         Self {
-            data: self.data.clone(),
+            // Deep-copy, not Arc::clone: the payload is mutated via `&self`
+            // interior mutability, so sharing the Arc would let a
+            // copy-on-write clone (Arc::make_mut) leak its mutations back into
+            // the cached page and any page mid-serialization on the writer
+            // thread — corrupting used_size/data consistency and losing updates.
+            data: self.data.deep_clone(),
             next_page: AtomicU64::new(self.next_page.load(std::sync::atomic::Ordering::Relaxed)),
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
-            data_size: self.data_size,
-            capacity: self.capacity,
+            page_data_size: self.page_data_size,
+            page_used_size: self.page_used_size,
             record_size: self.record_size,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(self.lsn.read().unwrap().clone()),
@@ -358,8 +507,8 @@ impl Clone for Page {
 
 impl PartialEq for Page {
     fn eq(&self, rhs: &Self) -> bool {
-        self.capacity == rhs.capacity
-            && self.data_size == rhs.data_size
+        self.page_used_size == rhs.page_used_size
+            && self.page_data_size == rhs.page_data_size
             && self.next_page.load(std::sync::atomic::Ordering::Relaxed)
                 == rhs.next_page.load(std::sync::atomic::Ordering::Relaxed)
             && self.flags.load(std::sync::atomic::Ordering::Relaxed)
@@ -431,19 +580,6 @@ mod tests {
         ));
         assert_eq!(p.is_dirty(), true);
         assert_eq!(p.can_store(&Tuple::new(3, b"abcd")), true);
-    }
-
-    #[test]
-    fn page_test_capacity() {
-        let size = Tuple::new(1, b"abcdefabcd").size() * 2 + PAGE_OVERHEAD as u64;
-        let mut p = Page::new_data(size + 1);
-        assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
-        assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
-        assert_eq!(p.capacity, 1);
-        assert!(matches!(
-            p.add_tuple(Tuple::new(3, b"abcd")),
-            Err(StoreError::PageCapacityError)
-        ));
     }
 
     #[test]
@@ -625,5 +761,47 @@ mod tests {
         let p2 = FixedPage::from_bytes(&p.to_bytes()).unwrap();
         assert_eq!(p2.iter().count(), 2);
         assert!(p2.iter().all(|t| t.data == b"abc"));
+    }
+
+    #[test]
+    fn test_can_store_true_for_fresh_page() {
+        let p = Page::new_data(1000);
+        assert!(p.can_store(&Tuple::new(1, b"anything")));
+    }
+
+    #[test]
+    fn test_any_size_tuple_accepted_while_page_has_capacity() {
+        let mut p = Page::new_data(1000);
+        let big_data = vec![0u8; 2000]; // much larger than page_data_size
+        assert!(p.can_store(&Tuple::new(1, &big_data)));
+        assert!(p.add_tuple(Tuple::new(1, &big_data)).is_ok());
+    }
+
+    #[test]
+    fn test_used_size_tracks_tuple_size() {
+        let mut p = Page::new_data(1000);
+        let t = Tuple::new(1, b"hello");
+        let expected = t.size();
+        p.add_tuple(t).unwrap();
+        assert_eq!(p.header().page_used_size, expected);
+    }
+
+    #[test]
+    fn test_can_store_false_after_oversized_tuple() {
+        let mut p = Page::new_data(1000);
+        let big_data = vec![0u8; 2000]; // page_used_size will exceed page_data_size
+        p.add_tuple(Tuple::new(1, &big_data)).unwrap();
+        assert!(!p.can_store(&Tuple::new(2, b"x")));
+    }
+
+    #[test]
+    fn test_second_tuple_rejected_when_page_full() {
+        let mut p = Page::new_data(1000);
+        let big_data = vec![0u8; 2000];
+        p.add_tuple(Tuple::new(1, &big_data)).unwrap();
+        assert!(matches!(
+            p.add_tuple(Tuple::new(2, b"tiny")),
+            Err(StoreError::PageCapacityError)
+        ));
     }
 }

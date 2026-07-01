@@ -94,9 +94,9 @@ where
 
     // Reclaim sole ownership to close cleanly, the way a real caller would.
     drop(tables);
-    let db = Arc::try_unwrap(db).unwrap_or_else(|_| {
-        panic!("Db still has outstanding references after all workers joined")
-    });
+    let db = Arc::try_unwrap(db)
+        .unwrap_or_else(|_| panic!("Db still has outstanding references after all workers joined"));
+    println!("Calling close");
     let _ = db.close();
     if cfg.backend == Backend::File {
         let _ = store::db::Db::<std::fs::File>::delete(&db_name);
@@ -123,7 +123,9 @@ where
         for (&(table_idx, key), expected) in &wr.private_expectations {
             private_checked += 1;
             // Tick so the watchdog sees liveness during verification.
-            stats.completed_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .completed_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let txn = db.begin().expect("begin for verification");
             let actual = db
                 .find(tables[table_idx], DBIdType::Int(key), &txn)
@@ -138,8 +140,12 @@ where
                         "thread {} table {} key {key}: expected {:?}, found {:?}",
                         wr.thread_idx,
                         table_idx,
-                        expected.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-                        actual_data.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
+                        expected
+                            .as_ref()
+                            .map(|v| String::from_utf8_lossy(v).into_owned()),
+                        actual_data
+                            .as_ref()
+                            .map(|v| String::from_utf8_lossy(v).into_owned()),
                     ),
                 );
             }
@@ -151,7 +157,9 @@ where
     for (table_idx, &tid) in tables.iter().enumerate() {
         for key in 0..cfg.hot_keys {
             hot_checked += 1;
-            stats.completed_ops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .completed_ops
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let txn = db.begin().expect("begin for hot verification");
             let found = db.find(tid, DBIdType::Int(key), &txn);
             let _ = db.rollback(txn);

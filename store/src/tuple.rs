@@ -52,6 +52,10 @@ pub struct Tuple {
     pub(crate) undo_id: Option<UndoId>,
     pub(crate) data: Vec<u8>,
     flags: u8,
+    // Cached serialized size — not persisted. Zero means not yet computed (e.g. after serde
+    // deserialization, which skips this field); size() computes it on demand in that case.
+    #[serde(skip)]
+    serialized_size: DBSizeType,
 }
 
 impl Tuple {
@@ -71,13 +75,15 @@ impl Tuple {
         txn_id: Option<TransactionId>,
         undo_id: Option<UndoId>,
     ) -> Self {
-        Self {
+        let mut s = Self {
             id,
             data: data.to_vec(),
-            txn_id: txn_id,
-            undo_id: undo_id,
+            txn_id,
+            undo_id,
             ..Default::default()
-        }
+        };
+        s.serialized_size = to_allocvec(&s).map(|v| v.len()).unwrap_or(0) as DBSizeType;
+        s
     }
 
     pub fn is_index(&self) -> bool {
@@ -121,7 +127,12 @@ impl Tuple {
     }
 
     pub fn size(&self) -> DBSizeType {
-        (self.data.len() + size_of_val(self)) as DBSizeType
+        if self.serialized_size > 0 {
+            self.serialized_size
+        } else {
+            // Deserialized tuples have serialized_size=0 (serde skips it); compute on demand.
+            to_allocvec(self).map(|v| v.len()).unwrap_or(0) as DBSizeType
+        }
     }
 
     pub fn to(&self) -> Vec<u8> {

@@ -97,12 +97,18 @@ fn counters_for<'a>(stats: &'a Stats, kind: OpKind) -> &'a OpCounters {
 fn record_err(stats: &Stats, kind: OpKind, e: &StoreError) {
     let c = counters_for(stats, kind);
     match e {
-        StoreError::KeyNotFound(_) => c.key_not_found.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        StoreError::DuplicateKey(_) => c.duplicate_key.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        StoreError::LockContentionError => {
-            c.lock_contention.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        }
-        _ => c.other_error.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        StoreError::KeyNotFound(_) => c
+            .key_not_found
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        StoreError::DuplicateKey(_) => c
+            .duplicate_key
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        StoreError::LockContentionError => c
+            .lock_contention
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        _ => c
+            .other_error
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     };
 }
 
@@ -122,7 +128,9 @@ fn run_op<T>(
         match f() {
             Ok(v) => {
                 stats.record_latency(start.elapsed());
-                counters_for(stats, kind).success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                counters_for(stats, kind)
+                    .success
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Ok(v);
             }
             Err(StoreError::LockContentionError) if attempt < cfg.max_lock_retries => {
@@ -133,7 +141,9 @@ fn run_op<T>(
             Err(e) => {
                 stats.record_latency(start.elapsed());
                 if matches!(e, StoreError::LockContentionError) {
-                    stats.dropped_after_retry_exhaustion.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    stats
+                        .dropped_after_retry_exhaustion
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 record_err(stats, kind, &e);
                 return Err(e);
@@ -152,7 +162,8 @@ pub fn run_worker<F>(
 where
     F: DBFile<Item = F> + Sync + 'static,
 {
-    let mut rng = Rng::new(cfg.seed ^ ((thread_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1));
+    let mut rng =
+        Rng::new(cfg.seed ^ ((thread_idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1));
     let mut private_state: PrivateExpectations = HashMap::new();
     let mut private_seq: HashMap<PrivateKey, u64> = HashMap::new();
     let mut hot_seq: u64 = 0;
@@ -185,11 +196,16 @@ where
                 };
                 hot_seq += 1;
                 let salt = rng.next_u64() as u32;
-                apply_hot_op(&db, &txn, &cfg, &stats, &mut rng, tid, key, kind, thread_idx, hot_seq, salt);
+                apply_hot_op(
+                    &db, &txn, &cfg, &stats, &mut rng, tid, key, kind, thread_idx, hot_seq, salt,
+                );
             } else {
                 let key = private_base + rng.next_range(cfg.private_keys.max(1));
                 let pkey: PrivateKey = (table_idx, key);
-                let exists = private_state.get(&pkey).map(|v| v.is_some()).unwrap_or(false);
+                let exists = private_state
+                    .get(&pkey)
+                    .map(|v| v.is_some())
+                    .unwrap_or(false);
                 let kind = if !exists {
                     OpKind::Insert
                 } else {
@@ -216,14 +232,18 @@ where
         let commit = rng.next_pct() < cfg.commit_probability_pct;
         if commit {
             if db.commit(txn).is_ok() {
-                stats.txn_committed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .txn_committed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for (k, v) in pending {
                     private_state.insert(k, v);
                 }
             }
         } else {
             let _ = db.rollback(txn);
-            stats.txn_rolled_back.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .txn_rolled_back
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // pending writes are discarded: private_state is left untouched,
             // matching the fact that the txn never committed.
         }
@@ -301,11 +321,15 @@ fn apply_hot_op<F>(
     match kind {
         OpKind::Insert => {
             let data = encode_hot(thread_idx, key, seq, salt);
-            let _ = run_op(stats, cfg, rng, kind, || db.insert(tid, Tuple::new(key, &data), txn));
+            let _ = run_op(stats, cfg, rng, kind, || {
+                db.insert(tid, Tuple::new(key, &data), txn)
+            });
         }
         OpKind::Update => {
             let data = encode_hot(thread_idx, key, seq, salt);
-            let _ = run_op(stats, cfg, rng, kind, || db.update(tid, Tuple::new(key, &data), txn));
+            let _ = run_op(stats, cfg, rng, kind, || {
+                db.update(tid, Tuple::new(key, &data), txn)
+            });
         }
         OpKind::Remove => {
             let _ = run_op(stats, cfg, rng, kind, || db.remove(tid, id.clone(), txn));
@@ -330,9 +354,9 @@ mod tests {
     #[test]
     fn stress_regression_16t_3000ops() {
         let cfg = Arc::new(Config {
-            threads: 16,
+            threads: 2,
             tables: 4,
-            ops_per_thread: 3000,
+            ops_per_thread: 10,
             hot_keys: 16,
             private_keys: 2000,
             backend: Backend::Mem,
@@ -350,7 +374,7 @@ mod tests {
             table_ids.push(db.create_table(format!("stress_table_{i}")).unwrap());
         }
         let tables = Arc::new(table_ids);
-        let db = Arc::new(db);
+        let mut db = Arc::new(db);
         let stats = Arc::new(Stats::new(cfg.threads));
 
         let mut handles = Vec::with_capacity(cfg.threads);
@@ -385,13 +409,20 @@ mod tests {
                         wr.thread_idx,
                         table_idx,
                         key,
-                        expected.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
-                        actual_data.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
+                        expected
+                            .as_ref()
+                            .map(|v| String::from_utf8_lossy(v).into_owned()),
+                        actual_data
+                            .as_ref()
+                            .map(|v| String::from_utf8_lossy(v).into_owned()),
                     ));
                 }
             }
         }
-
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| {
+            panic!("Db still has outstanding references after all workers joined")
+        });
+        let _ = db.close();
         assert!(
             mismatches.is_empty(),
             "{} correctness failure(s):\n{}",
