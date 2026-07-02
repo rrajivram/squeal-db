@@ -1575,4 +1575,141 @@ mod tests {
         drop(txn3);
         assert_eq!(found.expect("re-inserted large object must be visible").data, big);
     }
+
+    // ── large-object: exercise EVERY public op at 4–8× the page size ──────────
+
+    /// A payload of `len` bytes whose byte at each position varies with both the
+    /// position and `seed`. A uniform `vec![b'X'; len]` would still verify equal
+    /// even if the overflow-page chain were reassembled out of order or a page
+    /// were duplicated; a position-dependent pattern catches those.
+    fn big_payload(seed: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i as u64).wrapping_mul(31).wrapping_add(seed as u64) & 0xFF) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn test_large_object_full_lifecycle_all_ops() {
+        // One object driven through every public operation while it spans 4–8
+        // overflow pages: insert, find, update (grow), update (shrink), remove,
+        // re-insert, commit, rollback, and close/reopen. DEFAULT_PAGE_SIZE=16 KB,
+        // so 4×≈64 KB … 8×≈128 KB payloads.
+        let page = DEFAULT_PAGE_SIZE as usize;
+        assert!((4 * page..=8 * page).contains(&(6 * page)));
+        let base = big_payload(1, 6 * page); // ~6× page
+        let grown = big_payload(2, 8 * page); // ~8× page — more overflow pages
+        let shrunk = big_payload(3, 4 * page); // ~4× page — fewer overflow pages
+        let reins = big_payload(4, 5 * page); // ~5× page
+
+        let (db, tid) = make_db_with_table();
+
+        // insert + commit → find returns exactly what went in
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &base), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &t).unwrap().expect("inserted").data,
+            base
+        );
+        db.rollback(t).unwrap();
+
+        // update that GROWS the object (allocates more overflow pages)
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &grown), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &t).unwrap().expect("grown").data,
+            grown
+        );
+        db.rollback(t).unwrap();
+
+        // update that SHRINKS the object (frees overflow pages)
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &shrunk), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &t).unwrap().expect("shrunk").data,
+            shrunk
+        );
+        db.rollback(t).unwrap();
+
+        // remove → gone
+        let t = db.begin().unwrap();
+        db.remove(tid, id(1), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert!(
+            db.find(tid, id(1), &t).unwrap().is_none(),
+            "removed large object must be gone"
+        );
+        db.rollback(t).unwrap();
+
+        // re-insert, then close/reopen → overflow chain readable from storage
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &reins), &t).unwrap();
+        db.commit(t).unwrap();
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().expect("reopened").data,
+            reins
+        );
+        db2.rollback(t).unwrap();
+    }
+
+    #[test]
+    fn test_large_object_update_rollback_keeps_committed() {
+        // Rolling back an update between two large values must restore the exact
+        // committed overflow chain (Mod-revert across multiple pages).
+        let page = DEFAULT_PAGE_SIZE as usize;
+        let v1 = big_payload(10, 6 * page);
+        let v2 = big_payload(20, 8 * page);
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(5, &v1), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let t = db.begin().unwrap();
+        db.update(tid, row(5, &v2), &t).unwrap();
+        db.rollback(t).unwrap();
+
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(5), &t).unwrap().expect("v1 must stand").data,
+            v1,
+            "rolled-back large update must leave the committed value intact"
+        );
+        db.rollback(t).unwrap();
+    }
+
+    #[test]
+    fn test_large_object_remove_rollback_still_visible() {
+        // Rolling back the removal of a large object must leave it fully readable.
+        let page = DEFAULT_PAGE_SIZE as usize;
+        let v = big_payload(30, 7 * page);
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(8, &v), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let t = db.begin().unwrap();
+        db.remove(tid, id(8), &t).unwrap();
+        db.rollback(t).unwrap();
+
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(8), &t)
+                .unwrap()
+                .expect("large object must survive a rolled-back remove")
+                .data,
+            v
+        );
+        db.rollback(t).unwrap();
+    }
 }
