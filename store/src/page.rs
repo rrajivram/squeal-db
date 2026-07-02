@@ -208,8 +208,23 @@ impl Page {
         Ok(())
     }
 
+    /// Mutable access to the tuple store. Sound because every mutating Page
+    /// method takes `&mut self`, only reachable after `Arc::make_mut(&mut
+    /// Arc<Page>)` has made this Page uniquely owned — so its `data` Arc has a
+    /// single strong ref and `get_mut` succeeds. A `None` here would mean that
+    /// copy-on-write invariant was violated, so it surfaces as an error rather
+    /// than silently corrupting a shared page.
+    fn data_mut(&mut self) -> Result<&mut (dyn PageTuple + 'static), StoreError> {
+        Arc::get_mut(&mut self.data).ok_or_else(|| {
+            StoreError::UnknownError(
+                "page tuple store aliased while mutating through &mut Page (COW invariant violated)"
+                    .into(),
+            )
+        })
+    }
+
     pub(crate) fn clear(&mut self) -> Result<(), StoreError> {
-        self.data.clear()?;
+        self.data_mut()?.clear()?;
         self.page_used_size = 0;
         self.set_dirty(true)?;
         Ok(())
@@ -236,14 +251,14 @@ impl Page {
             return Err(StoreError::PageCapacityError);
         }
         let sz = tuple.size();
-        self.data.add(tuple)?;
+        self.data_mut()?.add(tuple)?;
         self.page_used_size += sz;
         self.set_dirty(true)?;
         Ok(())
     }
 
     pub(crate) fn remove_tuple(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
-        let old = self.data.remove(id)?;
+        let old = self.data_mut()?.remove(id)?;
         // checked_sub: an underflow here would wrap page_used_size to ~u64::MAX,
         // which then drives handle_large_page_size to allocate a giant overflow
         // chain (observed: 21 GB file / OOM). Surface it as an error instead.
@@ -264,7 +279,7 @@ impl Page {
         tuple: Tuple,
     ) -> Result<Tuple, StoreError> {
         let new_size = tuple.size();
-        let old = self.data.replace(id, tuple)?;
+        let old = self.data_mut()?.replace(id, tuple)?;
         let old_size = old.size();
         self.page_used_size = self.page_used_size.checked_sub(old_size).ok_or_else(|| {
             StoreError::UnknownError(format!(
@@ -485,11 +500,12 @@ impl From<Page> for PageDto {
 impl Clone for Page {
     fn clone(&self) -> Self {
         Self {
-            // Deep-copy, not Arc::clone: the payload is mutated via `&self`
-            // interior mutability, so sharing the Arc would let a
-            // copy-on-write clone (Arc::make_mut) leak its mutations back into
-            // the cached page and any page mid-serialization on the writer
-            // thread — corrupting used_size/data consistency and losing updates.
+            // Deep-copy, not Arc::clone: a Page is mutated through `&mut Page`
+            // obtained via Arc::make_mut, which calls this clone when the page is
+            // shared. Sharing the inner Arc instead would let the freshly-cloned
+            // (now "unique") page still alias the original's store, leaking
+            // mutations back into the cached page or a page mid-serialization on
+            // the writer thread — corrupting used_size/data and losing updates.
             data: self.data.deep_clone(),
             next_page: AtomicU64::new(self.next_page.load(std::sync::atomic::Ordering::Relaxed)),
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
@@ -555,6 +571,13 @@ impl PageId {
     }
 }
 
+// SAFETY: needed only because `data: Arc<dyn PageTuple>` is a trait object
+// without Send+Sync bounds. The concrete stores (AnyTuplePage/FixedTuplePage)
+// are Send+Sync plain data. Sharing `&Page` across threads is sound: `&self`
+// methods only read the store (concurrent BTreeMap reads are fine) and the
+// genuinely-shared mutable fields are atomics / a lock. Mutation requires
+// `&mut Page`, which the copy-on-write model (Arc::make_mut) hands out only for
+// a uniquely-owned page, so no thread can observe a page while it is written.
 unsafe impl Sync for Page {}
 unsafe impl Send for Page {}
 
@@ -616,7 +639,7 @@ mod tests {
         p.add_tuple(Tuple::new(7, b"payload")).unwrap();
         let found = p.get(DBIdType::Int(7)).unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().data, b"payload");
+        assert_eq!(found.unwrap().data.to_vec(), b"payload");
         let missing = p.get(DBIdType::Int(99)).unwrap();
         assert!(missing.is_none());
     }
@@ -674,8 +697,8 @@ mod tests {
         let p2 = Page::from_bytes(&bytes).unwrap();
         assert!(p2.contains(DBIdType::Int(1)).unwrap());
         assert!(p2.contains(DBIdType::Int(2)).unwrap());
-        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().unwrap().data, b"first");
-        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().unwrap().data, b"second");
+        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"first");
+        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().unwrap().data.to_vec(), b"second");
     }
 
     // --- PageIterator: AnyTuplePage ---
@@ -693,9 +716,9 @@ mod tests {
         p.add_tuple(Tuple::new(2, b"beta")).unwrap();
         p.add_tuple(Tuple::new(3, b"gamma")).unwrap();
         assert_eq!(p.iter().count(), 3);
-        assert!(p.iter().any(|t| t.data == b"alpha"));
-        assert!(p.iter().any(|t| t.data == b"beta"));
-        assert!(p.iter().any(|t| t.data == b"gamma"));
+        assert!(p.iter().any(|t| t.data.to_vec() == b"alpha"));
+        assert!(p.iter().any(|t| t.data.to_vec() == b"beta"));
+        assert!(p.iter().any(|t| t.data.to_vec() == b"gamma"));
     }
 
     #[test]
@@ -732,7 +755,7 @@ mod tests {
         let mut p = FixedPage::new_indexed(4000, record_size);
         p.add_tuple(Tuple::new(10, b"hello")).unwrap();
         p.add_tuple(Tuple::new(20, b"hello")).unwrap();
-        assert!(p.iter().all(|t| t.data == b"hello"));
+        assert!(p.iter().all(|t| t.data.to_vec() == b"hello"));
         let mut ids: Vec<u64> = p
             .iter()
             .map(|t| match t.id {
@@ -760,7 +783,7 @@ mod tests {
         p.add_tuple(Tuple::new(2, b"abc")).unwrap();
         let p2 = FixedPage::from_bytes(&p.to_bytes()).unwrap();
         assert_eq!(p2.iter().count(), 2);
-        assert!(p2.iter().all(|t| t.data == b"abc"));
+        assert!(p2.iter().all(|t| t.data.to_vec() == b"abc"));
     }
 
     #[test]

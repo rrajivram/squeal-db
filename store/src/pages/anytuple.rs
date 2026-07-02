@@ -1,4 +1,3 @@
-use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -10,23 +9,26 @@ use crate::{
     tuple::{DBIdType, Tuple},
 };
 
+// No interior lock: the store is only mutated through `&mut self`, which is only
+// reachable after `Arc::make_mut(&mut Arc<Page>)` has made the owning Page
+// uniquely owned (see `PageTuple::deep_clone`). Concurrent readers only ever see
+// a different, immutable Page snapshot, so a lock here would guard nothing.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AnyTuplePage {
-    data: RwLock<BTreeMap<DBSizeType, Vec<Tuple>>>,
+    data: BTreeMap<DBSizeType, Vec<Tuple>>,
 }
 
 impl Clone for AnyTuplePage {
     fn clone(&self) -> Self {
         Self {
-            data: RwLock::new(self.data.read().clone()),
-            ..Default::default()
+            data: self.data.clone(),
         }
     }
 }
 
 impl PartialEq for AnyTuplePage {
     fn eq(&self, other: &Self) -> bool {
-        *self.data.read() == *other.data.read()
+        self.data == other.data
     }
 }
 
@@ -50,9 +52,7 @@ impl AnyTuplePage {
                 .or_insert(vec![t]);
         }
 
-        Ok(Self {
-            data: RwLock::new(map),
-        })
+        Ok(Self { data: map })
     }
 }
 
@@ -62,15 +62,14 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn count(&self) -> Result<usize, StoreError> {
-        Ok(self.data.read().len())
+        Ok(self.data.len())
     }
 
-    fn add(&self, tuple: Tuple) -> Result<(), StoreError> {
+    fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         if self.contains(&tuple.id)? {
             return Err(StoreError::DuplicateKey(tuple.id));
         }
         self.data
-            .write()
             .entry(tuple.id.hashed())
             .and_modify(|v| v.push(tuple.clone()))
             .or_insert(vec![tuple]);
@@ -80,7 +79,6 @@ impl PageTuple for AnyTuplePage {
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
         Ok(self
             .data
-            .read()
             .get(&id.hashed())
             .map(|v| is_present(v, id))
             .unwrap_or_default())
@@ -89,26 +87,23 @@ impl PageTuple for AnyTuplePage {
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()
             .get(&id.hashed())
             .map(|t| extract(t, id))
             .flatten())
     }
 
-    fn replace(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
+    fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         Ok(self
             .data
-            .write()
             .get_mut(&id.hashed())
             .map(|v| replace(v, id, tuple))
             .flatten()
             .ok_or(StoreError::KeyNotFound(id.clone()))?)
     }
 
-    fn remove(&self, id: DBIdType) -> Result<Tuple, StoreError> {
+    fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
         Ok(self
             .data
-            .write()
             .get_mut(&id.hashed())
             .map(|t| remove(t, &id))
             .flatten()
@@ -116,25 +111,24 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn values(&self) -> Result<Vec<Tuple>, StoreError> {
-        Ok(self.data.read().values().flatten().cloned().collect())
+        Ok(self.data.values().flatten().cloned().collect())
     }
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
-        Ok(self.data.read().keys().copied().collect())
+        Ok(self.data.keys().copied().collect())
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
         Ok(to_allocvec(&self.values()?)?)
     }
 
-    fn clear(&self) -> Result<(), StoreError> {
-        Ok(self.data.write().clear())
+    fn clear(&mut self) -> Result<(), StoreError> {
+        Ok(self.data.clear())
     }
 
     fn first(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()
             .first_key_value()
             .map(|(_k, v)| v.first())
             .flatten()
@@ -144,7 +138,6 @@ impl PageTuple for AnyTuplePage {
     fn last(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
-            .read()
             .last_key_value()
             .map(|(_k, v)| v.last())
             .flatten()
@@ -197,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_add_and_count() {
-        let p = make_page();
+        let mut p = make_page();
         assert_eq!(p.count().unwrap(), 0);
         p.add(Tuple::new(1, b"hello")).unwrap();
         assert_eq!(p.count().unwrap(), 1);
@@ -207,7 +200,7 @@ mod tests {
 
     #[test]
     fn test_add_duplicate_returns_err() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(1, b"a")).unwrap();
         assert!(matches!(
             p.add(Tuple::new(1, b"b")),
@@ -217,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_contains() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(5, b"data")).unwrap();
         assert!(p.contains(&DBIdType::Int(5)).unwrap());
         assert!(!p.contains(&DBIdType::Int(99)).unwrap());
@@ -225,27 +218,27 @@ mod tests {
 
     #[test]
     fn test_get_hit_and_miss() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(10, b"value")).unwrap();
         let found = p.get(&DBIdType::Int(10)).unwrap();
         assert!(found.is_some());
-        assert_eq!(found.unwrap().data, b"value");
+        assert_eq!(found.unwrap().data.to_vec(), b"value");
         assert!(p.get(&DBIdType::Int(999)).unwrap().is_none());
     }
 
     #[test]
     fn test_set_updates_existing() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(1, b"old")).unwrap();
         let updated = Tuple::new(1, b"new");
         p.replace(&DBIdType::Int(1), updated).unwrap();
         let got = p.get(&DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(got.data, b"new");
+        assert_eq!(got.data.to_vec(), b"new");
     }
 
     #[test]
     fn test_set_missing_returns_err() {
-        let p = make_page();
+        let mut p = make_page();
         assert!(matches!(
             p.replace(&42.into(), Tuple::new(42, b"x")),
             Err(StoreError::KeyNotFound(_))
@@ -254,17 +247,17 @@ mod tests {
 
     #[test]
     fn test_remove_existing() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(3, b"bye")).unwrap();
         let removed = p.remove(DBIdType::Int(3));
         assert!(removed.is_ok());
-        assert_eq!(removed.unwrap().data, b"bye");
+        assert_eq!(removed.unwrap().data.to_vec(), b"bye");
         assert!(!p.contains(&DBIdType::Int(3)).unwrap());
     }
 
     #[test]
     fn test_remove_missing_returns_err() {
-        let p = make_page();
+        let mut p = make_page();
         assert!(matches!(
             p.remove(DBIdType::Int(7)),
             Err(StoreError::KeyNotFound(_))
@@ -273,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_values_returns_all() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(1, b"a")).unwrap();
         p.add(Tuple::new(2, b"b")).unwrap();
         p.add(Tuple::new(3, b"c")).unwrap();
@@ -283,21 +276,21 @@ mod tests {
 
     #[test]
     fn test_roundtrip_serialization() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(1, b"foo")).unwrap();
         p.add(Tuple::new(2, b"bar")).unwrap();
         let bytes = p.to_bytes().unwrap();
         let p2 = AnyTuplePage::from_bytes(&bytes).unwrap();
         assert_eq!(p2.count().unwrap(), 2);
-        assert_eq!(p2.get(&DBIdType::Int(1)).unwrap().unwrap().data, b"foo");
-        assert_eq!(p2.get(&DBIdType::Int(2)).unwrap().unwrap().data, b"bar");
+        assert_eq!(p2.get(&DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"foo");
+        assert_eq!(p2.get(&DBIdType::Int(2)).unwrap().unwrap().data.to_vec(), b"bar");
     }
 
     #[test]
     fn test_clone_is_independent() {
-        let p = make_page();
+        let mut p = make_page();
         p.add(Tuple::new(1, b"original")).unwrap();
-        let q = p.clone();
+        let mut q = p.clone();
         // Adding to q does not affect p
         q.add(Tuple::new(2, b"extra")).unwrap();
         assert_eq!(p.count().unwrap(), 1);
@@ -306,8 +299,8 @@ mod tests {
 
     #[test]
     fn test_partial_eq() {
-        let p = make_page();
-        let q = make_page();
+        let mut p = make_page();
+        let mut q = make_page();
         assert_eq!(p, q);
         p.add(Tuple::new(1, b"x")).unwrap();
         assert_ne!(p, q);
@@ -317,11 +310,11 @@ mod tests {
 
     #[test]
     fn test_vec_id() {
-        let p = make_page();
+        let mut p = make_page();
         let id = DBIdType::Vec(b"my_key".to_vec());
         p.add(Tuple::new_with(id.clone(), b"payload", None, None))
             .unwrap();
         assert!(p.contains(&id.clone()).unwrap());
-        assert_eq!(p.get(&id).unwrap().unwrap().data, b"payload");
+        assert_eq!(p.get(&id).unwrap().unwrap().data.to_vec(), b"payload");
     }
 }

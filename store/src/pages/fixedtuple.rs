@@ -61,7 +61,7 @@ impl PageTuple for FixedTuplePage {
         self.data.count()
     }
 
-    fn add(&self, tuple: Tuple) -> Result<(), StoreError> {
+    fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         if tuple.size() > self.tuple_size as DBSizeType {
             return Err(StoreError::TupleTooLarge(tuple.size(), self.tuple_size));
         }
@@ -76,14 +76,14 @@ impl PageTuple for FixedTuplePage {
         self.data.get(id)
     }
 
-    fn replace(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
+    fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         if tuple.size() > self.tuple_size as DBSizeType {
             return Err(StoreError::TupleTooLarge(tuple.size(), self.tuple_size));
         }
         self.data.replace(id, tuple)
     }
 
-    fn remove(&self, id: DBIdType) -> Result<Tuple, StoreError> {
+    fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
         self.data.remove(id)
     }
 
@@ -103,7 +103,7 @@ impl PageTuple for FixedTuplePage {
         };
         Ok(to_allocvec(&dto)?)
     }
-    fn clear(&self) -> Result<(), StoreError> {
+    fn clear(&mut self) -> Result<(), StoreError> {
         self.data.clear()
     }
 
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn test_add_within_limit() {
         let sz = tuple_size(b"hello");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         assert!(p.add(Tuple::new(1, b"hello")).is_ok());
         assert_eq!(p.count().unwrap(), 1);
     }
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn test_add_exceeds_limit_returns_err() {
         let sz = tuple_size(b"hi");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         // "toolong" is bigger than "hi" in tuple size
         assert!(matches!(
             p.add(Tuple::new(1, b"toolong_payload")),
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn test_set_exceeds_limit_returns_err() {
         let sz = tuple_size(b"hello");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(1, b"hello")).unwrap();
         assert!(matches!(
             p.replace(&1.into(), Tuple::new(1, b"way_too_long_payload")),
@@ -166,28 +166,28 @@ mod tests {
     #[test]
     fn test_contains_and_get() {
         let sz = tuple_size(b"abc");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(7, b"abc")).unwrap();
         assert!(p.contains(&DBIdType::Int(7)).unwrap());
         assert!(!p.contains(&DBIdType::Int(8)).unwrap());
-        assert_eq!(p.get(&DBIdType::Int(7)).unwrap().unwrap().data, b"abc");
+        assert_eq!(p.get(&DBIdType::Int(7)).unwrap().unwrap().data.to_vec(), b"abc");
     }
 
     #[test]
     fn test_remove() {
         let sz = tuple_size(b"x");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(1, b"x")).unwrap();
         let removed = p.remove(DBIdType::Int(1));
         assert!(removed.is_ok());
-        assert_eq!(removed.unwrap().data, b"x");
+        assert_eq!(removed.unwrap().data.to_vec(), b"x");
         assert!(!p.contains(&DBIdType::Int(1)).unwrap());
     }
 
     #[test]
     fn test_values() {
         let sz = tuple_size(b"v");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(1, b"v")).unwrap();
         p.add(Tuple::new(2, b"v")).unwrap();
         assert_eq!(p.values().unwrap().len(), 2);
@@ -196,21 +196,21 @@ mod tests {
     #[test]
     fn test_roundtrip_serialization() {
         let sz = tuple_size(b"data");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(1, b"data")).unwrap();
         p.add(Tuple::new(2, b"data")).unwrap();
         let bytes = p.to_bytes().unwrap();
         let p2 = FixedTuplePage::from_bytes(&bytes).unwrap();
         assert_eq!(p2.count().unwrap(), 2);
-        assert_eq!(p2.get(&DBIdType::Int(1)).unwrap().unwrap().data, b"data");
+        assert_eq!(p2.get(&DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"data");
     }
 
     #[test]
     fn test_clone_independence() {
         let sz = tuple_size(b"hi");
-        let p = make_page(sz);
+        let mut p = make_page(sz);
         p.add(Tuple::new(1, b"hi")).unwrap();
-        let q = p.clone();
+        let mut q = p.clone();
         q.add(Tuple::new(2, b"hi")).unwrap();
         assert_eq!(p.count().unwrap(), 1);
         assert_eq!(q.count().unwrap(), 2);
@@ -219,8 +219,8 @@ mod tests {
     #[test]
     fn test_partial_eq() {
         let sz = tuple_size(b"a");
-        let p = make_page(sz);
-        let q = make_page(sz);
+        let mut p = make_page(sz);
+        let mut q = make_page(sz);
         assert_eq!(p, q);
         p.add(Tuple::new(1, b"a")).unwrap();
         assert_ne!(p, q);
