@@ -119,7 +119,12 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
-        Ok(to_allocvec(&self.values()?)?)
+        // Serialize borrowed tuples: no clone / refcount bump of the payloads on
+        // the writer-thread path. `Vec<&Tuple>` serializes identically to
+        // `Vec<Tuple>` (serde forwards `&T` to `T`), so the wire format — and
+        // thus `from_bytes` — is unchanged.
+        let refs: Vec<&Tuple> = self.data.values().flatten().collect();
+        Ok(to_allocvec(&refs)?)
     }
 
     fn clear(&mut self) -> Result<(), StoreError> {
