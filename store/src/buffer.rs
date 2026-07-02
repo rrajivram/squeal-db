@@ -143,6 +143,10 @@ where
         self.page_size
     }
 
+    pub(crate) fn page_count_val(&self) -> u64 {
+        self.page_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
         Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
     }
@@ -434,14 +438,10 @@ where
             }
             Some(PageEntry::Weak(weak)) => {
                 if let Some(arc) = weak.upgrade() {
-                    // Still alive — either the writer hasn't flushed the
-                    // write that evicted it yet, or another reader is
-                    // holding it. Either way, reuse it directly.
-                    // cache_strong updates access_map atomically with the
-                    // buffer insert, avoiding the race in the standalone
-                    // update_page_access + cache_strong two-step.
-                    self.cache_strong(page_num, arc.clone())?;
-                    return Ok(arc);
+                    // Still alive — reuse it, but via get_or_install so we don't
+                    // clobber a concurrent writer's newer Strong with our
+                    // upgraded (possibly stale) copy.
+                    return Ok(self.get_or_install(page_num, arc));
                 }
                 // Dead: the writer already dropped its copy, which only
                 // happens after the file write completed, so the backing
@@ -466,7 +466,11 @@ where
             self.header.page_size,
             self.header.first_page_offset,
         )?);
-        self.cache_strong(page_num, page.clone())?;
+        drop(file);
+        // get_or_install, not cache_strong: a concurrent writer may have installed
+        // a newer Strong while we were reading from disk; don't overwrite it with
+        // the older on-disk copy.
+        let page = self.get_or_install(page_num, page);
         page.accessed();
         Ok(page)
     }
@@ -499,16 +503,28 @@ where
     //      cannot pop a page that is in access_map but not yet in the buffer.
     fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
         let mut buffer = self.buffer.write();
+        self.cache_strong_locked(&mut buffer, page_num, page);
+        Ok(())
+    }
+
+    // Install `page` as the Strong resident, evicting/counting/LRU-updating under
+    // the caller's held buffer write lock. This UNCONDITIONALLY overwrites — it
+    // is for WRITERS (write_page/write_locked_page), which hold the per-page lock
+    // and are the authority on the page's latest contents.
+    fn cache_strong_locked(
+        &self,
+        buffer: &mut HashMap<PageId, PageEntry>,
+        page_num: PageId,
+        page: Arc<Page>,
+    ) {
         let already_strong = matches!(buffer.get(&page_num), Some(PageEntry::Strong(_)));
         if !already_strong {
             if self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries {
-                self.evict_lru_locked(&mut buffer);
+                self.evict_lru_locked(buffer);
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // Update LRU position under the same write lock so evict_lru_locked
-        // always sees a consistent (buffer entry, access_map entry) pair.
         let priority = u128::MAX - timestamp();
         if !self.access_map.contains(&page_num) {
             self.access_map.push(page_num, priority);
@@ -516,7 +532,27 @@ where
             self.access_map.change_priority(&page_num, priority);
         }
         buffer.insert(page_num, PageEntry::Strong(page));
-        Ok(())
+    }
+
+    // Reader-side cache fill. If a Strong resident already exists (a writer's
+    // current version), return THAT and never overwrite it — otherwise a slow
+    // reader that upgraded a stale Weak (or read an older copy from disk) would
+    // clobber a concurrent writer's fresh version, silently losing that write.
+    // Only when there is no Strong do we install our `page`.
+    fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
+        let mut buffer = self.buffer.write();
+        if let Some(PageEntry::Strong(arc)) = buffer.get(&page_num) {
+            let arc = arc.clone();
+            let priority = u128::MAX - timestamp();
+            if !self.access_map.contains(&page_num) {
+                self.access_map.push(page_num, priority);
+            } else {
+                self.access_map.change_priority(&page_num, priority);
+            }
+            return arc;
+        }
+        self.cache_strong_locked(&mut buffer, page_num, page.clone());
+        page
     }
 
     // Downgrades the LRU resident to Weak. Takes the caller's already-held

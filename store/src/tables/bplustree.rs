@@ -102,60 +102,57 @@ where
     }
 
     pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<(), StoreError> {
-        let mut page = self.buffer.get_page(self.table.first_data_page)?;
-        let mut data_page_id = self.table.first_data_page;
         let tuple_id = tuple.id.clone();
-        loop {
-            if page.can_store(&tuple) {
-                self.write_page(self.buffer.get_page_mut(data_page_id)?, tuple.clone())?;
-                break;
-            }
-            // data_chain_next skips overflow chains: if this page has overflow, it reads
-            // the terminator's next_page (the real data-chain link) instead of the
-            // overflow pointer stored in page.next_page.
-            let next_page_id = self.buffer.data_chain_next(&page, data_page_id)?;
-            if next_page_id.is_valid_next_page() {
-                data_page_id = next_page_id;
-                page = self.buffer.get_page(data_page_id)?;
-            } else {
-                let current_page_id = data_page_id;
-                data_page_id = self.buffer.alloc_page(false)?;
-                self.buffer.set_data_chain_next(current_page_id, data_page_id)?;
-                page = self.buffer.get_page(data_page_id)?;
-            }
+        // Write the data row, then insert its index entry. If the index insert
+        // fails (e.g. DuplicateKey, or lock contention), the data-page write we
+        // just did must be undone: otherwise it's an orphaned row with no undo
+        // record (Db::insert only logs the undo *after* this returns Ok), so a
+        // rollback can't clean it up and a later retry/re-insert leaves the same
+        // key's data on multiple pages. Making the whole insert atomic here is
+        // exactly "a failed insert rolls back its own partial work".
+        let data_page_id = self.write_data(&tuple)?;
+        let res = self.insert_index(tuple_id.clone(), data_page_id, txn);
+        if let Err(orig) = &res {
+            // Undo the data-page write. This MUST succeed — we just wrote the row
+            // to this exact page and hold no belief that anyone else touched it.
+            // Surface (don't swallow) any failure: a failing remove_tuple here
+            // means the row isn't where we wrote it, which is itself the kind of
+            // corruption we're hunting, and silently ignoring it would hide it.
+            let mut h = self.buffer.get_page_mut(data_page_id)?;
+            Arc::make_mut(&mut h.page)
+                .remove_tuple(tuple_id.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "insert cleanup: remove_tuple({:?}) on page {} failed after insert_index err {:?}: {:?}",
+                        tuple_id, data_page_id.0, orig, e
+                    )
+                });
+            self.buffer.write_locked_page(h)?;
         }
+        res
+    }
+
+    fn insert_index(
+        &self,
+        tuple_id: DBIdType,
+        data_page_id: PageId,
+        txn: TransactionId,
+    ) -> Result<(), StoreError> {
         let id_tuple = Tuple::new_with(
             tuple_id,
             &to_allocvec(&Node::Leaf(data_page_id))?,
             Some(txn.clone()),
             None,
         );
-
         // The root-split pre-check uses an unlocked read, so by the time
-        // insert_recursive holds the root lock, another thread may have filled
-        // the root leaf. The retry loop below catches PageCapacityError
-        // (returned by insert_recursive when it finds a leaf already full) and
-        // re-tries: on the next pass, split_if_needed (or split_root_page
-        // inside insert_recursive itself) will detect and split the full page.
-
+        // insert_recursive holds the root lock the root may already be split.
         let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 {
             self.split_root_page(handle, txn.clone())?;
         } else {
             drop(handle);
         }
-        let inserted_id = id_tuple.id.clone();
-        self.insert_recursive(id_tuple, txn, self.table.first_index_page, None)?;
-        // TEMPORARY DIAGNOSTIC: catch orphaning the instant it happens, with a
-        // full backtrace, instead of finding out 50,000 finds later in a
-        // separate verification pass.
-        if self.find(inserted_id.clone())?.is_none() {
-            panic!(
-                "DIAGNOSTIC: just-inserted id {:?} is unreachable immediately after insert_recursive returned Ok",
-                inserted_id
-            );
-        }
-        Ok(())
+        self.insert_recursive(id_tuple, txn, self.table.first_index_page, None)
         /*         let mut retries = 0u32;
                loop {
                    let page = self.buffer.get_page(self.table.first_index_page)?;
@@ -174,6 +171,30 @@ where
                    }
                }
         */
+    }
+
+    /// Place `tuple` on a data page and return that page's id. Locks each
+    /// candidate page before checking capacity (no unlocked scan), and always
+    /// terminates: a freshly allocated page's `can_store` is unconditionally
+    /// true, so the walk ends by appending a new page if none has room.
+    fn write_data(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
+        let mut data_page_id = self.table.first_data_page;
+        loop {
+            let handle = self.buffer.get_page_mut(data_page_id)?;
+            if handle.page.can_store(tuple) {
+                self.write_page(handle, tuple.clone())?;
+                return Ok(data_page_id);
+            }
+            let next = self.buffer.data_chain_next(&handle.page, data_page_id)?;
+            drop(handle);
+            if next.is_valid_next_page() {
+                data_page_id = next;
+            } else {
+                let new_id = self.buffer.alloc_page(false)?;
+                self.buffer.set_data_chain_next(data_page_id, new_id)?;
+                data_page_id = new_id;
+            }
+        }
     }
 
     pub fn find(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
@@ -202,7 +223,7 @@ where
         let mut h = self.buffer.get_page_mut(pid)?;
         let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
         self.buffer.write_locked_page(h)?;
-        self.remove_index_entry(id, self.table.first_index_page)?;
+        self.remove_index_entry(id, self.table.first_index_page, None)?;
         Ok(old)
     }
 
@@ -250,24 +271,49 @@ where
         }
     }
 
-    fn remove_index_entry(&self, id: DBIdType, start: PageId) -> Result<(), StoreError> {
-        let page = self.buffer.get_page(start)?;
-        if page.is_flag_set(INNER_NODE) {
-            for row in page.iter() {
+    fn remove_index_entry(
+        &self,
+        id: DBIdType,
+        start: PageId,
+        parent: Option<WritePageHandle>,
+    ) -> Result<(), StoreError> {
+        // Hand-over-hand locking, mirroring insert_recursive: lock this node,
+        // *then* release the parent. The previous version navigated with
+        // unlocked get_page() reads, so a concurrent split could move entries
+        // (and flip a node leaf<->inner) between the routing read here and the
+        // locked remove below — corrupting the index and orphaning unrelated
+        // keys. Deciding leaf-vs-inner under the same lock we mutate under
+        // closes that window.
+        let mut handle = self.buffer.get_page_mut(start)?;
+        drop(parent);
+        if handle.page.is_flag_set(INNER_NODE) {
+            let mut last_child: Option<PageId> = None;
+            for row in handle.page.iter() {
                 if id < row.id {
-                    let node = from_bytes::<Node>(&row.data)?;
-                    if let Node::Inner(page_num) = node {
-                        return self.remove_index_entry(id, page_num);
+                    if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
+                        return self.remove_index_entry(id, page_num, Some(handle));
                     } else {
                         panic!("Expected Inner. Found leaf! {:?}", row.id);
                     }
                 }
+                if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
+                    last_child = Some(page_num);
+                }
+            }
+            // id >= all separators: route to the last child (same fallthrough as
+            // find_page). Without this, a key in the rightmost child of a
+            // non-root inner node would never have its index entry removed.
+            if let Some(child) = last_child {
+                return self.remove_index_entry(id, child, Some(handle));
             }
             Ok(())
         } else {
-            let mut handle = self.buffer.get_page_mut(start)?;
-            Arc::make_mut(&mut handle.page).remove_tuple(id)?;
-            self.buffer.write_locked_page(handle)?;
+            // Tolerate an already-absent entry: a concurrent path may have
+            // removed it, or a committed tombstone was reclaimed elsewhere.
+            if handle.page.contains(id.clone())? {
+                Arc::make_mut(&mut handle.page).remove_tuple(id)?;
+                self.buffer.write_locked_page(handle)?;
+            }
             Ok(())
         }
     }

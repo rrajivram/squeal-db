@@ -237,25 +237,34 @@ where
         // The transaction simply stays active (and correctly invisible) until
         // a retried commit completes successfully.
         let id = txn.into_id();
-        let ops = self.logger.get_undo_operations(id.clone())?;
-        for o in ops {
-            match o {
-                Operation::Del(_, r) => {
-                    let table = self.table_by_id(r.table_id)?;
-                    let t = table.find(r.tuple.id.clone())?;
-                    if let Some(tuple) = t {
-                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| table.remove(tuple.id.clone()))?;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Commit point FIRST — make the transaction atomically committed before
+        // touching the tree. The physical reclamation of tombstoned rows below
+        // is best-effort cleanup (find() already treats a committed tombstone as
+        // absent), so it must not run *before* the commit: doing so let commit
+        // remove rows and then return Err from a later step, leaving the caller
+        // unable to tell "fully failed" from "partially applied" — which diverged
+        // the caller's state from the DB's (a committed remove the caller thought
+        // had failed).
         let op = Operation::Commit(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
-        self.tx_mgr.commit(id)?;
+        self.tx_mgr.commit(id.clone())?;
+
+        // Best-effort tombstone reclamation. Errors here do not un-commit the
+        // transaction; the tombstone stays and is handled by find() until a
+        // later pass reclaims it.
+        let ops = self.logger.get_undo_operations(id.clone())?;
+        for o in ops {
+            if let Operation::Del(_, r) = o {
+                if let Ok(table) = self.table_by_id(r.table_id) {
+                    if let Ok(Some(tuple)) = table.find(r.tuple.id.clone()) {
+                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
+                            let _ = retry_on_contention(|| table.remove(tuple.id.clone()));
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -328,8 +337,16 @@ where
         let table = self.table_by_id(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
-            let tuple = self.find_last_committed(&tuple).map(|t| t.into_owned());
-            return Ok(tuple);
+            let committed = self.find_last_committed(&tuple).map(|t| t.into_owned());
+            // A committed tombstone means the key was removed — it must be
+            // invisible even if its physical row hasn't been reclaimed yet.
+            // (commit reclaims tombstones best-effort AFTER its commit point, so
+            // a committed-but-not-yet-reclaimed tombstone can legitimately still
+            // be present in the tree.)
+            match committed {
+                Some(t) if t.is_tombstoned() => return Ok(None),
+                other => return Ok(other),
+            }
         } else {
             return Ok(None);
         }
