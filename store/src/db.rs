@@ -197,6 +197,10 @@ where
      * as MemFile does not survive recreating. Similarly with open_using.
      */
     pub fn close(self) -> Result<(F, F, F), StoreError> {
+        // Revert any still-aborting transactions before persisting: the aborting
+        // set is in-memory only, so an un-reverted aborted row would reappear as
+        // committed after reopen (its txn no longer being in any set).
+        self.drain_aborting();
         self.write_system_tables()?;
         let mut hdr = (*self.header).clone();
         hdr.page_count = self.page_count();
@@ -227,6 +231,13 @@ where
     }
 
     pub fn begin(&self) -> Result<Transaction, StoreError> {
+        // Reclaim any transactions abandoned via Transaction::drop (parked in
+        // `aborting`) before starting new work: they are already invisible, this
+        // physically reverts them so their rows don't linger and a re-insert of
+        // the same key finds it free. The reverts are conditional (see
+        // revert_txn_writes), so this is safe even if another thread is making
+        // forward progress on the same keys.
+        self.drain_aborting();
         Ok(self.tx_mgr.begin()?)
     }
 
@@ -237,6 +248,18 @@ where
         // The transaction simply stays active (and correctly invisible) until
         // a retried commit completes successfully.
         let id = txn.into_id();
+        // Capture the tombstoned rows to reclaim BEFORE writing the commit
+        // marker: logging a Commit op discards this txn's undo records (see
+        // Logger::log_undo), so we must read them first.
+        let del_records: Vec<Record> = self
+            .logger
+            .get_undo_operations(id.clone())?
+            .into_iter()
+            .filter_map(|o| match o {
+                Operation::Del(_, r) => Some(r),
+                _ => None,
+            })
+            .collect();
         // Commit point FIRST — make the transaction atomically committed before
         // touching the tree. The physical reclamation of tombstoned rows below
         // is best-effort cleanup (find() already treats a committed tombstone as
@@ -253,14 +276,11 @@ where
         // Best-effort tombstone reclamation. Errors here do not un-commit the
         // transaction; the tombstone stays and is handled by find() until a
         // later pass reclaims it.
-        let ops = self.logger.get_undo_operations(id.clone())?;
-        for o in ops {
-            if let Operation::Del(_, r) = o {
-                if let Ok(table) = self.table_by_id(r.table_id) {
-                    if let Ok(Some(tuple)) = table.find(r.tuple.id.clone()) {
-                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
-                            let _ = retry_on_contention(|| table.remove(tuple.id.clone()));
-                        }
+        for r in del_records {
+            if let Ok(table) = self.table_by_id(r.table_id) {
+                if let Ok(Some(tuple)) = table.find(r.tuple.id.clone()) {
+                    if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
+                        let _ = retry_on_contention(|| table.remove(tuple.id.clone()));
                     }
                 }
             }
@@ -269,37 +289,68 @@ where
     }
 
     pub fn rollback(&self, txn: Transaction) -> Result<(), StoreError> {
-        // See the comment in `commit` above — same reasoning applies here.
+        // See the comment in `commit` above — `into_id` prevents Drop's default
+        // rollback so this is the single place the txn changes state.
         let id = txn.into_id();
+        // Revert while the txn is STILL ACTIVE. Active transactions are invisible
+        // (is_committed == false) and are never scanned by drain_aborting, so the
+        // owner reverts its own writes with zero cross-thread interference — no
+        // other thread can observe or reclaim this txn mid-revert. Only once the
+        // writes are physically undone do we retire it from the active set.
+        // Revert BEFORE the Rollback marker, which discards the undo records.
+        self.revert_txn_writes(&id)?;
+        let op = Operation::Rollback(id.clone(), timestamp());
+        self.logger.log_redo(op.clone())?;
+        self.logger.log_undo(op)?;
+        self.tx_mgr.finish_rolled_back(id);
+        Ok(())
+    }
+
+    /// Physically revert `id`'s writes by replaying its undo log. Each op is
+    /// applied *conditionally* — only if the row still belongs to `id` at the
+    /// moment of the write, checked under the data-page lock
+    /// (update_if_txn / remove_if_txn) — so a concurrent forward write to the
+    /// same key by another transaction is never clobbered. Performs no
+    /// transaction-set or undo-log bookkeeping; callers do that.
+    fn revert_txn_writes(&self, id: &TransactionId) -> Result<(), StoreError> {
         let ops = self.logger.get_undo_operations(id.clone())?;
         for o in ops {
             match o {
                 Operation::Add(_, r) => {
                     let table = self.table_by_id(r.table_id)?;
-                    let tuple = table.find(r.tuple.id.clone())?;
-                    if let Some(tuple) = tuple {
-                        if tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| table.remove(r.tuple.id.clone()))?;
-                        }
-                    }
+                    retry_on_contention(|| table.remove_if_txn(r.tuple.id.clone(), id))?;
                 }
                 Operation::Del(_, r) | Operation::Mod(_, r) => {
                     let table = self.table_by_id(r.table_id)?;
-                    let tuple = table.find(r.tuple.id.clone())?;
-                    if let Some(tuple) = tuple {
-                        if tuple.is_same_txn(id.clone()) {
-                            retry_on_contention(|| table.update(r.tuple.clone()))?;
-                        }
-                    }
+                    retry_on_contention(|| table.update_if_txn(r.tuple.clone(), id))?;
                 }
                 _ => {}
             }
         }
-        let op = Operation::Rollback(id.clone(), timestamp());
-        self.logger.log_redo(op.clone())?;
-        self.logger.log_undo(op)?;
-        self.tx_mgr.rollback(id)?;
         Ok(())
+    }
+
+    /// Reclaim a transaction parked in `aborting` — one abandoned via
+    /// Transaction::drop, which has no table access to revert itself. Reverts its
+    /// writes, drops its undo records, then finishes the abort. Safe to run
+    /// concurrently with the owner's forward progress (and with another drainer)
+    /// thanks to the conditional reverts in revert_txn_writes.
+    fn revert_aborted(&self, id: &TransactionId) -> Result<(), StoreError> {
+        self.revert_txn_writes(id)?;
+        self.logger.discard_undo(id);
+        self.tx_mgr.abort_complete(id);
+        Ok(())
+    }
+
+    /// Best-effort reclamation of transactions parked in `aborting` by
+    /// Transaction::drop. Only *dropped* txns land there — a Db-level rollback
+    /// reverts itself while active and never enters this set — so under healthy
+    /// operation this is empty and the loop is a no-op. A revert that errors is
+    /// simply retried on the next drain (the txn stays invisible meanwhile).
+    pub(crate) fn drain_aborting(&self) {
+        for id in self.tx_mgr.aborting_ids() {
+            let _ = self.revert_aborted(&id);
+        }
     }
 
     pub(crate) fn table_by_id(&self, id: TableIdType) -> Result<Arc<BPlusTree<F>>, StoreError> {
@@ -429,7 +480,11 @@ where
 
     fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
         if let Some(txn) = tuple.txn_id.clone() {
-            if !self.tx_mgr.is_transaction_active(&txn) {
+            // Visible iff the writer COMMITTED — i.e. it is neither still active
+            // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
+            // in `aborting` and is therefore correctly invisible here even
+            // though it has left the active set.
+            if self.tx_mgr.is_committed(&txn) {
                 Some(Cow::Borrowed(tuple))
             } else {
                 let mut tuple = tuple.clone();
@@ -440,18 +495,22 @@ where
                     }
                     let undo_id = tuple.undo_id.unwrap();
 
-                    let t = self.logger.find_undo_tuple(txn.clone(), undo_id);
-                    let next_tuple = t.expect(
-                        format!("Could not find undo record for {:?},{:?}", txn, undo_id).as_str(),
-                    );
-                    let next_txn = next_tuple
-                        .txn_id
-                        .clone()
-                        .expect(format!("Could not find txn id for {}", tuple.id).as_str());
-                    if !self.tx_mgr.is_transaction_active(&next_txn) {
+                    // Tolerate a missing undo record: an aborting txn's undo can
+                    // be discarded concurrently once its rows are reverted. If we
+                    // can't walk further, treat the row as not-yet-committed
+                    // (invisible) rather than panicking.
+                    let next_tuple = match self.logger.find_undo_tuple(txn.clone(), undo_id) {
+                        Some(t) => t,
+                        None => return None,
+                    };
+                    let next_txn = match next_tuple.txn_id.clone() {
+                        Some(t) => t,
+                        None => return None,
+                    };
+                    if self.tx_mgr.is_committed(&next_txn) {
                         // next_tuple is the committed ancestor we walked back
                         // to — return it, not the in-flight `tuple` we started
-                        // from (which belongs to the still-active txn and must
+                        // from (which belongs to a non-committed txn and must
                         // stay invisible to other readers).
                         return Some(Cow::Owned(next_tuple));
                     }
@@ -829,6 +888,69 @@ mod tests {
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
         assert!(found.is_none(), "rolled-back insert must not be visible");
+    }
+
+    #[test]
+    fn test_txn_dropped_guard_insert_not_visible() {
+        // A transaction guard dropped WITHOUT commit/rollback (e.g. an uncaught
+        // error) must not leak its writes as committed. Its write stays invisible
+        // (parked in `aborting`) and is physically reverted on the next drain.
+        let (db, tid) = make_db_with_table();
+        {
+            let txn = db.begin().unwrap();
+            db.insert(tid, row(1, b"dropped"), &txn).unwrap();
+            // txn dropped here — no commit, no rollback.
+        }
+        let txn2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn2).unwrap();
+        drop(txn2);
+        assert!(
+            found.is_none(),
+            "a dropped transaction's insert must not be visible as committed"
+        );
+    }
+
+    #[test]
+    fn test_txn_dropped_guard_update_reverts_to_committed() {
+        // A dropped guard that UPDATED a committed key must not leak the update;
+        // the committed value stands, and is physically restored on the next
+        // drain (Mod-revert path).
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t0).unwrap();
+        db.commit(t0).unwrap();
+        {
+            let t1 = db.begin().unwrap();
+            db.update(tid, row(1, b"v2"), &t1).unwrap();
+            // t1 dropped here — no commit, no rollback.
+        }
+        let t2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &t2).unwrap();
+        drop(t2);
+        assert_eq!(
+            found.expect("committed v1 must remain").data,
+            b"v1",
+            "a dropped update must not be visible; committed value stands"
+        );
+    }
+
+    #[test]
+    fn test_txn_dropped_guard_then_reinsert_succeeds() {
+        // After a dropped transaction's insert is reverted, the same key can be
+        // re-inserted cleanly (its orphaned row/index entry must be gone).
+        let (db, tid) = make_db_with_table();
+        {
+            let txn = db.begin().unwrap();
+            db.insert(tid, row(1, b"dropped"), &txn).unwrap();
+        }
+        let txn2 = db.begin().unwrap();
+        db.insert(tid, row(1, b"real"), &txn2).unwrap();
+        db.commit(txn2).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn3).unwrap();
+        drop(txn3);
+        assert_eq!(found.expect("re-insert must be visible").data(), b"real");
     }
 
     #[test]

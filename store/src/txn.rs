@@ -40,6 +40,15 @@ const TXN_GENERATOR_NANE: &str = "__system.transactions";
 pub(crate) struct TransactionManager {
     gens: Arc<Generator>,
     active_transactions: RwLock<HashSet<TransactionId>>,
+    // Aborted transactions whose writes have NOT yet been physically reverted.
+    // A transaction is "committed" (and therefore visible) only if it is in
+    // NEITHER `active_transactions` NOR here: committing removes it from
+    // `active`, so it falls through to visible; aborting moves it here and it
+    // stays invisible until `Db` drains it (replays its undo log, then calls
+    // abort_complete). This is what keeps a dropped/aborted txn's un-reverted
+    // rows from being read as committed — without storing any per-committed-txn
+    // record. Both sets are bounded by concurrency / abort backlog, not history.
+    aborting_transactions: RwLock<HashSet<TransactionId>>,
     transaction_data: RwLock<HashMap<u64, TransactionData>>,
 }
 
@@ -107,6 +116,7 @@ impl TransactionManager {
         Ok(Self {
             gens,
             active_transactions: RwLock::new(HashSet::new()),
+            aborting_transactions: RwLock::new(HashSet::new()),
             transaction_data: RwLock::new(HashMap::new()),
         })
     }
@@ -153,16 +163,62 @@ impl TransactionManager {
         self.active_transactions.read().contains(txn)
     }
 
+    /// A transaction's writes are visible ("committed") only if it is neither
+    /// still in flight nor aborting-with-unreverted-writes. Absence from both
+    /// sets is the definition of committed — no per-committed-txn record is kept.
+    pub(crate) fn is_committed(&self, txn: &TransactionId) -> bool {
+        !self.active_transactions.read().contains(txn)
+            && !self.aborting_transactions.read().contains(txn)
+    }
+
     pub(crate) fn commit(&self, txn: TransactionId) -> Result<(), StoreError> {
         self.active_transactions.write().remove(&txn);
         self.transaction_data.write().remove(&txn.0.id);
         Ok(())
     }
 
-    pub(crate) fn rollback(&self, txn: TransactionId) -> Result<(), StoreError> {
+    /// Begin aborting `txn`: move it out of `active` and into `aborting` so its
+    /// writes stay invisible. The physical revert (replaying the undo log) is
+    /// done separately by `Db` (which has table access), which then calls
+    /// `abort_complete`. Callers without table access (Transaction::drop) can
+    /// only get this far; the revert is drained by the next Db operation.
+    pub(crate) fn abort(&self, txn: TransactionId) -> Result<(), StoreError> {
+        let mut active = self.active_transactions.write();
+        let mut aborting = self.aborting_transactions.write();
+        active.remove(&txn);
+        aborting.insert(txn);
+        Ok(())
+    }
+
+    /// Retire a transaction whose writes were already physically reverted by a
+    /// Db-level rollback (revert-while-active). Set-level bookkeeping is
+    /// identical to `commit` — the txn simply stops being tracked — but its
+    /// writes were undone rather than published. It never enters `aborting`, so
+    /// no drain ever touches it: the owner reverts its own writes with no
+    /// cross-thread interference, then calls this.
+    pub(crate) fn finish_rolled_back(&self, txn: TransactionId) {
         self.active_transactions.write().remove(&txn);
         self.transaction_data.write().remove(&txn.0.id);
-        Ok(())
+    }
+
+    /// Finish aborting `txn` — call only after its undo log has been fully
+    /// replayed (all its rows reverted). Now it becomes "committed" by absence,
+    /// but no rows carrying its id remain, so nothing reads it as committed.
+    pub(crate) fn abort_complete(&self, txn: &TransactionId) {
+        self.aborting_transactions.write().remove(txn);
+        self.transaction_data.write().remove(&txn.0.id);
+    }
+
+    /// Snapshot of transactions whose undo still needs to be replayed.
+    pub(crate) fn aborting_ids(&self) -> Vec<TransactionId> {
+        self.aborting_transactions.read().iter().cloned().collect()
+    }
+
+    /// Back-compat shim: an explicit rollback with no undo replay just parks the
+    /// txn as aborting (invisible). Kept so `Transaction::rollback`/`drop` never
+    /// mislabel a txn as committed. Db-level rollback replays the undo itself.
+    pub(crate) fn rollback(&self, txn: TransactionId) -> Result<(), StoreError> {
+        self.abort(txn)
     }
 
     pub(crate) fn snapshots(&self) -> RwLockReadGuard<'_, HashMap<u64, TransactionData>> {

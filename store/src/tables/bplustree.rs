@@ -112,22 +112,19 @@ where
         // exactly "a failed insert rolls back its own partial work".
         let data_page_id = self.write_data(&tuple)?;
         let res = self.insert_index(tuple_id.clone(), data_page_id, txn);
-        if let Err(orig) = &res {
-            // Undo the data-page write. This MUST succeed — we just wrote the row
-            // to this exact page and hold no belief that anyone else touched it.
-            // Surface (don't swallow) any failure: a failing remove_tuple here
-            // means the row isn't where we wrote it, which is itself the kind of
-            // corruption we're hunting, and silently ignoring it would hide it.
+        if res.is_err() {
+            // Undo the data-page write so a failed index insert leaves no
+            // orphaned row. Tolerate the row already being gone (KeyNotFound):
+            // a concurrent abort-revert (drain_aborting) can remove it between
+            // write_data and here — which is exactly the cleanup goal already
+            // met. Any *other* error still propagates (real corruption isn't
+            // swallowed).
             let mut h = self.buffer.get_page_mut(data_page_id)?;
-            Arc::make_mut(&mut h.page)
-                .remove_tuple(tuple_id.clone())
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "insert cleanup: remove_tuple({:?}) on page {} failed after insert_index err {:?}: {:?}",
-                        tuple_id, data_page_id.0, orig, e
-                    )
-                });
-            self.buffer.write_locked_page(h)?;
+            match Arc::make_mut(&mut h.page).remove_tuple(tuple_id.clone()) {
+                Ok(_) => self.buffer.write_locked_page(h)?,
+                Err(StoreError::KeyNotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
         }
         res
     }
@@ -225,6 +222,63 @@ where
         self.buffer.write_locked_page(h)?;
         self.remove_index_entry(id, self.table.first_index_page, None)?;
         Ok(old)
+    }
+
+    /// Conditional `update` for abort-revert: replaces the row for `tuple.id`
+    /// with `tuple` **only if** the row currently on the page still belongs to
+    /// `expect_txn`. The read-check-and-write all happen under the same data-page
+    /// lock, so this is atomic with respect to a concurrent forward writer to the
+    /// same key — the write that would clobber a just-committed value never fires.
+    /// Returns Ok(None) when the row is gone or has been taken over by another
+    /// transaction (the revert is correctly a no-op in that case).
+    pub(crate) fn update_if_txn(
+        &self,
+        tuple: Tuple,
+        expect_txn: &TransactionId,
+    ) -> Result<Option<Tuple>, StoreError> {
+        let id = tuple.id.clone();
+        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let mut h = self.buffer.get_page_mut(pid)?;
+        let matches = matches!(
+            h.page.get(id.clone())?,
+            Some(cur) if cur.is_same_txn(expect_txn.clone())
+        );
+        if !matches {
+            return Ok(None);
+        }
+        let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
+        self.buffer.write_locked_page(h)?;
+        Ok(Some(old))
+    }
+
+    /// Conditional `remove` for abort-revert — see `update_if_txn`. Removes the
+    /// row (and its index entry) only if it still belongs to `expect_txn`, atomic
+    /// under the data-page lock. Returns Ok(None) if it is already gone or owned
+    /// by another transaction.
+    pub(crate) fn remove_if_txn(
+        &self,
+        id: DBIdType,
+        expect_txn: &TransactionId,
+    ) -> Result<Option<Tuple>, StoreError> {
+        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let mut h = self.buffer.get_page_mut(pid)?;
+        let matches = matches!(
+            h.page.get(id.clone())?,
+            Some(cur) if cur.is_same_txn(expect_txn.clone())
+        );
+        if !matches {
+            return Ok(None);
+        }
+        let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+        self.buffer.write_locked_page(h)?;
+        self.remove_index_entry(id, self.table.first_index_page, None)?;
+        Ok(Some(old))
     }
 
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {

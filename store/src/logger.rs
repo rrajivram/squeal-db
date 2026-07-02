@@ -108,12 +108,12 @@ impl Logger {
                     .or_insert(vec![op.clone()]);
                 MsgType::Undo(UndoOperation {
                     undo_id: Some(UndoId(id.len() as u16)),
-                    operation: op,
+                    operation: op.clone(),
                 })
             }
             _ => MsgType::Undo(UndoOperation {
                 undo_id: None,
-                operation: op,
+                operation: op.clone(),
             }),
         };
         if let Some(tx) = &self.undo_tx {
@@ -121,7 +121,20 @@ impl Logger {
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             // Now store record if available
         }
+        match &op {
+            Operation::Commit(id, _) | Operation::Rollback(id, _) => {
+                self.undo_txns.write().remove(id);
+            }
+            _ => {}
+        }
         Ok(())
+    }
+
+    /// Drop a transaction's in-memory undo records. Called after its undo has
+    /// been fully replayed (abort reclamation) — a dropped/aborted txn logs no
+    /// Commit/Rollback op, so its records aren't cleaned by log_undo above.
+    pub(crate) fn discard_undo(&self, id: &TransactionId) {
+        self.undo_txns.write().remove(id);
     }
 
     pub(crate) fn next_undo_id(&self, id: TransactionId) -> Result<UndoId, StoreError> {
