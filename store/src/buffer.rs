@@ -957,7 +957,7 @@ mod tests {
         let cached = buf.get_page(page_id).unwrap();
         assert_eq!(cached.count().unwrap(), 1);
         assert_eq!(
-            cached.get(DBIdType::Int(1)).unwrap().unwrap().data,
+            cached.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
             b"hello"
         );
         let _ = buf.shutdown();
@@ -1000,7 +1000,7 @@ mod tests {
         let cached = buf.get_page(page_id).unwrap();
         assert_eq!(cached.count().unwrap(), 1);
         let tuple = cached.get(DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(tuple.data.as_slice(), big_data.as_slice());
+        assert_eq!(tuple.data.to_vec(), big_data.as_slice());
         let _ = buf.shutdown();
     }
 
@@ -1027,7 +1027,7 @@ mod tests {
         let retrieved = buf2.get_page(page_id).unwrap();
         assert_eq!(retrieved.count().unwrap(), 1);
         let tuple = retrieved.get(DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(tuple.data.as_slice(), big_data.as_slice());
+        assert_eq!(tuple.data.to_vec(), big_data.as_slice());
         let _ = buf2.shutdown();
     }
 

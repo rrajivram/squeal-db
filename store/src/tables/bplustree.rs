@@ -726,7 +726,7 @@ mod tests {
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
-        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data, b"hello");
+        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"hello");
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 1);
@@ -791,7 +791,7 @@ mod tests {
 
         // All three remain findable through the index.
         for i in 1u64..=3 {
-            assert_eq!(tree.find(DBIdType::Int(i)).unwrap().unwrap().data, large);
+            assert_eq!(tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(), large);
         }
     }
 
@@ -860,8 +860,8 @@ mod tests {
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 2);
-        assert_eq!(dp.get(id1.clone()).unwrap().unwrap().data, b"a-data");
-        assert_eq!(dp.get(id2.clone()).unwrap().unwrap().data, b"b-data");
+        assert_eq!(dp.get(id1.clone()).unwrap().unwrap().data.to_vec(), b"a-data");
+        assert_eq!(dp.get(id2.clone()).unwrap().unwrap().data.to_vec(), b"b-data");
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 2);
@@ -904,7 +904,7 @@ mod tests {
         // Original value must be untouched, and no second entry was added.
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
-        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data, b"first");
+        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"first");
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
-        assert_eq!(dp.get(id).unwrap().unwrap().data, b"first");
+        assert_eq!(dp.get(id).unwrap().unwrap().data.to_vec(), b"first");
     }
 
     #[test]
@@ -930,7 +930,7 @@ mod tests {
         let tree = make_tree(BIG);
         tree.insert(Tuple::new(1, b"hello"), txn()).unwrap();
         let found = tree.find(DBIdType::Int(1)).unwrap();
-        assert_eq!(found.unwrap().data, b"hello");
+        assert_eq!(found.unwrap().data.to_vec(), b"hello");
     }
 
     #[test]
@@ -955,7 +955,7 @@ mod tests {
         }
         for i in 1u64..=5 {
             let t = tree.find(DBIdType::Int(i)).unwrap().unwrap();
-            assert_eq!(t.data, format!("val-{i}").into_bytes());
+            assert_eq!(t.data.to_vec(), format!("val-{i}").into_bytes());
         }
         assert!(tree.find(DBIdType::Int(6)).unwrap().is_none());
     }
@@ -969,7 +969,7 @@ mod tests {
         }
         for id in 1u64..=8 {
             let t = tree.find(DBIdType::Int(id)).unwrap().unwrap();
-            assert_eq!(t.data, format!("v{id}").into_bytes());
+            assert_eq!(t.data.to_vec(), format!("v{id}").into_bytes());
         }
     }
 
@@ -980,7 +980,7 @@ mod tests {
         tree.insert(Tuple::new_with(id.clone(), b"a-data", None, None), txn())
             .unwrap();
         let found = tree.find(id).unwrap().unwrap();
-        assert_eq!(found.data, b"a-data");
+        assert_eq!(found.data.to_vec(), b"a-data");
         assert!(
             tree.find(DBIdType::from("missing".to_string()))
                 .unwrap()
@@ -1000,8 +1000,8 @@ mod tests {
         // id 3 lives on the second (overflow) data page; find() must follow the
         // index's Node::Leaf pointer there rather than only checking the first page.
         let found = tree.find(DBIdType::Int(3)).unwrap().unwrap();
-        assert_eq!(found.data, large);
-        assert_eq!(tree.find(DBIdType::Int(1)).unwrap().unwrap().data, large);
+        assert_eq!(found.data.to_vec(), large);
+        assert_eq!(tree.find(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), large);
     }
 
     #[test]
@@ -1021,7 +1021,7 @@ mod tests {
         for i in 1u64..=5 {
             let found = tree.find(DBIdType::Int(i)).unwrap();
             assert_eq!(
-                found.map(|t| t.data),
+                found.map(|t| t.data.to_vec()),
                 Some(format!("v{i}").into_bytes()),
                 "id {i} must be found after root split"
             );
@@ -1055,7 +1055,7 @@ mod tests {
             let id = DBIdType::from(k.to_string());
             let found = tree.find(id).unwrap();
             assert_eq!(
-                found.map(|t| t.data),
+                found.map(|t| t.data.to_vec()),
                 Some(k.as_bytes().to_vec()),
                 "key {k} must be found after split"
             );
@@ -1165,10 +1165,10 @@ mod tests {
             .unwrap();
 
         let old = tree.update(tuple_with_txn(1.into(), b"world")).unwrap();
-        assert_eq!(old.data, b"hello", "update must return the previous value");
+        assert_eq!(old.data.to_vec(), b"hello", "update must return the previous value");
 
         let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(found.data, b"world", "update must replace the stored value");
+        assert_eq!(found.data.to_vec(), b"world", "update must replace the stored value");
     }
 
     #[test]
@@ -1183,9 +1183,9 @@ mod tests {
         for i in 1u64..=5 {
             let found = tree.find(DBIdType::Int(i)).unwrap().unwrap();
             if i == 3 {
-                assert_eq!(found.data, b"updated");
+                assert_eq!(found.data.to_vec(), b"updated");
             } else {
-                assert_eq!(found.data, format!("v{i}").into_bytes());
+                assert_eq!(found.data.to_vec(), format!("v{i}").into_bytes());
             }
         }
     }
@@ -1200,8 +1200,8 @@ mod tests {
         let old = tree
             .update(tuple_with_txn(id.clone(), b"a-data-2"))
             .unwrap();
-        assert_eq!(old.data, b"a-data");
-        assert_eq!(tree.find(id).unwrap().unwrap().data, b"a-data-2");
+        assert_eq!(old.data.to_vec(), b"a-data");
+        assert_eq!(tree.find(id).unwrap().unwrap().data.to_vec(), b"a-data-2");
     }
 
     #[test]
@@ -1248,7 +1248,7 @@ mod tests {
             .unwrap();
 
         let removed = tree.remove(DBIdType::Int(1)).unwrap();
-        assert_eq!(removed.data, b"hello");
+        assert_eq!(removed.data.to_vec(), b"hello");
 
         assert!(
             tree.find(DBIdType::Int(1)).unwrap().is_none(),
@@ -1270,7 +1270,7 @@ mod tests {
         assert!(tree.find(DBIdType::Int(3)).unwrap().is_none());
         for i in [1u64, 2, 4, 5] {
             let found = tree.find(DBIdType::Int(i)).unwrap().unwrap();
-            assert_eq!(found.data, format!("v{i}").into_bytes());
+            assert_eq!(found.data.to_vec(), format!("v{i}").into_bytes());
         }
     }
 
@@ -1282,7 +1282,7 @@ mod tests {
             .unwrap();
 
         let removed = tree.remove(id.clone()).unwrap();
-        assert_eq!(removed.data, b"a-data");
+        assert_eq!(removed.data.to_vec(), b"a-data");
         assert!(tree.find(id).unwrap().is_none());
     }
 
@@ -1313,7 +1313,7 @@ mod tests {
         // Re-inserting the same id must succeed once the index entry is gone.
         tree.insert(Tuple::new(1, b"second"), txn()).unwrap();
         let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(found.data, b"second");
+        assert_eq!(found.data.to_vec(), b"second");
     }
 
     #[test]
@@ -1329,7 +1329,7 @@ mod tests {
         for i in 0u64..400 {
             let found = tree.find(DBIdType::Int(i)).unwrap();
             assert_eq!(
-                found.map(|t| t.data),
+                found.map(|t| t.data.to_vec()),
                 Some(format!("v{i}").into_bytes()),
                 "id {i} must remain findable after 400 inserts across multiple splits"
             );

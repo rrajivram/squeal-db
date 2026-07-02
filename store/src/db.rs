@@ -874,7 +874,7 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("row should be visible").data, b"hello");
+        assert_eq!(found.expect("row should be visible").data.to_vec(), b"hello");
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
         let found = db.find(tid, id(1), &t2).unwrap();
         drop(t2);
         assert_eq!(
-            found.expect("committed v1 must remain").data,
+            found.expect("committed v1 must remain").data.to_vec(),
             b"v1",
             "a dropped update must not be visible; committed value stands"
         );
@@ -963,9 +963,9 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(tid, id(1), &txn2).unwrap().unwrap().data, b"A");
-        assert_eq!(db.find(tid, id(2), &txn2).unwrap().unwrap().data, b"B");
-        assert_eq!(db.find(tid, id(3), &txn2).unwrap().unwrap().data, b"C");
+        assert_eq!(db.find(tid, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"A");
+        assert_eq!(db.find(tid, id(2), &txn2).unwrap().unwrap().data.to_vec(), b"B");
+        assert_eq!(db.find(tid, id(3), &txn2).unwrap().unwrap().data.to_vec(), b"C");
         drop(txn2);
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
         let found = db.find(tid, id(42), &txn3).unwrap();
         drop(txn3);
         assert_eq!(
-            found.expect("committed row must be visible").data,
+            found.expect("committed row must be visible").data.to_vec(),
             b"secret"
         );
     }
@@ -1032,7 +1032,7 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("updated row must exist").data, b"v2");
+        assert_eq!(found.expect("updated row must exist").data.to_vec(), b"v2");
     }
 
     #[test]
@@ -1051,7 +1051,7 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("original must still be visible").data, b"v1");
+        assert_eq!(found.expect("original must still be visible").data.to_vec(), b"v1");
 
         db.commit(txn2).unwrap();
     }
@@ -1110,7 +1110,7 @@ mod tests {
         assert_eq!(
             found
                 .expect("row must still be visible before remove commits")
-                .data,
+                .data.to_vec(),
             b"alive"
         );
 
@@ -1149,8 +1149,8 @@ mod tests {
         db.commit(txn2).unwrap();
 
         let txn3 = db.begin().unwrap();
-        assert_eq!(db.find(tid, id(1), &txn3).unwrap().unwrap().data, b"A_v2");
-        assert_eq!(db.find(tid, id(2), &txn3).unwrap().unwrap().data, b"B");
+        assert_eq!(db.find(tid, id(1), &txn3).unwrap().unwrap().data.to_vec(), b"A_v2");
+        assert_eq!(db.find(tid, id(2), &txn3).unwrap().unwrap().data.to_vec(), b"B");
         assert!(
             db.find(tid, id(3), &txn3).unwrap().is_none(),
             "removed row must be gone"
@@ -1174,7 +1174,7 @@ mod tests {
         for i in 0..N {
             let found = db.find(tid, id(i), &txn2).unwrap();
             assert_eq!(
-                found.unwrap_or_else(|| panic!("row {i} missing")).data,
+                found.unwrap_or_else(|| panic!("row {i} missing")).data.to_vec(),
                 format!("val_{i}").as_bytes(),
                 "row {i} has wrong data"
             );
@@ -1199,7 +1199,7 @@ mod tests {
         let found = db2.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
         assert_eq!(
-            found.expect("data must survive close/reopen").data,
+            found.expect("data must survive close/reopen").data.to_vec(),
             b"persistent"
         );
     }
@@ -1325,7 +1325,7 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("original row must still exist").data, b"v1");
+        assert_eq!(found.expect("original row must still exist").data.to_vec(), b"v1");
     }
 
     #[test]
@@ -1344,7 +1344,7 @@ mod tests {
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
         assert_eq!(
-            found.expect("row must survive a rolled-back remove").data,
+            found.expect("row must survive a rolled-back remove").data.to_vec(),
             b"alive"
         );
     }
@@ -1361,8 +1361,8 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data, b"a1");
-        assert_eq!(db.find(tb, id(1), &txn2).unwrap().unwrap().data, b"b1");
+        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"a1");
+        assert_eq!(db.find(tb, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"b1");
         drop(txn2);
     }
 
@@ -1396,7 +1396,7 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data, b"a_v2");
+        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"a_v2");
         assert!(db.find(tb, id(1), &txn2).unwrap().is_none());
         drop(txn2);
     }
@@ -1417,12 +1417,12 @@ mod tests {
 
         let txn2 = db.begin().unwrap();
         assert_eq!(
-            db.find(ta, id(1), &txn2).unwrap().unwrap().data,
+            db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(),
             b"a_v1",
             "table A update must be rolled back"
         );
         assert_eq!(
-            db.find(tb, id(1), &txn2).unwrap().unwrap().data,
+            db.find(tb, id(1), &txn2).unwrap().unwrap().data.to_vec(),
             b"b_v1",
             "table B remove must be rolled back"
         );
@@ -1456,7 +1456,7 @@ mod tests {
             "table A's successful insert must be undone by the txn-wide rollback"
         );
         assert_eq!(
-            db.find(tb, id(1), &txn2).unwrap().unwrap().data,
+            db.find(tb, id(1), &txn2).unwrap().unwrap().data.to_vec(),
             b"existing",
             "table B must be unaffected by the failed duplicate insert"
         );
@@ -1480,7 +1480,7 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("large object must be visible after commit").data, big);
+        assert_eq!(found.expect("large object must be visible after commit").data.to_vec(), big);
     }
 
     #[test]
@@ -1509,7 +1509,7 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(42), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("5-page object must survive commit").data, big);
+        assert_eq!(found.expect("5-page object must survive commit").data.to_vec(), big);
     }
 
     #[test]
@@ -1528,7 +1528,7 @@ mod tests {
         let found = db2.find(tid, id(99), &txn2).unwrap();
         drop(txn2);
         assert_eq!(
-            found.expect("large object must survive close/reopen").data,
+            found.expect("large object must survive close/reopen").data.to_vec(),
             big
         );
     }
@@ -1548,7 +1548,7 @@ mod tests {
         for i in 1u64..=3 {
             let found = db.find(tid, id(i), &txn2).unwrap();
             assert_eq!(
-                found.unwrap_or_else(|| panic!("row {i} missing")).data,
+                found.unwrap_or_else(|| panic!("row {i} missing")).data.to_vec(),
                 small
             );
         }
@@ -1573,7 +1573,7 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(7), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("re-inserted large object must be visible").data, big);
+        assert_eq!(found.expect("re-inserted large object must be visible").data.to_vec(), big);
     }
 
     // ── large-object: exercise EVERY public op at 4–8× the page size ──────────
@@ -1609,7 +1609,7 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("inserted").data,
+            db.find(tid, id(1), &t).unwrap().expect("inserted").data.to_vec(),
             base
         );
         db.rollback(t).unwrap();
@@ -1620,7 +1620,7 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("grown").data,
+            db.find(tid, id(1), &t).unwrap().expect("grown").data.to_vec(),
             grown
         );
         db.rollback(t).unwrap();
@@ -1631,7 +1631,7 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("shrunk").data,
+            db.find(tid, id(1), &t).unwrap().expect("shrunk").data.to_vec(),
             shrunk
         );
         db.rollback(t).unwrap();
@@ -1655,7 +1655,7 @@ mod tests {
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
         let t = db2.begin().unwrap();
         assert_eq!(
-            db2.find(tid, id(1), &t).unwrap().expect("reopened").data,
+            db2.find(tid, id(1), &t).unwrap().expect("reopened").data.to_vec(),
             reins
         );
         db2.rollback(t).unwrap();
@@ -1680,7 +1680,7 @@ mod tests {
 
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(5), &t).unwrap().expect("v1 must stand").data,
+            db.find(tid, id(5), &t).unwrap().expect("v1 must stand").data.to_vec(),
             v1,
             "rolled-back large update must leave the committed value intact"
         );
@@ -1707,7 +1707,7 @@ mod tests {
             db.find(tid, id(8), &t)
                 .unwrap()
                 .expect("large object must survive a rolled-back remove")
-                .data,
+                .data.to_vec(),
             v
         );
         db.rollback(t).unwrap();

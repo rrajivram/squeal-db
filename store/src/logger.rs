@@ -446,10 +446,10 @@ mod tests {
         );
         assert_eq!(t.txn_id, Some(txn.clone()));
         assert_eq!(t.undo_id, Some(undo));
-        assert_eq!(t.data, b"hello");
+        assert_eq!(t.data.to_vec(), b"hello");
         let b = t.to();
         let t2 = Tuple::from(&b).unwrap();
         assert_eq!(t2.txn_id, Some(txn));
-        assert_eq!(t2.data, b"hello");
+        assert_eq!(t2.data.to_vec(), b"hello");
     }
 }

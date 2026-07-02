@@ -1,4 +1,5 @@
 use std::fmt::Display;
+use std::sync::Arc;
 
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,11 @@ pub struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
     pub(crate) undo_id: Option<UndoId>,
-    pub(crate) data: Vec<u8>,
+    // Reference-counted so cloning a Tuple (page scans, undo records, find/get)
+    // is an O(1) refcount bump instead of copying the whole payload. Serializes
+    // identically to `Vec<u8>` in postcard (a seq of u8), so on-disk format is
+    // unchanged. Mutation replaces the whole Arc (see `set_data`).
+    pub(crate) data: Arc<[u8]>,
     flags: u8,
     // Cached serialized size — not persisted. Zero means not yet computed (e.g. after serde
     // deserialization, which skips this field); size() computes it on demand in that case.
@@ -77,7 +82,7 @@ impl Tuple {
     ) -> Self {
         let mut s = Self {
             id,
-            data: data.to_vec(),
+            data: Arc::from(data),
             txn_id,
             undo_id,
             ..Default::default()
@@ -119,7 +124,7 @@ impl Tuple {
     }
 
     pub fn set_data(&mut self, data: &[u8]) {
-        self.data = data.to_vec()
+        self.data = Arc::from(data)
     }
 
     pub fn data(&self) -> &[u8] {
@@ -194,7 +199,7 @@ mod tests {
     fn test_tuple() {
         let t = Tuple {
             id: DBIdType::Int(0),
-            data: vec![b'h', b'e', b'l', b'l', b'o'],
+            data: vec![b'h', b'e', b'l', b'l', b'o'].into(),
             txn_id: None,
             undo_id: None,
             ..Default::default()
@@ -202,7 +207,7 @@ mod tests {
         let b = t.to();
         let t1 = Tuple::from(&b).unwrap();
         assert_eq!(t1.id, DBIdType::Int(0));
-        assert_eq!(t1.data, vec![b'h', b'e', b'l', b'l', b'o']);
+        assert_eq!(t1.data.to_vec(), vec![b'h', b'e', b'l', b'l', b'o']);
     }
 
     #[test]
@@ -210,7 +215,7 @@ mod tests {
         let id = DBIdType::Vec(b"my_key".to_vec());
         let t = Tuple {
             id: id.clone(),
-            data: b"value".to_vec(),
+            data: b"value".to_vec().into(),
             txn_id: None,
             undo_id: None,
             ..Default::default()
@@ -218,7 +223,7 @@ mod tests {
         let b = t.to();
         let t1 = Tuple::from(&b).unwrap();
         assert_eq!(t1.id, id);
-        assert_eq!(t1.data, b"value");
+        assert_eq!(t1.data.to_vec(), b"value");
     }
 
     #[test]
@@ -258,7 +263,7 @@ mod tests {
         let b = t.to();
         let t2 = Tuple::from(&b).unwrap();
         assert_eq!(t2.id, DBIdType::Int(10));
-        assert_eq!(t2.data, b"payload");
+        assert_eq!(t2.data.to_vec(), b"payload");
         assert_eq!(t2.txn_id, Some(TransactionId::from(1)));
     }
 }
