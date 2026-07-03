@@ -56,6 +56,23 @@ pub trait Opener {
     fn do_clone(&self) -> std::io::Result<Self::Item>;
     fn get_metadata(&self) -> std::io::Result<Meta>;
     fn do_lock(&self) -> Result<(), TryLockError>;
+
+    /// Positioned read: fills as much of `buf` as available starting at
+    /// `offset`, returning the number of bytes actually read (0 at EOF) —
+    /// same partial-transfer contract as `Read::read`. Does not use or affect
+    /// any shared seek cursor: `do_clone()`'d handles to the same underlying
+    /// file (e.g. `std::fs::File::try_clone`) share their OS-level cursor, so
+    /// a `seek` on one silently moves the position under a concurrent
+    /// `seek`+`read`/`write` on another — this is what let `PageBuffer`'s
+    /// `self_file` and its background writer thread's independently-cloned
+    /// handle race each other into misaligned reads/writes of the wrong file
+    /// offset. Positioned I/O (pread/pwrite) sidesteps that entirely: every
+    /// call is self-contained and safe to run concurrently across clones.
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize>;
+
+    /// Positioned write — see `pread`. Returns bytes actually written (same
+    /// partial-transfer contract as `Write::write`).
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize>;
 }
 
 pub trait DBFile:
@@ -554,6 +571,9 @@ where
     ) -> Result<NeededObjects<F>, StoreError> {
         let mut logger = Logger::new();
         logger.set_db(undo_file, redo_file)?;
+        // Buffer shares the logger's WAL clock, so page-flush deferral and redo
+        // LSNs are scoped to this one database (not a process global).
+        let clock = logger.clock();
         let nm = NeededObjects {
             buffer: Arc::new(PageBuffer::new(
                 header.page_size,
@@ -561,6 +581,7 @@ where
                 file,
                 header,
                 1024,
+                clock,
             )?),
             logger: Arc::new(logger),
             txn_mgr: Arc::new(TransactionManager::new(gens, TransactionId::default())?),

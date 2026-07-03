@@ -96,7 +96,12 @@ impl Tuple {
     }
 
     pub fn set_txn_id(&mut self, id: TransactionId) {
-        self.txn_id = Some(id)
+        self.txn_id = Some(id);
+        // txn_id is serialized, so its length changed — invalidate the cache
+        // (0 == "unknown", recompute on next size()). Page capacity accounting
+        // (add_tuple/remove_tuple/replace_tuple) depends on size() being exact
+        // after every mutation, not the pre-mutation value.
+        self.serialized_size = 0;
     }
 
     pub fn is_same_txn(&self, tx_id: TransactionId) -> bool {
@@ -107,7 +112,8 @@ impl Tuple {
     }
 
     pub fn set_undo_id(&mut self, id: UndoId) {
-        self.undo_id = Some(id)
+        self.undo_id = Some(id);
+        self.serialized_size = 0; // see set_txn_id
     }
 
     pub fn tombstone(&mut self) {
@@ -124,7 +130,8 @@ impl Tuple {
     }
 
     pub fn set_data(&mut self, data: &[u8]) {
-        self.data = Arc::from(data)
+        self.data = Arc::from(data);
+        self.serialized_size = 0; // see set_txn_id
     }
 
     pub fn data(&self) -> &[u8] {

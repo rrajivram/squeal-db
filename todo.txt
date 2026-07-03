@@ -1,0 +1,143 @@
+TODO / open issues
+==================
+
+[1] Large-object overflow free-and-reuse durability bug   [FIXED]
+    Symptom: test_large_object_full_lifecycle_all_ops (grow/shrink/remove/reuse
+    overflow pages, close, reopen) read stale/truncated data on reopen. Was
+    flaky even in isolation on the base commit; the process-global LSN masked it
+    in the full suite by staying "warm".
+    Confirmed root cause (via writer trace): a still-deferred write of a page
+    lingered in the writer's `pending` and, on the shutdown flush, overwrote the
+    page's newer contents. Two sub-causes:
+      - a cold-start write stamped lsn=u64::MAX was deferred FOREVER (see [4]);
+      - a repeatedly-mutated data page had several writes queued in `pending`,
+        drained out of order (swap_remove / shutdown vector order), so an older
+        snapshot could flush after the newest.
+    Fixes:
+      - Page::set_dirty: never stamp the u64::MAX sentinel; stamp low so a
+        cold-dirtied page writes promptly instead of forever-deferred. (see [4])
+      - Writer keeps at most one deferred write per page: a new WritePage
+        supersedes any pending write for the same slot (latest wins).
+      - free_page sends BufMsg::DiscardPending(page); the writer drops that
+        slot's deferred write so it can't clobber the next occupant after reuse.
+    Verified: lifecycle test 12/12 serial + 6/6 in isolation; suite green serial
+    AND parallel; file-backend stress 4/4, 0 mismatches.
+
+[2] Per-Db LSN clock   [DONE — unblocked by [1], still UNCOMMITTED]
+    LSN_COUNTER + LAST_WRITTEN_LSN moved off process-global statics into an
+    LsnClock owned by Logger, shared with PageBuffer and injected into Pages.
+    - Fixes the flaky test_txn_close_reopen_removed_row_stays_gone (now 6/6).
+    - Fixes a latent correctness bug: >1 live Db in one process stomped a shared
+      WAL watermark/counter.
+    - Ready to commit together with the [1] durability fixes.
+
+[3] write_page(&Page) breaks Arc identity   [OPEN — cleanup, not required]
+    write_page does Arc::new(page.clone()) per write, defeating the Weak-upgrade
+    coherence scheme write_locked_page preserves. Unifying every write onto a
+    WritePageHandle would remove the wart. Not needed for correctness now that
+    [1] is fixed, but worth doing.
+
+[4] WAL deferral cold-start semantics   [ADDRESSED by the [1] u64::MAX fix]
+    Root smell was: last_written starts at u64::MAX and set_dirty stamped that
+    onto pages, which then defer forever (page.lsn < last_written can never be
+    true once the watermark drops to real redo lsns). The set_dirty fix in [1]
+    stops stamping the sentinel. A fuller redesign (stamp a page with the redo
+    lsn that protects it, write when last_written >= that) is still worthwhile
+    but no longer urgent.
+
+[5] Tuple::size() cached serialized_size was stale + page accounting ignored
+    per-page serialization framing   [FIXED]
+    Reported bug: size() returns the cached serialized_size when non-zero, but
+    set_data / set_txn_id / set_undo_id mutated serialized fields without
+    invalidating it, so size() could under-report (e.g. ~21 bytes short right
+    after Db::insert's set_txn_id, since new_with caches size with txn_id=None).
+    A naive "invalidate the cache" fix is correct in isolation but destabilized
+    the stress (write_page assertions / correctness mismatches), because a
+    SECOND, independent bug was accidentally masked by the first: page capacity
+    accounting (page_used_size, a sum of per-tuple Tuple::size() values) never
+    accounted for the page's own serialization framing —
+    AnyTuplePage::to_bytes serializes `Vec<&Tuple>` with a top-level
+    varint(tuple_count) prefix, and FixedTuplePage (index pages) wraps that in
+    `FixedTupleDto { size: usize, data: &[u8] }`, adding two more length
+    varints — none of which any individual tuple's size() includes. The stale
+    (undercounting) cache from bug #1 happened to leave enough slack to absorb
+    this; fixing #1 alone removed that slack and exposed #2 (page bytes
+    overflow their physical slot without has_overflow set -> would silently
+    corrupt the next page on disk).
+    Fix (both parts, landed together):
+      - tuple.rs: set_data/set_txn_id/set_undo_id set serialized_size = 0
+        (invalidate), so size() always recomputes after a serialized field
+        changes.
+      - page.rs: added `USABLE_DATA_MARGIN` (16 bytes) and reworked
+        `PageHeader::usable_data_size()` / `Page::usable_data_size()` (was a
+        pure passthrough of page_data_size) to subtract that margin. can_store
+        and handle_large_page_size's overflow trigger now compare against this
+        smaller "usable" ceiling instead of the raw physical page_data_size, so
+        there is genuine reserved headroom for the framing bytes.
+        IMPORTANT: the margin must come out of usable_data_size, NOT out of
+        PAGE_OVERHEAD/page_data_size directly — page_data_size is a zero-sum
+        split of the fixed page_size (page_data_size = page_size -
+        PAGE_OVERHEAD), and the header always pads out to exactly PAGE_OVERHEAD
+        regardless of its value, so shrinking PAGE_OVERHEAD-derived
+        page_data_size does not create any real slack (tried this first; it
+        does not work, confirmed by measurement — see git history on this
+        branch for the reverted attempt).
+      - buffer.rs write_page: added an assert that a non-overflow page's
+        serialized bytes fit within its physical page_size slot, converting any
+        future accounting drift into a loud failure instead of silent
+        cross-page corruption.
+    Verified: lib suite 10/10 serial + 5/5 parallel (clean); mem-backend stress
+    6/6 PASS, 0 mismatches, 0 panics. See [6] for a separate, pre-existing bug
+    this work surfaced on the file backend under heavy concurrency.
+
+[6] Page with page_data_size == 0 causes a divide-by-zero in
+    handle_large_page_size   [FIXED — root cause: shared OS file cursor]
+    Symptom: file-backend stress (16 threads) occasionally panicked at
+    buffer.rs:231 in `(header.used_size() - 1) / header.usable_data_size()` —
+    a genuine divide-by-zero because `header.page_data_size` was 0 for the
+    page in question. The corrupted header was NOT a fully-blank/default
+    struct (e.g. observed page_used_size=34, lsn=164272 — real, plausible
+    values) with only page_data_size zeroed — a byte-shifted/misaligned read,
+    not a read of a never-written region.
+    Root cause (confirmed empirically, not just inferred): `PageBuffer::new`
+    creates two independent handles via `db_file.do_clone()` — one for
+    `self_file` (used by every synchronous read/write: get_page,
+    read_page_header, write_page_header, ...) and one moved into the
+    background writer thread. For `std::fs::File`, `do_clone()` is
+    `try_clone()`, which per Rust's documented semantics does NOT open a second
+    file description — it dups the same one, so both handles SHARE the
+    OS-level seek cursor. Verified directly with a standalone program: seeking
+    handle A and then reading handle B (no seek on B) returns A's data at A's
+    position, and vice versa. So self_file's seek+read (serialized against
+    OTHER self_file callers by its own RwLock) and the writer thread's
+    independent seek+write race on one shared cursor with zero cross-thread
+    coordination — a seek from one, interleaved with a seek+op from the other,
+    executes the first side's operation at whatever offset the second left
+    behind. This explains the byte-shifted header exactly, and explains why it
+    never reproduced on the mem backend: MemFile's clones share the backing
+    Vec (Arc<RwLock<Vec<u8>>>) but each clone owns its OWN `seek_pos` field —
+    no shared cursor exists there by construction.
+    Fix: replaced every seek-then-read/write pair reachable from a do_clone()'d
+    handle with positioned I/O (pread/pwrite: an explicit byte offset per call,
+    no shared mutable cursor involved at all).
+      - db.rs: added `pread`/`pwrite` to the `Opener` trait.
+      - memfile.rs: MemFile implements them directly against its `Arc<RwLock<
+        Vec<u8>>>` (bypassing seek_pos); `std::fs::File` implements them via
+        `std::os::unix::fs::FileExt::{read_at, write_at}` on unix and
+        `std::os::windows::fs::FileExt::{seek_read, seek_write}` on windows
+        (same partial-transfer contract on both, `#[cfg]`-gated to the right
+        trait — both confirmed to exist in std, this isn't unix-only).
+      - buffer.rs: `write_page`, `read_page`, `read_page_header` (free
+        functions) and `PageBuffer::read_page_header`/`write_page_header`
+        (member methods) now take `&impl DBFile` (no longer `&mut`) and use
+        `pread_exact`/`pwrite_all` helpers with explicitly computed offsets
+        (`page_offset(page_id, page_size, first_offset)`, plus `+
+        PAGE_OVERHEAD` for a page's data region) instead of implicit
+        sequential cursor advancement through a chain of seeks. `self_file`
+        callers now take `.read()` (shared) instead of `.write()` (exclusive)
+        since positioned I/O needs no mutual exclusion for the cursor — there
+        isn't one anymore.
+    Verified: lib suite 10/10 serial + 5/5 parallel; file-backend stress 15/15
+    at the original load and 8/8 at 2x load (32 threads, 8000 ops) — 0
+    mismatches, 0 panics in every run (was previously failing 3-8 out of
+    8-15 runs at the original load); mem-backend stress 6/6.

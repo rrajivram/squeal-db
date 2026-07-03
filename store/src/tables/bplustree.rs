@@ -61,7 +61,10 @@ where
         }
         let first_index_page = buffer.alloc_page(false)?;
         let first_data_page = buffer.alloc_page(false)?;
-        let index_page = Page::new_indexed(pg, MAX_ENTRY_BYTES as usize);
+        let mut index_page = Page::new_indexed(pg, MAX_ENTRY_BYTES as usize);
+        // Adopt into this database's WAL clock before flagging (set_page_flags
+        // dirties it, which stamps the lsn from the clock).
+        index_page.set_clock(buffer.clock());
         index_page.set_page_flags(LEAF_NODE)?;
         let mut handle = buffer.get_page_mut(first_index_page)?;
         handle.page = Arc::new(index_page);
@@ -683,7 +686,7 @@ mod tests {
     fn make_buffer(page_size: u64) -> Arc<PageBuffer<MemFile>> {
         let header = make_header(page_size);
         let counter = Arc::new(AtomicU64::new(FIRST_USER_PAGE));
-        Arc::new(PageBuffer::new(page_size, counter, MemFile::new(), header, 256).unwrap())
+        Arc::new(PageBuffer::new(page_size, counter, MemFile::new(), header, 256, Arc::new(crate::logger::LsnClock::default())).unwrap())
     }
 
     fn make_txn_mgr() -> Arc<TransactionManager> {

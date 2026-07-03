@@ -43,6 +43,27 @@ impl Opener for MemFile {
     fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
         Ok(())
     }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let data = self.data.read().unwrap();
+        let offset = offset as usize;
+        if offset >= data.len() {
+            return Ok(0); // at or past EOF
+        }
+        let n = (data.len() - offset).min(buf.len());
+        buf[..n].copy_from_slice(&data[offset..offset + n]);
+        Ok(n)
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        let mut data = self.data.write().unwrap();
+        let offset = offset as usize;
+        if offset + buf.len() > data.len() {
+            data.resize(offset + buf.len(), 0);
+        }
+        data[offset..offset + buf.len()].copy_from_slice(buf);
+        Ok(buf.len())
+    }
 }
 
 impl Opener for std::fs::File {
@@ -66,6 +87,24 @@ impl Opener for std::fs::File {
 
     fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
         self.try_lock()
+    }
+
+    #[cfg(unix)]
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(self, buf, offset)
+    }
+    #[cfg(unix)]
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(self, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(self, buf, offset)
+    }
+    #[cfg(windows)]
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_write(self, buf, offset)
     }
 }
 

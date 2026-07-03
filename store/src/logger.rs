@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::SeekFrom,
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
     thread::{self, JoinHandle},
 };
 
@@ -16,9 +16,48 @@ use crate::{
     txn::TransactionId,
 };
 
-static LSN_COUNTER: AtomicU64 = AtomicU64::new(0);
-// We make this very high at start so new pages will get written
-static LAST_WRITTEN_LSN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Per-database write-ahead-log clock. Was two process-global statics, which
+/// meant every `Db` (and every test) in the process shared one LSN counter and
+/// one flush watermark — leaking write-ordering state across databases (flaky
+/// close/reopen in the test suite; a latent corruption bug for >1 live `Db`).
+/// One clock per `Logger`, shared with the `PageBuffer` (and its writer thread)
+/// that the same `Db` owns, so the WAL deferral is scoped to a single database.
+#[derive(Debug)]
+pub(crate) struct LsnClock {
+    /// Monotonic source of redo LSNs.
+    counter: AtomicU64,
+    /// Highest redo LSN durably written — the flush watermark. Starts very high
+    /// so freshly created pages (stamped from it) are written promptly until the
+    /// first redo record lands and pulls the watermark down to a real value.
+    last_written: AtomicU64,
+}
+
+impl Default for LsnClock {
+    fn default() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+            last_written: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl LsnClock {
+    /// Allocate the next redo LSN.
+    pub(crate) fn next_lsn(&self) -> LsnId {
+        LsnId(self.counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel))
+    }
+
+    /// The current flush watermark (highest durably-written redo LSN).
+    pub(crate) fn last_written(&self) -> LsnId {
+        LsnId(self.last_written.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Advance the watermark as the redo runner persists records.
+    pub(crate) fn mark_written(&self, lsn: LsnId) {
+        self.last_written
+            .store(lsn.0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
 pub struct LsnId(pub(crate) u64);
@@ -68,6 +107,7 @@ pub(crate) struct Logger {
     undo_tx: Option<Sender<MsgType>>,
     redo_tx: Option<Sender<MsgType>>,
     undo_txns: RwLock<HashMap<TransactionId, Vec<Operation>>>,
+    clock: Arc<LsnClock>,
 }
 
 impl Logger {
@@ -87,9 +127,16 @@ impl Logger {
         self.undo_tx = Some(undo_tx);
         self.redo_tx = Some(redo_tx);
 
+        let clock = self.clock.clone();
         self.undo_handle = Some(thread::spawn(move || undo_log_runner(undo_file, undo_rx)));
-        self.redo_handle = Some(thread::spawn(move || redo_log_runner(redo_file, redo_rx)));
+        self.redo_handle = Some(thread::spawn(move || redo_log_runner(redo_file, redo_rx, clock)));
         Ok(())
+    }
+
+    /// Shared handle to this database's LSN clock, for the `PageBuffer` (and its
+    /// writer thread) that stamp/compare page LSNs against the same watermark.
+    pub(crate) fn clock(&self) -> Arc<LsnClock> {
+        self.clock.clone()
     }
 
     pub(crate) fn log_undo(&self, op: Operation) -> Result<(), StoreError> {
@@ -180,12 +227,8 @@ impl Logger {
         None
     }
 
-    pub(crate) fn last_lsn() -> LsnId {
-        LsnId(LAST_WRITTEN_LSN.load(std::sync::atomic::Ordering::Relaxed))
-    }
-
     pub(crate) fn log_redo(&self, op: Operation) -> Result<LsnId, StoreError> {
-        let lsn_id = LsnId(LSN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::AcqRel));
+        let lsn_id = self.clock.next_lsn();
         let msg = MsgType::Redo(RedoOperation {
             lsn_id,
             operation: op,
@@ -307,7 +350,11 @@ fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
     Ok(())
 }
 
-fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), StoreError> {
+fn redo_log_runner(
+    file: impl DBFile,
+    recv: Receiver<MsgType>,
+    clock: Arc<LsnClock>,
+) -> Result<(), StoreError> {
     let mut file = file;
     loop {
         let msg = recv
@@ -320,7 +367,7 @@ fn redo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
             MsgType::Redo(msg) => {
                 file.seek(SeekFrom::End(0))?;
                 file.write(&to_allocvec(&msg)?)?;
-                LAST_WRITTEN_LSN.store(msg.lsn_id.0, std::sync::atomic::Ordering::Relaxed);
+                clock.mark_written(msg.lsn_id);
             }
             MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
         }

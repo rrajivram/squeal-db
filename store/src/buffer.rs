@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    io::SeekFrom,
     ops::Rem,
     sync::{Arc, Weak, atomic::AtomicU64, atomic::AtomicUsize},
     thread::{self, JoinHandle},
@@ -17,7 +16,7 @@ use crate::{
     constant::timestamp,
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
-    logger::Logger,
+    logger::LsnClock,
     page::{PAGE_OVERHEAD, Page, PageHeader, PageId},
     utils::shardedpq::ShardedPQ,
 };
@@ -26,6 +25,10 @@ use crate::{
 enum BufMsg {
     WritePage(WriteMsg),
     WriteHeader(Header),
+    // Drop any deferred (pending) writes for this page: it has just been freed,
+    // so an as-yet-unflushed write of its old contents must not survive to
+    // clobber the next occupant after the slot is reallocated.
+    DiscardPending(PageId),
     Shutdowm,
 }
 
@@ -82,6 +85,10 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     access_map: ShardedPQ<PageId, u128>,
     locks: ArcLock<PageId>,
     free_pages: RwLock<Vec<PageId>>,
+    // This database's WAL clock, shared with its Logger. Read to stamp a page's
+    // LSN when submitting it for writing, and by the writer thread to decide
+    // flush-now vs defer. Per-Db, not a process global.
+    clock: Arc<LsnClock>,
 }
 
 impl<F: DBFile> PageBuffer<F>
@@ -94,12 +101,15 @@ where
         db_file: F,
         header: Arc<Header>,
         max_entries: usize,
+        clock: Arc<LsnClock>,
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let writer_file = db_file.do_clone()?;
         let (write_tx, write_rx) = unbounded();
         let w_header = header.clone();
-        let write_handle = thread::spawn(move || writer(writer_file, w_header, write_rx));
+        let writer_clock = clock.clone();
+        let write_handle =
+            thread::spawn(move || writer(writer_file, w_header, write_rx, writer_clock));
         Ok(Self {
             page_size,
             max_entries,
@@ -113,6 +123,7 @@ where
             header,
             locks: ArcLock::new(),
             free_pages: RwLock::new(vec![]),
+            clock,
         })
     }
 
@@ -308,11 +319,10 @@ where
             )));
         }
         let offset = self.header.first_page_offset + page_size * num;
-        let mut file = self.self_file.write();
-        file.seek(SeekFrom::Start(offset))?;
+        let file = self.self_file.read();
         // TODO - Need some cleaner refactoring here.
         let mut bytes = vec![0u8; PageHeader::header_size()];
-        file.read_exact(&mut bytes)?;
+        pread_exact(&*file, &mut bytes, offset)?;
         Ok(from_bytes::<PageHeader>(&bytes)?)
     }
 
@@ -328,19 +338,24 @@ where
             )));
         }
         let offset = self.header.first_page_offset + self.header.page_size * num;
-        let mut file = self.self_file.write();
-        file.seek(SeekFrom::Start(offset))?;
+        let file = self.self_file.read();
         // TODO - Need some cleaner refactoring here.
         let mut bytes = to_allocvec(&header)?;
         if bytes.len() < PageHeader::header_size() {
             bytes.append(&mut vec![0u8; PageHeader::header_size() - bytes.len()]);
         }
-        file.write(&bytes)?;
+        pwrite_all(&*file, &bytes, offset)?;
         Ok(())
     }
 
     pub(crate) fn free_page(&self, page: PageId) -> Result<(), StoreError> {
-        Ok(self.free_pages.write().push(page))
+        // Tell the writer to drop any deferred write still queued for this slot
+        // before it can be reallocated. Ordering is safe: this send precedes any
+        // reuse's write on the same (FIFO) channel, and the writer processes an
+        // earlier queued old write into `pending` before it sees this discard.
+        self.write_tx.send(BufMsg::DiscardPending(page))?;
+        self.free_pages.write().push(page);
+        Ok(())
     }
 
     // Follow the overflow chain from page_id to its terminator (first non-IS_OVERFLOW page).
@@ -451,22 +466,20 @@ where
             }
             None => {}
         }
-        /*         let mut bytes = vec![0u8; self.page_size as usize];
-               let offset = self.header.first_page_offset + self.header.page_size * u64::from(page_num);
-               self.self_file.write()?.seek(SeekFrom::Start(offset))?;
-               self.self_file.write()?.read(&mut bytes)?;
-               let page = Arc::new(Page::from_bytes(&bytes)?);
-        */
         // cache_strong handles both the access_map update and the buffer
         // insert under one write lock — the old two-step was racy.
-        let mut file = self.self_file.write();
-        let page = Arc::new(read_page(
+        let file = self.self_file.read();
+        let mut page = read_page(
             page_num,
-            &mut *file,
+            &*file,
             self.header.page_size,
             self.header.first_page_offset,
-        )?);
+        )?;
         drop(file);
+        // Adopt the freshly-loaded page into this database's WAL clock before it
+        // can be mutated (set_dirty stamps from it; clones inherit it).
+        page.set_clock(self.clock.clone());
+        let page = Arc::new(page);
         // get_or_install, not cache_strong: a concurrent writer may have installed
         // a newer Strong while we were reading from disk; don't overwrite it with
         // the older on-disk copy.
@@ -604,13 +617,22 @@ where
     }
 
     fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
-        let p = if should_pin {
+        let mut p = if should_pin {
             Page::new_pinned(self.header.page_size)
         } else {
             Page::new_data(self.header.page_size)
         };
+        // Adopt the page into this database's WAL clock so later mutations stamp
+        // their lsn from it (and copy-on-write clones inherit it).
+        p.set_clock(self.clock.clone());
         self.write_page(page_num, &p)?;
         Ok(())
+    }
+
+    /// Shared handle to this database's WAL clock, for callers (e.g. BPlusTree)
+    /// that create a Page outside the buffer and must adopt it before use.
+    pub(crate) fn clock(&self) -> Arc<LsnClock> {
+        self.clock.clone()
     }
 }
 
@@ -664,6 +686,7 @@ fn writer<F: DBFile>(
     file: F,
     header: Arc<Header>,
     recv: Receiver<BufMsg>,
+    clock: Arc<LsnClock>,
 ) -> Result<(), StoreError> {
     let mut file = file;
     let mut pending: Vec<WriteMsg> = vec![];
@@ -677,7 +700,7 @@ fn writer<F: DBFile>(
         // pass keeps it bounded to just the pages whose redo isn't durable yet.
         let mut i = 0;
         while i < pending.len() {
-            if pending[i].page.is_pinned() || pending[i].page.lsn_id()? < Logger::last_lsn() {
+            if pending[i].page.is_pinned() || pending[i].page.lsn_id()? < clock.last_written() {
                 let m = pending.swap_remove(i);
                 write_page(
                     m.page_num,
@@ -709,7 +732,13 @@ fn writer<F: DBFile>(
                 break;
             }
             Ok(BufMsg::WritePage(msg)) => {
-                if msg.page.is_pinned() || msg.page.lsn_id()? < Logger::last_lsn() {
+                // This write supersedes any still-deferred write of the same
+                // slot: an older snapshot must never reach disk after this one.
+                // `pending` is drained with swap_remove (out of order) and at
+                // shutdown in vector order, so without this a stale entry for a
+                // repeatedly-mutated page could flush last and clobber it.
+                pending.retain(|m| m.page_num != msg.page_num);
+                if msg.page.is_pinned() || msg.page.lsn_id()? < clock.last_written() {
                     write_page(
                         msg.page_num,
                         &msg.page,
@@ -722,13 +751,19 @@ fn writer<F: DBFile>(
                 }
             }
             Ok(BufMsg::WriteHeader(header)) => {
-                file.seek(SeekFrom::Start(0))?;
-                let bytes = to_allocvec(&header)?;
-                file.write(&bytes)?;
+                let mut bytes = to_allocvec(&header)?;
                 if bytes.len() < size_of::<Header>() {
-                    let b = vec![0u8; size_of::<Header>() - bytes.len()];
-                    file.write(&b)?;
+                    bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
                 }
+                pwrite_all(&file, &bytes, 0)?;
+            }
+            Ok(BufMsg::DiscardPending(page_id)) => {
+                // The slot was freed; drop its deferred write so it can't clobber
+                // the next occupant on a later flush. Any earlier queued write of
+                // this slot has already been moved into `pending` above (FIFO),
+                // and a reuse's write arrives after this message, so this removes
+                // exactly the stale old-contents write.
+                pending.retain(|m| m.page_num != page_id);
             }
             Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
@@ -742,47 +777,115 @@ fn writer<F: DBFile>(
     Ok(())
 }
 
+// Positioned I/O only below this point — no `seek`. `file` here may be one of
+// several independently do_clone()'d handles to the same underlying OS file
+// (PageBuffer::self_file, the writer thread's own handle, ...); those clones
+// SHARE the OS-level seek cursor (confirmed: std::fs::File::try_clone dups the
+// file description, not just the Rust handle), so a `seek` on one silently
+// moves the position under a concurrent `seek`+read/write on another —
+// producing exactly the kind of byte-shifted, partially-valid header corruption
+// this replaced (some fields decode correctly, others land on the wrong bytes).
+// pread/pwrite take an explicit offset and never touch a shared cursor, so
+// concurrent calls on independent clones are safe.
+
+fn page_offset(page: PageId, page_size: DBSizeType, first_offset: DBSizeType) -> u64 {
+    first_offset + page.0 * page_size
+}
+
+fn pread_exact(file: &impl DBFile, buf: &mut [u8], offset: u64) -> Result<(), StoreError> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = file.pread(&mut buf[total..], offset + total as u64)?;
+        if n == 0 {
+            return Err(StoreError::IoError(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "pread_exact: failed to fill whole buffer",
+            )));
+        }
+        total += n;
+    }
+    Ok(())
+}
+
+fn pwrite_all(file: &impl DBFile, buf: &[u8], offset: u64) -> Result<(), StoreError> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = file.pwrite(&buf[total..], offset + total as u64)?;
+        if n == 0 {
+            return Err(StoreError::IoError(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "pwrite_all: failed to write whole buffer",
+            )));
+        }
+        total += n;
+    }
+    Ok(())
+}
+
 fn write_page(
     page_id: PageId,
     page: &Arc<Page>,
-    file: &mut impl DBFile,
+    file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
 ) -> Result<(), StoreError> {
     let header = page.header();
+    let start_offset = page_offset(page_id, page_size, first_offset);
     if header.has_overflow() {
         let bytes = page.to_data_bytes();
-        // Seek to the start of the primary page slot and re-write the HAS_OVERFLOW header.
-        // An async init_page write (queued by alloc_page before handle_large_page_size ran)
-        // may arrive in the writer thread before this message and clobber the header that
-        // handle_large_page_size already wrote synchronously.  Writing it here — inside the
-        // writer thread with the data — eliminates the race window.
-        seek_to_page(page_id.into(), file, page_size, first_offset)?;
+        // Re-write the HAS_OVERFLOW header at the primary page slot. An async
+        // init_page write (queued by alloc_page before handle_large_page_size
+        // ran) may arrive in the writer thread before this message and clobber
+        // the header that handle_large_page_size already wrote synchronously.
+        // Writing it here — inside the writer thread with the data —
+        // eliminates the race window.
         let page_bytes = page.to_bytes();
-        file.write(&page_bytes[..PAGE_OVERHEAD])?; // header with HAS_OVERFLOW
-        // File is now positioned at the primary page's data area.
+        pwrite_all(file, &page_bytes[..PAGE_OVERHEAD], start_offset)?; // header with HAS_OVERFLOW
         let first_end = (header.page_data_size as usize).min(bytes.len());
-        file.write(&bytes[..first_end])?;
+        pwrite_all(file, &bytes[..first_end], start_offset + PAGE_OVERHEAD as u64)?;
         let mut start = first_end;
         if start < bytes.len() {
-            let mut cur_header =
-                read_page_header(header.next_page(), file, page_size, first_offset)?;
+            let mut cur_page_id = header.next_page();
             loop {
+                let cur_offset = page_offset(cur_page_id, page_size, first_offset);
+                let cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
                 let end = (start + cur_header.page_data_size as usize).min(bytes.len());
-                file.write(&bytes[start..end])?;
+                pwrite_all(
+                    file,
+                    &bytes[start..end],
+                    cur_offset + PAGE_OVERHEAD as u64,
+                )?;
                 start = end;
                 // Stop when all data is written or when we've written to the terminator page.
                 if !cur_header.is_overflow() || start >= bytes.len() {
                     break;
                 }
-                cur_header =
-                    read_page_header(cur_header.next_page(), file, page_size, first_offset)?;
+                cur_page_id = cur_header.next_page();
             }
         }
     } else {
-        seek_to_page(page_id.into(), file, page_size, first_offset)?;
         let bytes = page.to_bytes();
-        file.write(&bytes)?;
+        // This page isn't flagged has_overflow, so its slot is exactly
+        // `page_size` bytes — writing more would silently spill into the next
+        // page's slot. That can only happen if page_used_size (a sum of
+        // per-tuple Tuple::size() values) has drifted from the tuple store's
+        // true serialized length — an accounting bug, not a normal condition
+        // (a legitimately oversized single object goes through the has_overflow
+        // branch above instead). Fail loudly here rather than corrupt silently.
+        assert!(
+            bytes.len() <= page_size as usize,
+            "write_page: page {:?} serialized to {} bytes, exceeding its {} byte \
+             slot without has_overflow set — page_used_size has drifted from the \
+             tuple store's actual size. header={:?} data_bytes_len={} count={:?} index_page={}",
+            page_id,
+            bytes.len(),
+            page_size,
+            header,
+            page.to_data_bytes().len(),
+            page.count(),
+            page.is_index_page(),
+        );
+        pwrite_all(file, &bytes, start_offset)?;
     }
 
     Ok(())
@@ -790,17 +893,18 @@ fn write_page(
 
 fn read_page(
     page_id: PageId,
-    file: &mut impl DBFile,
+    file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
 ) -> Result<Page, StoreError> {
     let header = read_page_header(page_id, file, page_size, first_offset)?;
     if header.has_overflow() {
-        // After read_page_header, file is positioned at primary page data area.
-        // Use read() not read_exact(): the last overflow page (terminator) may hold fewer
-        // bytes than page_data_size when the data doesn't exactly fill the page.
-        // The zero-initialized buffers act as natural zero-padding; postcard ignores trailing
-        // zeros when deserializing since from_bytes does not check that all input is consumed.
+        // Use a single pread (like the old read()), not pread_exact: the last
+        // overflow page (terminator) may hold fewer bytes than page_data_size
+        // when the data doesn't exactly fill the page. The zero-initialized
+        // buffers act as natural zero-padding; postcard ignores trailing zeros
+        // when deserializing since from_bytes does not check that all input is
+        // consumed.
         if header.page_data_size > page_size {
             return Err(StoreError::UnknownError(format!(
                 "read_page: corrupt primary page_data_size {} > page_size {} for {:?}",
@@ -808,9 +912,13 @@ fn read_page(
             )));
         }
         let mut all_data = vec![0u8; header.page_data_size as usize];
-        file.read(&mut all_data)?;
+        file.pread(
+            &mut all_data,
+            page_offset(page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
+        )?;
         let primary_header = header;
-        let mut cur_header = primary_header.clone();
+        let mut cur_header;
+        let mut cur_page_id = primary_header.next_page();
         // Bound the walk: a cyclic/corrupt overflow chain would otherwise
         // extend all_data forever, reallocating it up to many GB (observed).
         let mut guard = 0u64;
@@ -822,7 +930,7 @@ fn read_page(
                     page_id
                 )));
             }
-            cur_header = read_page_header(cur_header.next_page(), file, page_size, first_offset)?;
+            cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
             if cur_header.page_data_size > page_size {
                 return Err(StoreError::UnknownError(format!(
                     "read_page: corrupt overflow page_data_size {} > page_size {}",
@@ -830,11 +938,15 @@ fn read_page(
                 )));
             }
             let mut chunk = vec![0u8; cur_header.page_data_size as usize];
-            file.read(&mut chunk)?;
+            file.pread(
+                &mut chunk,
+                page_offset(cur_page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
+            )?;
             all_data.extend_from_slice(&chunk);
             if !cur_header.is_overflow() {
                 break;
             }
+            cur_page_id = cur_header.next_page();
         }
         // Reconstruct as full header+data bytes so Page::from_bytes can deserialize correctly.
         let mut full_bytes = primary_header.to_bytes()?;
@@ -842,37 +954,25 @@ fn read_page(
         full_bytes.extend_from_slice(&all_data);
         Ok(Page::from_bytes(&full_bytes)?)
     } else {
-        // Read the full page slot so Page::from_bytes gets the complete serialized data.
-        // Use read() not read_exact(): if the async writer hasn't flushed yet the file
-        // may be shorter than page_size; the zero-initialized buffer acts as padding.
-        seek_to_page(page_id, file, page_size, first_offset)?;
+        // Read the full page slot so Page::from_bytes gets the complete
+        // serialized data. Single pread, not pread_exact: if the async writer
+        // hasn't flushed yet the file may be shorter than page_size; the
+        // zero-initialized buffer acts as padding.
         let mut bytes = vec![0u8; page_size as usize];
-        file.read(&mut bytes)?;
+        file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
         Ok(Page::from_bytes(&bytes)?)
     }
 }
 
 fn read_page_header(
     page: PageId,
-    file: &mut impl DBFile,
+    file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
 ) -> Result<PageHeader, StoreError> {
-    seek_to_page(page, file, page_size, first_offset)?;
     let mut bytes = vec![0u8; PageHeader::header_size()];
-    file.read_exact(&mut bytes)?;
+    pread_exact(file, &mut bytes, page_offset(page, page_size, first_offset))?;
     Ok(from_bytes(&bytes)?)
-}
-
-fn seek_to_page(
-    page: PageId,
-    file: &mut impl DBFile,
-    page_size: DBSizeType,
-    first_offset: DBSizeType,
-) -> Result<(), StoreError> {
-    let pos = first_offset + page.0 * page_size;
-    file.seek(SeekFrom::Start(pos))?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -919,6 +1019,7 @@ mod tests {
             mem,
             make_header(),
             max_entries,
+            Arc::new(crate::logger::LsnClock::default()),
         )
         .unwrap();
         (buf, page_counter)
@@ -943,7 +1044,7 @@ mod tests {
         let header =
             Arc::new(from_bytes::<Header>(&make_header_bytes(0, num_pages, page_size)).unwrap());
         let buf =
-            PageBuffer::new(page_size, page_counter.clone(), mem, header, max_entries).unwrap();
+            PageBuffer::new(page_size, page_counter.clone(), mem, header, max_entries, Arc::new(crate::logger::LsnClock::default())).unwrap();
         (buf, page_counter, file_clone)
     }
 
@@ -1022,7 +1123,7 @@ mod tests {
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
         let header2 =
             Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size)).unwrap());
-        let buf2 = PageBuffer::new(page_size, page_counter2, file_clone, header2, 10).unwrap();
+        let buf2 = PageBuffer::new(page_size, page_counter2, file_clone, header2, 10, Arc::new(crate::logger::LsnClock::default())).unwrap();
 
         let retrieved = buf2.get_page(page_id).unwrap();
         assert_eq!(retrieved.count().unwrap(), 1);
