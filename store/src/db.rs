@@ -1,6 +1,7 @@
 #![allow(private_bounds)]
 use crate::buffer::PageBuffer;
 use crate::constant::FIRST_USER_PAGE;
+use crate::constant::FREE_PAGE_TABLE_PAGE;
 use crate::constant::GENERATOR_TABLE_PAGE;
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
@@ -23,6 +24,7 @@ use crate::txn::TransactionManager;
 use log::LevelFilter;
 use log::info;
 use parking_lot::RwLock;
+use portable_atomic::AtomicU128;
 use postcard::from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
@@ -82,7 +84,12 @@ pub trait DBFile:
 pub(crate) type DBSizeType = u64;
 
 impl<T> DBFile for T where
-    T: std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + std::marker::Sync + Opener
+    T: std::io::Write
+        + std::io::Read
+        + std::io::Seek
+        + std::marker::Send
+        + std::marker::Sync
+        + Opener
 {
 }
 
@@ -95,6 +102,7 @@ pub(crate) struct Header {
     page_count: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
     pub(crate) page_size: DBSizeType,
+    pub(crate) last_checkpoint: u128,
 }
 
 pub struct Db<F: DBFile + 'static> {
@@ -109,6 +117,7 @@ pub struct Db<F: DBFile + 'static> {
     logger: Arc<Logger>,
     tx_mgr: Arc<TransactionManager>,
     buffer: Arc<PageBuffer<F>>,
+    last_checkpoint: AtomicU128, // Store the actual checkopint so it can be mutated
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -162,6 +171,7 @@ where
             redo_file.do_clone()?,
         )?;
         let sf = Self {
+            last_checkpoint: AtomicU128::new(header.last_checkpoint),
             page_count: page_count,
             header: header,
             file: file,
@@ -221,6 +231,7 @@ where
         self.write_system_tables()?;
         let mut hdr = (*self.header).clone();
         hdr.page_count = self.page_count();
+        hdr.last_checkpoint = timestamp();
         // Each BPlusTree in tables holds Arc<PageBuffer>, Arc<Logger>, and
         // Arc<TransactionManager>. Drop them before Arc::into_inner so the
         // reference counts reach 1 and into_inner succeeds.
@@ -245,6 +256,18 @@ where
 
     pub fn page_count(&self) -> DBSizeType {
         self.page_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn checkpoint(&self) -> Result<(), StoreError> {
+        self.buffer.checkpoint()?;
+        let mut hdr = (*self.header).clone();
+        hdr.page_count = self.page_count();
+        let ts = timestamp();
+        hdr.last_checkpoint = ts;
+        self.buffer.write_header(hdr)?;
+        self.last_checkpoint
+            .store(ts, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn begin(&self) -> Result<Transaction, StoreError> {
@@ -345,6 +368,11 @@ where
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn get_last_checkpoint(&self) -> u128 {
+        self.last_checkpoint
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Reclaim a transaction parked in `aborting` — one abandoned via
@@ -618,6 +646,7 @@ where
             first_page_offset: ZERO_PAGE_SIZE,
             page_count: 0,
             page_size,
+            last_checkpoint: timestamp(),
         };
         let bytes = to_allocvec(&header)?;
         f.write(&bytes)?;
@@ -636,6 +665,7 @@ where
         )?;
 
         Ok(Self {
+            last_checkpoint: AtomicU128::new(header.last_checkpoint),
             name: name,
             header: header,
             file: f,
@@ -678,8 +708,9 @@ where
         let mut page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
         self.buffer.write_page(1usize.into(), &page)?;
-        // TODO : Handle page overflows correctly
-        // TODO: Handle empty pages
+        let mut page = Page::new_pinned(self.header.page_size);
+        page.add_tuple(Tuple::new(0, &to_allocvec(&self.buffer.get_free_pages())?))?;
+        self.buffer.write_page(2usize.into(), &page)?;
         Ok(())
     }
 
@@ -715,6 +746,10 @@ where
         let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
         let gens = from_bytes(&tuple.data)?;
         self.generator.set_values(gens)?;
+        let page = self.buffer.get_page(FREE_PAGE_TABLE_PAGE.into())?;
+        let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
+        let free_pages = from_bytes::<Vec<_>>(&tuple.data)?;
+        self.buffer.set_free_pages(free_pages);
         Ok(())
     }
 
@@ -895,7 +930,10 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("row should be visible").data.to_vec(), b"hello");
+        assert_eq!(
+            found.expect("row should be visible").data.to_vec(),
+            b"hello"
+        );
     }
 
     #[test]
@@ -984,9 +1022,18 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(tid, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"A");
-        assert_eq!(db.find(tid, id(2), &txn2).unwrap().unwrap().data.to_vec(), b"B");
-        assert_eq!(db.find(tid, id(3), &txn2).unwrap().unwrap().data.to_vec(), b"C");
+        assert_eq!(
+            db.find(tid, id(1), &txn2).unwrap().unwrap().data.to_vec(),
+            b"A"
+        );
+        assert_eq!(
+            db.find(tid, id(2), &txn2).unwrap().unwrap().data.to_vec(),
+            b"B"
+        );
+        assert_eq!(
+            db.find(tid, id(3), &txn2).unwrap().unwrap().data.to_vec(),
+            b"C"
+        );
         drop(txn2);
     }
 
@@ -1072,7 +1119,10 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("original must still be visible").data.to_vec(), b"v1");
+        assert_eq!(
+            found.expect("original must still be visible").data.to_vec(),
+            b"v1"
+        );
 
         db.commit(txn2).unwrap();
     }
@@ -1131,7 +1181,8 @@ mod tests {
         assert_eq!(
             found
                 .expect("row must still be visible before remove commits")
-                .data.to_vec(),
+                .data
+                .to_vec(),
             b"alive"
         );
 
@@ -1170,8 +1221,14 @@ mod tests {
         db.commit(txn2).unwrap();
 
         let txn3 = db.begin().unwrap();
-        assert_eq!(db.find(tid, id(1), &txn3).unwrap().unwrap().data.to_vec(), b"A_v2");
-        assert_eq!(db.find(tid, id(2), &txn3).unwrap().unwrap().data.to_vec(), b"B");
+        assert_eq!(
+            db.find(tid, id(1), &txn3).unwrap().unwrap().data.to_vec(),
+            b"A_v2"
+        );
+        assert_eq!(
+            db.find(tid, id(2), &txn3).unwrap().unwrap().data.to_vec(),
+            b"B"
+        );
         assert!(
             db.find(tid, id(3), &txn3).unwrap().is_none(),
             "removed row must be gone"
@@ -1195,7 +1252,10 @@ mod tests {
         for i in 0..N {
             let found = db.find(tid, id(i), &txn2).unwrap();
             assert_eq!(
-                found.unwrap_or_else(|| panic!("row {i} missing")).data.to_vec(),
+                found
+                    .unwrap_or_else(|| panic!("row {i} missing"))
+                    .data
+                    .to_vec(),
                 format!("val_{i}").as_bytes(),
                 "row {i} has wrong data"
             );
@@ -1346,7 +1406,10 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("original row must still exist").data.to_vec(), b"v1");
+        assert_eq!(
+            found.expect("original row must still exist").data.to_vec(),
+            b"v1"
+        );
     }
 
     #[test]
@@ -1365,7 +1428,10 @@ mod tests {
         let found = db.find(tid, id(1), &txn3).unwrap();
         drop(txn3);
         assert_eq!(
-            found.expect("row must survive a rolled-back remove").data.to_vec(),
+            found
+                .expect("row must survive a rolled-back remove")
+                .data
+                .to_vec(),
             b"alive"
         );
     }
@@ -1382,8 +1448,14 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"a1");
-        assert_eq!(db.find(tb, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"b1");
+        assert_eq!(
+            db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(),
+            b"a1"
+        );
+        assert_eq!(
+            db.find(tb, id(1), &txn2).unwrap().unwrap().data.to_vec(),
+            b"b1"
+        );
         drop(txn2);
     }
 
@@ -1417,7 +1489,10 @@ mod tests {
         db.commit(txn).unwrap();
 
         let txn2 = db.begin().unwrap();
-        assert_eq!(db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(), b"a_v2");
+        assert_eq!(
+            db.find(ta, id(1), &txn2).unwrap().unwrap().data.to_vec(),
+            b"a_v2"
+        );
         assert!(db.find(tb, id(1), &txn2).unwrap().is_none());
         drop(txn2);
     }
@@ -1501,7 +1576,13 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("large object must be visible after commit").data.to_vec(), big);
+        assert_eq!(
+            found
+                .expect("large object must be visible after commit")
+                .data
+                .to_vec(),
+            big
+        );
     }
 
     #[test]
@@ -1515,7 +1596,10 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(1), &txn2).unwrap();
         drop(txn2);
-        assert!(found.is_none(), "rolled-back large object must not be visible");
+        assert!(
+            found.is_none(),
+            "rolled-back large object must not be visible"
+        );
     }
 
     #[test]
@@ -1530,7 +1614,13 @@ mod tests {
         let txn2 = db.begin().unwrap();
         let found = db.find(tid, id(42), &txn2).unwrap();
         drop(txn2);
-        assert_eq!(found.expect("5-page object must survive commit").data.to_vec(), big);
+        assert_eq!(
+            found
+                .expect("5-page object must survive commit")
+                .data
+                .to_vec(),
+            big
+        );
     }
 
     #[test]
@@ -1549,7 +1639,10 @@ mod tests {
         let found = db2.find(tid, id(99), &txn2).unwrap();
         drop(txn2);
         assert_eq!(
-            found.expect("large object must survive close/reopen").data.to_vec(),
+            found
+                .expect("large object must survive close/reopen")
+                .data
+                .to_vec(),
             big
         );
     }
@@ -1558,7 +1651,7 @@ mod tests {
     fn test_multiple_large_objects_same_txn_commit() {
         let (db, tid) = make_db_with_table();
         // Three objects that collectively span many overflow pages
-        let small = vec![b'E'; 20_000];  // 2 pages each
+        let small = vec![b'E'; 20_000]; // 2 pages each
         let txn = db.begin().unwrap();
         db.insert(tid, row(1, &small), &txn).unwrap();
         db.insert(tid, row(2, &small), &txn).unwrap();
@@ -1569,7 +1662,10 @@ mod tests {
         for i in 1u64..=3 {
             let found = db.find(tid, id(i), &txn2).unwrap();
             assert_eq!(
-                found.unwrap_or_else(|| panic!("row {i} missing")).data.to_vec(),
+                found
+                    .unwrap_or_else(|| panic!("row {i} missing"))
+                    .data
+                    .to_vec(),
                 small
             );
         }
@@ -1594,7 +1690,13 @@ mod tests {
         let txn3 = db.begin().unwrap();
         let found = db.find(tid, id(7), &txn3).unwrap();
         drop(txn3);
-        assert_eq!(found.expect("re-inserted large object must be visible").data.to_vec(), big);
+        assert_eq!(
+            found
+                .expect("re-inserted large object must be visible")
+                .data
+                .to_vec(),
+            big
+        );
     }
 
     // ── large-object: exercise EVERY public op at 4–8× the page size ──────────
@@ -1630,7 +1732,11 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("inserted").data.to_vec(),
+            db.find(tid, id(1), &t)
+                .unwrap()
+                .expect("inserted")
+                .data
+                .to_vec(),
             base
         );
         db.rollback(t).unwrap();
@@ -1641,7 +1747,11 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("grown").data.to_vec(),
+            db.find(tid, id(1), &t)
+                .unwrap()
+                .expect("grown")
+                .data
+                .to_vec(),
             grown
         );
         db.rollback(t).unwrap();
@@ -1652,7 +1762,11 @@ mod tests {
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(1), &t).unwrap().expect("shrunk").data.to_vec(),
+            db.find(tid, id(1), &t)
+                .unwrap()
+                .expect("shrunk")
+                .data
+                .to_vec(),
             shrunk
         );
         db.rollback(t).unwrap();
@@ -1676,7 +1790,11 @@ mod tests {
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
         let t = db2.begin().unwrap();
         assert_eq!(
-            db2.find(tid, id(1), &t).unwrap().expect("reopened").data.to_vec(),
+            db2.find(tid, id(1), &t)
+                .unwrap()
+                .expect("reopened")
+                .data
+                .to_vec(),
             reins
         );
         db2.rollback(t).unwrap();
@@ -1701,7 +1819,11 @@ mod tests {
 
         let t = db.begin().unwrap();
         assert_eq!(
-            db.find(tid, id(5), &t).unwrap().expect("v1 must stand").data.to_vec(),
+            db.find(tid, id(5), &t)
+                .unwrap()
+                .expect("v1 must stand")
+                .data
+                .to_vec(),
             v1,
             "rolled-back large update must leave the committed value intact"
         );
@@ -1728,9 +1850,514 @@ mod tests {
             db.find(tid, id(8), &t)
                 .unwrap()
                 .expect("large object must survive a rolled-back remove")
-                .data.to_vec(),
+                .data
+                .to_vec(),
             v
         );
         db.rollback(t).unwrap();
+    }
+
+    // ── checkpoint ─────────────────────────────────────────────────────────
+    // Db::checkpoint() drains the page buffer's deferred-write queue (making
+    // every page dirtied so far durable to the backing store) and then
+    // persists an updated header (page_count / last_checkpoint) — all without
+    // requiring a full close(). These tests exercise both halves of that
+    // contract, plus that checkpoint is a purely physical operation with no
+    // effect on logical (MVCC) visibility.
+
+    use crate::constant::timestamp;
+    use crate::db::Header;
+    use postcard::from_bytes;
+
+    // Reads the on-disk header directly via the DBFile's own positioned read,
+    // bypassing the page cache entirely, so these tests observe exactly what
+    // checkpoint() has made durable rather than what's merely cached in
+    // memory. A generous fixed-size buffer is fine: postcard ignores trailing
+    // unconsumed bytes when deserializing.
+    fn read_raw_header(db: &TestDB) -> Header {
+        let mut buf = vec![0u8; 128];
+        db.file.pread(&mut buf, 0).unwrap();
+        from_bytes(&buf).unwrap()
+    }
+
+    // PageBuffer::write_header enqueues the header write asynchronously (it
+    // does not round-trip like the page-flush half of checkpoint does), so
+    // there is a short window after checkpoint() returns before the new
+    // header is actually durable. Poll instead of asserting immediately.
+    fn wait_for_raw_last_checkpoint_at_least(db: &TestDB, min_ts: u128) -> Header {
+        for _ in 0..200 {
+            let h = read_raw_header(db);
+            if h.last_checkpoint >= min_ts {
+                return h;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        panic!("persisted header's last_checkpoint never reached >= {min_ts}");
+    }
+
+    #[test]
+    fn test_checkpoint_on_empty_db_succeeds() {
+        let (db, _tid) = make_db_with_table();
+        assert!(db.checkpoint().is_ok());
+    }
+
+    #[test]
+    fn test_checkpoint_is_idempotent() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        db.checkpoint().unwrap();
+        let first = wait_for_raw_last_checkpoint_at_least(&db, 0);
+
+        db.checkpoint().unwrap();
+        let second = wait_for_raw_last_checkpoint_at_least(&db, first.last_checkpoint);
+
+        assert!(
+            second.last_checkpoint >= first.last_checkpoint,
+            "a second, no-op checkpoint must not regress last_checkpoint"
+        );
+        assert_eq!(second.page_count, db.page_count());
+    }
+
+    #[test]
+    fn test_checkpoint_flushes_allocated_pages_to_storage() {
+        let (db, tid) = make_db_with_table();
+        // Enough rows to allocate several data pages, not just the initial
+        // system/index pages created at table creation.
+        for i in 0..200u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("value-{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+
+        db.checkpoint().unwrap();
+
+        // Every page up to page_count must physically exist in the backing
+        // store once checkpoint() returns — a page write still sitting in the
+        // writer's deferred queue would leave the file shorter than this.
+        let expected_min_len = db.header.first_page_offset + db.page_count() * db.header.page_size;
+        // The header write itself is async (see wait_for_raw_last_checkpoint_at_least);
+        // poll get_metadata the same way rather than asserting immediately.
+        let mut len = db.file.get_metadata().unwrap().len;
+        for _ in 0..200 {
+            if len >= expected_min_len {
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+            len = db.file.get_metadata().unwrap().len;
+        }
+        assert!(
+            len >= expected_min_len,
+            "checkpoint must flush every allocated page to storage: file len {len} < expected {expected_min_len}"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_persists_page_count_and_last_checkpoint() {
+        let (db, tid) = make_db_with_table();
+        for i in 0..50u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, b"v"), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+
+        let before = timestamp();
+        db.checkpoint().unwrap();
+        let persisted = wait_for_raw_last_checkpoint_at_least(&db, before);
+
+        assert_eq!(
+            persisted.page_count,
+            db.page_count(),
+            "persisted header page_count must match the live allocator state"
+        );
+        assert!(persisted.last_checkpoint >= before);
+    }
+
+    #[test]
+    fn test_checkpoint_does_not_affect_visibility_of_rolled_back_data() {
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"committed"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let t1 = db.begin().unwrap();
+        db.update(tid, row(1, b"uncommitted-update"), &t1).unwrap();
+        db.rollback(t1).unwrap();
+
+        // Checkpoint is purely physical; it must not resurrect or otherwise
+        // change what's logically visible.
+        db.checkpoint().unwrap();
+
+        let t2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &t2).unwrap();
+        drop(t2);
+        assert_eq!(
+            found.expect("row must still exist").data.to_vec(),
+            b"committed",
+            "checkpoint must not make a rolled-back write visible"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_across_multiple_tables() {
+        let (db, ta, tb) = make_db_with_two_tables();
+        let t = db.begin().unwrap();
+        db.insert(ta, row(1, b"a1"), &t).unwrap();
+        db.insert(tb, row(1, b"b1"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        db.checkpoint().unwrap();
+
+        let t2 = db.begin().unwrap();
+        assert_eq!(
+            db.find(ta, id(1), &t2).unwrap().unwrap().data.to_vec(),
+            b"a1"
+        );
+        assert_eq!(
+            db.find(tb, id(1), &t2).unwrap().unwrap().data.to_vec(),
+            b"b1"
+        );
+        drop(t2);
+    }
+
+    #[test]
+    fn test_checkpoint_with_large_overflow_object() {
+        let (db, tid) = make_db_with_table();
+        let big = vec![b'K'; 60_000]; // several overflow pages
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &big), &t).unwrap();
+        db.commit(t).unwrap();
+
+        db.checkpoint().unwrap();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let t2 = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t2)
+                .unwrap()
+                .expect("large object must survive checkpoint + close/reopen")
+                .data
+                .to_vec(),
+            big
+        );
+        drop(t2);
+    }
+
+    #[test]
+    fn test_checkpoint_then_close_then_reopen_preserves_data() {
+        let (db, tid) = make_db_with_table();
+        for i in 0..10u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("row-{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let page_count_at_checkpoint = db.page_count();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        assert_eq!(db2.page_count(), page_count_at_checkpoint);
+
+        let t = db2.begin().unwrap();
+        for i in 0..10u64 {
+            assert_eq!(
+                db2.find(tid, id(i), &t)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} missing after checkpoint+close+reopen"))
+                    .data
+                    .to_vec(),
+                format!("row-{i}").as_bytes()
+            );
+        }
+        drop(t);
+    }
+
+    #[test]
+    fn test_checkpoint_concurrent_with_active_writers() {
+        use std::sync::Arc;
+
+        const THREADS: u64 = 8;
+        const ROWS_PER_THREAD: u64 = 50;
+
+        // Each thread gets its own table (disjoint B+tree, no shared
+        // index/data pages) so the only cross-thread interaction is via the
+        // shared PageBuffer/writer thread that checkpoint() also touches —
+        // this isolates checkpoint's own thread-safety from same-table insert
+        // contention, which has its own pre-existing, unrelated correctness
+        // issues under heavy concurrency (not a checkpoint concern).
+        let db = TestDB::create("checkpoint_concurrent_test.db").unwrap();
+        let tids: Vec<TableIdType> = (0..THREADS)
+            .map(|i| db.create_table(format!("t{i}")).unwrap())
+            .collect();
+        let db = Arc::new(db);
+
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            let tid = tids[thread_idx as usize];
+            handles.push(thread::spawn(move || {
+                for i in 0..ROWS_PER_THREAD {
+                    let t = db.begin().unwrap();
+                    db.insert(tid, row(i, format!("v{thread_idx}-{i}").as_bytes()), &t)
+                        .unwrap();
+                    db.commit(t).unwrap();
+                }
+            }));
+        }
+
+        // Checkpoint repeatedly while writers are still active, interleaved
+        // with their inserts rather than after — this is the scenario the
+        // Checkpoint message type and its reply channel exist to handle
+        // safely.
+        let checkpoint_db = Arc::clone(&db);
+        let checkpoint_handle = thread::spawn(move || {
+            for _ in 0..10 {
+                checkpoint_db.checkpoint().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        checkpoint_handle.join().unwrap();
+
+        // A final checkpoint after all writers finished, then verify every
+        // row committed by every thread is visible and correct.
+        db.checkpoint().unwrap();
+        let t = db.begin().unwrap();
+        for thread_idx in 0..THREADS {
+            let tid = tids[thread_idx as usize];
+            for i in 0..ROWS_PER_THREAD {
+                let found = db.find(tid, id(i), &t).unwrap();
+                assert_eq!(
+                    found
+                        .unwrap_or_else(|| panic!(
+                            "table {thread_idx} row {i} missing after concurrent checkpoint"
+                        ))
+                        .data
+                        .to_vec(),
+                    format!("v{thread_idx}-{i}").as_bytes()
+                );
+            }
+        }
+        drop(t);
+    }
+
+    // ── free-page persistence ────────────────────────────────────────────
+    // Freed pages (e.g. overflow continuations reclaimed when a large object
+    // shrinks) are tracked in-memory by PageBuffer::free_pages and, as of this
+    // change, also serialized into the reserved FREE_PAGE_TABLE_PAGE (page 2)
+    // by write_system_tables() and restored by load_system_tables(). Before
+    // this, every close/reopen forgot any freed pages: they became permanent,
+    // unreachable holes (page_count only ever grows, so a forgotten free page
+    // could never be reused). These tests check both that the recorded set
+    // round-trips exactly, and — the part that actually matters — that a page
+    // reused after reopen is safe to write fresh data into.
+
+    use crate::page::PageId;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_free_pages_empty_by_default_persists_as_empty() {
+        let (db, _tid) = make_db_with_table();
+        assert!(db.buffer.get_free_pages().is_empty());
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        assert!(
+            db2.buffer.get_free_pages().is_empty(),
+            "a DB that never freed anything must not spuriously report free pages"
+        );
+    }
+
+    #[test]
+    fn test_freed_overflow_pages_persist_across_close_reopen() {
+        let (db, tid) = make_db_with_table();
+        let page = DEFAULT_PAGE_SIZE as usize;
+        let grown = big_payload(1, 8 * page);
+        let shrunk = big_payload(2, 4 * page); // frees several overflow pages
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &grown), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &shrunk), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let freed_before: HashSet<PageId> = db.buffer.get_free_pages().into_iter().collect();
+        assert!(
+            !freed_before.is_empty(),
+            "shrinking an 8-page object to 4 pages must free some overflow pages"
+        );
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let freed_after: HashSet<PageId> = db2.buffer.get_free_pages().into_iter().collect();
+
+        assert_eq!(
+            freed_after, freed_before,
+            "the exact set of freed pages must survive close/reopen"
+        );
+    }
+
+    #[test]
+    fn test_reopened_db_reuses_freed_pages_before_growing_page_count() {
+        let (db, tid) = make_db_with_table();
+        let page = DEFAULT_PAGE_SIZE as usize;
+        let grown = big_payload(3, 8 * page);
+        let shrunk = big_payload(4, 4 * page);
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &grown), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &shrunk), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let free_count = db2.buffer.get_free_pages().len();
+        assert!(free_count > 0);
+        let page_count_at_reopen = db2.page_count();
+
+        // Draining exactly the free list must satisfy every allocation from
+        // it (alloc_page always checks free_pages before growing page_count),
+        // so page_count must not move at all during this loop.
+        for _ in 0..free_count {
+            db2.buffer.alloc_page(false).unwrap();
+            assert_eq!(
+                db2.page_count(),
+                page_count_at_reopen,
+                "reusing a freed page must not grow page_count"
+            );
+        }
+        assert!(db2.buffer.get_free_pages().is_empty());
+
+        // The free list is now exhausted; the next allocation must fall back
+        // to growing page_count, proving the earlier ones really did come
+        // from reuse and not from some other accounting quirk.
+        db2.buffer.alloc_page(false).unwrap();
+        assert_eq!(db2.page_count(), page_count_at_reopen + 1);
+    }
+
+    #[test]
+    // Regression test for a real bug this test originally caught: freeing an
+    // overflow continuation page used to only clear its header FLAGS
+    // (free_overflow_pages), never page_used_size, next_page, or the data
+    // region — so a page freed while it held a chunk of an overflow object
+    // came back from alloc_page()'s free-list reuse still carrying that old
+    // page_used_size (observed: 131090, i.e. roughly the original 8-page
+    // object's total size, on a page whose own page_data_size is 16304),
+    // making a perfectly ordinary Page::add_tuple on it fail with
+    // PageCapacityError (can_store() saw it as already full). Fixed by
+    // PageBuffer::reset_freed_page, which writes a genuinely fresh, empty
+    // Page through the normal write path before the page goes on the free
+    // list — the same thing init_page does for a brand-new page.
+    fn test_reused_freed_overflow_page_is_safe_to_write_fresh_data_into() {
+        let (db, tid) = make_db_with_table();
+        let page_sz = DEFAULT_PAGE_SIZE as usize;
+        let grown = big_payload(5, 8 * page_sz);
+        let shrunk = big_payload(6, 4 * page_sz);
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &grown), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &shrunk), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let reused_id = db2.buffer.alloc_page(false).unwrap();
+        assert!(
+            !db2.buffer.get_free_pages().contains(&reused_id),
+            "sanity: alloc_page must not return an id still in the free list"
+        );
+
+        // Mutate-and-write through the exact same handle pattern
+        // BPlusTree::write_page (the real production path for adding a tuple
+        // to a newly allocated data-chain continuation) uses: get_page_mut,
+        // Arc::make_mut, mutate, write_locked_page. This exercises reuse
+        // exactly as it happens in practice, rather than bypassing whatever
+        // get_page_mut actually returns for a page whose on-disk bytes are a
+        // raw overflow-chunk slice, not a standalone serialized Page.
+        let mut handle = db2.buffer.get_page_mut(reused_id).unwrap();
+        Arc::make_mut(&mut handle.page)
+            .add_tuple(Tuple::new(42, b"fresh-after-reuse"))
+            .unwrap();
+        db2.buffer.write_locked_page(handle).unwrap();
+
+        let readback = db2.buffer.get_page(reused_id).unwrap();
+        assert_eq!(readback.count().unwrap(), 1);
+        assert_eq!(
+            readback
+                .get(DBIdType::Int(42))
+                .unwrap()
+                .expect("the freshly written tuple must be readable")
+                .data
+                .to_vec(),
+            b"fresh-after-reuse"
+        );
+
+        // The original (shrunk) large object must still read back correctly
+        // too — reuse of an unrelated freed page must not disturb it.
+        let t2 = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t2)
+                .unwrap()
+                .expect("shrunk object must still be intact")
+                .data
+                .to_vec(),
+            shrunk
+        );
+        drop(t2);
+    }
+
+    #[test]
+    fn test_free_pages_do_not_accumulate_across_multiple_close_reopen_cycles() {
+        let (db, tid) = make_db_with_table();
+        let page = DEFAULT_PAGE_SIZE as usize;
+
+        // Round 1: free some pages, close, reopen.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &big_payload(7, 8 * page)), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &big_payload(8, 4 * page)), &t).unwrap();
+        db.commit(t).unwrap();
+        let (f, u, r) = db.close().unwrap();
+        let db = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let round1_free: HashSet<PageId> = db.buffer.get_free_pages().into_iter().collect();
+        assert!(!round1_free.is_empty());
+
+        // Round 2: grow the SAME object back up (consuming free pages, and
+        // possibly needing fresh ones too), then shrink again, then close.
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &big_payload(9, 8 * page)), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, &big_payload(10, 4 * page)), &t).unwrap();
+        db.commit(t).unwrap();
+        let round2_free_before_close: HashSet<PageId> =
+            db.buffer.get_free_pages().into_iter().collect();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let round2_free_after_reopen: HashSet<PageId> =
+            db2.buffer.get_free_pages().into_iter().collect();
+
+        assert_eq!(
+            round2_free_after_reopen, round2_free_before_close,
+            "the persisted set must reflect only the latest close, not an \
+             accumulation of every round's freed pages"
+        );
     }
 }

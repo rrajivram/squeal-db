@@ -141,3 +141,83 @@ TODO / open issues
     at the original load and 8/8 at 2x load (32 threads, 8000 ops) — 0
     mismatches, 0 panics in every run (was previously failing 3-8 out of
     8-15 runs at the original load); mem-backend stress 6/6.
+
+[7] Concurrent inserts to the SAME table can spuriously return DuplicateKey
+    [OPEN — pre-existing, found while writing checkpoint tests, NOT a
+    checkpoint bug]
+    Symptom: 8 threads each doing begin() -> retry_on_contention(|| insert)
+    -> commit() against one shared table (each thread's own disjoint key
+    range, so no real duplicate is possible) occasionally (~9/25 runs at
+    8 threads x 50 rows) return DuplicateKey(some_key) from insert() on a
+    RETRIED attempt, even though the retry reuses the SAME open transaction
+    (never re-begins) — i.e. this is not the "retry created a second
+    transaction for the same logical write" hazard, it's insert() itself
+    returning Err(DuplicateKey) for a key that was never successfully
+    inserted by anyone.
+    Confirmed NOT related to checkpoint: reproduces identically with a
+    throwaway test that never calls checkpoint() at all (isolated and
+    verified during this session — see the removed temp_isolation_no_checkpoint
+    test in db.rs's history). Also confirmed NOT a test-harness mistake: an
+    earlier version of the test that retried "begin+insert+commit" as one
+    unit was ALSO hitting DuplicateKey, but so does the corrected version that
+    matches the stress harness's proven begin-once/retry-only-the-op pattern
+    (workload.rs's run_op) — ruling out "stale transaction from a failed
+    retry attempt" as the explanation.
+    Leading hypothesis (UNCONFIRMED): under contention, some internal step of
+    BPlusTree::insert()/insert_index() (root/leaf split path most likely,
+    given it's the part of insert that touches multiple pages and re-acquires
+    locks) can return Err(LockContentionError) or similar AFTER the key has
+    already been physically placed, in a way that isn't captured by the
+    "insert() undoes its own partial work on failure" invariant documented
+    on BPlusTree::insert (that invariant specifically covers "data write
+    succeeded, index insert failed" — it may not cover a partial failure
+    *inside* insert_index's own split/retry logic). A retried insert() call
+    then sees the key as already present and returns DuplicateKey instead of
+    succeeding.
+    Workaround applied in the new checkpoint tests (db.rs
+    test_checkpoint_concurrent_with_active_writers): give each thread its own
+    table (disjoint B+tree, no shared index/data pages) instead of one shared
+    table, which avoids the contention path entirely. This is a valid, real
+    workload shape for testing checkpoint's own thread-safety, but it does NOT
+    fix or paper over issue [7] — same-table heavy concurrent insert is still
+    broken and worth its own investigation (start in BPlusTree::insert_index /
+    insert_recursive's split-retry paths under contention).
+
+[8] Freeing a page never resets its content, so reusing a freed overflow page
+    can spuriously fail with PageCapacityError   [FIXED]
+    Context: free-page persistence (serializing PageBuffer::free_pages into
+    FREE_PAGE_TABLE_PAGE on close, restoring it in load_system_tables on
+    open — so freed pages survive a restart instead of becoming permanent
+    unreachable holes) is otherwise correct: the exact freed-page set
+    round-trips across close/reopen, alloc_page() correctly drains the
+    restored free list before growing page_count, and multiple close/reopen
+    cycles don't accumulate stale entries (all covered by passing tests in
+    db.rs's new "free-page persistence" section).
+    But reusing one of those pages doesn't safely work. free_overflow_pages
+    (buffer.rs) — the only place that calls free_page — only clears a
+    continuation page's IS_OVERFLOW flag via write_page_header; it never
+    resets page_used_size, next_page, or the data region. Confirmed via a
+    test that reopens a DB with freed pages, calls alloc_page() (returning a
+    freed id), and does the exact real production sequence
+    (get_page_mut -> Arc::make_mut -> add_tuple -> write_locked_page, i.e.
+    BPlusTree::write_page's own pattern for a new data-chain continuation):
+    add_tuple fails with PageCapacityError. Observed header on the "reused"
+    page: page_used_size=131090 (≈ the original 8-page object's total size)
+    against its own page_data_size=16304, and next_page=8 (a stale chain
+    pointer) — can_store() sees a page that looks already full/chained, not
+    empty. This is pre-existing (not caused by the persistence feature
+    itself) but the persistence feature makes it bite more often, since a
+    freed page can now survive to be reused in a LATER process, not just
+    later in the same session.
+    Test: db.rs::test_reused_freed_overflow_page_is_safe_to_write_fresh_data_into
+    — was deterministically FAILING (verified 5/5) before the fix.
+    Fix applied: PageBuffer::reset_freed_page (buffer.rs) constructs a fresh,
+    empty Page (matching the freed page's original record_size — Page::new_data
+    or Page::new_indexed) and writes it through the normal write_page path
+    (same as init_page's own pattern for a brand-new page), resetting
+    page_used_size/next_page/flags/data region all at once. Wired into
+    free_overflow_pages: called on each continuation page right before
+    free_page(), instead of the old clear_is_overflow-then-header-only-write.
+    Verified: the regression test passes deterministically (5/5); full lib
+    suite 196/196 stable across 10 serial + 8 parallel runs; file-backend
+    stress 8/8 and mem-backend 6/6, 0 mismatches, 0 panics.

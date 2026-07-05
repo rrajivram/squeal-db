@@ -680,6 +680,10 @@ mod tests {
         v.extend_from_slice(&0u64.to_le_bytes()); // first_page_offset
         v.extend_from_slice(&FIRST_USER_PAGE.to_le_bytes()); // page_count
         v.extend_from_slice(&page_size.to_le_bytes());
+        // last_checkpoint: u128, not fixint-annotated, so postcard varint-
+        // encodes it — append its own to_allocvec output (see the identical
+        // fix/comment in buffer.rs's make_header_bytes).
+        v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap());
         Arc::new(from_bytes::<Header>(&v).unwrap())
     }
 
