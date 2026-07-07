@@ -137,7 +137,7 @@ where
     F: DBFile<Item = F>,
 {
     pub fn create<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
-        Ok(Self::create_with_page_size(name, DEFAULT_PAGE_SIZE)?)
+        Self::create_with_page_size(name, DEFAULT_PAGE_SIZE)
     }
 
     pub fn create_with_page_size<S: AsRef<str>>(
@@ -204,9 +204,9 @@ where
         )?;
         let sf = Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
-            page_count: page_count,
-            header: header,
-            file: file,
+            page_count,
+            header,
+            file,
             undo_file,
             redo_file,
             name: name.as_ref().to_string(),
@@ -311,7 +311,7 @@ where
         // revert_txn_writes), so this is safe even if another thread is making
         // forward progress on the same keys.
         self.drain_aborting();
-        Ok(self.tx_mgr.begin()?)
+        self.tx_mgr.begin()
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<(), StoreError> {
@@ -432,12 +432,11 @@ where
     }
 
     pub(crate) fn table_by_id(&self, id: TableIdType) -> Result<Arc<BPlusTree<F>>, StoreError> {
-        Ok(self
-            .tables
+        self.tables
             .read()
             .get(&id)
-            .map(|t| Arc::clone(t))
-            .ok_or(StoreError::TableNotFound(id.to_string()))?)
+            .map(Arc::clone)
+            .ok_or(StoreError::TableNotFound(id.to_string()))
     }
 
     pub fn insert(
@@ -473,11 +472,11 @@ where
             // a committed-but-not-yet-reclaimed tombstone can legitimately still
             // be present in the tree.)
             match committed {
-                Some(t) if t.is_tombstoned() => return Ok(None),
-                other => return Ok(other),
+                Some(t) if t.is_tombstoned() => Ok(None),
+                other => Ok(other),
             }
         } else {
-            return Ok(None);
+            Ok(None)
         }
     }
 
@@ -514,9 +513,9 @@ where
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
             table.update(updated)?;
-            return Ok(());
+            Ok(())
         } else {
-            return Err(StoreError::KeyNotFound(new_tuple.id));
+            Err(StoreError::KeyNotFound(new_tuple.id))
         }
     }
 
@@ -550,9 +549,9 @@ where
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
             table.update(tombstoned.clone())?;
-            return Ok(tombstoned);
+            Ok(tombstoned)
         } else {
-            return Err(StoreError::KeyNotFound(id));
+            Err(StoreError::KeyNotFound(id))
         }
     }
 
@@ -568,23 +567,15 @@ where
                 let mut tuple = tuple.clone();
                 let mut txn = txn;
                 loop {
-                    if tuple.undo_id.is_none() {
-                        return None;
-                    }
+                    tuple.undo_id?;
                     let undo_id = tuple.undo_id.unwrap();
 
                     // Tolerate a missing undo record: an aborting txn's undo can
                     // be discarded concurrently once its rows are reverted. If we
                     // can't walk further, treat the row as not-yet-committed
                     // (invisible) rather than panicking.
-                    let next_tuple = match self.logger.find_undo_tuple(txn.clone(), undo_id) {
-                        Some(t) => t,
-                        None => return None,
-                    };
-                    let next_txn = match next_tuple.txn_id.clone() {
-                        Some(t) => t,
-                        None => return None,
-                    };
+                    let next_tuple = self.logger.find_undo_tuple(txn.clone(), undo_id)?;
+                    let next_txn = next_tuple.txn_id.clone()?;
                     if self.tx_mgr.is_committed(&next_txn) {
                         // next_tuple is the committed ancestor we walked back
                         // to — return it, not the in-flight `tuple` we started
@@ -688,10 +679,10 @@ where
             last_checkpoint: timestamp(),
         };
         let bytes = to_allocvec(&header)?;
-        f.write(&bytes)?;
+        f.write_all(&bytes)?;
         let header = Arc::new(header);
         let gens = Generator::new();
-        gens.create_generator(&SYSTEM_TABLE_NAME.to_owned(), None)?;
+        gens.create_generator(SYSTEM_TABLE_NAME, None)?;
         let gens = Arc::new(gens);
         let page_count = Arc::new(AtomicU64::new(0));
         let nm = Self::setup_needed_modules(
@@ -706,12 +697,12 @@ where
 
         Ok(Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
-            name: name,
-            header: header,
+            name,
+            header,
             file: f,
             undo_file,
             redo_file,
-            page_count: page_count,
+            page_count,
             tables: Arc::new(RwLock::new(HashMap::new())),
             generator: gens,
             logger: nm.logger,
@@ -839,7 +830,7 @@ pub(crate) fn retry_on_contention<T>(
 pub(crate) fn db_hash(bytes: &[u8]) -> u64 {
     let mut h = 0x811C9DC5;
     for b in bytes {
-        h = h ^ *b as u64;
+        h ^= *b as u64;
         h = (h * 0x01000193) & 0xFFFFFFFF;
     }
     h
@@ -906,7 +897,7 @@ mod tests {
     fn test_create() {
         const DB_NAME: &str = "test1.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = TestDB::create(DB_NAME.to_string());
+        let db = TestDB::create(DB_NAME);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.first_page_offset, ZERO_PAGE_SIZE);
@@ -924,7 +915,7 @@ mod tests {
     fn test_simple_alloc_page() {
         const DB_NAME: &str = "test2.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = TestDB::create(DB_NAME.to_string()).unwrap();
+        let db = TestDB::create(DB_NAME).unwrap();
         let page = db.buffer.alloc_page(false);
         assert!(page.is_ok());
         let page = page.unwrap();
@@ -948,14 +939,14 @@ mod tests {
     fn test_create_table() {
         const DB_NAME: &str = "test3.db";
         //FileDB::delete(DB_NAME).unwrap_or_default();
-        let db = TestDB::create(DB_NAME.to_string());
+        let db = TestDB::create(DB_NAME);
         assert!(db.is_ok());
         let db = db.unwrap();
         let r = db.create_table("table_1".to_string());
         assert!(r.is_ok());
         assert_eq!(db.get_tables().unwrap().len(), 1);
         let (f, u, r) = db.close().unwrap();
-        let db = TestDB::open_using(DB_NAME.to_string(), f, u, r).unwrap();
+        let db = TestDB::open_using(DB_NAME, f, u, r).unwrap();
         let t = db.get_tables().unwrap();
         assert!(t.len() == 1);
         assert_eq!(t[0].name, "table_1");

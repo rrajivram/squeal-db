@@ -383,7 +383,7 @@ where
                 if id < row.id {
                     let page_id = from_bytes::<Node>(&row.data)?;
                     if let Node::Inner(page_num) = page_id {
-                        return Ok(self.find_page(id, page_num)?);
+                        return self.find_page(id, page_num);
                     } else {
                         panic!("Expected Inner. Found leaf ! {:?}", row.id);
                     }
@@ -397,13 +397,13 @@ where
             // Non-root inner nodes have no u64::MAX sentinel; the last child
             // covers all keys from its separator up to the parent's upper bound.
             if let Some(child) = last_child {
-                return Ok(self.find_page(id, child)?);
+                return self.find_page(id, child);
             }
-            return Ok(None);
+            Ok(None)
         } else {
             Ok(page
                 .get(id)?
-                .map(|t| {
+                .and_then(|t| {
                     let id = from_bytes::<Node>(&t.data);
                     match id {
                         Ok(Node::Leaf(page_id)) => Some(Ok(page_id)),
@@ -413,7 +413,6 @@ where
                         Err(e) => Some(Err(StoreError::from(e))),
                     }
                 })
-                .flatten()
                 .transpose()?)
         }
     }
@@ -595,7 +594,6 @@ where
         }
         Ok(())
     }
-
 
     fn split_if_needed(
         &self,
@@ -946,7 +944,7 @@ mod tests {
             let page = tree.buffer.get_page(page_id).unwrap();
             let count = page.count().unwrap();
             assert!(
-                count <= tree.table.nodes_per_page - 1,
+                count < tree.table.nodes_per_page,
                 "page {page_id:?} holds {count} entries, over the max of {}",
                 tree.table.nodes_per_page - 1
             );
@@ -986,7 +984,10 @@ mod tests {
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
-        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"hello");
+        assert_eq!(
+            dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"hello"
+        );
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 1);
@@ -1039,10 +1040,16 @@ mod tests {
 
         let dp1 = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp1.count().unwrap(), 2, "dp1 holds the 2 tuples that fit");
-        assert!(!dp1.has_overflow(), "dp1 must NOT overflow — it chains instead");
+        assert!(
+            !dp1.has_overflow(),
+            "dp1 must NOT overflow — it chains instead"
+        );
 
         // dp1 links to dp2 via the normal data-chain pointer (no overflow).
-        let dp2_id = tree.buffer.data_chain_next(&dp1, tree.table.first_data_page).unwrap();
+        let dp2_id = tree
+            .buffer
+            .data_chain_next(&dp1, tree.table.first_data_page)
+            .unwrap();
         assert!(dp2_id.is_valid_next_page(), "dp1 must link to dp2");
 
         let dp2 = tree.buffer.get_page(dp2_id).unwrap();
@@ -1051,7 +1058,10 @@ mod tests {
 
         // All three remain findable through the index.
         for i in 1u64..=3 {
-            assert_eq!(tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(), large);
+            assert_eq!(
+                tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(),
+                large
+            );
         }
     }
 
@@ -1132,7 +1142,7 @@ mod tests {
     // inefficiency alone.
     fn assert_logarithmic_depth(depths: &[usize], n: usize) {
         let max = *depths.iter().max().unwrap();
-        let bound = 6 * (usize::BITS - (n as u64 + 1).leading_zeros() as u32) as usize;
+        let bound = 6 * (usize::BITS - (n as u64 + 1).leading_zeros()) as usize;
         assert!(
             max <= bound,
             "tree depth {max} far exceeds the logarithmic bound {bound} for n={n} — \
@@ -1267,8 +1277,14 @@ mod tests {
 
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 2);
-        assert_eq!(dp.get(id1.clone()).unwrap().unwrap().data.to_vec(), b"a-data");
-        assert_eq!(dp.get(id2.clone()).unwrap().unwrap().data.to_vec(), b"b-data");
+        assert_eq!(
+            dp.get(id1.clone()).unwrap().unwrap().data.to_vec(),
+            b"a-data"
+        );
+        assert_eq!(
+            dp.get(id2.clone()).unwrap().unwrap().data.to_vec(),
+            b"b-data"
+        );
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert_eq!(ip.count().unwrap(), 2);
@@ -1311,7 +1327,10 @@ mod tests {
         // Original value must be untouched, and no second entry was added.
         let dp = tree.buffer.get_page(tree.table.first_data_page).unwrap();
         assert_eq!(dp.count().unwrap(), 1);
-        assert_eq!(dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"first");
+        assert_eq!(
+            dp.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"first"
+        );
     }
 
     #[test]
@@ -1408,7 +1427,10 @@ mod tests {
         // index's Node::Leaf pointer there rather than only checking the first page.
         let found = tree.find(DBIdType::Int(3)).unwrap().unwrap();
         assert_eq!(found.data.to_vec(), large);
-        assert_eq!(tree.find(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), large);
+        assert_eq!(
+            tree.find(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            large
+        );
     }
 
     #[test]
@@ -1572,10 +1594,18 @@ mod tests {
             .unwrap();
 
         let old = tree.update(tuple_with_txn(1.into(), b"world")).unwrap();
-        assert_eq!(old.data.to_vec(), b"hello", "update must return the previous value");
+        assert_eq!(
+            old.data.to_vec(),
+            b"hello",
+            "update must return the previous value"
+        );
 
         let found = tree.find(DBIdType::Int(1)).unwrap().unwrap();
-        assert_eq!(found.data.to_vec(), b"world", "update must replace the stored value");
+        assert_eq!(
+            found.data.to_vec(),
+            b"world",
+            "update must replace the stored value"
+        );
     }
 
     #[test]

@@ -94,7 +94,7 @@ pub fn validate_hot_encoding(data: &[u8]) -> bool {
         && parts[4][4..].parse::<u32>().is_ok()
 }
 
-fn counters_for<'a>(stats: &'a Stats, kind: OpKind) -> &'a OpCounters {
+fn counters_for(stats: &Stats, kind: OpKind) -> &OpCounters {
     match kind {
         OpKind::Insert => &stats.insert,
         OpKind::Update => &stats.update,
@@ -271,9 +271,10 @@ where
         // Record this batch's full per-key trace, annotated with the
         // batch's own outcome — see WorkerResult::key_history.
         for (k, kind, ok) in &batch_trace {
-            key_history.entry(*k).or_default().push(format!(
-                "txn{this_txn} {kind:?} op_ok={ok} batch={outcome}"
-            ));
+            key_history
+                .entry(*k)
+                .or_default()
+                .push(format!("txn{this_txn} {kind:?} op_ok={ok} batch={outcome}"));
         }
     }
 
@@ -289,6 +290,7 @@ where
 /// by None) IF the op should update the caller's expectation once committed.
 /// Returns None when the op doesn't change expected state (e.g. a Find, or an
 /// op that errored).
+#[allow(clippy::too_many_arguments)]
 fn apply_private_op<F>(
     db: &Db<F>,
     txn: &store::txn::Transaction,
@@ -331,6 +333,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_hot_op<F>(
     db: &Db<F>,
     txn: &store::txn::Transaction,

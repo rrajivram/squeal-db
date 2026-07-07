@@ -105,10 +105,7 @@ impl Tuple {
     }
 
     pub fn is_same_txn(&self, tx_id: TransactionId) -> bool {
-        self.txn_id
-            .as_ref()
-            .and_then(|t| Some(*t == tx_id))
-            .unwrap_or(false)
+        self.txn_id.as_ref().map(|t| *t == tx_id).unwrap_or(false)
     }
 
     pub fn set_undo_id(&mut self, id: UndoId) {
@@ -192,7 +189,7 @@ impl DBIdType {
     pub(crate) fn hashed(&self) -> u64 {
         match self {
             Self::Int(i) => *i,
-            Self::Vec(v) => db_hash(&v),
+            Self::Vec(v) => db_hash(v),
         }
     }
 }

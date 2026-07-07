@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{db::DBSizeType, page::PageId};
@@ -27,8 +29,8 @@ impl From<DBSizeType> for TableIdType {
     }
 }
 
-impl TableIdType {
-    pub(crate) fn to_string(&self) -> String {
-        self.0.to_string()
+impl Display for TableIdType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }

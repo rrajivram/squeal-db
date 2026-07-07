@@ -69,7 +69,7 @@ impl Opener for MemFile {
 impl Opener for std::fs::File {
     type Item = std::fs::File;
     fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<std::fs::File> {
-        Ok(op.open(p)?)
+        op.open(p)
     }
 
     fn do_sync(&mut self) -> std::io::Result<()> {
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn test_seek_end_zero() {
         let mut f = MemFile::new();
-        f.write(b"hello world").unwrap();
+        f.write_all(b"hello world").unwrap();
         let pos = f.seek(SeekFrom::End(0)).unwrap();
         assert_eq!(pos, 11);
         let mut buf = vec![0u8; 4];
@@ -187,69 +187,69 @@ mod tests {
     #[test]
     fn test_seek_end_negative() {
         let mut f = MemFile::new();
-        f.write(b"hello world").unwrap();
+        f.write_all(b"hello world").unwrap();
         let pos = f.seek(SeekFrom::End(-5)).unwrap();
         assert_eq!(pos, 6);
         let mut buf = vec![0u8; 5];
-        f.read(&mut buf).unwrap();
+        f.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
     }
 
     #[test]
     fn test_seek_current_forward() {
         let mut f = MemFile::new();
-        f.write(b"hello world").unwrap();
+        f.write_all(b"hello world").unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
         f.seek(SeekFrom::Current(6)).unwrap();
         let mut buf = vec![0u8; 5];
-        f.read(&mut buf).unwrap();
+        f.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
     }
 
     #[test]
     fn test_seek_current_backward() {
         let mut f = MemFile::new();
-        f.write(b"hello world").unwrap();
+        f.write_all(b"hello world").unwrap();
         f.seek(SeekFrom::Start(9)).unwrap();
         f.seek(SeekFrom::Current(-3)).unwrap();
         let mut buf = vec![0u8; 5];
-        f.read(&mut buf).unwrap();
+        f.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"world");
     }
 
     #[test]
     fn test_overwrite_at_offset() {
         let mut f = MemFile::new();
-        f.write(b"hello world").unwrap();
+        f.write_all(b"hello world").unwrap();
         f.seek(SeekFrom::Start(6)).unwrap();
-        f.write(b"Rust!").unwrap();
+        f.write_all(b"Rust!").unwrap();
         f.seek(SeekFrom::Start(0)).unwrap();
         let mut buf = vec![0u8; 11];
-        f.read(&mut buf).unwrap();
+        f.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"hello Rust!");
     }
 
     #[test]
     fn test_clone_shares_data() {
         let mut f = MemFile::new();
-        f.write(b"shared").unwrap();
+        f.write_all(b"shared").unwrap();
         let mut g = f.clone();
         g.seek(SeekFrom::Start(0)).unwrap();
         let mut buf = vec![0u8; 6];
-        g.read(&mut buf).unwrap();
+        g.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"shared");
         // Write via f is visible through g
         f.seek(SeekFrom::Start(0)).unwrap();
-        f.write(b"SHARED").unwrap();
+        f.write_all(b"SHARED").unwrap();
         g.seek(SeekFrom::Start(0)).unwrap();
-        g.read(&mut buf).unwrap();
+        g.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"SHARED");
     }
 
     #[test]
     fn test_read_partial_data() {
         let mut f = MemFile::new();
-        f.write(b"abcde").unwrap();
+        f.write_all(b"abcde").unwrap();
         f.seek(SeekFrom::Start(2)).unwrap();
         let mut buf = vec![0u8; 10]; // request more than available
         let n = f.read(&mut buf).unwrap();

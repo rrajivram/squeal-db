@@ -85,29 +85,21 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self
-            .data
-            .get(&id.hashed())
-            .map(|t| extract(t, id))
-            .flatten())
+        Ok(self.data.get(&id.hashed()).and_then(|t| extract(t, id)))
     }
 
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
-        Ok(self
-            .data
+        self.data
             .get_mut(&id.hashed())
-            .map(|v| replace(v, id, tuple))
-            .flatten()
-            .ok_or(StoreError::KeyNotFound(id.clone()))?)
+            .and_then(|v| replace(v, id, tuple))
+            .ok_or(StoreError::KeyNotFound(id.clone()))
     }
 
     fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
-        Ok(self
-            .data
+        self.data
             .get_mut(&id.hashed())
-            .map(|t| remove(t, &id))
-            .flatten()
-            .ok_or(StoreError::KeyNotFound(id))?)
+            .and_then(|t| remove(t, &id))
+            .ok_or(StoreError::KeyNotFound(id))
     }
 
     fn values(&self) -> Result<Vec<Tuple>, StoreError> {
@@ -128,15 +120,15 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn clear(&mut self) -> Result<(), StoreError> {
-        Ok(self.data.clear())
+        self.data.clear();
+        Ok(())
     }
 
     fn first(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self
             .data
             .first_key_value()
-            .map(|(_k, v)| v.first())
-            .flatten()
+            .and_then(|(_k, v)| v.first())
             .cloned())
     }
 
@@ -144,20 +136,19 @@ impl PageTuple for AnyTuplePage {
         Ok(self
             .data
             .last_key_value()
-            .map(|(_k, v)| v.last())
-            .flatten()
+            .and_then(|(_k, v)| v.last())
             .cloned())
     }
 }
 
 #[inline(always)]
-fn is_present(items: &Vec<Tuple>, id: &DBIdType) -> bool {
+fn is_present(items: &[Tuple], id: &DBIdType) -> bool {
     items.iter().any(|i| i.id == *id)
 }
 
 #[inline(always)]
-fn extract(items: &Vec<Tuple>, id: &DBIdType) -> Option<Tuple> {
-    items.iter().find(|i| i.id == *id).map(|v| v.clone())
+fn extract(items: &[Tuple], id: &DBIdType) -> Option<Tuple> {
+    items.iter().find(|i| i.id == *id).cloned()
 }
 
 #[inline(always)]
@@ -166,7 +157,7 @@ fn remove(items: &mut Vec<Tuple>, id: &DBIdType) -> Option<Tuple> {
 }
 
 #[inline(always)]
-fn replace(items: &mut Vec<Tuple>, id: &DBIdType, tuple: Tuple) -> Option<Tuple> {
+fn replace(items: &mut [Tuple], id: &DBIdType, tuple: Tuple) -> Option<Tuple> {
     items
         .iter_mut()
         .try_for_each(|t| {
@@ -287,8 +278,14 @@ mod tests {
         let bytes = p.to_bytes().unwrap();
         let p2 = AnyTuplePage::from_bytes(&bytes).unwrap();
         assert_eq!(p2.count().unwrap(), 2);
-        assert_eq!(p2.get(&DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"foo");
-        assert_eq!(p2.get(&DBIdType::Int(2)).unwrap().unwrap().data.to_vec(), b"bar");
+        assert_eq!(
+            p2.get(&DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"foo"
+        );
+        assert_eq!(
+            p2.get(&DBIdType::Int(2)).unwrap().unwrap().data.to_vec(),
+            b"bar"
+        );
     }
 
     #[test]

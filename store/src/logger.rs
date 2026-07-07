@@ -209,18 +209,13 @@ impl Logger {
         // rely on this returning `Ok` so they can reach their final
         // tx_mgr.commit/rollback call and actually deactivate the
         // transaction — see Transaction::into_id.
-        Ok(self
-            .undo_txns
-            .read()
-            .get(&id)
-            .map(|v| v.clone())
-            .unwrap_or_default())
+        Ok(self.undo_txns.read().get(&id).cloned().unwrap_or_default())
     }
 
-    pub(crate) fn find_undo_tuple<'a>(&self, id: TransactionId, undo_id: UndoId) -> Option<Tuple> {
+    pub(crate) fn find_undo_tuple(&self, id: TransactionId, undo_id: UndoId) -> Option<Tuple> {
         let map = self.undo_txns.read();
 
-        let o = map.get(&id).map(|v| v.get(undo_id.0 as usize)).flatten();
+        let o = map.get(&id).and_then(|v| v.get(undo_id.0 as usize));
         if let Some(op) = o {
             let tuple = match op {
                 Operation::Add(_, r) | Operation::Del(_, r) | Operation::Mod(_, r) => {
@@ -361,12 +356,12 @@ fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
             }
             MsgType::Undo(msg) => {
                 file.seek(SeekFrom::End(0))?;
-                file.write(&to_allocvec(&msg)?)?;
+                file.write_all(&to_allocvec(&msg)?)?;
             }
             MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
             MsgType::Checkpoint(_ts) => {
                 file.seek(SeekFrom::End(0))?;
-                file.write(&to_allocvec(&msg)?)?;
+                file.write_all(&to_allocvec(&msg)?)?;
             }
         }
     }
@@ -389,13 +384,13 @@ fn redo_log_runner(
             }
             MsgType::Redo(msg) => {
                 file.seek(SeekFrom::End(0))?;
-                file.write(&to_allocvec(&msg)?)?;
+                file.write_all(&to_allocvec(&msg)?)?;
                 clock.mark_written(msg.lsn_id);
             }
             MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
             MsgType::Checkpoint(_ts) => {
                 file.seek(SeekFrom::End(0))?;
-                file.write(&to_allocvec(&msg)?)?;
+                file.write_all(&to_allocvec(&msg)?)?;
             }
         }
     }
@@ -404,7 +399,7 @@ fn redo_log_runner(
 
 impl From<usize> for UndoId {
     fn from(value: usize) -> Self {
-        Self { 0: value as u16 }
+        Self(value as u16)
     }
 }
 

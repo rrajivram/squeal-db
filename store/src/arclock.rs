@@ -230,7 +230,7 @@ where
 
 #[cfg(test)]
 mod arclock_tests {
-    use std::{thread, u64};
+    use std::thread;
 
     use super::ArcLock;
 

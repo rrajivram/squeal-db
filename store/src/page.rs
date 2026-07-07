@@ -179,7 +179,7 @@ impl Page {
             page_data_size: self.page_data_size,
             page_used_size: self.page_used_size,
             record_size: self.record_size,
-            lsn: self.lsn.read().unwrap().clone(),
+            lsn: *self.lsn.read().unwrap(),
             flags: self.flags.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
@@ -189,7 +189,7 @@ impl Page {
     }
 
     pub(crate) fn lsn_id(&self) -> Result<LsnId, StoreError> {
-        Ok(self.lsn.read()?.clone())
+        Ok(*self.lsn.read()?)
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
@@ -356,7 +356,7 @@ impl Page {
     }
 
     pub(crate) fn count(&self) -> Result<usize, StoreError> {
-        Ok(self.data.count()?)
+        self.data.count()
     }
 
     pub(crate) fn written(&self) {
@@ -415,7 +415,7 @@ impl Page {
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
         let header = &bytes[..PAGE_OVERHEAD];
-        let header = from_bytes::<PageHeader>(&header)?;
+        let header = from_bytes::<PageHeader>(header)?;
         let data = &bytes[PAGE_OVERHEAD..];
         // Deserialize the tuple payload with `?` rather than routing through the
         // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
@@ -447,7 +447,7 @@ impl Page {
         }
         self.flags
             .set_bit(flag, std::sync::atomic::Ordering::Relaxed);
-        Ok(self.set_dirty(true)?)
+        self.set_dirty(true)
     }
 
     pub(crate) fn clear_page_flag(&self, flag: usize) -> Result<(), StoreError> {
@@ -456,7 +456,7 @@ impl Page {
         }
         self.flags
             .clear_bit(flag, std::sync::atomic::Ordering::Relaxed);
-        Ok(self.set_dirty(true)?)
+        self.set_dirty(true)
     }
 
     pub(crate) fn is_flag_set(&self, flag: usize) -> bool {
@@ -555,7 +555,7 @@ impl From<Page> for PageDto {
             page_data_size: value.page_data_size,
             page_used_size: value.page_used_size,
             record_size: value.record_size,
-            lsn: value.lsn.read().unwrap().clone(),
+            lsn: *value.lsn.read().unwrap(),
             flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
             data: value.data.to_bytes().unwrap(),
         }
@@ -578,7 +578,7 @@ impl Clone for Page {
             page_used_size: self.page_used_size,
             record_size: self.record_size,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
-            lsn: RwLock::new(self.lsn.read().unwrap().clone()),
+            lsn: RwLock::new(*self.lsn.read().unwrap()),
             lsn_clock: self.lsn_clock.clone(),
             accessed: AtomicU128::new(self.accessed.load(std::sync::atomic::Ordering::Relaxed)),
             written: AtomicU128::new(self.written.load(std::sync::atomic::Ordering::Relaxed)),
@@ -613,7 +613,7 @@ impl From<PageId> for DBSizeType {
 
 impl From<usize> for PageId {
     fn from(value: usize) -> Self {
-        Self { 0: value as u64 }
+        Self(value as u64)
     }
 }
 
@@ -628,7 +628,7 @@ impl PageId {
         self.0 != 0
     }
 
-    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+    pub(crate) fn to_bytes(self) -> Result<Vec<u8>, StoreError> {
         Ok(to_allocvec(&self)?)
     }
 
@@ -667,8 +667,8 @@ mod tests {
             p.add_tuple(Tuple::new(2, b"aa")),
             Err(StoreError::DuplicateKey(_))
         ));
-        assert_eq!(p.is_dirty(), true);
-        assert_eq!(p.can_store(&Tuple::new(3, b"abcd")), true);
+        assert!(p.is_dirty());
+        assert!(p.can_store(&Tuple::new(3, b"abcd")));
     }
 
     #[test]
@@ -767,8 +767,14 @@ mod tests {
         let p2 = Page::from_bytes(&bytes).unwrap();
         assert!(p2.contains(DBIdType::Int(1)).unwrap());
         assert!(p2.contains(DBIdType::Int(2)).unwrap());
-        assert_eq!(p2.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(), b"first");
-        assert_eq!(p2.get(DBIdType::Int(2)).unwrap().unwrap().data.to_vec(), b"second");
+        assert_eq!(
+            p2.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"first"
+        );
+        assert_eq!(
+            p2.get(DBIdType::Int(2)).unwrap().unwrap().data.to_vec(),
+            b"second"
+        );
     }
 
     // --- PageIterator: AnyTuplePage ---

@@ -117,7 +117,7 @@ where
         // Never larger than max_pending_writes itself, so a small configured
         // cap (e.g. in tests) isn't silently widened back out by this.
         const WRITE_CHANNEL_CAPACITY: usize = 64;
-        let (write_tx, write_rx) = bounded(max_pending_writes.min(WRITE_CHANNEL_CAPACITY).max(1));
+        let (write_tx, write_rx) = bounded(max_pending_writes.clamp(1, WRITE_CHANNEL_CAPACITY));
         let w_header = header.clone();
         let writer_clock = clock.clone();
         let write_handle = thread::spawn(move || {
@@ -191,13 +191,13 @@ where
                    .send(BufMsg::WritePage(WriteMsg { page_num, page }))?)
 
         */
-        Ok(write_page(
+        write_page(
             page_num,
             &page,
             &*(self.self_file.read()),
             self.header.page_size,
             self.header.first_page_offset,
-        )?)
+        )
     }
 
     pub(crate) fn write_locked_page(&self, handle: WritePageHandle) -> Result<(), StoreError> {
@@ -488,7 +488,7 @@ where
                 .page_count
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             let pg: PageId = next_page.into();
-            self.init_page(pg.clone(), should_pin)?;
+            self.init_page(pg, should_pin)?;
             Ok(next_page.into())
         }
     }
@@ -757,7 +757,6 @@ fn writer<F: DBFile>(
     clock: Arc<LsnClock>,
     max_pending: usize,
 ) -> Result<(), StoreError> {
-    let mut file = file;
     let mut pending: Vec<WriteMsg> = vec![];
     loop {
         // Drain deferred pages EVERY iteration, not just when idle. Db::insert
@@ -774,7 +773,7 @@ fn writer<F: DBFile>(
                 write_page(
                     m.page_num,
                     &m.page,
-                    &mut file,
+                    &file,
                     header.page_size,
                     header.first_page_offset,
                 )?;
@@ -834,7 +833,7 @@ fn writer<F: DBFile>(
                         write_page(
                             m.page_num,
                             &m.page,
-                            &mut file,
+                            &file,
                             header.page_size,
                             header.first_page_offset,
                         )?;
@@ -851,7 +850,7 @@ fn writer<F: DBFile>(
                     write_page(
                         m.page_num,
                         &m.page,
-                        &mut file,
+                        &file,
                         header.page_size,
                         header.first_page_offset,
                     )?;
@@ -870,7 +869,7 @@ fn writer<F: DBFile>(
                     write_page(
                         msg.page_num,
                         &msg.page,
-                        &mut file,
+                        &file,
                         header.page_size,
                         header.first_page_offset,
                     )?;
