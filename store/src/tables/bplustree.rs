@@ -341,6 +341,21 @@ where
         Ok(Some(old))
     }
 
+    pub(crate) fn next_data_page(
+        &self,
+        page: Option<Arc<Page>>,
+    ) -> Result<Option<Arc<Page>>, StoreError> {
+        if let Some(page) = page {
+            if PageId::is_valid_next_page(&page.get_next_page()) {
+                Ok(Some(self.buffer.get_page(page.get_next_page())?))
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(Some(self.buffer.get_page(self.table.first_data_page)?))
+        }
+    }
+
     /// Conditional `remove` for abort-revert — see `update_if_txn`. Removes the
     /// row (and its index entry) only if it still belongs to `expect_txn`, atomic
     /// under the data-page lock. Returns Ok(None) if it is already gone or owned
@@ -374,6 +389,7 @@ where
         Ok(Some(old))
     }
 
+    #[allow(clippy::bind_instead_of_map)]
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
         let page = self.buffer.get_page(start)?;
         if page.is_flag_set(INNER_NODE) {

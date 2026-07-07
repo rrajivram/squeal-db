@@ -7,6 +7,7 @@ use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::constant::timestamp;
+use crate::cursor::TableCursor;
 use crate::error::StoreError;
 use crate::generator::Generator;
 use crate::logger::Logger;
@@ -111,6 +112,11 @@ pub(crate) struct Header {
     pub(crate) last_checkpoint: u128,
 }
 
+// Every constructor (create*/open*) returns Arc<Db<F>>, never a bare Db<F>:
+// TableCursor needs to hold its own reference to the Db it's scanning (to
+// resolve MVCC visibility per row via find_last_committed), so Db is meant
+// to always be shared this way rather than owned outright by one caller.
+// close() reflects this too — it takes Arc<Self> and unwraps it internally.
 pub struct Db<F: DBFile + 'static> {
     name: String,
     pub(crate) header: Arc<Header>,
@@ -136,14 +142,14 @@ impl<F: DBFile + 'static> Db<F>
 where
     F: DBFile<Item = F>,
 {
-    pub fn create<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
+    pub fn create<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
         Self::create_with_page_size(name, DEFAULT_PAGE_SIZE)
     }
 
     pub fn create_with_page_size<S: AsRef<str>>(
         name: S,
         page_size: DBSizeType,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Arc<Self>, StoreError> {
         Self::create_with_limits(name, page_size, DEFAULT_MAX_PENDING_WRITES)
     }
 
@@ -156,10 +162,10 @@ where
         name: S,
         page_size: DBSizeType,
         max_pending_writes: usize,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Arc<Self>, StoreError> {
         let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_pending_writes)?;
         sf.create_system_tables()?;
-        Ok(sf)
+        Ok(Arc::new(sf))
     }
 
     pub fn open_using<S: AsRef<str>>(
@@ -167,7 +173,7 @@ where
         file: F,
         undo_file: F,
         redo_file: F,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Arc<Self>, StoreError> {
         Self::open_using_with_limits(name, file, undo_file, redo_file, DEFAULT_MAX_PENDING_WRITES)
     }
 
@@ -179,7 +185,7 @@ where
         undo_file: F,
         redo_file: F,
         max_pending_writes: usize,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Arc<Self>, StoreError> {
         let mut bytes = vec![0u8; size_of::<Header>()];
         let mut file = file;
         file.seek(SeekFrom::Start(0))?;
@@ -224,10 +230,10 @@ where
             buffer: nm.buffer,
         };
         sf.load_system_tables()?;
-        Ok(sf)
+        Ok(Arc::new(sf))
     }
 
-    pub fn open<S: AsRef<str>>(name: S) -> Result<Self, StoreError> {
+    pub fn open<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
         let uf_name = name.as_ref().to_string() + ".undo";
         let rf_name = name.as_ref().to_string() + ".redo";
         let f = OpenOptions::new()
@@ -255,14 +261,27 @@ where
      * Close only return files used so this can be used with MemFile for testing,
      * as MemFile does not survive recreating. Similarly with open_using.
      */
-    pub fn close(self) -> Result<(F, F, F), StoreError> {
+    // Takes Arc<Self> (not a bare owned Db) because every constructor now
+    // hands out Arc<Db<F>> — see the type's own doc comment. Closing still
+    // needs unique ownership (to tear down the buffer/logger threads and
+    // hand the underlying files back), so this unwraps the Arc first: it
+    // errors instead of panicking if some other clone (e.g. a TableCursor,
+    // or another thread) is still holding a reference.
+    pub fn close(self: Arc<Self>) -> Result<(F, F, F), StoreError> {
+        let db = Arc::try_unwrap(self).map_err(|_| {
+            StoreError::UnknownError(
+                "Db::close: other Arc<Db> references still exist (e.g. a live TableCursor or \
+                 another thread) — drop them before closing"
+                    .into(),
+            )
+        })?;
         // Revert any still-aborting transactions before persisting: the aborting
         // set is in-memory only, so an un-reverted aborted row would reappear as
         // committed after reopen (its txn no longer being in any set).
-        self.drain_aborting();
-        self.write_system_tables()?;
-        let mut hdr = (*self.header).clone();
-        hdr.page_count = self.page_count();
+        db.drain_aborting();
+        db.write_system_tables()?;
+        let mut hdr = (*db.header).clone();
+        hdr.page_count = db.page_count();
         hdr.last_checkpoint = timestamp();
         // Each BPlusTree in tables holds Arc<PageBuffer>, Arc<Logger>, and
         // Arc<TransactionManager>. Drop them before Arc::into_inner so the
@@ -275,7 +294,7 @@ where
             undo_file,
             redo_file,
             ..
-        } = self;
+        } = db;
         drop(tables);
         let buffer = Arc::into_inner(buffer).unwrap();
         buffer.write_header(hdr)?;
@@ -349,6 +368,7 @@ where
         // Best-effort tombstone reclamation. Errors here do not un-commit the
         // transaction; the tombstone stays and is handled by find() until a
         // later pass reclaims it.
+        #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
         for r in del_records {
             if let Ok(table) = self.table_by_id(r.table_id) {
                 if let Ok(Some(tuple)) = table.find(r.tuple.id.clone()) {
@@ -555,7 +575,15 @@ where
         }
     }
 
-    fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
+    // Takes &Arc<Self>, not &self: the returned cursor holds its own
+    // Arc<Db<F>> clone (it needs to call find_last_committed per row to
+    // resolve MVCC visibility as it scans), which only a caller already
+    // holding the Db as Arc<Db<F>> can provide.
+    pub fn table_scan(self: &Arc<Self>, tid: TableIdType) -> Result<TableCursor<F>, StoreError> {
+        TableCursor::new(Arc::clone(self), tid, None)
+    }
+
+    pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
         if let Some(txn) = tuple.txn_id.clone() {
             // Visible iff the writer COMMITTED — i.e. it is neither still active
             // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
@@ -861,7 +889,7 @@ fn init_logger() {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{sync::Arc, thread, time::Duration};
 
     use crate::{
         db::{DEFAULT_PAGE_SIZE, Db, Opener, ZERO_PAGE_SIZE},
@@ -872,13 +900,13 @@ mod tests {
     };
     type TestDB = Db<MemFile>;
 
-    fn make_db_with_table() -> (TestDB, TableIdType) {
+    fn make_db_with_table() -> (Arc<TestDB>, TableIdType) {
         let db = TestDB::create("txn_test.db").unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         (db, tid)
     }
 
-    fn make_db_with_two_tables() -> (TestDB, TableIdType, TableIdType) {
+    fn make_db_with_two_tables() -> (Arc<TestDB>, TableIdType, TableIdType) {
         let db = TestDB::create("txn_test_multi.db").unwrap();
         let ta = db.create_table("table_a".to_string()).unwrap();
         let tb = db.create_table("table_b".to_string()).unwrap();
@@ -2199,7 +2227,6 @@ mod tests {
 
     use crate::page::PageId;
     use std::collections::HashSet;
-    use std::sync::Arc;
 
     #[test]
     fn test_free_pages_empty_by_default_persists_as_empty() {

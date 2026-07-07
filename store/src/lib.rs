@@ -30,6 +30,7 @@ pub mod memfile;
 //  insert into table ([id][blob])
 //  select from table [id[]]
 //  delete from table [id[]]
+pub mod cursor;
 mod page;
 pub mod pages;
 pub mod table;

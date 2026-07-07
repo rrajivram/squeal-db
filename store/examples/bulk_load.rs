@@ -13,6 +13,7 @@
 //!
 //!     cargo run --release --example bulk_load -- --help
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use store::db::{DBFile, Db};
@@ -194,8 +195,8 @@ where
             .into_owned(),
     };
 
-    let db: Db<F> =
-        Db::create_with_page_size(&db_name, cfg.page_size).expect("failed to create bulk-load db");
+    let db: Arc<Db<F>> = Db::create_with_limits(&db_name, cfg.page_size, cfg.max_pending_writes)
+        .expect("failed to create bulk-load db");
     let tid = db.create_table("bulk".to_string()).unwrap();
 
     let value = vec![b'v'; cfg.value_size];

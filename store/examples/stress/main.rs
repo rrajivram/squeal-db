@@ -50,13 +50,12 @@ where
             .into_owned(),
     };
 
-    let db: Db<F> = Db::create(&db_name).expect("failed to create stress db");
+    let db: Arc<Db<F>> = Db::create(&db_name).expect("failed to create stress db");
     let mut table_ids = Vec::with_capacity(cfg.tables);
     for i in 0..cfg.tables {
         table_ids.push(db.create_table(format!("stress_table_{i}")).unwrap());
     }
     let tables = Arc::new(table_ids);
-    let db = Arc::new(db);
 
     let stats = Arc::new(Stats::new(cfg.threads));
     let stop = Arc::new(AtomicBool::new(false));
@@ -92,12 +91,13 @@ where
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = watchdog.join();
 
-    // Reclaim sole ownership to close cleanly, the way a real caller would.
+    // Drop this example's own extra clones so close() (which needs to be the
+    // sole owner) doesn't just fail with "still shared" — close() itself now
+    // does the Arc::try_unwrap internally.
     drop(tables);
-    let db = Arc::try_unwrap(db)
-        .unwrap_or_else(|_| panic!("Db still has outstanding references after all workers joined"));
     println!("Calling close");
-    let _ = db.close();
+    db.close()
+        .unwrap_or_else(|e| panic!("Db still has outstanding references after all workers joined: {e:?}"));
     if cfg.backend == Backend::File {
         let _ = store::db::Db::<std::fs::File>::delete(&db_name);
     }

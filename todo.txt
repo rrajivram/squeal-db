@@ -552,3 +552,28 @@ TODO / open issues
     page size, --max-pending-writes 512) that originally motivated all of
     [12]/[13]/[14] completed in 95s insert + 32s verify, RSS bounded at
     ~300-930 MB throughout (never unbounded), 0 mismatches, RESULT: PASS.
+
+[15] test_concurrent_insert_remove_reinsert_does_not_resurrect_stale_value
+    (the [11] regression test) still flakes at a low rate   [OPEN]
+    Found while re-running the full lib suite many times back-to-back
+    (something not previously done) after an unrelated Arc<Db> API change:
+    the panic is a genuine test failure (Db::commit or a background
+    writer thread panicking, "Any { .. }" downcast), not a false positive.
+    Rate: ~1/13 in one serial sweep, 3/40 (7.5%) in a larger isolated
+    sample.
+    Confirmed NOT caused by the Arc<Db> change: reproduces at a similar
+    rate (0/25, then 3/40 — consistent with the same underlying rate,
+    just not sampled large enough the first time) on the commit *before*
+    that change too, via git stash. So [11]'s fix (internal
+    retry_on_contention around the index-removal step, 8 attempts with
+    backoff) reduces the failure rate hugely (was ~100% reproducible
+    pre-fix under the same stress-harness contention, per [11]'s own
+    verification) but doesn't provably eliminate it — likely the same
+    class of residual risk as [7]'s retry-based fix: under sufficiently
+    extreme scheduling, 8 retries with short backoff still isn't always
+    enough.
+    Not investigated further this session (out of scope for the Arc<Db>
+    task in progress) — needs its own dedicated repro/triage pass. Options
+    to consider: raise the retry budget for this specific path, or make
+    the index-removal step's own locking non-blocking/wait-based instead
+    of retry-based.

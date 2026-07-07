@@ -38,6 +38,7 @@ where
             .change_priority(item, new_priority)
     }
 
+    #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
     pub(crate) fn pop(&self) -> Option<(I, P)> {
         loop {
             // PriorityQueue::pop() is max-first, so the global pop must be

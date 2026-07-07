@@ -400,13 +400,12 @@ mod tests {
             max_lock_retries: 5,
         });
 
-        let db: Db<MemFile> = Db::create("stress-regression").unwrap();
+        let db: Arc<Db<MemFile>> = Db::create("stress-regression").unwrap();
         let mut table_ids = Vec::with_capacity(cfg.tables);
         for i in 0..cfg.tables {
             table_ids.push(db.create_table(format!("stress_table_{i}")).unwrap());
         }
         let tables = Arc::new(table_ids);
-        let mut db = Arc::new(db);
         let stats = Arc::new(Stats::new(cfg.threads));
 
         let mut handles = Vec::with_capacity(cfg.threads);
