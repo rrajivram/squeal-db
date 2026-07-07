@@ -148,6 +148,17 @@ where
                             .map(|v| String::from_utf8_lossy(v).into_owned()),
                     ),
                 );
+                // Dump this key's full event history — invaluable for root-causing
+                // a mismatch (see key_history's own doc comment in workload.rs).
+                if let Some(hist) = wr.key_history.get(&(table_idx, key)) {
+                    eprintln!(
+                        "  history thread={} table={table_idx} key={key}:",
+                        wr.thread_idx
+                    );
+                    for line in hist {
+                        eprintln!("    {line}");
+                    }
+                }
             }
         }
     }

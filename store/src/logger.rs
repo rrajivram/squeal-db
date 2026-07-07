@@ -44,7 +44,10 @@ impl Default for LsnClock {
 impl LsnClock {
     /// Allocate the next redo LSN.
     pub(crate) fn next_lsn(&self) -> LsnId {
-        LsnId(self.counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel))
+        LsnId(
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel),
+        )
     }
 
     /// The current flush watermark (highest durably-written redo LSN).
@@ -70,6 +73,7 @@ pub(crate) enum MsgType {
     Undo(UndoOperation),
     Redo(RedoOperation),
     ShutDown,
+    Checkpoint(u128),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -129,7 +133,9 @@ impl Logger {
 
         let clock = self.clock.clone();
         self.undo_handle = Some(thread::spawn(move || undo_log_runner(undo_file, undo_rx)));
-        self.redo_handle = Some(thread::spawn(move || redo_log_runner(redo_file, redo_rx, clock)));
+        self.redo_handle = Some(thread::spawn(move || {
+            redo_log_runner(redo_file, redo_rx, clock)
+        }));
         Ok(())
     }
 
@@ -241,6 +247,19 @@ impl Logger {
         Ok(lsn_id)
     }
 
+    pub(crate) fn checkpoint(&self, ts: u128) -> Result<(), StoreError> {
+        let msg = MsgType::Checkpoint(ts);
+        if let Some(tx) = &self.redo_tx {
+            tx.send(msg.clone())
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        }
+        if let Some(tx) = &self.undo_tx {
+            tx.send(msg.clone())
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn shutdown(self) -> Result<(), StoreError> {
         if let Some(tx) = self.redo_tx {
             tx.send(MsgType::ShutDown)
@@ -345,6 +364,10 @@ fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
                 file.write(&to_allocvec(&msg)?)?;
             }
             MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
+            MsgType::Checkpoint(_ts) => {
+                file.seek(SeekFrom::End(0))?;
+                file.write(&to_allocvec(&msg)?)?;
+            }
         }
     }
     Ok(())
@@ -370,6 +393,10 @@ fn redo_log_runner(
                 clock.mark_written(msg.lsn_id);
             }
             MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
+            MsgType::Checkpoint(_ts) => {
+                file.seek(SeekFrom::End(0))?;
+                file.write(&to_allocvec(&msg)?)?;
+            }
         }
     }
     Ok(())

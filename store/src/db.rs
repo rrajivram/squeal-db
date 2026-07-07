@@ -45,6 +45,12 @@ const RDB_MAGIC: u16 = 0x5365;
 const MAGIC: [u8; 2] = [0x53, 0x65];
 const ZERO_PAGE_SIZE: DBSizeType = 8 * 1024;
 const DEFAULT_PAGE_SIZE: DBSizeType = 16 * 1024;
+// Cap on pages the writer thread will hold in memory awaiting durable redo
+// before applying backpressure to callers (see PageBuffer's writer). Not
+// persisted — purely a runtime memory/throughput knob, safe to pick freshly
+// on every open. Matches PageBuffer's existing page-cache size (max_entries)
+// as a reasonable default order of magnitude.
+const DEFAULT_MAX_PENDING_WRITES: usize = 1024;
 
 pub type FileDB = Db<File>;
 pub struct Meta {
@@ -138,7 +144,20 @@ where
         name: S,
         page_size: DBSizeType,
     ) -> Result<Self, StoreError> {
-        let sf = Self::create_core_db(name.as_ref().to_string(), page_size)?;
+        Self::create_with_limits(name, page_size, DEFAULT_MAX_PENDING_WRITES)
+    }
+
+    // Like create_with_page_size, but also controls how many dirty pages the
+    // writer thread will hold in memory awaiting durable redo before blocking
+    // callers (see PageBuffer's writer/DEFAULT_MAX_PENDING_WRITES). Lower this
+    // for a small page_size on a memory-constrained machine; the default is
+    // tuned for the normal (16 KiB) page size.
+    pub fn create_with_limits<S: AsRef<str>>(
+        name: S,
+        page_size: DBSizeType,
+        max_pending_writes: usize,
+    ) -> Result<Self, StoreError> {
+        let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_pending_writes)?;
         sf.create_system_tables()?;
         Ok(sf)
     }
@@ -148,6 +167,18 @@ where
         file: F,
         undo_file: F,
         redo_file: F,
+    ) -> Result<Self, StoreError> {
+        Self::open_using_with_limits(name, file, undo_file, redo_file, DEFAULT_MAX_PENDING_WRITES)
+    }
+
+    // Like open_using, but also controls the writer thread's pending-write
+    // cap — see create_with_limits.
+    pub fn open_using_with_limits<S: AsRef<str>>(
+        name: S,
+        file: F,
+        undo_file: F,
+        redo_file: F,
+        max_pending_writes: usize,
     ) -> Result<Self, StoreError> {
         let mut bytes = vec![0u8; size_of::<Header>()];
         let mut file = file;
@@ -169,6 +200,7 @@ where
             file.do_clone()?,
             undo_file.do_clone()?,
             redo_file.do_clone()?,
+            max_pending_writes,
         )?;
         let sf = Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
@@ -265,6 +297,7 @@ where
         let ts = timestamp();
         hdr.last_checkpoint = ts;
         self.buffer.write_header(hdr)?;
+        self.logger.checkpoint(ts)?;
         self.last_checkpoint
             .store(ts, std::sync::atomic::Ordering::Relaxed);
         Ok(())
@@ -596,6 +629,7 @@ where
         file: F,
         undo_file: F,
         redo_file: F,
+        max_pending_writes: usize,
     ) -> Result<NeededObjects<F>, StoreError> {
         let mut logger = Logger::new();
         logger.set_db(undo_file, redo_file)?;
@@ -610,6 +644,7 @@ where
                 header,
                 1024,
                 clock,
+                max_pending_writes,
             )?),
             logger: Arc::new(logger),
             txn_mgr: Arc::new(TransactionManager::new(gens, TransactionId::default())?),
@@ -617,7 +652,11 @@ where
         Ok(nm)
     }
 
-    fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
+    fn create_core_db(
+        name: String,
+        page_size: DBSizeType,
+        max_pending_writes: usize,
+    ) -> Result<Self, StoreError> {
         let uf_name = name.to_string() + ".undo";
         let rf_name = name.to_string() + ".redo";
         let f = OpenOptions::new()
@@ -662,6 +701,7 @@ where
             f.do_clone()?,
             undo_file.do_clone()?,
             redo_file.do_clone()?,
+            max_pending_writes,
         )?;
 
         Ok(Self {
@@ -773,11 +813,17 @@ where
 }
 
 /// Retries `f` on `LockContentionError` with a short linear backoff. Used by
-/// `Db::commit`/`Db::rollback`'s per-record cleanup loops: those calls race
+/// `Db::commit`/`Db::rollback`'s per-record cleanup loops (those calls race
 /// against the same per-page locks every other concurrent operation uses, and
 /// under load a single transient lock timeout shouldn't abort the whole
-/// commit/rollback (see `Transaction::into_id`).
-fn retry_on_contention<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
+/// commit/rollback — see `Transaction::into_id`) and by
+/// `BPlusTree::insert`'s failure-cleanup path (undoing a data-page write after
+/// a failed index insert must not itself be allowed to fail from ordinary
+/// contention — that would leave the write permanently orphaned instead of
+/// rolled back).
+pub(crate) fn retry_on_contention<T>(
+    mut f: impl FnMut() -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
     let mut attempt = 0u32;
     loop {
         match f() {
@@ -2328,10 +2374,12 @@ mod tests {
 
         // Round 1: free some pages, close, reopen.
         let t = db.begin().unwrap();
-        db.insert(tid, row(1, &big_payload(7, 8 * page)), &t).unwrap();
+        db.insert(tid, row(1, &big_payload(7, 8 * page)), &t)
+            .unwrap();
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
-        db.update(tid, row(1, &big_payload(8, 4 * page)), &t).unwrap();
+        db.update(tid, row(1, &big_payload(8, 4 * page)), &t)
+            .unwrap();
         db.commit(t).unwrap();
         let (f, u, r) = db.close().unwrap();
         let db = TestDB::open_using("txn_test.db", f, u, r).unwrap();
@@ -2341,10 +2389,12 @@ mod tests {
         // Round 2: grow the SAME object back up (consuming free pages, and
         // possibly needing fresh ones too), then shrink again, then close.
         let t = db.begin().unwrap();
-        db.update(tid, row(1, &big_payload(9, 8 * page)), &t).unwrap();
+        db.update(tid, row(1, &big_payload(9, 8 * page)), &t)
+            .unwrap();
         db.commit(t).unwrap();
         let t = db.begin().unwrap();
-        db.update(tid, row(1, &big_payload(10, 4 * page)), &t).unwrap();
+        db.update(tid, row(1, &big_payload(10, 4 * page)), &t)
+            .unwrap();
         db.commit(t).unwrap();
         let round2_free_before_close: HashSet<PageId> =
             db.buffer.get_free_pages().into_iter().collect();
@@ -2359,5 +2409,142 @@ mod tests {
             "the persisted set must reflect only the latest close, not an \
              accumulation of every round's freed pages"
         );
+    }
+
+    // Regression test for a real bug found while investigating todo.txt item
+    // [7] (spurious DuplicateKey under concurrent inserts into one shared
+    // table). Confirmed root cause via targeted instrumentation: insert_index
+    // failing with LockContentionError is normal under contention, but
+    // BPlusTree::insert's cleanup of the just-written data-page row (undoing
+    // write_data's write before returning the error) used a bare `?` on its
+    // own get_page_mut/write_locked_page calls — so if *that* itself hit
+    // LockContentionError, the cleanup was abandoned and the row was left
+    // permanently orphaned (written, but never indexed, and invisible to
+    // find() since nothing points to it). write_data's page selection is
+    // deterministic (always starts from first_data_page), so a later retry
+    // of the same key reliably lands on that same page and hits a real, but
+    // bogus, DuplicateKey — permanently, not just transiently, since the
+    // orphaned row is never cleaned up by anything. Fixed by wrapping the
+    // cleanup in retry_on_contention so its own contention can't abort it.
+    // This test reliably reproduced the bug before the fix (roughly 1 in 3
+    // runs with 8 threads x 50 rows into a single shared table).
+    #[test]
+    fn test_concurrent_inserts_into_shared_table_do_not_orphan_rows() {
+        use std::sync::Arc;
+        const THREADS: u64 = 8;
+        const ROWS_PER_THREAD: u64 = 50;
+        let (db, tid) = make_db_with_table();
+        let db = Arc::new(db);
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for i in 0..ROWS_PER_THREAD {
+                    let key = thread_idx * ROWS_PER_THREAD + i;
+                    let t = db.begin().unwrap();
+                    super::retry_on_contention(|| {
+                        db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
+                    })
+                    .unwrap();
+                    db.commit(t).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let t = db.begin().unwrap();
+        for thread_idx in 0..THREADS {
+            for i in 0..ROWS_PER_THREAD {
+                let key = thread_idx * ROWS_PER_THREAD + i;
+                let found = db.find(tid, id(key), &t).unwrap();
+                assert_eq!(
+                    found
+                        .unwrap_or_else(|| panic!("row {key} missing"))
+                        .data
+                        .to_vec(),
+                    format!("v{key}").as_bytes()
+                );
+            }
+        }
+        drop(t);
+    }
+
+    // Regression test for todo.txt item [11]: BPlusTree::remove (and
+    // remove_if_txn, used by rollback's revert-of-insert path) removed the
+    // data tuple and the index entry as two separate steps, with a bare `?`
+    // on the index-removal step. Under contention, that step could fail
+    // (LockContentionError) *after* the data step had already succeeded —
+    // leaving a permanently stale index entry pointing at a now-vacated
+    // page. On its own that just meant "this key can never be re-inserted
+    // again" — but combined with [7]'s insert-cleanup path *also*
+    // occasionally exhausting its own retries under extreme contention, a
+    // later insert's orphaned-but-uncleaned row could land on that exact
+    // same page, making find() resolve the stale index entry straight to
+    // it: a committed remove whose key comes back with a value that was
+    // never legitimately written to it.
+    // Confirmed root cause via a dedicated per-key event history added to
+    // the stress harness (store/examples/stress): reproduced reliably
+    // (~14/15 runs) under extreme contention (16 threads, 1 table, 20
+    // keys) and traced one failing key's full history — a successful,
+    // committed remove was followed by every subsequent insert attempt
+    // failing with DuplicateKey forever, yet the final read still found a
+    // real (if stale) value.
+    // Fixed by retrying the index-removal step internally (inside
+    // BPlusTree::remove/remove_if_txn) instead of relying on the caller
+    // retrying the whole function — unsafe once the data step has already
+    // succeeded, since the retried data-removal call then hits
+    // KeyNotFound (not LockContentionError), so the caller's own
+    // retry_on_contention gives up without ever retrying the index
+    // cleanup.
+    #[test]
+    fn test_concurrent_insert_remove_reinsert_does_not_resurrect_stale_value() {
+        use std::sync::Arc;
+        const THREADS: u64 = 16;
+        const KEYS_PER_THREAD: u64 = 20;
+        const CYCLES: u64 = 10;
+        let (db, tid) = make_db_with_table();
+        let db = Arc::new(db);
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for cycle in 0..CYCLES {
+                    for i in 0..KEYS_PER_THREAD {
+                        let key = thread_idx * KEYS_PER_THREAD + i;
+                        let value = format!("v{key}-{cycle}");
+                        let t = db.begin().unwrap();
+                        super::retry_on_contention(|| {
+                            db.insert(tid, row(key, value.as_bytes()), &t)
+                        })
+                        .unwrap();
+                        db.commit(t).unwrap();
+
+                        let t = db.begin().unwrap();
+                        super::retry_on_contention(|| db.remove(tid, id(key), &t)).unwrap();
+                        db.commit(t).unwrap();
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Every key's last committed op (per thread, per cycle) was a
+        // remove, so every key must now be absent.
+        let t = db.begin().unwrap();
+        for thread_idx in 0..THREADS {
+            for i in 0..KEYS_PER_THREAD {
+                let key = thread_idx * KEYS_PER_THREAD + i;
+                let found = db.find(tid, id(key), &t).unwrap();
+                assert!(
+                    found.is_none(),
+                    "key {key} should be absent (last committed op was remove) but found {found:?}"
+                );
+            }
+        }
+        drop(t);
     }
 }

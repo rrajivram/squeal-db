@@ -143,45 +143,76 @@ TODO / open issues
     8-15 runs at the original load); mem-backend stress 6/6.
 
 [7] Concurrent inserts to the SAME table can spuriously return DuplicateKey
-    [OPEN — pre-existing, found while writing checkpoint tests, NOT a
-    checkpoint bug]
+    [FIXED — root cause confirmed via targeted instrumentation, not just
+    theorized]
     Symptom: 8 threads each doing begin() -> retry_on_contention(|| insert)
     -> commit() against one shared table (each thread's own disjoint key
-    range, so no real duplicate is possible) occasionally (~9/25 runs at
-    8 threads x 50 rows) return DuplicateKey(some_key) from insert() on a
-    RETRIED attempt, even though the retry reuses the SAME open transaction
-    (never re-begins) — i.e. this is not the "retry created a second
-    transaction for the same logical write" hazard, it's insert() itself
-    returning Err(DuplicateKey) for a key that was never successfully
-    inserted by anyone.
-    Confirmed NOT related to checkpoint: reproduces identically with a
-    throwaway test that never calls checkpoint() at all (isolated and
-    verified during this session — see the removed temp_isolation_no_checkpoint
-    test in db.rs's history). Also confirmed NOT a test-harness mistake: an
-    earlier version of the test that retried "begin+insert+commit" as one
-    unit was ALSO hitting DuplicateKey, but so does the corrected version that
-    matches the stress harness's proven begin-once/retry-only-the-op pattern
-    (workload.rs's run_op) — ruling out "stale transaction from a failed
-    retry attempt" as the explanation.
-    Leading hypothesis (UNCONFIRMED): under contention, some internal step of
-    BPlusTree::insert()/insert_index() (root/leaf split path most likely,
-    given it's the part of insert that touches multiple pages and re-acquires
-    locks) can return Err(LockContentionError) or similar AFTER the key has
-    already been physically placed, in a way that isn't captured by the
-    "insert() undoes its own partial work on failure" invariant documented
-    on BPlusTree::insert (that invariant specifically covers "data write
-    succeeded, index insert failed" — it may not cover a partial failure
-    *inside* insert_index's own split/retry logic). A retried insert() call
-    then sees the key as already present and returns DuplicateKey instead of
-    succeeding.
-    Workaround applied in the new checkpoint tests (db.rs
-    test_checkpoint_concurrent_with_active_writers): give each thread its own
-    table (disjoint B+tree, no shared index/data pages) instead of one shared
-    table, which avoids the contention path entirely. This is a valid, real
-    workload shape for testing checkpoint's own thread-safety, but it does NOT
-    fix or paper over issue [7] — same-table heavy concurrent insert is still
-    broken and worth its own investigation (start in BPlusTree::insert_index /
-    insert_recursive's split-retry paths under contention).
+    range, so no real duplicate is possible) occasionally (~1 in 3 runs at
+    8 threads x 50 rows) return DuplicateKey(some_key) from insert(), even
+    though the key was never successfully inserted by anyone.
+    Two hypotheses were considered and ruled out by instrumenting every
+    add_tuple call site in the split path (leaf-level index add, inner-node
+    separator add on split, split_root_page) and reproducing repeatedly:
+    neither ever fired. The user's hypothesis (a split promoting a separator
+    key equal to the parent's existing routing key for that child, so the
+    add collides) doesn't hold structurally: in split_non_root_page,
+    separator = new_vals[0].id is drawn from the child's own entries, all of
+    which must already be < the parent's routing key for that child (that's
+    what makes the routing key a valid upper bound) — so separator < row_id
+    always, before the split even runs.
+    Confirmed actual root cause (instrumented BPlusTree::insert and
+    write_data directly, captured the full sequence for a real failure):
+      1. write_data writes the row onto data page P.
+      2. insert_index fails with LockContentionError (ordinary, expected
+         contention under concurrent load on one table).
+      3. BPlusTree::insert's cleanup path — meant to undo the data write
+         above so a failed insert leaves no trace — did
+         `let mut h = self.buffer.get_page_mut(data_page_id)?;` with a bare
+         `?`. This acquisition can ITSELF hit LockContentionError under the
+         same load, and when it does, the cleanup is abandoned and the
+         original error is discarded.
+      4. The row is now permanently orphaned on page P: written, but never
+         indexed (so invisible to find()), and never removed.
+      5. retry_on_contention retries the whole insert (correct, since step 2
+         was ordinary contention). write_data's page-selection is
+         deterministic (always walks from first_data_page), so the retry
+         lands on page P again, finds the orphaned row, and correctly (but
+         bogusly) reports DuplicateKey.
+      This is a *permanent* failure for that key (every future attempt keeps
+      landing on the same page), not a transient one, plus a leaked page slot.
+    Fix: BPlusTree::insert's cleanup (get_page_mut + remove_tuple +
+    write_locked_page) is now wrapped in retry_on_contention (promoted from
+    db.rs-private to pub(crate) and shared) — a cleanup whose whole job is
+    restoring consistency after a failure must not itself be allowed to fail
+    from the same transient cause.
+    Regression test: db.rs::test_concurrent_inserts_into_shared_table_do_not_orphan_rows
+    (reliably reproduced the bug ~1 in 3 runs before the fix; 40/40 clean
+    after). Full lib suite 197/197 stable across 10 serial + 8 parallel runs;
+    file-backend stress 8/8 and mem-backend 6/6, 0 mismatches, 0 panics.
+
+[9] find_page vs insert_recursive's "last child" fallthrough asymmetry
+    [FIXED — confirmed reachable and fixed, once [10] unblocked 3-level trees]
+    find_page's non-root inner-node routing explicitly falls through to the
+    last child when a key is >= every entry's bound ("Non-root inner nodes
+    have no u64::MAX sentinel; the last child covers all keys from its
+    separator up to the parent's upper bound"). insert_recursive's own
+    routing scan had no equivalent fallthrough — it did
+    `rows.next().expect("inner node must have a row covering every key")`,
+    which panicked instead of routing to the last child if tuple.id was >=
+    every entry in a non-root inner node. Originally instrumented this exact
+    panic while chasing [7] and it never fired across dozens of
+    reproductions — turned out to be genuinely unreachable at the time, not
+    because the bug didn't exist, but because [10]'s bug independently
+    capped every tree at 2 levels, so a non-root inner node could never
+    exist at all. remove_index_entry already had the correct fallthrough
+    (checked and confirmed no change needed there).
+    Fix: insert_recursive's routing scan now falls through to the last row
+    instead of panicking when tuple.id is >= every entry, mirroring
+    find_page/remove_index_entry.
+    Verified: once [10] was fixed and 3-level trees became reachable,
+    test_sequential_inserts_past_root_second_split_do_not_panic (40
+    sequential inserts, asserts a real non-root inner node exists, then
+    re-finds every key) exercises this fallthrough directly and passes.
 
 [8] Freeing a page never resets its content, so reusing a freed overflow page
     can spuriously fail with PageCapacityError   [FIXED]
@@ -221,3 +252,303 @@ TODO / open issues
     Verified: the regression test passes deterministically (5/5); full lib
     suite 196/196 stable across 10 serial + 8 parallel runs; file-backend
     stress 8/8 and mem-backend 6/6, 0 mismatches, 0 panics.
+
+[10] split_root_page can never re-split an already-inner root, permanently
+    capping every B+tree at 2 levels — plus a latent separator-formula bug
+    that would have corrupted a 3rd level anyway   [FIXED]
+    Bug 1 (the cap): split_root_page's guard was
+    `if handle.page.is_flag_set(INNER_NODE) || count != nodes_per_page - 1
+    { return Ok(()); }` — treating "root is already inner" as always
+    meaning "nothing to do," instead of only treating a fresh (2-entry,
+    just-split) root that way. Once the root is promoted from leaf to inner
+    on its first split, it can never split again: every insert that would
+    need to grow the tree to a 3rd level instead hits an uncaught
+    PageCapacityError from insert_recursive. Confirmed via instrumentation
+    (is_root=true at the panic site) while investigating [9]'s reachability
+    — this is *why* [9] looked unreachable: no non-root inner node could
+    ever exist. Fix: guard on count alone; a freshly-split root only has 2
+    entries, which won't collide with nodes_per_page - 1 except in a
+    degenerate nodes_per_page == 3 table, so the count check alone already
+    detects "someone else just split this" without needing the leaf/inner
+    special case. update_root_page and the redistribution logic already
+    handle re-rooting an inner root correctly (they don't care what the
+    root's previous flag was), so no other change was needed for this part.
+    Bug 2 (the real corruptor, found while validating bug 1's fix): once
+    2nd splits were possible, a dedicated regression test
+    (40 sequential inserts, nodes_per_page=4) failed — not with the [9]
+    panic, but with most ids silently unfindable afterward. Root cause:
+    split_root_page (and split_non_root_page, previously only ever
+    exercised on leaves before this fix, since non-root inner nodes were
+    unreachable) computed the separator as `new_vals[0].id` (the first
+    *moved* entry's own key) unconditionally. That formula is correct for
+    leaves (exact-match lookup, any clean dividing key works) but wrong for
+    inner nodes: an inner entry's key is "< key routes to *this entry's*
+    child," and the *last* entry is the sole exception, inheriting
+    everything up to the node's external bound via fallthrough. Using the
+    first-moved-entry's key as the new external bound for the kept
+    (lower) half means the kept half's new last entry silently absorbs,
+    via fallthrough, the whole range that actually belongs to the entry
+    that just moved to the sibling — orphaning that entry's subtree
+    (still on disk, unreachable via routing). Traced with a manual
+    tree-structure dump that showed a degenerate single-entry-per-level
+    chain, confirming the mechanism.
+    Fix: for inner-node splits, separator = the *last kept* entry's own
+    key (`current_vals.last().id` / `left_vals.last().id`), not the first
+    moved entry's key. Leaf splits are unchanged (`new_vals[0].id` /
+    `right_vals[0].id`). Applied identically in split_non_root_page (keyed
+    off its existing `is_inner` flag) and split_root_page.
+    Investigated a stress-harness mismatch ("expected None, found Some" —
+    a row surviving that should have been rolled back) that appeared in
+    ~1/14 mem-backend runs with this fix applied; bisected against the
+    pre-session baseline (8/8 clean) and an isolated variant with just this
+    fix's guard reverted (14/14 clean), which looked suspicious — but a
+    counter instrumented into split_root_page confirmed a real 2nd root
+    split *never fires* in the stress harness's default configuration
+    (~30k keys/table caps out well below the ~50-65k needed at the default
+    256-fanout to fill an inner root), so this fix's code is not even
+    exercised in those runs. The mismatch is a separate, pre-existing,
+    depth-independent flake — see [11].
+    Verified: test_sequential_inserts_past_root_second_split_do_not_panic
+    passes (40 sequential inserts, asserts a real non-root inner node
+    exists, re-finds every key); full lib suite 198/198 stable across 3
+    serial + 5 parallel runs; mem-backend stress clean at this scale
+    (root 2nd split not reachable there, see above) — file/mem stress
+    otherwise unaffected (0 mismatches attributable to this fix).
+
+[11] Stress harness intermittent mismatch: a row survives that should have
+    been rolled back   [FIXED]
+    Symptom: mem-backend stress (default config, 16 threads x 20000 ops)
+    occasionally (~1 run out of 14) reported
+    "MISMATCH: thread N table T key K: expected None, found Some(...)" — the
+    workload's shadow state expected a private key to be absent (its
+    owning transaction had *committed* a remove, not rolled back — the
+    "expected None" came from a real commit, confirmed once root-caused,
+    not from a rollback as first assumed), but the DB actually had a value
+    for it.
+    Confirmed NOT caused by [10]'s split_root_page/separator fix (a counter
+    showed a real 2nd root split never fires in the default stress config,
+    so that code path was dead in every failing run).
+    Found a much faster, reliable repro by maximizing contention instead of
+    relying on the default config's ~1/14 rate: --tables 1 --private-keys
+    20 --hot-keys 0 reproduced in 14/15 runs (vs ~1/14 default), because
+    fewer tables and fewer keys means far more threads sharing the exact
+    same small set of B+tree pages.
+    Root-caused via a permanent addition to the stress harness itself
+    (store/examples/stress/workload.rs's WorkerResult::key_history): a
+    full per-key event log (txn id, op kind, whether the op itself
+    succeeded, and the enclosing batch's commit/rollback outcome), dumped
+    by main.rs for any key that ends up mismatched. The trace for one
+    failing key showed: a Remove op that succeeded AND committed, followed
+    by *every single subsequent Insert attempt failing* (hundreds of them,
+    for the rest of the run) — yet the final read still found a real
+    value. That "insert always fails forever after a successful remove"
+    pattern was the key clue: it meant the remove's commit left something
+    behind that made every later insert look like a duplicate.
+    Confirmed mechanism via targeted instrumentation directly in the
+    library (temporary, removed after confirming): 241 remove_index_entry
+    failures and, critically, 4 insert-cleanup failures whose logged ids
+    were *exactly* the 4 keys that mismatched in that run, all pointing at
+    the same PageId.
+    Root cause (two compounding bugs):
+      1. BPlusTree::remove (used by Db::commit's best-effort tombstone
+         reclaim) and remove_if_txn (used by rollback's revert-of-insert
+         path) each remove the data tuple and the index entry as two
+         separate steps, with a bare `?` on the index-removal step. Under
+         contention, that step can fail (LockContentionError) *after* the
+         data step already succeeded. The caller (commit()'s reclaim, or
+         revert_txn_writes) wraps the *whole* call in retry_on_contention
+         and retries it from scratch — but on the retry, the data-removal
+         step now hits KeyNotFound (data's already gone), which isn't
+         LockContentionError, so retry_on_contention gives up immediately.
+         Net effect: the index entry is permanently stale, still pointing
+         at a data page this key no longer occupies.
+      2. On its own, (1) is "merely" a availability bug — the stale entry
+         makes every future insert of that key fail with a bogus
+         DuplicateKey (matching the stale entry), forever. But combined
+         with [7]'s insert-cleanup-on-duplicate-failure *also* occasionally
+         exhausting its own retry_on_contention under this same extreme
+         contention, a later insert attempt's own write_data call can land
+         its new (uncleaned, orphaned) row on that exact same page —
+         write_data always walks forward through the same shared pages
+         everyone else uses. At that point the stale index entry, still
+         pointing at that page, resolves straight to the unrelated
+         orphaned row: a committed remove whose key comes back with a
+         value that was never legitimately written to it.
+    Fix: both BPlusTree::remove and remove_if_txn now retry the
+    index-removal step internally (wrapped in retry_on_contention inside
+    the function) instead of relying on a caller-level retry of the whole
+    function, which is unsafe once the data-removal step has already
+    succeeded.
+    Verified: new regression test
+    db.rs::test_concurrent_insert_remove_reinsert_does_not_resurrect_stale_value
+    (16 threads x 20 keys x 10 insert/remove cycles, one shared table) —
+    8/8 FAILURES on the unfixed code (confirming the test's own
+    reliability), 8/8 clean after the fix. Stress harness: 30/30 clean on
+    the fast-repro config (was 14/15 failing before), 10/10 clean on
+    tables=1 with default keys, 8/8 clean on the fully default config.
+    Full lib suite 202/202 stable across serial + 5 parallel runs.
+    The per-key history tracking added to the stress harness during this
+    investigation was kept as a permanent feature (not reverted) — it's
+    what actually made root-causing this tractable, and will do the same
+    for any future regression.
+
+[12] B+tree depth degenerated under sequential/monotonic inserts   [FIXED]
+    Found while stress-testing [10]'s fix at real depth (a small page size
+    forces splits after just a few inserts, needed to reach 10+ levels
+    without inserting millions of rows). At nodes_per_page=4, 2000
+    sequential ascending inserts produced a tree 999 levels deep — vs
+    depth ~31 for the same 2000 keys inserted in random order. The tree
+    stayed perfectly balanced throughout (every leaf at the same depth,
+    confirmed) — the bug was in how fast that shared depth grew, not in
+    balance.
+    Root cause: split_non_root_page/split_root_page always split at the
+    midpoint. For a node at capacity, that keeps roughly half the entries
+    on the "lower" side and moves the rest to the "upper" sibling. Under
+    strictly ascending inserts, every future insert descends into
+    whichever side holds the highest keys — always the "upper" sibling,
+    never the "lower" (kept) side — so the lower side froze permanently at
+    its post-split size the instant it was created, while the upper side
+    kept absorbing every subsequent insert, splitting again, freezing half
+    again, repeat. Each such split adds one level to the *entire* tree
+    (everything under the node that split sits one level deeper,
+    uniformly — which is why balance survived even as depth ballooned),
+    which is why depth grew almost linearly with N instead of
+    logarithmically.
+    Verified this is specific to small nodes_per_page, not a fundamental
+    flaw: scaling nodes_per_page from 4 up to 256 (the production default)
+    with the same 2000 sequential inserts dropped depth from 999 to 6, 3,
+    2, ... down to 1 — at realistic page sizes the "refill cost" per level
+    is large enough that depth stays logarithmic even under pure
+    sequential insertion. The severe case only shows up at deliberately
+    tiny page sizes (as used here specifically to reach deep trees for
+    testing), but the underlying inefficiency (the frozen "kept" side
+    permanently wasting ~50% of its capacity) exists at any page size —
+    real DBs fix it, so it's fixed here too rather than left as a known
+    limitation.
+    Fix: mirrors PostgreSQL nbtree's rightmost-split heuristic. New shared
+    helper BPlusTree::split_point(values, is_inner, incoming_id) — used by
+    both split_non_root_page and split_root_page — detects when the key
+    driving the split will land past everything already in the node (for
+    inner nodes: at or past the second-to-last entry, since the last entry
+    is a fallthrough with no bound of its own; see the [9]/[10] fallthrough
+    notes above). When detected, split off only the single highest entry
+    to the new sibling instead of half the node, keeping the "kept" side
+    essentially full and leaving the sibling primed to keep absorbing
+    further appends. Falls back to the existing midpoint split otherwise,
+    so random-order workloads are unaffected. Threaded the triggering key
+    through split_if_needed (already had `tuple: &Tuple`) and
+    insert_index/split_root_page (added an `incoming_id: &DBIdType` param)
+    down to split_point.
+    Verified: depth 999 -> 10 for 2000 sequential inserts at
+    nodes_per_page=4 (test_btree_stays_shallow_under_sequential_inserts,
+    bplustree.rs — asserts same-depth balance AND a generous logarithmic
+    depth bound, 6x log2(n+1)); random-order sibling test
+    (test_btree_stays_balanced_and_shallow_under_random_order_inserts)
+    still passes, confirming the optimization doesn't regress the normal
+    case. Full lib suite 200/200 stable across 4 serial + 5 parallel runs
+    (also much faster overall: the pathological test dropped from ~6.5s to
+    ~0.02s). Stress harness: mem-backend 8/8, file-backend 8/8, 0
+    mismatches, 0 panics.
+
+[13] write_data always rescanned the data-page chain from scratch, making
+    every insert O(chain length) — O(N^2) total for N sequential inserts
+    [FIXED]
+    Found building a bulk-load volume test (store/examples/bulk_load.rs,
+    added this session) to validate [12] at real depth without inserting
+    millions of rows one at a time — needed a small page size to reach
+    depth quickly, which also meant far more, smaller data pages for the
+    same row count, making this bug's cost impossible to miss.
+    Root cause: BPlusTree::write_data always started its search for a data
+    page with room at self.table.first_data_page and walked forward — once
+    early pages fill (which they do permanently; nothing un-fills them),
+    every future insert had to walk past all of them before reaching the
+    live tail. Confirmed via direct code read and empirically: throughput
+    dropped from ~1300 to ~200 rows/sec between row 15k and row 20k with a
+    small page size (the classic quadratic signature). Confirmed
+    first_data_page has no other production dependents (only write_data and
+    test assertions reference it), so nothing else relies on the chain
+    being walked from the head.
+    Fix ("Option A" of three discussed — a persisted tail field on Table,
+    this in-memory cached one, or a candidate-page free-space map; chose
+    this one for being the smallest change with no persisted-format impact):
+    added last_data_page: AtomicU64 to BPlusTree, a hint (not a correctness-
+    bearing value) for where write_data should start looking. On a fresh
+    table it starts at first_data_page (nothing to discover); on reopen,
+    BPlusTree::from_bytes walks the chain once to its real end
+    (discover_tail_data_page) instead of paying that cost on every insert.
+    Concurrent writers can race to extend the chain — that's fine, since
+    write_data still validates can_store and walks forward (allocating a
+    new page if needed) exactly as before regardless of where it starts, so
+    a stale cached value only costs a few extra hops, never wrong behavior.
+    Trade-off (accepted, standard for this class of fix): rows freed by
+    deletes on an earlier page no longer get opportunistically reused by
+    new inserts, since the cursor never walks backward — reclaiming that
+    space is a separate concern from the hot insert path.
+    Verified: 200K sequential rows went from a projected multi-minute
+    runtime (quadratic blowup already visible by row 20k) to 1.68s
+    (118,755 rows/sec); 2M rows in 18.34s at a completely flat ~109-110k
+    rows/sec through the whole run (no degradation from 27% to 82% done,
+    confirming truly O(1) amortized per insert now). Full lib suite
+    200/200 stable across serial + parallel runs.
+
+[14] PageBuffer's writer thread had no bound on in-memory writes awaiting
+    durable redo — observed 13+ GB RSS for just 2M rows   [FIXED]
+    Found while stress-testing [13] at volume: with the *default* (16 KiB)
+    page size — not the small one used to stress the B+tree — 2M sequential
+    inserts drove RSS to 13.6 GB in under 25 seconds, with throughput
+    oscillating wildly (23k-70k rows/sec). A small page size showed the same
+    mechanism, just less severely (223 MB -> 858 MB over 83s for 4.4M rows),
+    since each backlogged page is physically smaller — confirming this
+    wasn't specific to page size at all, just proportional to it.
+    Root cause: the writer thread's `pending: Vec<WriteMsg>` (each holding
+    an Arc<Page>) holds any page whose redo record isn't durable yet, and
+    nothing throttled how fast new WritePage messages could arrive relative
+    to how fast the redo watermark (clock.last_written()) advances. A prior
+    incident is even flagged in the existing code ("observed: 12 GB RSS,
+    then thrash") and was partially mitigated (draining pending every loop
+    iteration instead of only when idle), but that bounds pending to "pages
+    not yet durable," which itself has no bound under sustained load.
+    Fix: added max_pending_writes as a real, caller-supplied parameter
+    (Db::create_with_limits / Db::open_using_with_limits; create/
+    create_with_page_size/open/open_using keep their existing signatures,
+    defaulting to DEFAULT_MAX_PENDING_WRITES=1024). The writer now gates
+    intake on `pending.len() >= max_pending`: once hit, it stops popping new
+    WritePage messages off the channel entirely (deliberately not counting
+    the channel's own backlog too — see below) — and since write_tx is now
+    a *bounded* channel, sends from get_page_mut/write_locked_page callers
+    then block on send(), applying real backpressure all the way back to
+    whatever's inserting, instead of buffering without limit.
+    Can't deadlock: the redo watermark advances via the Logger's own
+    independent redo-writer thread, not through this channel, so pending
+    keeps draining — and the gate keeps reopening — even while this thread
+    isn't receiving anything new. Deliberately kept everything on ONE
+    channel rather than splitting control messages (Checkpoint,
+    DiscardPending) onto a separate one to dodge the gate: both of those
+    rely on FIFO order relative to WritePage on this exact channel for their
+    own correctness (see their comments) — pausing intake entirely delays
+    everything equally and preserves that order; splitting channels would
+    not.
+    Caught a real bug in an early version of this fix via the regression
+    test below: gating on `pending.len() + recv.len()` looked tighter (caps
+    the total closer to the configured value instead of ~2x it, since the
+    channel's own backlog can queue up on top of an already-full pending
+    before any send() blocks) but is NOT safe — once the channel fills,
+    pending draining to 0 doesn't reopen a gate that's also counting
+    recv.len(), because the only way recv.len() ever shrinks is via recv(),
+    which that gate is itself blocking. Reverted to gating on pending
+    alone (unconditionally reopens once pending drains), and instead
+    capped the channel's own bound to a small fixed constant (min(64,
+    max_pending_writes)) so the resulting slop stays small and fixed
+    rather than scaling with the configured cap.
+    Verified: new regression test
+    buffer.rs::test_pending_write_cap_blocks_then_drains_without_deadlock —
+    sends beyond a tiny (2) cap actually block (not a no-op), then
+    complete once the watermark advances (not a deadlock); caught the
+    recv.len() deadlock bug above before it went further. Full lib suite
+    201/201 stable across serial + 5 parallel runs. End-to-end: 2M rows at
+    the default page size that previously hit 13.6 GB now stays at
+    ~100-160 MB RSS (0 mismatches, stable ~32k rows/sec, vs previously
+    wildly oscillating 23k-70k); the full 10M-row bulk-load test (small
+    page size, --max-pending-writes 512) that originally motivated all of
+    [12]/[13]/[14] completed in 95s insert + 32s verify, RSS bounded at
+    ~300-930 MB throughout (never unbounded), 0 mismatches, RESULT: PASS.

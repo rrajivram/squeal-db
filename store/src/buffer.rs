@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use crossbeam::channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam::channel::{Receiver, Sender, bounded};
 use log::{error, info};
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
@@ -99,14 +99,36 @@ where
         header: Arc<Header>,
         max_entries: usize,
         clock: Arc<LsnClock>,
+        max_pending_writes: usize,
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let writer_file = db_file.do_clone()?;
-        let (write_tx, write_rx) = unbounded();
+        // Bounded so a full `pending` in the writer thread (see writer's own
+        // comment) turns into real backpressure on senders, not an
+        // ever-growing in-memory backlog. The channel's own bound is a small
+        // fixed constant, not max_pending_writes itself: the writer's gate
+        // (pending.len() + recv.len() >= max_pending_writes) already governs
+        // the real cap, and messages can keep arriving in the channel after
+        // the gate trips (right up until the channel's own bound) before any
+        // send() actually blocks — so a channel bound equal to
+        // max_pending_writes would let the effective total run to roughly
+        // 2x the configured cap. Keeping the channel small caps that slop to
+        // a fixed, negligible amount instead of one that scales with it.
+        // Never larger than max_pending_writes itself, so a small configured
+        // cap (e.g. in tests) isn't silently widened back out by this.
+        const WRITE_CHANNEL_CAPACITY: usize = 64;
+        let (write_tx, write_rx) = bounded(max_pending_writes.min(WRITE_CHANNEL_CAPACITY).max(1));
         let w_header = header.clone();
         let writer_clock = clock.clone();
-        let write_handle =
-            thread::spawn(move || writer(writer_file, w_header, write_rx, writer_clock));
+        let write_handle = thread::spawn(move || {
+            writer(
+                writer_file,
+                w_header,
+                write_rx,
+                writer_clock,
+                max_pending_writes.max(1),
+            )
+        });
         Ok(Self {
             page_size,
             max_entries,
@@ -733,6 +755,7 @@ fn writer<F: DBFile>(
     header: Arc<Header>,
     recv: Receiver<BufMsg>,
     clock: Arc<LsnClock>,
+    max_pending: usize,
 ) -> Result<(), StoreError> {
     let mut file = file;
     let mut pending: Vec<WriteMsg> = vec![];
@@ -759,6 +782,47 @@ fn writer<F: DBFile>(
             } else {
                 i += 1;
             }
+        }
+        // The drain above bounds `pending` to pages whose redo genuinely isn't
+        // durable yet — but under sustained write load with a small page size
+        // (many more distinct pages touched per row than a large page size),
+        // even that "not yet durable" set can grow unboundedly, since nothing
+        // upstream throttles how fast new WritePage messages arrive relative to
+        // how fast the redo watermark advances (confirmed: 13+ GB RSS for 2M
+        // rows at the default page size before this fix). Once `pending` hits
+        // the cap, stop pulling new messages off `write_tx` entirely instead of
+        // draining into an ever-growing Vec: since `write_tx` is now bounded to
+        // the same capacity, senders (get_page_mut/write_locked_page callers)
+        // block on send() once it fills, applying real backpressure all the way
+        // back to whatever's inserting.
+        //
+        // This can't deadlock: the redo watermark (clock.last_written(), which
+        // is what the drain above is waiting on) advances via the Logger's own
+        // independent redo-writer thread, not through this channel — so pending
+        // keeps draining, and thus this gate keeps re-opening, even while this
+        // thread isn't receiving anything new.
+        //
+        // Staying on one channel (not splitting control messages like
+        // Checkpoint/DiscardPending onto a separate one to dodge this) is
+        // deliberate: DiscardPending's and Checkpoint's correctness both rely
+        // on FIFO order relative to WritePage on this exact channel (see their
+        // own comments) — pausing intake entirely delays everything equally
+        // and preserves that order; splitting channels would not.
+        //
+        // Gate on `pending` alone, deliberately NOT `pending.len() +
+        // recv.len()`: counting the channel's own backlog too seems tighter,
+        // but it isn't safe — once the channel fills, the only way its
+        // backlog ever shrinks is for this thread to recv() from it, which a
+        // recv.len()-inclusive gate would itself be blocking. That's a
+        // deadlock: pending drains to 0, but pending.len() + recv.len() stays
+        // at the cap forever, since nothing is popping recv. Gating on
+        // pending alone reopens unconditionally once pending drains, which
+        // is what actually lets the channel drain too. The channel's own
+        // bound (see PageBuffer::new — a small fixed constant, not
+        // max_pending_writes) already keeps the resulting slop small.
+        if pending.len() >= max_pending {
+            thread::sleep(Duration::from_millis(1));
+            continue;
         }
         // Block up to 1ms for the next message instead of busy-spinning: lets
         // this thread idle cheaply while still waking promptly to re-drain
@@ -1090,6 +1154,7 @@ mod tests {
             make_header(),
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
+            1024,
         )
         .unwrap();
         (buf, page_counter)
@@ -1120,6 +1185,7 @@ mod tests {
             header,
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
+            1024,
         )
         .unwrap();
         (buf, page_counter, file_clone)
@@ -1207,6 +1273,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
+            1024,
         )
         .unwrap();
 
@@ -1273,5 +1340,97 @@ mod tests {
         let header = from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE)).unwrap();
         assert!(buf.write_header(header).is_ok());
         assert!(buf.shutdown().is_ok());
+    }
+
+    // Regression test for the writer's unbounded `pending` growth (see
+    // writer's own comment: "observed 13+ GB RSS for 2M rows at the default
+    // page size" during a bulk-load stress run). Proves two things at once:
+    // sends beyond the cap actually block (backpressure is real, not a
+    // no-op), and they unblock and complete once the redo watermark
+    // advances (not a deadlock).
+    #[test]
+    fn test_pending_write_cap_blocks_then_drains_without_deadlock() {
+        use std::sync::mpsc;
+
+        use crate::logger::{LsnClock, LsnId};
+
+        const MAX_PENDING: usize = 2;
+        const NUM_PAGES: u64 = 6;
+
+        let mut mem = MemFile::new();
+        for _ in 0..NUM_PAGES {
+            let page = Page::new_data(PAGE_SIZE);
+            mem.write_all(&page.to_bytes()).unwrap();
+        }
+        mem.seek(SeekFrom::Start(0)).unwrap();
+        let page_counter = Arc::new(AtomicU64::new(NUM_PAGES));
+        let clock = Arc::new(LsnClock::default());
+        let buf = Arc::new(
+            PageBuffer::new(
+                PAGE_SIZE,
+                page_counter,
+                mem,
+                make_header(),
+                10,
+                clock.clone(),
+                MAX_PENDING,
+            )
+            .unwrap(),
+        );
+
+        // Pull the watermark down to a real value: Page::set_dirty stamps a
+        // page with the *current* watermark, and a cold u64::MAX watermark
+        // stamps low (writes promptly) specifically to avoid deferring
+        // forever — so without this, nothing here would defer into
+        // `pending` at all.
+        clock.mark_written(LsnId(100));
+
+        fn dirty_and_send(buf: &PageBuffer<MemFile>, page_num: crate::page::PageId) {
+            let mut handle = buf.get_page_mut(page_num).unwrap();
+            std::sync::Arc::make_mut(&mut handle.page)
+                .set_dirty(true)
+                .unwrap();
+            buf.write_locked_page(handle).unwrap();
+        }
+
+        // These fill `pending` exactly to capacity (both stamped at 100,
+        // which never satisfies "< last_written" until it advances) —
+        // sends here must not block.
+        for i in 0..MAX_PENDING as u64 {
+            dirty_and_send(&buf, i.into());
+        }
+
+        // Pending is now at the cap. Send the rest from another thread: if
+        // the cap didn't apply real backpressure, this finishes immediately;
+        // if the gating logic deadlocks instead of backing off, this hangs
+        // forever instead of taking down the whole test process.
+        let (done_tx, done_rx) = mpsc::channel();
+        let buf2 = Arc::clone(&buf);
+        let sender = std::thread::spawn(move || {
+            for i in MAX_PENDING as u64..NUM_PAGES {
+                dirty_and_send(&buf2, i.into());
+            }
+            let _ = done_tx.send(());
+        });
+
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "sends beyond the cap should block until pending drains, but finished immediately"
+        );
+
+        // Advance the watermark: everything stamped at 100 now satisfies
+        // "100 < 101". The writer's per-iteration drain (unconditional, not
+        // gated on receiving a new message) picks this up on its own,
+        // draining `pending` and reopening the gate — unblocking the sender.
+        clock.mark_written(LsnId(101));
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("writes beyond the cap must complete once pending drains, not hang forever");
+        sender.join().unwrap();
+
+        let _ = Arc::try_unwrap(buf).unwrap().shutdown();
     }
 }

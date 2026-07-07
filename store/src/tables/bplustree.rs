@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     buffer::{PageBuffer, WritePageHandle},
-    db::{DBFile, DBSizeType},
+    db::{DBFile, DBSizeType, retry_on_contention},
     error::StoreError,
     logger::Logger,
     page::{Page, PageId},
@@ -38,6 +39,23 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     buffer: Arc<PageBuffer<F>>,
     txn_mgr: Arc<TransactionManager>,
     logger: Arc<Logger>,
+    // Cached hint for where write_data should start looking for room,
+    // instead of always rescanning the data-chain from table.first_data_page
+    // (which made every insert O(chain length), i.e. O(N) per insert / O(N^2)
+    // total for N sequential inserts — confirmed empirically: throughput
+    // dropped from ~1300 to ~200 rows/sec between row 15k and row 20k with a
+    // small page size). Not persisted: on a fresh table it starts at
+    // first_data_page (nothing to discover); on reopen it's rebuilt once by
+    // walking the chain to its actual end (see from_bytes) — a one-time,
+    // load-time cost instead of a per-insert one.
+    //
+    // This is purely a hint, not a correctness-bearing value: write_data
+    // still calls can_store on whatever page it starts from and walks
+    // forward (allocating a new page if needed) exactly as before, so a
+    // stale value just costs a few extra hops, never wrong behavior. That's
+    // why a plain Relaxed store (not a CAS/fetch_max) is fine even though
+    // concurrent writers can race to extend the chain — see write_data.
+    last_data_page: AtomicU64,
 }
 
 impl<F: DBFile> BPlusTree<F>
@@ -82,6 +100,7 @@ where
             buffer,
             txn_mgr,
             logger,
+            last_data_page: AtomicU64::new(first_data_page.into()),
         })
     }
 
@@ -92,11 +111,15 @@ where
         logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
         let t: Table = from_bytes(bytes)?;
+        // One-time cost, not per-insert: walk the chain to its real end so
+        // write_data doesn't have to rediscover it on every call after reopen.
+        let tail = Self::discover_tail_data_page(&buffer, t.first_data_page)?;
         Ok(Self {
             table: t,
             buffer,
             txn_mgr,
             logger,
+            last_data_page: AtomicU64::new(tail.into()),
         })
     }
 
@@ -117,17 +140,34 @@ where
         let res = self.insert_index(tuple_id.clone(), data_page_id, txn);
         if res.is_err() {
             // Undo the data-page write so a failed index insert leaves no
-            // orphaned row. Tolerate the row already being gone (KeyNotFound):
-            // a concurrent abort-revert (drain_aborting) can remove it between
-            // write_data and here — which is exactly the cleanup goal already
-            // met. Any *other* error still propagates (real corruption isn't
-            // swallowed).
-            let mut h = self.buffer.get_page_mut(data_page_id)?;
-            match Arc::make_mut(&mut h.page).remove_tuple(tuple_id.clone()) {
-                Ok(_) => self.buffer.write_locked_page(h)?,
-                Err(StoreError::KeyNotFound(_)) => {}
-                Err(e) => return Err(e),
-            }
+            // orphaned row. Retry on LockContentionError: this cleanup is
+            // undoing a failure that may itself have been mere contention
+            // (insert_index racing another thread's page locks), so it must
+            // not be allowed to fail from that same transient cause — unlike
+            // an ordinary insert failure, a failed *cleanup* leaves the write
+            // permanently orphaned (un-indexed, so invisible to find(), but
+            // still occupying its data page) instead of rolled back. That
+            // orphan then primes a spurious, permanent DuplicateKey for any
+            // later insert of the same key that lands on the same data page
+            // (write_data's page selection is deterministic) — confirmed via
+            // reproduction, not just theory: the exact sequence was
+            // insert_index failing with LockContentionError, this cleanup's
+            // own get_page_mut *also* hitting LockContentionError and
+            // bailing out via `?` (the bug), leaving the row orphaned, then a
+            // retried insert of the same key hitting DuplicateKey on that
+            // same page. Tolerate the row already being gone (KeyNotFound):
+            // a concurrent abort-revert (drain_aborting) can remove it
+            // between write_data and here — which is exactly the cleanup
+            // goal already met. Any *other* error still propagates (real
+            // corruption isn't swallowed).
+            retry_on_contention(|| {
+                let mut h = self.buffer.get_page_mut(data_page_id)?;
+                match Arc::make_mut(&mut h.page).remove_tuple(tuple_id.clone()) {
+                    Ok(_) => self.buffer.write_locked_page(h),
+                    Err(StoreError::KeyNotFound(_)) => Ok(()),
+                    Err(e) => Err(e),
+                }
+            })?;
         }
         res
     }
@@ -148,7 +188,7 @@ where
         // insert_recursive holds the root lock the root may already be split.
         let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 {
-            self.split_root_page(handle, txn.clone())?;
+            self.split_root_page(handle, txn.clone(), &id_tuple.id)?;
         } else {
             drop(handle);
         }
@@ -177,8 +217,27 @@ where
     /// candidate page before checking capacity (no unlocked scan), and always
     /// terminates: a freshly allocated page's `can_store` is unconditionally
     /// true, so the walk ends by appending a new page if none has room.
+    // One-time (per BPlusTree::from_bytes, i.e. per Db open) walk to the real
+    // end of the data chain — see last_data_page's doc comment for why this
+    // is only ever paid once instead of on every insert.
+    fn discover_tail_data_page(
+        buffer: &PageBuffer<F>,
+        start: PageId,
+    ) -> Result<PageId, StoreError> {
+        let mut page_id = start;
+        loop {
+            let page = buffer.get_page(page_id)?;
+            let next = buffer.data_chain_next(&page, page_id)?;
+            if next.is_valid_next_page() {
+                page_id = next;
+            } else {
+                return Ok(page_id);
+            }
+        }
+    }
+
     fn write_data(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
-        let mut data_page_id = self.table.first_data_page;
+        let mut data_page_id = PageId::from(self.last_data_page.load(Ordering::Relaxed));
         loop {
             let handle = self.buffer.get_page_mut(data_page_id)?;
             if handle.page.can_store(tuple) {
@@ -193,6 +252,7 @@ where
                 let new_id = self.buffer.alloc_page(false)?;
                 self.buffer.set_data_chain_next(data_page_id, new_id)?;
                 data_page_id = new_id;
+                self.last_data_page.store(new_id.into(), Ordering::Relaxed);
             }
         }
     }
@@ -223,7 +283,31 @@ where
         let mut h = self.buffer.get_page_mut(pid)?;
         let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
         self.buffer.write_locked_page(h)?;
-        self.remove_index_entry(id, self.table.first_index_page, None)?;
+        // Data is now gone for good — the index entry must follow, no matter
+        // what, or it's left pointing at a page this key no longer occupies.
+        // That's not just a leaked entry: it permanently blocks re-inserting
+        // this key (DuplicateKey forever, matching the stale entry) AND, far
+        // worse, if a *later* insert of some other key's data ever lands on
+        // this same now-vacated page (write_data's page selection walks
+        // forward through the same pages everyone else uses) and that
+        // insert's own index step fails, its cleanup-on-error can itself
+        // fail under contention and leave that new row physically present
+        // but un-indexed — at which point this stale entry, still pointing
+        // at that same page, resolves straight to it. find() then returns
+        // that unrelated orphaned row for *this* key: a committed remove
+        // whose key comes back with someone else's value. Confirmed via
+        // targeted reproduction (extreme contention: 16 threads, 1 table, 20
+        // keys), not just theory — caught by a dedicated regression test.
+        // Retrying here (not just relying on the caller retrying this whole
+        // function, e.g. commit()'s best-effort reclaim) matters because a
+        // caller-level retry is unsafe once the data step above has already
+        // succeeded: remove_tuple would hit KeyNotFound (not
+        // LockContentionError) on the retried call and the caller's own
+        // retry_on_contention wouldn't retry further, abandoning the index
+        // cleanup permanently on the very first contention hit.
+        retry_on_contention(|| {
+            self.remove_index_entry(id.clone(), self.table.first_index_page, None)
+        })?;
         Ok(old)
     }
 
@@ -280,7 +364,13 @@ where
         }
         let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
         self.buffer.write_locked_page(h)?;
-        self.remove_index_entry(id, self.table.first_index_page, None)?;
+        // See remove()'s comment on why this must retry internally rather
+        // than rely on the caller (revert_txn_writes) retrying this whole
+        // function: that's unsafe once the data step above has already
+        // succeeded.
+        retry_on_contention(|| {
+            self.remove_index_entry(id.clone(), self.table.first_index_page, None)
+        })?;
         Ok(Some(old))
     }
 
@@ -434,12 +524,25 @@ where
             // version broke out of the scan on the first row that *didn't*
             // match, instead of continuing to the next row — so with 3+ entries
             // it could get stuck on an early row and route to the wrong child.
+            //
+            // If tuple.id is >= even the LAST row's id, fall through to that
+            // last row anyway (same fallthrough find_page and
+            // remove_index_entry already implement) instead of panicking. A
+            // non-root inner node's last entry does not bound its own child —
+            // that child's true upper bound is inherited from this node's own
+            // governing entry in its parent — so "ran out of rows" does not
+            // mean "no child covers this key", it means "the key falls in the
+            // last child's range". This only matters once the tree is 3+
+            // levels deep (a non-root inner node exists); the root always
+            // carries a u64::MAX sentinel as its last entry (see
+            // update_root_page), so real ids never run off the end there.
             let mut rows = handle.page.iter();
             let mut row_id = rows.next().unwrap();
             while tuple.id >= row_id.id {
-                row_id = rows
-                    .next()
-                    .expect("inner node must have a row covering every key");
+                match rows.next() {
+                    Some(next) => row_id = next,
+                    None => break,
+                }
             }
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
@@ -504,7 +607,7 @@ where
             if self.is_root_page(page_id) {
                 panic!("Trying to split root in the wrong place");
             } else {
-                Ok(Some(self.split_non_root_page(handle)?))
+                Ok(Some(self.split_non_root_page(handle, &tuple.id)?))
             }
         } else {
             Ok(None)
@@ -515,21 +618,88 @@ where
         self.table.first_index_page == page_id
     }
 
+    // Shared by split_non_root_page and split_root_page: picks where to cut
+    // `values` (already known to be at capacity). `incoming_id` is the key
+    // that triggered this split — not necessarily inserted into this exact
+    // node, but always the key driving the split somewhere in this node's
+    // subtree.
+    //
+    // Default: split at the midpoint, discarding nothing.
+    //
+    // Exception — rightmost-append optimization (mirrors PostgreSQL
+    // nbtree's rightmost-split heuristic): if `incoming_id` is going to
+    // land past everything already here, keep all of it together instead
+    // of a 50/50 split. A plain midpoint split strands the "kept" half at
+    // ~50% full forever under sustained sequential/monotonic insertion —
+    // once created, nothing ever descends into it again, since every
+    // future key is higher and always routes to the "moved" sibling. That
+    // isn't just wasted space: each such split still adds one level to the
+    // *entire* tree (see split_root_page), so under pure ascending
+    // insertion, depth grows almost linearly with N instead of
+    // logarithmically (confirmed empirically: depth 999 after 2000
+    // sequential inserts at nodes_per_page=4, vs depth ~31 for the same
+    // 2000 keys in random order). Moving only the single highest entry to
+    // the sibling avoids that: the kept side stays essentially full, and
+    // the sibling starts with just 1 entry, primed to keep absorbing
+    // further appends — which is exactly the pattern sequential insertion
+    // needs to stay efficient, and self-corrects a few splits later back
+    // to a normal midpoint split if the insertion pattern turns out not to
+    // be an unbroken ascending run after all.
+    //
+    // For an inner node, the last entry has no bound of its own — it's a
+    // fallthrough (see find_page) — so "would land past everything" means
+    // landing at or past the entry *before* the last one.
+    fn split_point(values: &[Tuple], is_inner: bool, incoming_id: &DBIdType) -> usize {
+        let is_rightmost_append = if is_inner {
+            values.len() < 2 || *incoming_id >= values[values.len() - 2].id
+        } else {
+            *incoming_id > values.last().unwrap().id
+        };
+        if is_rightmost_append {
+            values.len() - 1
+        } else {
+            values.len() / 2
+        }
+    }
+
     fn split_non_root_page(
         &self,
         handle: WritePageHandle,
+        incoming_id: &DBIdType,
     ) -> Result<(DBIdType, PageId), StoreError> {
         let mut current_handle = handle;
         let values = current_handle.page.iter().collect::<Vec<_>>();
+        let is_inner = current_handle.page.is_flag_set(INNER_NODE);
 
-        // Split at the midpoint without discarding any entry: the right half
-        // (including the entry at `mid`) keeps its full payload, and its first
-        // entry's id doubles as the separator key for the parent.
-        let mid = values.len() / 2;
+        let mid = Self::split_point(&values, is_inner, incoming_id);
         let current_vals = &values[..mid];
         let new_vals = &values[mid..];
-        let separator_id = new_vals[0].id.clone();
-        let is_inner = current_handle.page.is_flag_set(INNER_NODE);
+        // The separator becomes the parent's new boundary key between the
+        // kept (lower) and moved (upper) halves — but what that boundary
+        // *means* differs by node kind:
+        //
+        // Leaf entries are exact-match data, so any key that cleanly divides
+        // the two sorted slices works; the first moved entry's own id is the
+        // natural choice ("< separator" lands exactly on current_vals).
+        //
+        // Inner entries encode "< key routes to *this entry's* child" (the
+        // last entry is the sole exception, covering everything up to the
+        // node's own external bound via fallthrough). That means the last
+        // *kept* entry's own key is the true, exclusive upper bound of its
+        // child — using the first *moved* entry's key instead would make it
+        // the new external bound for the kept page, and since that page's
+        // now-last entry inherits everything up to its external bound via
+        // fallthrough, it would silently absorb the range that actually
+        // belongs to the entry that just moved to the sibling — orphaning
+        // that entry's whole subtree (findable on disk, unreachable via
+        // routing). This only matters once a non-root inner node can
+        // actually exist and split; a leaf split's exact-match semantics
+        // hide the same subtlety.
+        let separator_id = if is_inner {
+            current_vals.last().unwrap().id.clone()
+        } else {
+            new_vals[0].id.clone()
+        };
         let new_page_id = self.buffer.alloc_page(false)?;
         let mut new_handle = self.buffer.get_page_mut(new_page_id)?;
 
@@ -595,30 +765,51 @@ where
         &self,
         handle: WritePageHandle,
         txn_id: TransactionId,
+        incoming_id: &DBIdType,
     ) -> Result<(), StoreError> {
         // insert()'s caller decides whether to call this based on an
         // *unlocked* read of the root's count — by the time we actually hold
         // the lock (this `handle`), another thread may have already split the
-        // root (it's now an inner node) or otherwise changed its count. Treat
-        // that as "nothing to do" rather than blindly re-splitting, which
-        // would corrupt the index (double-wrapping an already-split root).
-        if handle.page.is_flag_set(INNER_NODE)
-            || handle.page.count()? != self.table.nodes_per_page - 1
-        {
+        // root and changed its count. The count check alone is the correct
+        // guard for that race: a freshly-split root only has 2 entries, which
+        // won't match nodes_per_page - 1 except in a degenerate
+        // nodes_per_page == 3 table, so re-checking count under the lock is
+        // enough to detect "someone already handled this."
+        //
+        // Deliberately NOT special-cased on leaf vs inner: the root starts as
+        // a leaf and is promoted to inner on its first split, but once inner
+        // it can fill up again and need a *second* split to grow the tree to
+        // a third level. The redistribution logic below already preserves
+        // the root's current flag (leaf or inner) onto the two new child
+        // pages, and update_root_page already unconditionally leaves the
+        // root as an inner node with exactly 2 entries — both are already
+        // correct for re-splitting an inner root, so gating on "already
+        // inner" here was the only thing wrong: it made every second split
+        // silently no-op, permanently capping the tree at 2 levels.
+        if handle.page.count()? != self.table.nodes_per_page - 1 {
             return Ok(());
         }
         let values = handle.page.iter().collect::<Vec<_>>();
-        let flags = if handle.page.is_flag_set(INNER_NODE) {
-            INNER_NODE
-        } else {
-            LEAF_NODE
-        };
+        let is_inner = handle.page.is_flag_set(INNER_NODE);
+        let flags = if is_inner { INNER_NODE } else { LEAF_NODE };
 
-        // Split at the midpoint without discarding any entry (see split_non_root_page).
-        let mid = values.len() / 2;
+        // See split_non_root_page's split_point for the rightmost-append
+        // optimization this shares.
+        let mid = Self::split_point(&values, is_inner, incoming_id);
         let left_vals = &values[..mid];
         let right_vals = &values[mid..];
-        let separator_id = right_vals[0].id.clone();
+        // See split_non_root_page's comment for why the separator formula
+        // differs for inner vs leaf: an inner node's last entry inherits
+        // everything up to its own external bound via fallthrough, so the
+        // boundary between left_vals and right_vals must be left_vals' own
+        // last key, not right_vals' first key — otherwise left's new last
+        // entry silently swallows the range that belongs to whatever moved
+        // into right, orphaning it.
+        let separator_id = if flags == INNER_NODE {
+            left_vals.last().unwrap().id.clone()
+        } else {
+            right_vals[0].id.clone()
+        };
         let left_page_id = self.buffer.alloc_page(false)?;
         let right_page_id = self.buffer.alloc_page(false)?;
         let mut left_handle = self.buffer.get_page_mut(left_page_id)?;
@@ -690,7 +881,18 @@ mod tests {
     fn make_buffer(page_size: u64) -> Arc<PageBuffer<MemFile>> {
         let header = make_header(page_size);
         let counter = Arc::new(AtomicU64::new(FIRST_USER_PAGE));
-        Arc::new(PageBuffer::new(page_size, counter, MemFile::new(), header, 256, Arc::new(crate::logger::LsnClock::default())).unwrap())
+        Arc::new(
+            PageBuffer::new(
+                page_size,
+                counter,
+                MemFile::new(),
+                header,
+                256,
+                Arc::new(crate::logger::LsnClock::default()),
+                1024,
+            )
+            .unwrap(),
+        )
     }
 
     fn make_txn_mgr() -> Arc<TransactionManager> {
@@ -721,6 +923,57 @@ mod tests {
     // row need to insert it with an explicit txn_id via this helper instead.
     fn tuple_with_txn(id: DBIdType, data: &[u8]) -> Tuple {
         Tuple::new_with(id, data, Some(txn()), None)
+    }
+
+    // Universal B+tree structural invariants — not a design choice of this
+    // codebase, these hold for any B+tree by definition:
+    //   1. Every leaf is at the same depth from the root (perfect balance;
+    //      this is what distinguishes a B+tree from a general BST).
+    //   2. Within any node, entry ids are strictly ascending.
+    //   3. Every node holds at most nodes_per_page - 1 entries (the split
+    //      threshold this implementation enforces).
+    // Walks the whole tree and returns every leaf's depth (root = depth 0),
+    // asserting (2) and (3) along the way. Callers assert (1) themselves
+    // (comparing min/max of the returned depths) so a violation shows the
+    // actual spread instead of failing inside the walk.
+    fn leaf_depths(tree: &BPlusTree<MemFile>) -> Vec<usize> {
+        fn walk(
+            tree: &BPlusTree<MemFile>,
+            page_id: crate::page::PageId,
+            depth: usize,
+            out: &mut Vec<usize>,
+        ) {
+            let page = tree.buffer.get_page(page_id).unwrap();
+            let count = page.count().unwrap();
+            assert!(
+                count <= tree.table.nodes_per_page - 1,
+                "page {page_id:?} holds {count} entries, over the max of {}",
+                tree.table.nodes_per_page - 1
+            );
+            let mut prev: Option<DBIdType> = None;
+            for row in page.iter() {
+                if let Some(p) = &prev {
+                    assert!(
+                        *p < row.id,
+                        "page {page_id:?} entries not strictly ascending: {p:?} >= {:?}",
+                        row.id
+                    );
+                }
+                prev = Some(row.id.clone());
+            }
+            if page.is_flag_set(INNER_NODE) {
+                for row in page.iter() {
+                    if let Node::Inner(child) = from_bytes::<Node>(&row.data).unwrap() {
+                        walk(tree, child, depth + 1, out);
+                    }
+                }
+            } else {
+                out.push(depth);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, tree.table.first_index_page, 0, &mut out);
+        out
     }
 
     // Large page — no splits during basic tests.
@@ -826,6 +1079,153 @@ mod tests {
             "inner root must hold at least 2 child pointers, got {}",
             ip.count().unwrap()
         );
+    }
+
+    #[test]
+    // Regression test for todo.txt item [9]: insert_recursive's inner-node
+    // routing scan used to panic ("inner node must have a row covering every
+    // key") whenever tuple.id was >= every entry in a non-root inner node,
+    // instead of falling through to the last entry's child the way find_page
+    // and remove_index_entry already do. That gap only exists once the tree
+    // is 3+ levels deep (the root always carries a u64::MAX sentinel as its
+    // last entry, so it never runs off the end) — with nodes_per_page=4 here,
+    // the root splits a second time (creating non-root inner nodes) well
+    // before 20 sequential inserts, and every key after that point which
+    // exceeds the current maximum exercises exactly this fallthrough.
+    fn test_sequential_inserts_past_root_second_split_do_not_panic() {
+        let page_size = MAX_ENTRY_BYTES * 4;
+        let tree = make_tree(page_size);
+
+        for i in 1u64..=40 {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+
+        // The root must actually have split a second time (a non-root inner
+        // node exists) for this test to be exercising the bug at all.
+        let root = tree.buffer.get_page(tree.table.first_index_page).unwrap();
+        assert!(root.is_flag_set(INNER_NODE));
+        let has_non_root_inner = root.iter().any(|row| {
+            matches!(
+                from_bytes::<Node>(&row.data).unwrap(),
+                Node::Inner(child) if tree.buffer.get_page(child).unwrap().is_flag_set(INNER_NODE)
+            )
+        });
+        assert!(
+            has_non_root_inner,
+            "test setup must grow the tree to 3+ levels to exercise the bug"
+        );
+
+        for i in 1u64..=40 {
+            assert_eq!(
+                tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(),
+                b"v",
+                "id {i} must remain findable"
+            );
+        }
+    }
+
+    // A B+tree with fanout >= 2 at every level guarantees height <=
+    // log2(n+1); this generously allows 6x that (small nodes_per_page and a
+    // node's post-split "kept" half being as small as 1 entry both cost
+    // real but bounded slack) so it only fires on genuine, order-of-
+    // magnitude degeneration, not on this implementation's small-page
+    // inefficiency alone.
+    fn assert_logarithmic_depth(depths: &[usize], n: usize) {
+        let max = *depths.iter().max().unwrap();
+        let bound = 6 * (usize::BITS - (n as u64 + 1).leading_zeros() as u32) as usize;
+        assert!(
+            max <= bound,
+            "tree depth {max} far exceeds the logarithmic bound {bound} for n={n} — \
+             the tree has degenerated into something close to a linked list"
+        );
+    }
+
+    #[test]
+    fn test_btree_stays_balanced_and_shallow_under_random_order_inserts() {
+        let page_size = MAX_ENTRY_BYTES * 4;
+        let tree = make_tree(page_size);
+
+        // Deterministic shuffle (xorshift), no external RNG dependency.
+        let mut ids: Vec<u64> = (1u64..=2000).collect();
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        for i in (1..ids.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            ids.swap(i, j);
+        }
+        for &i in &ids {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+
+        let depths = leaf_depths(&tree);
+        let (min, max) = (depths.iter().min().unwrap(), depths.iter().max().unwrap());
+        assert_eq!(
+            min, max,
+            "every leaf must be at the same depth (got range {min}..={max})"
+        );
+        assert_logarithmic_depth(&depths, ids.len());
+
+        for &i in &ids {
+            assert_eq!(
+                tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(),
+                b"v",
+                "id {i} must remain findable"
+            );
+        }
+    }
+
+    #[test]
+    // Regression test for a real (if niche) design gap: without the
+    // rightmost-append optimization in split_point, sequential ascending
+    // inserts degenerated this B+tree into near-linear depth instead of
+    // the logarithmic depth a B+tree is supposed to guarantee regardless
+    // of insertion order — depth 999 after 2000 sequential inserts at
+    // nodes_per_page=4, vs depth ~31 for the same 2000 keys in random
+    // order (see the sibling test above). The tree stayed perfectly
+    // balanced throughout (every leaf at the same depth) — the bug was in
+    // how fast that shared depth grew, not in balance.
+    // Root cause (now fixed): split_non_root_page/split_root_page always
+    // split at the midpoint. For a node at capacity, that keeps roughly
+    // half the entries on the "lower" side and moves the rest to the
+    // "upper" sibling. Under strictly ascending inserts, every future
+    // insert descends into whichever side holds the *highest* keys —
+    // always the "upper" sibling, never the "lower" (kept) side — so the
+    // lower side froze permanently at its post-split size the instant it
+    // was created, while the upper side kept absorbing every subsequent
+    // insert, split, freeze-half-again, repeat. Each such split added one
+    // level to the *entire* tree, which is why depth ballooned roughly
+    // linearly with N.
+    // Fix: split_point (shared by both split sites) detects when the key
+    // driving the split is going to land past everything already in the
+    // node (the same heuristic PostgreSQL's nbtree uses for rightmost
+    // page splits) and, when so, moves only the single highest entry to
+    // the new sibling instead of half the node — keeping the "kept" side
+    // essentially full and giving the sibling room to keep absorbing
+    // further appends, which is exactly the access pattern sequential
+    // insertion produces.
+    fn test_btree_stays_shallow_under_sequential_inserts() {
+        let page_size = MAX_ENTRY_BYTES * 4;
+        let tree = make_tree(page_size);
+        for i in 1u64..=2000 {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+        let depths = leaf_depths(&tree);
+        let (min, max) = (depths.iter().min().unwrap(), depths.iter().max().unwrap());
+        assert_eq!(
+            min, max,
+            "every leaf must be at the same depth (got range {min}..={max})"
+        );
+        assert_logarithmic_depth(&depths, 2000);
+
+        for i in 1u64..=2000 {
+            assert_eq!(
+                tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(),
+                b"v",
+                "id {i} must remain findable"
+            );
+        }
     }
 
     #[test]

@@ -55,6 +55,15 @@ pub type PrivateExpectations = HashMap<PrivateKey, Option<Vec<u8>>>;
 pub struct WorkerResult {
     pub thread_idx: usize,
     pub private_expectations: PrivateExpectations,
+    // Full per-key event history (one line per op: txn, kind, whether the op
+    // itself succeeded, and the batch's own commit/rollback outcome) — dumped
+    // by main.rs for any key that ends up mismatched. This is what root-caused
+    // todo.txt item [11] (a committed remove whose key later resolved to a
+    // stale value under extreme contention): the trace showed a successful
+    // commit-ok remove followed by every subsequent insert attempt failing
+    // forever, yet the final read still found a value — impossible to see
+    // from the mismatch line alone.
+    pub key_history: HashMap<PrivateKey, Vec<String>>,
 }
 
 pub fn encode_private(thread_idx: usize, key: u64, seq: u64) -> Vec<u8> {
@@ -167,6 +176,9 @@ where
     let mut private_state: PrivateExpectations = HashMap::new();
     let mut private_seq: HashMap<PrivateKey, u64> = HashMap::new();
     let mut hot_seq: u64 = 0;
+    // See WorkerResult::key_history's doc comment.
+    let mut key_history: HashMap<PrivateKey, Vec<String>> = HashMap::new();
+    let mut txn_counter: u64 = 0;
 
     // Offset past the shared hot-key range [0, hot_keys) so a thread's
     // "private" keys never alias the keys every thread contends on.
@@ -180,6 +192,7 @@ where
 
         let batch_size = 1 + rng.next_range(cfg.max_ops_per_txn as u64) as u32;
         let mut pending: Vec<(PrivateKey, Option<Vec<u8>>)> = Vec::new();
+        let mut batch_trace: Vec<(PrivateKey, OpKind, bool)> = Vec::new();
 
         for _ in 0..batch_size {
             let table_idx = rng.next_range(tables.len() as u64) as usize;
@@ -221,6 +234,7 @@ where
                 let new_value = apply_private_op(
                     &db, &txn, &cfg, &stats, &mut rng, tid, key, kind, thread_idx, seq_val,
                 );
+                batch_trace.push((pkey, kind, new_value.is_some()));
                 if let Some(outcome) = new_value {
                     pending.push((pkey, outcome));
                 }
@@ -229,29 +243,44 @@ where
             stats.mark_thread_progress(thread_idx);
         }
 
+        txn_counter += 1;
+        let this_txn = txn_counter;
+
         let commit = rng.next_pct() < cfg.commit_probability_pct;
-        if commit {
-            if db.commit(txn).is_ok() {
+        let outcome = if commit {
+            let ok = db.commit(txn).is_ok();
+            if ok {
                 stats
                     .txn_committed
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                for (k, v) in pending {
-                    private_state.insert(k, v);
+                for (k, v) in &pending {
+                    private_state.insert(*k, v.clone());
                 }
             }
+            if ok { "commit-ok" } else { "commit-ERR" }
         } else {
-            let _ = db.rollback(txn);
+            let ok = db.rollback(txn).is_ok();
             stats
                 .txn_rolled_back
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // pending writes are discarded: private_state is left untouched,
             // matching the fact that the txn never committed.
+            if ok { "rollback-ok" } else { "rollback-ERR" }
+        };
+
+        // Record this batch's full per-key trace, annotated with the
+        // batch's own outcome — see WorkerResult::key_history.
+        for (k, kind, ok) in &batch_trace {
+            key_history.entry(*k).or_default().push(format!(
+                "txn{this_txn} {kind:?} op_ok={ok} batch={outcome}"
+            ));
         }
     }
 
     WorkerResult {
         thread_idx,
         private_expectations: private_state,
+        key_history,
     }
 }
 
