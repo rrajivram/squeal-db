@@ -366,16 +366,36 @@ where
         self.tx_mgr.commit(id.clone())?;
 
         // Best-effort tombstone reclamation. Errors here do not un-commit the
-        // transaction; the tombstone stays and is handled by find() until a
-        // later pass reclaims it.
+        // transaction: find() already treats a committed tombstone as absent,
+        // so a caller never sees the removed row regardless of whether this
+        // physical cleanup below ever runs.
+        //
+        // But it's not purely cosmetic either: tombstoning (Db::remove) only
+        // flips a flag via table.update — it never touches the index — so
+        // until this reclaim actually completes, the index entry is still
+        // live and a future insert of the same key hits a real, permanent
+        // DuplicateKey (there is no other pass that ever revisits this row).
+        // find() and remove() must therefore be retried TOGETHER as one unit,
+        // not just remove() alone: table.find() below walks the index/data
+        // pages the same way any other read does and can itself return
+        // LockContentionError under write contention. The old code let that
+        // specific failure through an `if let Ok(...)` unchecked, silently
+        // skipping the reclaim entirely on the very first contention hit on
+        // find() — permanently orphaning the index entry, since there's no
+        // later pass to retry it. Retrying the whole find+remove sequence is
+        // safe to repeat: find is a pure read, and remove (since the earlier
+        // fix) tolerates the data already being gone from a prior attempt.
         #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
         for r in del_records {
             if let Ok(table) = self.table_by_id(r.table_id) {
-                if let Ok(Some(tuple)) = table.find(r.tuple.id.clone()) {
-                    if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
-                        let _ = retry_on_contention(|| table.remove(tuple.id.clone()));
+                let _ = retry_on_contention(|| {
+                    if let Some(tuple) = table.find(r.tuple.id.clone())? {
+                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
+                            table.remove(tuple.id.clone())?;
+                        }
                     }
-                }
+                    Ok(())
+                });
             }
         }
         Ok(())
@@ -846,9 +866,19 @@ pub(crate) fn retry_on_contention<T>(
     let mut attempt = 0u32;
     loop {
         match f() {
-            Err(StoreError::LockContentionError) if attempt < 8 => {
+            // 16 attempts with a 300us/attempt linear backoff (was 8 at
+            // 100us/attempt): each attempt already spends up to 5ms inside
+            // the page lock's own wait (see PageBuffer::get_page_mut), so the
+            // old budget's ~3.6ms of total backoff was negligible next to
+            // realistic OS scheduling jitter under real load — a lock
+            // holder preempted mid-critical-section for even one scheduling
+            // quantum could exhaust every retry here despite never being
+            // near a genuine deadlock. Confirmed as a real (not just
+            // theoretical) contributor to a hard-to-reproduce flake in
+            // Db::commit's tombstone reclaim.
+            Err(StoreError::LockContentionError) if attempt < 16 => {
                 attempt += 1;
-                std::thread::sleep(std::time::Duration::from_micros(100 * attempt as u64));
+                std::thread::sleep(std::time::Duration::from_micros(300 * attempt as u64));
             }
             other => return other,
         }
@@ -2159,7 +2189,6 @@ mod tests {
         let tids: Vec<TableIdType> = (0..THREADS)
             .map(|i| db.create_table(format!("t{i}")).unwrap())
             .collect();
-        let db = Arc::new(db);
 
         let mut handles = Vec::new();
         for thread_idx in 0..THREADS {
@@ -2448,11 +2477,9 @@ mod tests {
     // runs with 8 threads x 50 rows into a single shared table).
     #[test]
     fn test_concurrent_inserts_into_shared_table_do_not_orphan_rows() {
-        use std::sync::Arc;
         const THREADS: u64 = 8;
         const ROWS_PER_THREAD: u64 = 50;
         let (db, tid) = make_db_with_table();
-        let db = Arc::new(db);
         let mut handles = Vec::new();
         for thread_idx in 0..THREADS {
             let db = Arc::clone(&db);
@@ -2489,41 +2516,36 @@ mod tests {
         drop(t);
     }
 
-    // Regression test for todo.txt item [11]: BPlusTree::remove (and
-    // remove_if_txn, used by rollback's revert-of-insert path) removed the
-    // data tuple and the index entry as two separate steps, with a bare `?`
-    // on the index-removal step. Under contention, that step could fail
-    // (LockContentionError) *after* the data step had already succeeded —
-    // leaving a permanently stale index entry pointing at a now-vacated
-    // page. On its own that just meant "this key can never be re-inserted
-    // again" — but combined with [7]'s insert-cleanup path *also*
-    // occasionally exhausting its own retries under extreme contention, a
-    // later insert's orphaned-but-uncleaned row could land on that exact
-    // same page, making find() resolve the stale index entry straight to
-    // it: a committed remove whose key comes back with a value that was
-    // never legitimately written to it.
-    // Confirmed root cause via a dedicated per-key event history added to
-    // the stress harness (store/examples/stress): reproduced reliably
-    // (~14/15 runs) under extreme contention (16 threads, 1 table, 20
-    // keys) and traced one failing key's full history — a successful,
-    // committed remove was followed by every subsequent insert attempt
-    // failing with DuplicateKey forever, yet the final read still found a
-    // real (if stale) value.
-    // Fixed by retrying the index-removal step internally (inside
-    // BPlusTree::remove/remove_if_txn) instead of relying on the caller
-    // retrying the whole function — unsafe once the data step has already
-    // succeeded, since the retried data-removal call then hits
-    // KeyNotFound (not LockContentionError), so the caller's own
-    // retry_on_contention gives up without ever retrying the index
-    // cleanup.
+    // Regression test for todo.txt items [11] and [15]: BPlusTree::remove
+    // (and remove_if_txn, used by rollback's revert-of-insert path) removed
+    // the data tuple and the index entry as two separate steps. Under
+    // contention the index-removal step could fail after the data step had
+    // already succeeded, leaving a permanently stale index entry pointing
+    // at a now-vacated page — "this key can never be re-inserted again"
+    // (DuplicateKey forever), and combined with [7]'s insert-cleanup path
+    // also occasionally exhausting its retries, sometimes worse: a later
+    // insert's orphaned row landing on that same page, so a committed
+    // remove's key comes back with a stale value that was never
+    // legitimately written to it.
+    // [11] fixed the first layer (retry the index-removal step internally
+    // instead of relying on a caller-level retry, which is unsafe once the
+    // data step already succeeded — the retried call hits KeyNotFound, not
+    // LockContentionError, so the caller's own retry gives up without ever
+    // retrying the index cleanup). That reduced the failure rate hugely but
+    // left a residual ~7.5% flake, tracked as [15] and fully root-caused
+    // there: the same "outer retry re-invokes a function that's unsafe to
+    // re-invoke" pattern recurring one layer up in Db::commit's tombstone
+    // reclaim (silently swallowing find()'s own LockContentionError), plus
+    // an unrelated timing issue (the page lock's timeout and
+    // retry_on_contention's total backoff were both far shorter than
+    // realistic OS scheduling jitter). See todo.txt item [15] for the full
+    // three-part root cause and fix.
     #[test]
     fn test_concurrent_insert_remove_reinsert_does_not_resurrect_stale_value() {
-        use std::sync::Arc;
         const THREADS: u64 = 16;
         const KEYS_PER_THREAD: u64 = 20;
         const CYCLES: u64 = 10;
         let (db, tid) = make_db_with_table();
-        let db = Arc::new(db);
         let mut handles = Vec::new();
         for thread_idx in 0..THREADS {
             let db = Arc::clone(&db);

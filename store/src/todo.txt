@@ -3,7 +3,7 @@ Redo log should support add/drop table ( so replication can happen)
 arclock needs a thread to monitor how long locks have been kept and kill lock if too long
 leaf_node should support external storage
 support hash indexes
-support table scan
+support range query
 dont write page to disk on every write - only when shutdown called or buffer clearing or checkpoint
 
 
@@ -19,3 +19,4 @@ done: IGNORE: This is done by page.set_dirty IMPORTANT: LSN is not updated. log_
 done: next_page in Page should be option to be idiomatic
 done: add support for checkpoint
 done: store reclaimed pages on disk
+done: support table scan

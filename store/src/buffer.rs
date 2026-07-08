@@ -561,9 +561,20 @@ where
         // for its entire read-modify-write cycle (see write_locked_page), so
         // reading only after we hold it guarantees we see the latest committed
         // write rather than a snapshot from before some other writer's update.
+        // 5ms, not the ~500us this used to be: a page's critical section
+        // (read-modify-write a single page) normally finishes in low
+        // microseconds, but the *lock holder* can be preempted by the OS
+        // scheduler for a full quantum (easily 1-15ms+ on a busy machine)
+        // while still holding it. A timeout close to the actual work time
+        // gives no margin for that and times out on ordinary scheduling
+        // jitter, not just genuine contention — confirmed as a real
+        // contributor to a hard-to-reproduce flake (see the callers of
+        // retry_on_contention in db.rs). 5ms is still imperceptible for a
+        // caller that has to wait it out, but gives an order of magnitude
+        // more room before concluding the lock is genuinely contended.
         let lock = self
             .locks
-            .lock(page_num, 500)
+            .lock(page_num, 5000)
             .ok_or(StoreError::LockContentionError)?;
         let page = self.get_page(page_num)?;
         page.accessed();

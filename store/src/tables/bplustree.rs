@@ -276,13 +276,34 @@ where
         Ok(old)
     }
 
-    pub fn remove(&self, id: DBIdType) -> Result<Tuple, StoreError> {
-        let pid = self
-            .find_page(id.clone(), self.table.first_index_page)?
-            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+    // Returns Ok(None) when the data was already gone by the time this call
+    // reached it (see the comment below) — same convention as
+    // update_if_txn/remove_if_txn, and NOT an error: the caller's goal
+    // (this id absent from both data and index) is still met.
+    pub fn remove(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
+        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
         let mut h = self.buffer.get_page_mut(pid)?;
-        let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
-        self.buffer.write_locked_page(h)?;
+        let old = match Arc::make_mut(&mut h.page).remove_tuple(id.clone()) {
+            Ok(t) => {
+                self.buffer.write_locked_page(h)?;
+                Some(t)
+            }
+            // The index entry we just found via find_page still exists, but
+            // the data behind it is already gone — this can only mean an
+            // earlier, retried attempt of this exact call already removed
+            // the data but not yet the index (see below for why that
+            // retried attempt happens at all). There's no txn-ownership
+            // question here the way update_if_txn/remove_if_txn have: with
+            // no tuple left to check, a stale index entry pointing at
+            // missing data is never valid, full stop — so finish the
+            // cleanup below unconditionally instead of bailing out and
+            // leaving it stale forever.
+            Err(StoreError::KeyNotFound(_)) => None,
+            Err(e) => return Err(e),
+        };
         // Data is now gone for good — the index entry must follow, no matter
         // what, or it's left pointing at a page this key no longer occupies.
         // That's not just a leaked entry: it permanently blocks re-inserting
@@ -298,13 +319,19 @@ where
         // whose key comes back with someone else's value. Confirmed via
         // targeted reproduction (extreme contention: 16 threads, 1 table, 20
         // keys), not just theory — caught by a dedicated regression test.
+        //
         // Retrying here (not just relying on the caller retrying this whole
         // function, e.g. commit()'s best-effort reclaim) matters because a
         // caller-level retry is unsafe once the data step above has already
         // succeeded: remove_tuple would hit KeyNotFound (not
-        // LockContentionError) on the retried call and the caller's own
-        // retry_on_contention wouldn't retry further, abandoning the index
-        // cleanup permanently on the very first contention hit.
+        // LockContentionError) on the retried call. That in itself is now
+        // handled (the match above tolerates it and still proceeds to the
+        // index cleanup) — but this internal retry is still needed for the
+        // common case, since it means an outer caller retry is rarely
+        // needed at all. remove_index_entry is itself idempotent (checks
+        // `contains` before removing), so retrying it — from here or from
+        // an outer caller's retry of the whole function — is always safe,
+        // never a double-remove.
         retry_on_contention(|| {
             self.remove_index_entry(id.clone(), self.table.first_index_page, None)
         })?;
@@ -370,23 +397,41 @@ where
             None => return Ok(None),
         };
         let mut h = self.buffer.get_page_mut(pid)?;
-        let matches = matches!(
-            h.page.get(id.clone())?,
-            Some(cur) if cur.is_same_txn(expect_txn.clone())
-        );
-        if !matches {
-            return Ok(None);
-        }
-        let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
-        self.buffer.write_locked_page(h)?;
+        let current = h.page.get(id.clone())?;
+        let old = match current {
+            // Row is still here and still ours: remove it.
+            Some(cur) if cur.is_same_txn(expect_txn.clone()) => {
+                let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+                self.buffer.write_locked_page(h)?;
+                Some(old)
+            }
+            // Row exists but now belongs to someone else — a genuine no-op,
+            // matching this function's documented contract. Nothing to
+            // clean up: the index entry is legitimately still pointing at
+            // live data.
+            Some(_) => return Ok(None),
+            // The index entry we just found via find_page still exists, but
+            // there's no data behind it at all. Unlike the case above,
+            // there's no live tuple whose ownership could still be "someone
+            // else's" — an index entry pointing at missing data is never
+            // valid, regardless of expect_txn. This can only mean an
+            // earlier, retried attempt of this exact call already removed
+            // the data but not yet the index (see remove()'s matching
+            // comment) — finish that cleanup below instead of silently
+            // leaving the index entry stale, which the old `if !matches {
+            // return Ok(None) }` short-circuit used to do.
+            None => None,
+        };
         // See remove()'s comment on why this must retry internally rather
         // than rely on the caller (revert_txn_writes) retrying this whole
         // function: that's unsafe once the data step above has already
-        // succeeded.
+        // succeeded. remove_index_entry checks `contains` before removing,
+        // so retrying it here — or via an outer caller retry — is always
+        // safe, never a double-remove.
         retry_on_contention(|| {
             self.remove_index_entry(id.clone(), self.table.first_index_page, None)
         })?;
-        Ok(Some(old))
+        Ok(old)
     }
 
     #[allow(clippy::bind_instead_of_map)]
@@ -499,12 +544,21 @@ where
             if count == self.table.nodes_per_page - 1 {
                 if self.is_root_page(start) {
                     // Root leaf was filled by a concurrent insert between the
-                    // unlocked pre-check in insert() and this locked arrival.
+                    // unlocked pre-check in insert_index() and this locked
+                    // arrival (that pre-check reads the count, then releases
+                    // the lock before insert_recursive re-acquires it — a
+                    // real gap, not just theoretical: reproduced under
+                    // stress once the retry_on_contention backoff/lock
+                    // timeout budgets were widened to tolerate realistic OS
+                    // scheduling jitter, which incidentally also gave more
+                    // concurrent inserts room to race this exact window).
                     // We hold the lock here, so split it now and retry.
-                    panic!("Root page split should not happen here");
-                    /*                     self.split_root_page(handle, txn_id.clone())?;
-                                       return self.insert_recursive(tuple, txn_id, start);
-                    */
+                    // split_root_page re-checks the count under this same
+                    // lock and no-ops if some other thread already split it
+                    // first, so this is safe even if the race resolves a
+                    // different way than assumed here.
+                    self.split_root_page(handle, txn_id.clone(), &tuple.id)?;
+                    return self.insert_recursive(tuple, txn_id, start, None);
                 }
                 panic!("count == nodes- should not happen");
                 // A non-root leaf was concurrently filled to capacity after its
@@ -1700,7 +1754,7 @@ mod tests {
         tree.insert(tuple_with_txn(1.into(), b"hello"), txn())
             .unwrap();
 
-        let removed = tree.remove(DBIdType::Int(1)).unwrap();
+        let removed = tree.remove(DBIdType::Int(1)).unwrap().unwrap();
         assert_eq!(removed.data.to_vec(), b"hello");
 
         assert!(
@@ -1734,18 +1788,18 @@ mod tests {
         tree.insert(tuple_with_txn(id.clone(), b"a-data"), txn())
             .unwrap();
 
-        let removed = tree.remove(id.clone()).unwrap();
+        let removed = tree.remove(id.clone()).unwrap().unwrap();
         assert_eq!(removed.data.to_vec(), b"a-data");
         assert!(tree.find(id).unwrap().is_none());
     }
 
     #[test]
-    fn test_remove_nonexistent_id_returns_err() {
+    fn test_remove_nonexistent_id_returns_none() {
         let tree = make_tree(BIG);
-        let result = tree.remove(DBIdType::Int(999));
+        let result = tree.remove(DBIdType::Int(999)).unwrap();
         assert!(
-            matches!(result, Err(StoreError::KeyNotFound(_))),
-            "remove on a never-inserted id must return KeyNotFound, got {:?}",
+            result.is_none(),
+            "remove on a never-inserted id must return Ok(None), got {:?}",
             result
         );
     }

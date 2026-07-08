@@ -554,26 +554,94 @@ TODO / open issues
     ~300-930 MB throughout (never unbounded), 0 mismatches, RESULT: PASS.
 
 [15] test_concurrent_insert_remove_reinsert_does_not_resurrect_stale_value
-    (the [11] regression test) still flakes at a low rate   [OPEN]
-    Found while re-running the full lib suite many times back-to-back
-    (something not previously done) after an unrelated Arc<Db> API change:
-    the panic is a genuine test failure (Db::commit or a background
-    writer thread panicking, "Any { .. }" downcast), not a false positive.
-    Rate: ~1/13 in one serial sweep, 3/40 (7.5%) in a larger isolated
-    sample.
-    Confirmed NOT caused by the Arc<Db> change: reproduces at a similar
-    rate (0/25, then 3/40 — consistent with the same underlying rate,
-    just not sampled large enough the first time) on the commit *before*
-    that change too, via git stash. So [11]'s fix (internal
-    retry_on_contention around the index-removal step, 8 attempts with
-    backoff) reduces the failure rate hugely (was ~100% reproducible
-    pre-fix under the same stress-harness contention, per [11]'s own
-    verification) but doesn't provably eliminate it — likely the same
-    class of residual risk as [7]'s retry-based fix: under sufficiently
-    extreme scheduling, 8 retries with short backoff still isn't always
-    enough.
-    Not investigated further this session (out of scope for the Arc<Db>
-    task in progress) — needs its own dedicated repro/triage pass. Options
-    to consider: raise the retry budget for this specific path, or make
-    the index-removal step's own locking non-blocking/wait-based instead
-    of retry-based.
+    (the [11] regression test) still flakes at a low rate   [FIXED]
+    Found while re-running the full lib suite many times back-to-back after
+    an unrelated Arc<Db> API change; confirmed pre-existing (reproduces on
+    the commit before that change too, via git stash), not caused by it.
+    Rate at the time: ~1/13 in one serial sweep, 3/40 (7.5%) in a larger
+    isolated sample.
+    Root cause #1 (BPlusTree::remove / remove_if_txn): both had a bare `?`
+    (remove()) or an early `if !matches { return Ok(None) }` (remove_if_txn)
+    on the data-tuple-removal step. [11]'s fix made the INDEX-removal step
+    retry internally, but if that internal retry itself exhausted (its own
+    8 attempts), the function returned Err — and since production callers
+    (commit()'s reclaim, revert_txn_writes) wrap the WHOLE function call in
+    their OWN retry_on_contention, that outer retry re-invoked the entire
+    function from scratch. The data step then hit KeyNotFound (data already
+    gone from the prior attempt) — not LockContentionError — so remove()'s
+    bare `?` propagated it immediately, never reaching the index cleanup a
+    second time; remove_if_txn's `matches` check similarly saw no live
+    tuple, silently returned Ok(None), and also skipped the index cleanup.
+    Either way: permanently stale index entry, blocking all future
+    re-inserts of that key with a real DuplicateKey.
+    Fix: both functions now treat "index entry found via find_page but no
+    data behind it" as unconditionally meaning a prior attempt already did
+    the data-removal step — never a live-ownership question, since there's
+    no tuple left to check ownership of — and proceed to (re-)attempt the
+    index cleanup regardless. remove()'s signature changed from
+    Result<Tuple, StoreError> to Result<Option<Tuple>, StoreError> to
+    represent this honestly (mirroring remove_if_txn's existing Option
+    return) instead of needing a fake placeholder tuple.
+    Root cause #2 (Db::commit's tombstone reclaim): even with #1 fixed, the
+    reclaim loop's `if let Ok(Some(tuple)) = table.find(...)` silently
+    swallowed a LockContentionError from find() itself — not just from
+    remove() — permanently skipping reclaim for that tombstone with no
+    other pass ever revisiting it (the "later pass" the old comment
+    promised did not actually exist). Fixed by wrapping find()+remove()
+    together in one retry_on_contention closure, so a contention hit on
+    either step retries the whole sequence (both are safe to repeat: find
+    is a pure read, remove tolerates data already being gone per #1's fix).
+    Root cause #3 (timing budget, found while verifying #1/#2): with both
+    fixed, DuplicateKey dropped from ~2% to ~0.7% but didn't hit zero.
+    Traced to PageBuffer::get_page_mut's per-page lock timeout actually
+    being 500 MICROSECONDS (arclock polls every 100us, gives up after the
+    timeout param — buffer.rs was passing 500, i.e. 500us, not 500ms as
+    previously assumed), combined with retry_on_contention's total backoff
+    of only ~3.6ms across 8 attempts. Total worst-case budget before giving
+    up (~7.6ms) is smaller than an ordinary OS scheduling quantum under
+    real load (confirmed on a moderately loaded 16-core dev machine, load
+    average ~8.5) — a lock holder preempted mid-critical-section could
+    exhaust every retry despite no genuine deadlock. Fixed by raising the
+    per-page lock timeout to 5ms and retry_on_contention to 16 attempts at
+    300us/attempt backoff (~40ms total backoff, ~120ms worst case
+    end-to-end) — still fast in absolute terms, an order of magnitude more
+    forgiving of scheduling jitter.
+    Verification: 900+ combined runs of the regression test across the
+    three fixes (200, 300, 400-run sweeps) — 0 DuplicateKey, 0
+    LockContentionError-panic failures in the final (all-three-fixes)
+    400-run sweep. Full lib suite 203/203 (serial + 5x parallel). Stress
+    harness (mem and file backends, seeds 1-3, sequential per-backend, not
+    parallel) all RESULT: PASS, 0 mismatches, 0 corrupt hot keys.
+    Widening the retry/lock-timeout budget (#3) is the same class of fix as
+    [11]/[7]'s retry-based approach and is still probabilistic in principle
+    — but the empirical rate is now indistinguishable from zero at the
+    sample sizes tested, and the budget has real headroom versus the
+    scheduling jitter actually observed.
+
+[16] insert_recursive's non-root "leaf filled by a concurrent split-window
+    race" branch is still a live panic (`panic!("count == nodes- should not
+    happen")`), same category as [15]'s now-fixed root-page sibling   [OPEN]
+    Found incidentally while chasing [15]: fixing the ROOT case (leaf-is-
+    root, filled between insert_index's unlocked pre-check and
+    insert_recursive's locked arrival) surfaced via a genuine, if rare
+    (~1/300 in one sweep), stress-test panic ("Root page split should not
+    happen here") once widened retry timing gave more concurrent inserts
+    room to actually hit the race window. Fixed that one: split_root_page()
+    + retry, self-contained since split_root_page re-checks under its own
+    lock and no-ops if already handled.
+    The sibling non-root case (a non-root leaf filled after its parent's
+    split_if_needed released the parent lock) has an already-sketched fix
+    in a comment (`return Err(StoreError::PageCapacityError)`), but wiring
+    that in isn't enough by itself: grepped every production caller
+    (BPlusTree::insert_index, BPlusTree::insert, Db::insert) and none of
+    them retry on PageCapacityError — only test code and an already-dead
+    commented-out block do. Returning it would just convert a clear panic
+    into a silent, unretried propagated error reaching the application
+    (e.g. a stress-harness `.unwrap()` panicking the same way, just with a
+    less specific message) — not an actual fix.
+    Not fixed this session: never observed in ~700+ combined test/stress
+    runs, and a real fix needs a design decision (where does the retry
+    loop live — insert_index? insert? how deep can recursion/retry go?)
+    that's speculative without a reproduction to validate against, unlike
+    [15]'s root case which had one. Left as a documented, located gap
+    rather than a guessed fix.
