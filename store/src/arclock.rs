@@ -99,13 +99,14 @@ impl<T> ArcLock<T>
 where
     T: Eq + Hash + Debug + Clone,
 {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
             locks: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
-    pub fn lock(&self, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
+    pub fn lock(self: &Arc<Self>, val: T, _timeout: u64) -> Option<ArcLockGuard<T>> {
+        let timeout = Duration::from_secs(60).as_micros() as u64;
         let now = Instant::now();
         let mut map = self.locks.write().unwrap();
         trace!(
@@ -156,7 +157,7 @@ where
         Some(fresh)
     }
 
-    fn wait_for_lock(&self, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
+    fn wait_for_lock(self: &Arc<Self>, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
         let now = Instant::now();
         let mut checked = 0;
         loop {

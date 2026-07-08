@@ -80,7 +80,7 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     write_handle: Option<JoinHandle<Result<(), StoreError>>>,
     self_file: RwLock<F>,
     access_map: ShardedPQ<PageId, u128>,
-    locks: ArcLock<PageId>,
+    locks: Arc<ArcLock<PageId>>,
     free_pages: RwLock<Vec<PageId>>,
     // This database's WAL clock, shared with its Logger. Read to stamp a page's
     // LSN when submitting it for writing, and by the writer thread to decide
