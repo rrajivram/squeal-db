@@ -9,16 +9,18 @@ use crate::{
     error::StoreError,
     logger::UndoId,
     txn::TransactionId,
+    valueitem::IndexKey,
 };
 
 const NONE: u8 = 0;
 const INDEXED: u8 = 1;
 const TOMBSTONED: u8 = 2;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Hash, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum DBIdType {
     Int(u64),
     Vec(Vec<u8>),
+    Rec(IndexKey),
 }
 
 // Ordered by `hashed()` rather than structurally, so that comparisons here
@@ -46,7 +48,7 @@ impl Ord for DBIdType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default, Hash)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
@@ -160,6 +162,7 @@ impl Display for DBIdType {
         match &self {
             DBIdType::Int(i) => write!(f, "{}", i),
             DBIdType::Vec(v) => write!(f, "{:?}", v),
+            DBIdType::Rec(r) => write!(f, "{:?}", r),
         }
     }
 }
@@ -175,6 +178,7 @@ impl From<DBIdType> for String {
         match value {
             DBIdType::Int(i) => i.to_string(),
             DBIdType::Vec(v) => String::from_utf8(v).unwrap_or_default(),
+            DBIdType::Rec(r) => format!("{:?}", r),
         }
     }
 }
@@ -190,6 +194,7 @@ impl DBIdType {
         match self {
             Self::Int(i) => *i,
             Self::Vec(v) => db_hash(v),
+            Self::Rec(r) => r.hash(),
         }
     }
 }

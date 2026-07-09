@@ -38,3 +38,4 @@ pub mod tables;
 pub mod tuple;
 pub mod txn;
 mod utils;
+pub mod valueitem;
