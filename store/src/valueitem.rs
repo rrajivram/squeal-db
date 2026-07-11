@@ -867,25 +867,23 @@ mod indexkey_tests {
         assert_eq!(k.hash(), k.hash());
     }
 
-    // hash() combines per-field hashes with bitwise OR, which is a weak
-    // combiner: OR-ing more/larger values only ever sets more bits, so
-    // structurally different keys collide far more easily than with a
-    // proper mixing function (XOR, wrapping multiply-add, etc). Since
-    // DBIdType::hashed() (tuple.rs) uses this directly to order
-    // DBIdType::Rec entries in the B+ tree, frequent collisions mean more
-    // keys tie on ordering than a stronger hash would produce — not
-    // incorrect by itself (the tree only requires a consistent order,
-    // per DBIdType's own doc comment), but worth knowing about if lookups
-    // ever seem to hit more hash-collision fallback paths than expected.
+    // hash() mixes per-field hashes with an FNV-1a-style XOR+multiply
+    // combiner, unlike the plain bitwise-OR it used to use — field order
+    // and each field's own value both affect the result, so two
+    // structurally different keys built from the same field values in a
+    // different arrangement should (not guaranteed, but expected in
+    // practice) land on different hashes, unlike the old OR-combiner where
+    // e.g. [Integer(1), Integer(2)] and [Integer(3)] collided outright
+    // (1|2 == 3).
     #[test]
-    fn test_hash_or_combiner_collides_across_different_keys() {
+    fn test_hash_mixes_field_order_not_just_bitwise_union() {
         let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(3)]);
-        assert_ne!(a, b, "structurally different keys");
-        assert_eq!(
+        let b = IndexKey::new_from(&[ValueItem::Integer(2), ValueItem::Integer(1)]);
+        assert_ne!(a, b, "structurally different keys (order matters)");
+        assert_ne!(
             a.hash(),
             b.hash(),
-            "but OR-combining collides here: 1|2 == 3"
+            "a real mixing function shouldn't collide on such a simple reordering"
         );
     }
 

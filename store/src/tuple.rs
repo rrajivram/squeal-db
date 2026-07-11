@@ -23,19 +23,35 @@ pub enum DBIdType {
     Rec(IndexKey),
 }
 
-// Ordered by `hashed()` rather than structurally, so that comparisons here
-// agree with `AnyTuplePage`'s hash-bucketed iteration/storage order — the
-// B+ tree's navigation and split logic rely on `<`/`>` matching iteration
-// order, and for `Vec` ids the derived (lexical) order would not.
+// Int/Vec order by `hashed()` rather than structurally, so that
+// comparisons here agree with `AnyTuplePage`'s (now id-keyed, see its own
+// comment) storage/iteration order — the B+ tree's navigation and split
+// logic rely on `<`/`>` matching iteration order, and for `Vec` ids the
+// derived (lexical) order would not.
 //
-// RISK: this intentionally diverges from `Eq`/`PartialEq`, which stay exact.
-// Two distinct ids whose hashes collide will compare as `Ordering::Equal`
-// here while still being `!=` under `PartialEq`/`Hash`. That's fine for the
-// current use (the B+ tree only ever compares hashed keys), but it means
-// `DBIdType` must NOT be used directly as a key in a `BTreeMap`/`BTreeSet`
-// — colliding-but-distinct ids would silently collapse into one slot.
-// Key by `.hashed()` (a plain `u64`) for that purpose instead, as
-// `AnyTuplePage` already does.
+// Rec is the one exception: it orders structurally (field-by-field via
+// IndexKey::partial_cmp) instead. A hashed comparison — by design — loses
+// any relationship to the actual field values, which defeats the entire
+// point of a multi-key index: a range query over (customer_id, order_date)
+// needs "close values" to sort "close together" in the tree, and no hash
+// function can preserve that (it has to scramble to avoid collisions,
+// which is the opposite of what ordering needs). Confirmed as a real,
+// reachable problem, not just theoretical, in cursor.rs's range_scan
+// tests: a range meant to select a contiguous span of small integer keys
+// returned almost none of them once the ids were wrapped in a
+// single-field IndexKey and ordered by hash.
+//
+// RISK: for Int/Vec, this still intentionally diverges from `Eq`/
+// `PartialEq`, which stay exact — two distinct ids whose hashes collide
+// compare as `Ordering::Equal` here while still being `!=` under
+// `PartialEq`/`Hash`. For Rec, the analogous (much narrower) risk is
+// IndexKey::partial_cmp's own documented quirks: a Str/Blob field whose
+// reserved capacity differs compares Equal despite being `!=` under
+// PartialEq, and a key that is a strict field-wise prefix of a longer key
+// compares Equal to it despite having a different field count. Either way,
+// `Ordering::Equal` here does NOT imply true equality — `AnyTuplePage`
+// already has to tolerate that (see its own doc comment on why it buckets
+// by full `DBIdType`, not just `.hashed()`).
 impl PartialOrd for DBIdType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -44,7 +60,18 @@ impl PartialOrd for DBIdType {
 
 impl Ord for DBIdType {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.hashed().cmp(&other.hashed())
+        match (self, other) {
+            (Self::Rec(a), Self::Rec(b)) => {
+                // IndexKey::partial_cmp only ever returns None if a field's
+                // own PartialOrd does (see ValueItem — it panics instead of
+                // returning None for any comparison it can't make sense of,
+                // e.g. Blob), so this never actually falls back in practice;
+                // it's here so Ord's contract (a total order) still holds
+                // if that ever changes.
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            _ => self.hashed().cmp(&other.hashed()),
+        }
     }
 }
 

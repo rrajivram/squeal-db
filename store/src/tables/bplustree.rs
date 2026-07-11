@@ -434,48 +434,95 @@ where
         Ok(old)
     }
 
-    #[allow(clippy::bind_instead_of_map)]
-    fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
+    // Routes through inner nodes to find the LEAF index page that contains
+    // (or, if `id` isn't an existing key, would contain) `id` — shared by
+    // find_page (which then does an exact lookup within that leaf and
+    // resolves its Node::Leaf pointer to a data page) and find_leaf_page
+    // (which returns the leaf itself, for a range scan's positional
+    // "first key >= id" starting point — no exact match required).
+    fn route_to_leaf(&self, id: &DBIdType, start: PageId) -> Result<PageId, StoreError> {
         let page = self.buffer.get_page(start)?;
-        if page.is_flag_set(INNER_NODE) {
-            let rows_iter = page.iter();
-            let mut last_child: Option<PageId> = None;
-            for row in rows_iter {
-                if id < row.id {
-                    let page_id = from_bytes::<Node>(&row.data)?;
-                    if let Node::Inner(page_num) = page_id {
-                        return self.find_page(id, page_num);
-                    } else {
-                        panic!("Expected Inner. Found leaf ! {:?}", row.id);
-                    }
-                }
+        if !page.is_flag_set(INNER_NODE) {
+            return Ok(start);
+        }
+        let mut last_child: Option<PageId> = None;
+        for row in page.iter() {
+            if *id < row.id {
                 let node = from_bytes::<Node>(&row.data)?;
                 if let Node::Inner(page_num) = node {
-                    last_child = Some(page_num);
+                    return self.route_to_leaf(id, page_num);
+                } else {
+                    panic!("Expected Inner. Found leaf ! {:?}", row.id);
                 }
             }
-            // id >= all entry bounds: route to the last child.
-            // Non-root inner nodes have no u64::MAX sentinel; the last child
-            // covers all keys from its separator up to the parent's upper bound.
-            if let Some(child) = last_child {
-                return self.find_page(id, child);
+            let node = from_bytes::<Node>(&row.data)?;
+            if let Node::Inner(page_num) = node {
+                last_child = Some(page_num);
             }
-            Ok(None)
-        } else {
-            Ok(page
-                .get(id)?
-                .and_then(|t| {
-                    let id = from_bytes::<Node>(&t.data);
-                    match id {
-                        Ok(Node::Leaf(page_id)) => Some(Ok(page_id)),
-                        Ok(Node::Inner(_)) => {
-                            panic!("Expected leaf, found inner! {:?}", t.id)
-                        }
-                        Err(e) => Some(Err(StoreError::from(e))),
-                    }
-                })
-                .transpose()?)
         }
+        // id >= all entry bounds: route to the last child.
+        // Non-root inner nodes have no u64::MAX sentinel; the last child
+        // covers all keys from its separator up to the parent's upper bound.
+        match last_child {
+            Some(child) => self.route_to_leaf(id, child),
+            // An INNER_NODE page always has at least one Node::Inner entry
+            // (routing pages are never created empty) — this is here so
+            // the match is exhaustive, not because it's expected to happen.
+            None => Ok(start),
+        }
+    }
+
+    // Positional lookup for RangeCursor: the leaf that would hold `id`,
+    // whether or not `id` actually exists there. Unlike find_page/find,
+    // this never requires an exact match — the caller (a range scan) wants
+    // "start here and walk forward via the leaf chain," not "this exact
+    // key must exist."
+    pub(crate) fn find_leaf_page(&self, id: &DBIdType) -> Result<Arc<Page>, StoreError> {
+        let leaf_id = self.route_to_leaf(id, self.table.first_index_page)?;
+        self.buffer.get_page(leaf_id)
+    }
+
+    // Given a leaf index page, returns its sibling in the leaf chain (see
+    // split_non_root_page/split_root_page, which wire up next_page on
+    // every leaf split), or None once the walk reaches the last leaf.
+    // Mirrors next_data_page's pattern, but for index leaves rather than
+    // data pages — leaves never have overflow, so (unlike
+    // PageBuffer::data_chain_next) a plain get_next_page() is enough.
+    pub(crate) fn next_leaf_page(&self, page: &Page) -> Result<Option<Arc<Page>>, StoreError> {
+        let next = page.get_next_page();
+        if next.is_valid_next_page() {
+            Ok(Some(self.buffer.get_page(next)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    // Resolves an index leaf entry (a Tuple whose `.data` is a serialized
+    // Node::Leaf pointer, not real row content — see insert_index) to the
+    // actual row it points to.
+    pub(crate) fn resolve_index_entry(&self, entry: &Tuple) -> Result<Option<Tuple>, StoreError> {
+        match from_bytes::<Node>(&entry.data)? {
+            Node::Leaf(data_page_id) => self.buffer.get_page(data_page_id)?.get(entry.id.clone()),
+            Node::Inner(_) => panic!("Expected leaf entry, found inner! {:?}", entry.id),
+        }
+    }
+
+    #[allow(clippy::bind_instead_of_map)]
+    fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
+        let leaf_id = self.route_to_leaf(&id, start)?;
+        let page = self.buffer.get_page(leaf_id)?;
+        page.get(id)?
+            .and_then(|t| {
+                let id = from_bytes::<Node>(&t.data);
+                match id {
+                    Ok(Node::Leaf(page_id)) => Some(Ok(page_id)),
+                    Ok(Node::Inner(_)) => {
+                        panic!("Expected leaf, found inner! {:?}", t.id)
+                    }
+                    Err(e) => Some(Err(StoreError::from(e))),
+                }
+            })
+            .transpose()
     }
 
     fn remove_index_entry(
@@ -780,6 +827,16 @@ where
             new_page.set_page_flags(INNER_NODE)?;
         } else {
             new_page.set_page_flags(LEAF_NODE)?;
+            // Maintain the leaf-level sibling chain that RangeCursor walks
+            // for range scans — the same idea as the data-page chain
+            // (write_data/set_data_chain_next), just for index leaves.
+            // The new sibling inherits whatever this leaf pointed to
+            // before the split (captured before current_page.clear(),
+            // though clear() only touches the tuple data, not next_page —
+            // reading it here regardless keeps this correct even if that
+            // ever changes), and this leaf now points at the new sibling.
+            new_page.set_next_page(current_page.get_next_page())?;
+            current_page.set_next_page(new_page_id)?;
         }
         current_page.clear()?;
         current_vals
@@ -887,6 +944,16 @@ where
         let right_page = Arc::make_mut(&mut right_handle.page);
         left_page.set_page_flags(flags)?;
         right_page.set_page_flags(flags)?;
+        if flags == LEAF_NODE {
+            // See split_non_root_page's matching comment: maintain the
+            // leaf-level sibling chain. The old root (about to become an
+            // inner routing page via update_root_page) was itself the
+            // only leaf so far, so right inherits whatever it pointed to
+            // (normally nothing, but preserved for consistency regardless)
+            // and left now points at right.
+            right_page.set_next_page(handle.page.get_next_page())?;
+            left_page.set_next_page(right_page_id)?;
+        }
         left_vals
             .iter()
             .try_for_each(|t| left_page.add_tuple(t.clone()))?;
@@ -1135,6 +1202,49 @@ mod tests {
         }
     }
 
+    // Regression test for RangeCursor's leaf-to-leaf walk (cursor.rs):
+    // index LEAF pages must be chained via next_page on every split, the
+    // same way data pages already are, so a range scan can walk them in
+    // ascending key order without ever going through the index's inner
+    // nodes. Forces enough sequential inserts to produce several leaf
+    // splits (both the root's own first split and at least one
+    // non-root leaf split), then walks the chain purely via
+    // find_leaf_page/next_leaf_page and checks it visits every key
+    // exactly once, in order — not through find()/range_scan, so this
+    // isolates the chain-wiring itself from the rest of RangeCursor.
+    #[test]
+    fn test_leaf_pages_chain_across_multiple_splits_in_ascending_order() {
+        let page_size = MAX_ENTRY_BYTES * 4; // nodes_per_page = 4
+        let tree = make_tree(page_size);
+
+        for i in 1u64..=40 {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+
+        let mut leaf = tree.find_leaf_page(&DBIdType::Int(1)).unwrap();
+        let mut seen: Vec<u64> = vec![];
+        loop {
+            for row in leaf.iter() {
+                match row.id {
+                    DBIdType::Int(i) => seen.push(i),
+                    other => panic!("unexpected id type {other:?}"),
+                }
+            }
+            match tree.next_leaf_page(&leaf).unwrap() {
+                Some(next) => leaf = next,
+                None => break,
+            }
+        }
+
+        assert_eq!(
+            seen,
+            (1u64..=40).collect::<Vec<_>>(),
+            "walking the leaf chain from the first leaf must visit every \
+             key exactly once, in ascending order, regardless of how many \
+             splits happened along the way"
+        );
+    }
+
     #[test]
     fn test_root_splits_into_inner_node() {
         // page_size = MAX_ENTRY_BYTES * 4 → nodes_per_page = 4; split fires after 3 index entries.
@@ -1254,6 +1364,54 @@ mod tests {
                 "id {i} must remain findable"
             );
         }
+    }
+
+    // Same idea as test_leaf_pages_chain_across_multiple_splits_in_
+    // ascending_order, but under random insertion order — sequential
+    // inserts always split at the rightmost edge (see split_point's
+    // rightmost-append optimization), which is a narrower code path than
+    // splits triggered by inserts landing in the middle of a page. Random
+    // order exercises both, so this is the stronger check that the
+    // leaf-chain wiring in split_non_root_page/split_root_page is correct
+    // regardless of where in a page the split point falls.
+    #[test]
+    fn test_leaf_chain_remains_complete_and_ordered_under_random_inserts() {
+        let page_size = MAX_ENTRY_BYTES * 4;
+        let tree = make_tree(page_size);
+
+        let mut ids: Vec<u64> = (1u64..=2000).collect();
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        for i in (1..ids.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let j = (state % (i as u64 + 1)) as usize;
+            ids.swap(i, j);
+        }
+        for &i in &ids {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+
+        let mut leaf = tree.find_leaf_page(&DBIdType::Int(1)).unwrap();
+        let mut seen: Vec<u64> = vec![];
+        loop {
+            for row in leaf.iter() {
+                match row.id {
+                    DBIdType::Int(i) => seen.push(i),
+                    other => panic!("unexpected id type {other:?}"),
+                }
+            }
+            match tree.next_leaf_page(&leaf).unwrap() {
+                Some(next) => leaf = next,
+                None => break,
+            }
+        }
+        assert_eq!(
+            seen,
+            (1u64..=2000).collect::<Vec<_>>(),
+            "leaf chain must cover every inserted key exactly once, in \
+             ascending order, no matter what order they were inserted in"
+        );
     }
 
     #[test]

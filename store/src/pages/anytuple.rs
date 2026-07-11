@@ -13,9 +13,23 @@ use crate::{
 // reachable after `Arc::make_mut(&mut Arc<Page>)` has made the owning Page
 // uniquely owned (see `PageTuple::deep_clone`). Concurrent readers only ever see
 // a different, immutable Page snapshot, so a lock here would guard nothing.
+//
+// Keyed by the id itself (via DBIdType's own Ord), not by `.hashed()` as a
+// separately-computed u64: this map's iteration order is what the B+ tree's
+// navigation/split logic treats as "sorted by DBIdType::cmp" (see
+// find_page/insert_recursive in bplustree.rs), so the two must always agree
+// by construction. Keying by a separately-derived u64 only guaranteed that
+// as long as every id type's Ord WAS `.hashed().cmp(...)` — which stopped
+// being true once DBIdType::Rec got a structural Ord (see tuple.rs) so that
+// range queries over multi-key ids mean something. Bucketing (the Vec) still
+// covers the same risk the old scheme had: DBIdType::cmp can say `Equal`
+// for ids that are `PartialEq`-distinct (hash collisions for Int/Vec;
+// IndexKey's own documented ties — same content, different reserved
+// capacity, or a strict field-wise prefix — for Rec), and `is_present`/
+// `extract`/etc. below still disambiguate within a bucket via `PartialEq`.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct AnyTuplePage {
-    data: BTreeMap<DBSizeType, Vec<Tuple>>,
+    data: BTreeMap<DBIdType, Vec<Tuple>>,
 }
 
 impl Clone for AnyTuplePage {
@@ -43,9 +57,9 @@ impl AnyTuplePage {
         let mut vec: Vec<Tuple> = from_bytes(bytes)?;
         let data = vec
             .drain(..)
-            .map(|t| (t.id.hashed(), t))
+            .map(|t| (t.id.clone(), t))
             .collect::<Vec<_>>();
-        let mut map: BTreeMap<u64, Vec<Tuple>> = BTreeMap::new();
+        let mut map: BTreeMap<DBIdType, Vec<Tuple>> = BTreeMap::new();
         for (id, t) in data {
             map.entry(id)
                 .and_modify(|f| f.push(t.clone()))
@@ -70,7 +84,7 @@ impl PageTuple for AnyTuplePage {
             return Err(StoreError::DuplicateKey(tuple.id));
         }
         self.data
-            .entry(tuple.id.hashed())
+            .entry(tuple.id.clone())
             .and_modify(|v| v.push(tuple.clone()))
             .or_insert(vec![tuple]);
         Ok(())
@@ -79,25 +93,25 @@ impl PageTuple for AnyTuplePage {
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
         Ok(self
             .data
-            .get(&id.hashed())
+            .get(id)
             .map(|v| is_present(v, id))
             .unwrap_or_default())
     }
 
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.data.get(&id.hashed()).and_then(|t| extract(t, id)))
+        Ok(self.data.get(id).and_then(|t| extract(t, id)))
     }
 
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         self.data
-            .get_mut(&id.hashed())
+            .get_mut(id)
             .and_then(|v| replace(v, id, tuple))
             .ok_or(StoreError::KeyNotFound(id.clone()))
     }
 
     fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
         self.data
-            .get_mut(&id.hashed())
+            .get_mut(&id)
             .and_then(|t| remove(t, &id))
             .ok_or(StoreError::KeyNotFound(id))
     }
@@ -107,7 +121,11 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
-        Ok(self.data.keys().copied().collect())
+        // Unused externally (no caller outside this trait's own impls as of
+        // this writing) — kept returning the hashed u64 rather than
+        // widening the trait's signature to DBIdType for a method nothing
+        // reads.
+        Ok(self.data.keys().map(|k| k.hashed()).collect())
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
@@ -318,5 +336,97 @@ mod tests {
             .unwrap();
         assert!(p.contains(&id.clone()).unwrap());
         assert_eq!(p.get(&id).unwrap().unwrap().data.to_vec(), b"payload");
+    }
+
+    fn rec_id(a: i64, b: i64) -> DBIdType {
+        DBIdType::Rec(crate::valueitem::IndexKey::new_from(&[
+            crate::valueitem::ValueItem::Integer(a),
+            crate::valueitem::ValueItem::Integer(b),
+        ]))
+    }
+
+    #[test]
+    fn test_rec_id_add_get_remove() {
+        let mut p = make_page();
+        let id = rec_id(1, 2);
+        p.add(Tuple::new_with(id.clone(), b"payload", None, None))
+            .unwrap();
+        assert!(p.contains(&id).unwrap());
+        assert_eq!(p.get(&id).unwrap().unwrap().data.to_vec(), b"payload");
+        let removed = p.remove(id.clone()).unwrap();
+        assert_eq!(removed.data.to_vec(), b"payload");
+        assert!(!p.contains(&id).unwrap());
+    }
+
+    #[test]
+    fn test_rec_id_iterates_in_structural_order() {
+        // The map is now keyed by DBIdType directly (see this file's own
+        // doc comment on `data`), so its natural BTreeMap key order IS
+        // DBIdType::cmp's order — for Rec, that's structural. Confirms
+        // values()/iteration produce ids in ascending field order, not
+        // insertion order or hash order.
+        let mut p = make_page();
+        for (a, b) in [(3, 1), (1, 2), (2, 1), (1, 1)] {
+            p.add(Tuple::new_with(
+                rec_id(a, b),
+                format!("{a}-{b}").as_bytes(),
+                None,
+                None,
+            ))
+            .unwrap();
+        }
+        let vals: Vec<String> = p
+            .values()
+            .unwrap()
+            .into_iter()
+            .map(|t| String::from_utf8(t.data.to_vec()).unwrap())
+            .collect();
+        // values() flattens BTreeMap::values() in key order (ascending),
+        // so this should come out already sorted structurally.
+        assert_eq!(vals, vec!["1-1", "1-2", "2-1", "3-1"]);
+    }
+
+    // DBIdType::cmp for Rec can say Equal for ids that are `!=` under
+    // PartialEq (see IndexKey::partial_cmp's own documented ties: same
+    // content with a different Str/Blob reserved capacity, or a key that's
+    // a strict field-wise prefix of a longer one). Keying the map by
+    // DBIdType (Ord) rather than a separately-hashed u64 makes this the
+    // SAME kind of "collision" the old hash-keyed scheme already had to
+    // tolerate — confirm the Vec-bucketing + PartialEq disambiguation
+    // still correctly keeps both entries distinct and independently
+    // reachable, rather than one silently shadowing the other.
+    #[test]
+    fn test_rec_ids_that_tie_under_ord_but_differ_under_partial_eq_both_survive() {
+        use crate::valueitem::{IndexKey, ValueItem};
+
+        let mut p = make_page();
+        let short = DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(1)]));
+        let long = DBIdType::Rec(IndexKey::new_from(&[
+            ValueItem::Integer(1),
+            ValueItem::Integer(2),
+        ]));
+        assert_eq!(
+            short.cmp(&long),
+            std::cmp::Ordering::Equal,
+            "sanity: a prefix key ties under Ord with the longer key it prefixes"
+        );
+        assert_ne!(short, long, "but they are NOT the same id under PartialEq");
+
+        p.add(Tuple::new_with(short.clone(), b"short", None, None))
+            .unwrap();
+        p.add(Tuple::new_with(long.clone(), b"long", None, None))
+            .unwrap();
+
+        assert_eq!(p.count().unwrap(), 1, "both land in the same bucket (one map slot)");
+        assert_eq!(p.get(&short).unwrap().unwrap().data.to_vec(), b"short");
+        assert_eq!(p.get(&long).unwrap().unwrap().data.to_vec(), b"long");
+
+        let removed_short = p.remove(short.clone()).unwrap();
+        assert_eq!(removed_short.data.to_vec(), b"short");
+        assert!(!p.contains(&short).unwrap());
+        assert!(
+            p.contains(&long).unwrap(),
+            "removing one tied id must not remove the other"
+        );
     }
 }

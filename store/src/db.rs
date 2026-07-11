@@ -7,6 +7,7 @@ use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::constant::timestamp;
+use crate::cursor::RangeCursor;
 use crate::cursor::TableCursor;
 use crate::error::StoreError;
 use crate::generator::Generator;
@@ -601,6 +602,15 @@ where
     // holding the Db as Arc<Db<F>> can provide.
     pub fn table_scan(self: &Arc<Self>, tid: TableIdType) -> Result<TableCursor<F>, StoreError> {
         TableCursor::new(Arc::clone(self), tid, None)
+    }
+
+    pub fn range_scan(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        start: DBIdType,
+        end: DBIdType,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        RangeCursor::new(Arc::clone(self), tid, None, start, end)
     }
 
     pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
