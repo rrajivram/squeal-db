@@ -1,8 +1,6 @@
-use std::{
-    fs::OpenOptions,
-    path::Path,
-    sync::{Arc, RwLock},
-};
+use std::{fs::OpenOptions, path::Path, sync::Arc};
+
+use parking_lot::RwLock;
 
 use crate::db::{Meta, Opener};
 
@@ -17,6 +15,10 @@ impl MemFile {
         Self {
             ..Default::default()
         }
+    }
+
+    pub fn data(&self) -> Vec<u8> {
+        self.data.read().clone()
     }
 }
 
@@ -36,7 +38,7 @@ impl Opener for MemFile {
 
     fn get_metadata(&self) -> std::io::Result<Meta> {
         Ok(Meta {
-            len: self.data.read().unwrap().len() as u64,
+            len: self.data.read().len() as u64,
         })
     }
 
@@ -45,7 +47,7 @@ impl Opener for MemFile {
     }
 
     fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        let data = self.data.read().unwrap();
+        let data = self.data.read();
         let offset = offset as usize;
         if offset >= data.len() {
             return Ok(0); // at or past EOF
@@ -56,13 +58,16 @@ impl Opener for MemFile {
     }
 
     fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
-        let mut data = self.data.write().unwrap();
+        let mut data = self.data.write();
         let offset = offset as usize;
         if offset + buf.len() > data.len() {
             data.resize(offset + buf.len(), 0);
         }
         data[offset..offset + buf.len()].copy_from_slice(buf);
         Ok(buf.len())
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -106,11 +111,15 @@ impl Opener for std::fs::File {
     fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
         std::os::windows::fs::FileExt::seek_write(self, buf, offset)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl std::io::Write for MemFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut data = self.data.write().unwrap();
+        let mut data = self.data.write();
         let c_size = data.len();
         if self.seek_pos + buf.len() > c_size {
             data.resize(self.seek_pos + buf.len(), 0);
@@ -128,7 +137,7 @@ impl std::io::Write for MemFile {
 impl std::io::Read for MemFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut len = buf.len();
-        let data = self.data.read().unwrap();
+        let data = self.data.read();
         if self.seek_pos >= data.len() {
             return Ok(0); // at or past EOF
         }
@@ -148,7 +157,7 @@ impl std::io::Seek for MemFile {
                 self.seek_pos = (self.seek_pos as i64 + c).max(0) as usize;
             }
             std::io::SeekFrom::End(e) => {
-                let len = self.data.read().unwrap().len() as i64;
+                let len = self.data.read().len() as i64;
                 self.seek_pos = (len + e).max(0) as usize;
             }
             std::io::SeekFrom::Start(s) => self.seek_pos = s as usize,

@@ -31,6 +31,7 @@ use postcard::from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
 use serde::Serialize;
+use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
@@ -59,13 +60,14 @@ pub struct Meta {
     pub len: u64,
 }
 
-pub trait Opener {
+pub trait Opener: Any {
     type Item;
     fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<Self::Item>;
     fn do_sync(&mut self) -> std::io::Result<()>;
     fn do_clone(&self) -> std::io::Result<Self::Item>;
     fn get_metadata(&self) -> std::io::Result<Meta>;
     fn do_lock(&self) -> Result<(), TryLockError>;
+    fn as_any(&self) -> &dyn Any;
 
     /// Positioned read: fills as much of `buf` as available starting at
     /// `offset`, returning the number of bytes actually read (0 at EOF) —
@@ -685,16 +687,17 @@ where
         // Buffer shares the logger's WAL clock, so page-flush deferral and redo
         // LSNs are scoped to this one database (not a process global).
         let clock = logger.clock();
+        let buffer = Arc::new(PageBuffer::new(
+            header.page_size,
+            page_counter,
+            file,
+            header,
+            1024,
+            clock,
+            max_pending_writes,
+        )?);
         let nm = NeededObjects {
-            buffer: Arc::new(PageBuffer::new(
-                header.page_size,
-                page_counter,
-                file,
-                header,
-                1024,
-                clock,
-                max_pending_writes,
-            )?),
+            buffer,
             logger: Arc::new(logger),
             txn_mgr: Arc::new(TransactionManager::new(gens, TransactionId::default())?),
         };
