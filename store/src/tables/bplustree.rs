@@ -126,8 +126,42 @@ where
     pub fn id(&self) -> TableIdType {
         self.table.id
     }
+    // Redo-replay counterpart to insert(): tolerates the row already being
+    // there, since a committed Add's row may or may not have made it to
+    // disk before a crash (that's the whole reason it needs replaying at
+    // all). Used to compare `page.lsn_id()` (the page's own LSN) against
+    // this record's LSN to decide "already applied, skip" vs "must
+    // reapply" — but page.lsn_id() is stamped by set_dirty() from the
+    // *flush watermark at dirty-time*, not this operation's own LSN, and
+    // dirtying always happens before this operation's redo record is even
+    // logged (see Db::insert: table.insert() writes the page, *then*
+    // logger.log_redo() allocates the LSN) — so page.lsn_id() is
+    // structurally always less than this record's own lsn, and the
+    // "already applied" branch could never actually trigger. In practice
+    // that meant insert_if_needed always fell into re-adding a row that
+    // was already there, hitting DuplicateKey on the most ordinary
+    // "commit, then reopen without a checkpoint in between" case.
+    //
+    // Existence is sufficient evidence on its own: redo records are
+    // replayed strictly in their original log order, so the only way this
+    // id could already be present when its own Add is processed is that
+    // the very write it's replaying already landed (pre-crash or an
+    // earlier pass of this same replay) — a fresh, unrelated row can't
+    // occupy the same id without a Del in between, which would already
+    // have removed it. No LSN comparison needed.
+    pub(crate) fn insert_if_needed(
+        &self,
+        tuple: &Tuple,
+        txn: TransactionId,
+    ) -> Result<PageId, StoreError> {
+        if let Some(page_id) = self.find_page(tuple.id.clone(), self.table.first_index_page)? {
+            Ok(page_id)
+        } else {
+            self.insert(tuple.clone(), txn)
+        }
+    }
 
-    pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<(), StoreError> {
+    pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<PageId, StoreError> {
         let tuple_id = tuple.id.clone();
         // Write the data row, then insert its index entry. If the index insert
         // fails (e.g. DuplicateKey, or lock contention), the data-page write we
@@ -177,7 +211,7 @@ where
         tuple_id: DBIdType,
         data_page_id: PageId,
         txn: TransactionId,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PageId, StoreError> {
         let id_tuple = Tuple::new_with(
             tuple_id,
             &to_allocvec(&Node::Leaf(data_page_id))?,
@@ -274,6 +308,32 @@ where
         let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
         self.buffer.write_locked_page(h)?;
         Ok(old)
+    }
+
+    // Redo-replay counterpart to update(), mirroring insert_if_needed:
+    // tolerates the row already reflecting this exact write (the common
+    // case when a crash happens after the corresponding page write already
+    // landed), skipping update()'s underlying work entirely in that case.
+    //
+    // This isn't just an optimization — update() unconditionally tears
+    // down and rebuilds the row's overflow chain (write_locked_page's
+    // handle_large_page_size: free whatever overflow pages are currently
+    // linked, then allocate however many the tuple's current size needs).
+    // That's correct for a genuine content change, but replaying it
+    // against a tuple whose content hasn't actually changed still frees
+    // the existing chain and immediately reallocates one of the same
+    // length — and there's no guarantee the free list hands back the same
+    // pages it was just given, so the net effect can be extra pages left
+    // on the free list that a real update would never have produced.
+    // Confirmed via test_freed_overflow_pages_persist_across_close_reopen.
+    pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
+        let id = tuple.id.clone();
+        if let Some(current) = self.find(id)?
+            && current.data == tuple.data
+        {
+            return Ok(current);
+        }
+        self.update(tuple)
     }
 
     // Returns Ok(None) when the data was already gone by the time this call
@@ -578,7 +638,7 @@ where
         txn_id: TransactionId,
         start: PageId,
         parent: Option<WritePageHandle>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<PageId, StoreError> {
         let mut handle = self.buffer.get_page_mut(start)?;
         // Hand-over-hand (crabbing): now that we hold this node's lock, release
         // the parent's. Acquiring the child lock *before* releasing the parent
@@ -615,7 +675,9 @@ where
             } else if handle.page.count()? < self.table.nodes_per_page
                 && handle.page.can_store(&tuple)
             {
+                let id = handle.page_num;
                 self.write_page(handle, tuple)?;
+                Ok(id)
             } else {
                 panic!(
                     "count == nodes {}, or too big {}",
@@ -702,14 +764,13 @@ where
                 }
                 // Crab into the child: pass our still-held parent lock down so
                 // it is only released once the child lock has been acquired.
-                return self.insert_recursive(tuple, txn_id, p, Some(handle));
+                self.insert_recursive(tuple, txn_id, p, Some(handle))
             } else {
                 panic!("Expected inner - found leaf : {:?}", start);
             }
         } else {
             panic!("Unknown page {:?}", start);
         }
-        Ok(())
     }
 
     fn split_if_needed(
@@ -992,7 +1053,7 @@ mod tests {
         generator::Generator,
         logger::Logger,
         memfile::MemFile,
-        page::Page,
+        page::{Page, PageId},
         tuple::{DBIdType, Tuple},
         txn::{TransactionId, TransactionManager},
     };
@@ -1782,12 +1843,12 @@ mod tests {
                 })
                 .collect();
 
-            let results: Vec<Result<(), StoreError>> =
+            let results: Vec<Result<PageId, StoreError>> =
                 handles.into_iter().map(|h| h.join().unwrap()).collect();
 
             for (&id, result) in racer_ids.iter().zip(results.iter()) {
                 match result {
-                    Ok(()) => {
+                    Ok(_p) => {
                         if tree.find(DBIdType::Int(id)).unwrap().is_none() {
                             lost_update_iterations.push((iteration, id));
                         }

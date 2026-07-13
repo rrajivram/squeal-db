@@ -6,7 +6,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use crossbeam::channel::{Receiver, Sender, unbounded};
+use crossbeam::channel::{Receiver, Sender, bounded};
 use log::error;
 use memmap::MmapOptions;
 use parking_lot::RwLock;
@@ -14,8 +14,8 @@ use postcard::{take_from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    constant::timestamp, db::DBFile, error::StoreError, memfile::MemFile, table::TableIdType,
-    tuple::Tuple, txn::TransactionId,
+    constant::timestamp, db::DBFile, error::StoreError, memfile::MemFile, page::PageId,
+    table::TableIdType, tuple::Tuple, txn::TransactionId,
 };
 
 /// Per-database write-ahead-log clock. Was two process-global statics, which
@@ -80,14 +80,14 @@ pub(crate) enum MsgType {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct RedoOperation {
-    lsn_id: LsnId,
-    operation: Operation,
+    pub(crate) lsn_id: LsnId,
+    pub(crate) operation: Operation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct UndoOperation {
-    undo_id: Option<UndoId>,
-    operation: Operation,
+    pub(crate) undo_id: Option<UndoId>,
+    pub(crate) operation: Operation,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -102,8 +102,9 @@ pub(crate) enum Operation {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Record {
     pub(crate) table_id: TableIdType,
-    timestamp: u128,
+    pub(crate) timestamp: u128,
     pub(crate) tuple: Tuple,
+    pub(crate) data_page: Option<PageId>,
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +123,15 @@ impl Logger {
             ..Default::default()
         }
     }
+    pub(crate) fn new_with_lsn(lsn: LsnId) -> Self {
+        Self {
+            clock: Arc::new(LsnClock {
+                counter: AtomicU64::new(lsn.0 + 1),
+                last_written: AtomicU64::new(u64::MAX),
+            }),
+            ..Default::default()
+        }
+    }
 
     pub(crate) fn set_db(
         &mut self,
@@ -129,8 +139,8 @@ impl Logger {
         redo_file: impl DBFile + 'static,
     ) -> Result<(), StoreError> {
         let _ = self.load_logs(&undo_file, &redo_file)?;
-        let (redo_tx, redo_rx) = unbounded();
-        let (undo_tx, undo_rx) = unbounded();
+        let (redo_tx, redo_rx) = bounded(1);
+        let (undo_tx, undo_rx) = bounded(1);
         self.undo_tx = Some(undo_tx);
         self.redo_tx = Some(redo_tx);
 
@@ -353,11 +363,16 @@ impl Logger {
 }
 
 impl Record {
-    pub(crate) fn new(table_id: TableIdType, tuple: Tuple) -> Self {
+    pub(crate) fn new(
+        table_id: TableIdType,
+        tuple: Tuple,
+        data_page: Option<PageId>, // Only set for Add
+    ) -> Self {
         Self {
             table_id,
             tuple,
             timestamp: timestamp(),
+            data_page,
         }
     }
 }
@@ -428,10 +443,7 @@ fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), Sto
                 file.write_all(&to_allocvec(&MsgType::Undo(undo_op))?)?;
             }
             MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
-            MsgType::Checkpoint(_ts) => {
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(&to_allocvec(&msg)?)?;
-            }
+            MsgType::Checkpoint(_ts) => file.truncate()?,
         }
     }
     Ok(())
@@ -460,10 +472,7 @@ fn redo_log_runner(
                 clock.mark_written(lsn_id);
             }
             MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
-            MsgType::Checkpoint(_ts) => {
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(&to_allocvec(&msg)?)?;
-            }
+            MsgType::Checkpoint(_ts) => file.truncate()?,
         }
     }
     Ok(())
@@ -528,7 +537,7 @@ mod tests {
         let txn_id = TransactionId::from(10);
         let mut tuple = Tuple::new(1, b"hello");
         tuple.set_txn_id(txn_id.clone());
-        let record = Record::new(0.into(), tuple);
+        let record = Record::new(0.into(), tuple, None);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
     }
@@ -543,7 +552,7 @@ mod tests {
         let logger = Logger::new();
         let txn_id = TransactionId::from(10);
         let tuple = Tuple::new(1, b"hello"); // txn_id not set
-        let record = Record::new(0.into(), tuple);
+        let record = Record::new(0.into(), tuple, None);
         let op = Operation::new_add(txn_id.clone(), record);
         assert!(logger.log_undo(op).is_ok());
         assert_eq!(logger.next_undo_id(txn_id).unwrap(), 1.into());
@@ -567,7 +576,7 @@ mod tests {
         let txn_id = TransactionId::from(5);
         let mut tuple = Tuple::new(42, b"data");
         tuple.set_txn_id(txn_id.clone());
-        let record = Record::new(0.into(), tuple);
+        let record = Record::new(0.into(), tuple, None);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_undo(op).is_ok());
         assert!(logger.shutdown().is_ok());
@@ -622,9 +631,7 @@ mod tests {
     #[test]
     fn test_load_logs_empty_memfiles_returns_zero_counts() {
         let logger = Logger::new();
-        let (redo_count, undo_count) = logger
-            .load_logs(&MemFile::new(), &MemFile::new())
-            .unwrap();
+        let (redo_count, undo_count) = logger.load_logs(&MemFile::new(), &MemFile::new()).unwrap();
         assert_eq!((redo_count, undo_count), (0, 0));
     }
 
@@ -656,9 +663,7 @@ mod tests {
         // everything is flushed through the runner threads before we try
         // to read it back.
         let mut logger = Logger::new();
-        logger
-            .set_db(undo_file.clone(), redo_file.clone())
-            .unwrap();
+        logger.set_db(undo_file.clone(), redo_file.clone()).unwrap();
         for i in 0..4u64 {
             logger
                 .log_redo(Operation::new_commit(TransactionId::from(i)))
@@ -715,25 +720,40 @@ mod tests {
     // and interleaved with ordinary Undo/Redo records — load_logs must
     // parse straight through them as just another MsgType variant, not
     // choke on the shape difference or miscount.
+    // --- checkpoint truncation ---
+    //
+    // Checkpoint used to append a MsgType::Checkpoint marker into both log
+    // files (a permanent record, counted like any other). It now instead
+    // truncates each file to zero bytes: everything checkpointed is
+    // already durable in the page data by the time Db::checkpoint calls
+    // this (buffer.checkpoint() flushes pages first — see its own call
+    // site), so the WAL entries that would replay it are no longer needed
+    // and dropping them is what keeps the log bounded across a long-lived
+    // database's lifetime, not just this test.
+
     #[test]
-    fn test_load_logs_counts_records_interleaved_with_checkpoints() {
-        let (redo_path, undo_path) = temp_log_paths("checkpoint");
+    fn test_checkpoint_truncates_both_logs_to_empty() {
+        let (redo_path, undo_path) = temp_log_paths("truncate_basic");
 
         let mut logger = Logger::new();
         logger
             .set_db(open_fresh(&undo_path), open_fresh(&redo_path))
             .unwrap();
-        logger
-            .log_redo(Operation::new_commit(TransactionId::from(1)))
-            .unwrap();
+        for i in 0..3u64 {
+            logger
+                .log_redo(Operation::new_commit(TransactionId::from(i)))
+                .unwrap();
+        }
+        for i in 0..2u64 {
+            logger
+                .log_undo(Operation::new_commit(TransactionId::from(100 + i)))
+                .unwrap();
+        }
         logger.checkpoint(1).unwrap();
-        logger
-            .log_redo(Operation::new_commit(TransactionId::from(2)))
-            .unwrap();
-        logger
-            .log_undo(Operation::new_commit(TransactionId::from(3)))
-            .unwrap();
-        logger.checkpoint(2).unwrap();
+        // shutdown() sends ShutDown on the same (FIFO) channel right after
+        // checkpoint()'s message, then joins the runner threads — so by
+        // the time it returns, the truncate is guaranteed to have already
+        // been processed, not just enqueued.
         logger.shutdown().unwrap();
 
         let reopened = Logger::new();
@@ -742,8 +762,133 @@ mod tests {
         let _ = std::fs::remove_file(&redo_path);
         let _ = std::fs::remove_file(&undo_path);
 
-        // redo file: 2 commits + 2 checkpoints; undo file: 1 commit + 2 checkpoints.
-        assert_eq!(result.unwrap(), (4, 3));
+        assert_eq!(
+            result.unwrap(),
+            (0, 0),
+            "everything logged before the checkpoint must be gone after it"
+        );
+    }
+
+    #[test]
+    fn test_records_logged_after_checkpoint_survive_and_are_countable() {
+        let (redo_path, undo_path) = temp_log_paths("truncate_then_append");
+
+        let mut logger = Logger::new();
+        logger
+            .set_db(open_fresh(&undo_path), open_fresh(&redo_path))
+            .unwrap();
+        // Pre-checkpoint noise: must NOT show up in the final count.
+        for i in 0..5u64 {
+            logger
+                .log_redo(Operation::new_commit(TransactionId::from(i)))
+                .unwrap();
+        }
+        logger.checkpoint(1).unwrap();
+        // Post-checkpoint: must be the ONLY thing counted afterward.
+        for i in 0..2u64 {
+            logger
+                .log_redo(Operation::new_commit(TransactionId::from(200 + i)))
+                .unwrap();
+        }
+        logger
+            .log_undo(Operation::new_commit(TransactionId::from(300)))
+            .unwrap();
+        logger.shutdown().unwrap();
+
+        let reopened = Logger::new();
+        let result = reopened.load_logs(&open_readonly(&undo_path), &open_readonly(&redo_path));
+
+        let _ = std::fs::remove_file(&redo_path);
+        let _ = std::fs::remove_file(&undo_path);
+
+        assert_eq!(
+            result.unwrap(),
+            (2, 1),
+            "truncation must not corrupt the file for further appends — \
+             only the post-checkpoint records should be found"
+        );
+    }
+
+    #[test]
+    fn test_checkpoint_on_empty_logs_is_a_safe_noop() {
+        let (redo_path, undo_path) = temp_log_paths("truncate_empty");
+
+        let mut logger = Logger::new();
+        logger
+            .set_db(open_fresh(&undo_path), open_fresh(&redo_path))
+            .unwrap();
+        // Nothing logged yet — checkpoint must not error or corrupt an
+        // already-empty file, and logging must still work fine afterward.
+        logger.checkpoint(1).unwrap();
+        logger
+            .log_redo(Operation::new_commit(TransactionId::from(1)))
+            .unwrap();
+        logger.shutdown().unwrap();
+
+        let reopened = Logger::new();
+        let result = reopened.load_logs(&open_readonly(&undo_path), &open_readonly(&redo_path));
+
+        let _ = std::fs::remove_file(&redo_path);
+        let _ = std::fs::remove_file(&undo_path);
+
+        assert_eq!(result.unwrap(), (1, 0));
+    }
+
+    #[test]
+    fn test_multiple_checkpoints_only_last_batch_survives() {
+        let (redo_path, undo_path) = temp_log_paths("truncate_multi");
+
+        let mut logger = Logger::new();
+        logger
+            .set_db(open_fresh(&undo_path), open_fresh(&redo_path))
+            .unwrap();
+        for round in 0..3u64 {
+            for i in 0..4u64 {
+                logger
+                    .log_redo(Operation::new_commit(TransactionId::from(round * 10 + i)))
+                    .unwrap();
+            }
+            logger.checkpoint(round as u128).unwrap();
+        }
+        // One record survives past the final checkpoint.
+        logger
+            .log_redo(Operation::new_commit(TransactionId::from(999)))
+            .unwrap();
+        logger.shutdown().unwrap();
+
+        let reopened = Logger::new();
+        let result = reopened.load_logs(&open_readonly(&undo_path), &open_readonly(&redo_path));
+
+        let _ = std::fs::remove_file(&redo_path);
+        let _ = std::fs::remove_file(&undo_path);
+
+        assert_eq!(result.unwrap(), (1, 0));
+    }
+
+    // MemFile's truncate() must behave identically to File's — same
+    // contract, different backing storage.
+    #[test]
+    fn test_checkpoint_truncates_memfile_backed_logs() {
+        let redo_file = MemFile::new();
+        let undo_file = MemFile::new();
+
+        let mut logger = Logger::new();
+        logger.set_db(undo_file.clone(), redo_file.clone()).unwrap();
+        logger
+            .log_redo(Operation::new_commit(TransactionId::from(1)))
+            .unwrap();
+        logger
+            .log_undo(Operation::new_commit(TransactionId::from(2)))
+            .unwrap();
+        logger.checkpoint(1).unwrap();
+        logger
+            .log_redo(Operation::new_commit(TransactionId::from(3)))
+            .unwrap();
+        logger.shutdown().unwrap();
+
+        let reopened = Logger::new();
+        let result = reopened.load_logs(&undo_file, &redo_file);
+        assert_eq!(result.unwrap(), (1, 0));
     }
 
     // A restarted process appends to the same log files rather than

@@ -12,8 +12,10 @@ use crate::cursor::TableCursor;
 use crate::error::StoreError;
 use crate::generator::Generator;
 use crate::logger::Logger;
+use crate::logger::MsgType;
 use crate::logger::Operation;
 use crate::logger::Record;
+use crate::memfile::MemFile;
 use crate::page::Page;
 use crate::table::Table;
 use crate::table::TableIdType;
@@ -25,15 +27,18 @@ use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
 use log::LevelFilter;
 use log::info;
+use memmap::MmapOptions;
 use parking_lot::RwLock;
 use portable_atomic::AtomicU128;
 use postcard::from_bytes;
+use postcard::take_from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
 use serde::Serialize;
 use std::any::Any;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::TryLockError;
@@ -63,6 +68,7 @@ pub struct Meta {
 pub trait Opener: Any {
     type Item;
     fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<Self::Item>;
+    fn truncate(&mut self) -> std::io::Result<()>;
     fn do_sync(&mut self) -> std::io::Result<()>;
     fn do_clone(&self) -> std::io::Result<Self::Item>;
     fn get_metadata(&self) -> std::io::Result<Meta>;
@@ -233,6 +239,7 @@ where
             buffer: nm.buffer,
         };
         sf.load_system_tables()?;
+        sf.load_logs()?;
         Ok(Arc::new(sf))
     }
 
@@ -285,7 +292,8 @@ where
         db.write_system_tables()?;
         let mut hdr = (*db.header).clone();
         hdr.page_count = db.page_count();
-        hdr.last_checkpoint = timestamp();
+        let ts = timestamp();
+        hdr.last_checkpoint = ts;
         // Each BPlusTree in tables holds Arc<PageBuffer>, Arc<Logger>, and
         // Arc<TransactionManager>. Drop them before Arc::into_inner so the
         // reference counts reach 1 and into_inner succeeds.
@@ -304,6 +312,22 @@ where
         buffer.shutdown()?;
         // Unwrapping here as the expectation is there is only this thread accessing logger
         let logger = Arc::into_inner(logger).unwrap();
+        // A clean close is, by definition, a point where everything is
+        // durable (buffer.shutdown() just flushed every remaining pending
+        // page write) — exactly the condition checkpoint() truncates the
+        // logs under. Without this, close()+reopen never truncates at all
+        // (only an explicit checkpoint() does), so every such cycle
+        // accumulates the *entire* history of redo/undo records instead of
+        // just what's new — replay then has to reprocess everything from
+        // the very first write on every single reopen. That's wasteful on
+        // its own, but for Mod operations specifically it's also
+        // incorrect: replaying superseded intermediate updates (not just
+        // the latest one) repeatedly tears down and rebuilds the
+        // overflow-page chain for content that never needed to change,
+        // and each such rebuild can land on a different set of pages than
+        // the original run did — confirmed via
+        // test_free_pages_do_not_accumulate_across_multiple_close_reopen_cycles.
+        logger.checkpoint(ts)?;
         logger.shutdown()?;
         Ok((file, undo_file, redo_file))
     }
@@ -313,6 +337,19 @@ where
     }
 
     pub fn checkpoint(&self) -> Result<(), StoreError> {
+        // Must happen before the log truncate below, and really before
+        // anything else here: write_system_tables() persists the
+        // generator's current sequences (including the transaction-id
+        // one) to GENERATOR_TABLE_PAGE. That's the *only* place this state
+        // is durable — close() is the only other caller — so without this,
+        // a reopen after checkpoint-but-no-close restores a stale
+        // transaction-id sequence (whatever it was at table creation) and
+        // can mint a "new" transaction that numerically collides with an
+        // old, already-committed one (see TransactionId's PartialEq/Hash
+        // and TransactionManager::advance_past). Called first so its own
+        // page write is queued before, and thus flushed synchronously by,
+        // buffer.checkpoint() below rather than left pending.
+        self.write_system_tables()?;
         self.buffer.checkpoint()?;
         let mut hdr = (*self.header).clone();
         hdr.page_count = self.page_count();
@@ -323,6 +360,145 @@ where
         self.last_checkpoint
             .store(ts, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    fn load_logs(&self) -> Result<(usize, usize), StoreError> {
+        let (mut redo_count, mut undo_count) = (0, 0);
+        // mmap-ing a zero-length file errors ("memory map must have a
+        // non-zero length") rather than yielding an empty mapping — and a
+        // brand-new database's redo/undo files are exactly that (0 bytes,
+        // nothing ever written yet), so this isn't an edge case, it's the
+        // state of every single fresh Db::create::<File>() call. Skip the
+        // mmap entirely when there's nothing to read.
+        if let Some(redo_file) = self.redo_file.as_any().downcast_ref::<File>()
+            && redo_file.metadata()?.len() > 0
+        {
+            let map = unsafe { MmapOptions::new().map(redo_file)? };
+            let buf = &map[..];
+            redo_count = self.process_redo(buf)?;
+        }
+        if let Some(undo_file) = self.undo_file.as_any().downcast_ref::<File>()
+            && undo_file.metadata()?.len() > 0
+        {
+            let map = unsafe { MmapOptions::new().map(undo_file)? };
+            let buf = &map[..];
+            undo_count = self.process_undo(buf)?;
+        }
+        if let Some(redo_file) = self.redo_file.as_any().downcast_ref::<MemFile>() {
+            let buf = &redo_file.data()[..];
+            redo_count = self.process_redo(buf)?;
+        }
+        if let Some(undo_file) = self.undo_file.as_any().downcast_ref::<MemFile>() {
+            let buf = &undo_file.data()[..];
+            undo_count = self.process_undo(buf)?;
+        }
+
+        println!("{} redo found, {} undo found", redo_count, undo_count);
+
+        Ok((redo_count, undo_count))
+    }
+
+    fn process_redo(&self, buffer: &[u8]) -> Result<usize, StoreError> {
+        let mut count = 0;
+        let mut buf = buffer;
+        let (mut committed, mut inprogress, mut rollback) =
+            (HashSet::new(), HashSet::new(), HashSet::new());
+        while !buf.is_empty() {
+            let (redo, remaining) = take_from_bytes::<MsgType>(buf)?;
+            buf = remaining;
+            match redo {
+                MsgType::Redo(redo) => {
+                    let op = redo.operation;
+                    match op {
+                        Operation::Add(t, _r) | Operation::Mod(t, _r) | Operation::Del(t, _r) => {
+                            inprogress.insert(t);
+                        }
+                        Operation::Commit(t, _ts) => {
+                            committed.insert(t);
+                        }
+                        Operation::Rollback(t, _ts) => {
+                            rollback.insert(t);
+                        }
+                    }
+                }
+                _ => {
+                    panic!("Unknown message in redo log: {:?}", redo)
+                }
+            }
+            count += 1;
+        }
+        let mut buf = buffer;
+        while !buf.is_empty() {
+            let (redo, remaining) = take_from_bytes(buf)?;
+            buf = remaining;
+            if let MsgType::Redo(redo) = redo {
+                let op = redo.operation;
+                match op {
+                    Operation::Add(t, r) if committed.contains(&t) => {
+                        self.table_by_id(r.table_id)?
+                            .insert_if_needed(&r.tuple, t)?;
+                    }
+                    Operation::Mod(t, r) if committed.contains(&t) => {
+                        self.table_by_id(r.table_id)?.update_if_needed(r.tuple)?;
+                    }
+                    Operation::Del(t, r) if committed.contains(&t) => {
+                        self.table_by_id(r.table_id)?.remove(r.tuple.id)?;
+                    }
+                    _ => {}
+                }
+            };
+        }
+        Ok(count)
+    }
+
+    fn process_undo(&self, buffer: &[u8]) -> Result<usize, StoreError> {
+        let mut count = 0;
+        let mut buf = buffer;
+        let (mut committed, mut inprogress, mut rollback) =
+            (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut operations = HashMap::new();
+        while !buf.is_empty() {
+            let (redo, remaining) = take_from_bytes::<MsgType>(buf)?;
+            buf = remaining;
+            match redo {
+                MsgType::Undo(undo) => {
+                    let op = undo.operation;
+                    match &op {
+                        Operation::Add(t, _r) | Operation::Mod(t, _r) | Operation::Del(t, _r) => {
+                            inprogress.insert(t.clone());
+                            operations
+                                .entry(t.clone())
+                                .and_modify(|v: &mut Vec<_>| v.push(op.clone()))
+                                .or_insert(vec![op.clone()]);
+                        }
+                        Operation::Commit(t, _ts) => {
+                            committed.insert(t.clone());
+                        }
+                        Operation::Rollback(t, _ts) => {
+                            rollback.insert(t.clone());
+                        }
+                    }
+                }
+                _ => {
+                    panic!("Unknown message in redo log: {:?}", redo)
+                }
+            }
+            count += 1;
+        }
+        // BUG (fixed): `extract_if` returns a lazy iterator — none of its
+        // matching entries are actually removed unless the iterator is
+        // driven (via `.next()`, a `for` loop, `.collect()`, etc). Binding
+        // it to `let _ = ...` drops it immediately without ever iterating,
+        // so this was a complete no-op: `operations` kept every
+        // transaction, committed ones included, and revert_undo_ops below
+        // reverted committed writes right back out. `retain` doesn't have
+        // that gotcha — it mutates directly, no separate consumption step
+        // needed.
+        operations.retain(|k, _v| !committed.contains(k));
+        operations
+            .iter()
+            .try_for_each(|(id, ops)| self.revert_undo_ops(ops, id))?;
+        Ok(count)
     }
 
     pub fn begin(&self) -> Result<Transaction, StoreError> {
@@ -430,6 +606,10 @@ where
     /// transaction-set or undo-log bookkeeping; callers do that.
     fn revert_txn_writes(&self, id: &TransactionId) -> Result<(), StoreError> {
         let ops = self.logger.get_undo_operations(id.clone())?;
+        self.revert_undo_ops(&ops, id)
+    }
+
+    fn revert_undo_ops(&self, ops: &Vec<Operation>, id: &TransactionId) -> Result<(), StoreError> {
         for o in ops {
             match o {
                 Operation::Add(_, r) => {
@@ -491,8 +671,8 @@ where
         let tx_id = txn.id();
         let mut tuple = tuple;
         tuple.set_txn_id(tx_id.clone());
-        self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
-        let op = Operation::Add(tx_id, Record::new(id, tuple));
+        let page_id = self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
+        let op = Operation::Add(tx_id, Record::new(id, tuple, Some(page_id)));
         self.logger.log_undo(op.clone())?;
         self.logger.log_redo(op)?;
         Ok(())
@@ -551,8 +731,8 @@ where
             // resolve that undo_id via find_last_committed. If the undo entry
             // doesn't exist yet, that lookup panics (find_undo_tuple returns
             // None where the code expects Some).
-            let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone()));
-            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple));
+            let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone(), None));
+            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple, None));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
             table.update(updated)?;
@@ -587,8 +767,8 @@ where
             // Same ordering requirement as update(): log undo/redo before the
             // tombstoned tuple becomes visible in the tree, so a concurrent
             // reader can never observe an undo_id that doesn't resolve yet.
-            let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone()));
-            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple));
+            let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone(), None));
+            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple, None));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
             table.update(tombstoned.clone())?;
@@ -803,6 +983,7 @@ where
         let mut page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&self.buffer.get_free_pages())?))?;
         self.buffer.write_page(2usize.into(), &page)?;
+
         Ok(())
     }
 
@@ -937,16 +1118,73 @@ mod tests {
     use crate::{
         db::{DEFAULT_PAGE_SIZE, Db, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
+        logger::MsgType,
         memfile::MemFile,
         table::TableIdType,
         tuple::{DBIdType, Tuple},
     };
+    use postcard::take_from_bytes;
     type TestDB = Db<MemFile>;
 
     fn make_db_with_table() -> (Arc<TestDB>, TableIdType) {
         let db = TestDB::create("txn_test.db").unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         (db, tid)
+    }
+
+    // Simulates a crash: direct clones of the live db's file handles
+    // (MemFile::do_clone shares the underlying buffer), without going
+    // through close(). close() is a clean shutdown — it flushes
+    // everything and truncates the redo/undo logs, since a cleanly-closed
+    // db has nothing left that needs replaying — so it can never be used
+    // to test replay itself. This is what actually leaves whatever's
+    // durable so far sitting in the (unclosed, untruncated) logs, exactly
+    // like an abrupt process stop would.
+    fn crash_clone(db: &TestDB) -> (MemFile, MemFile, MemFile) {
+        (
+            db.file.do_clone().unwrap(),
+            db.undo_file.do_clone().unwrap(),
+            db.redo_file.do_clone().unwrap(),
+        )
+    }
+
+    // Passive record count (unlike Db::load_logs, which actually replays):
+    // just walks MsgType entries off the raw bytes.
+    fn count_log_records(file: &MemFile) -> usize {
+        let data = file.data();
+        let mut buf = &data[..];
+        let mut count = 0;
+        while !buf.is_empty() {
+            let (_msg, remaining) = take_from_bytes::<MsgType>(buf).unwrap();
+            buf = remaining;
+            count += 1;
+        }
+        count
+    }
+
+    // log_redo/log_undo's send() over a bounded(1) channel only guarantees
+    // the *previous* message has been dequeued by the writer thread, not
+    // that it (or the message just sent) has actually been written to the
+    // file yet — under contention (e.g. many tests running in parallel)
+    // that write can lag behind the point where a test's last commit()
+    // call returns. crash_clone must not race that: it takes a raw,
+    // point-in-time clone, so a snapshot taken too early silently omits
+    // the last record(s), which then corrupts replay (e.g. a Commit
+    // marker missing from the undo log makes an already-committed
+    // transaction look abandoned). Poll for the expected counts instead of
+    // assuming synchronous delivery.
+    fn wait_for_durable_logs(db: &TestDB, expected_redo: usize, expected_undo: usize) {
+        for _ in 0..1000 {
+            if count_log_records(&db.redo_file) == expected_redo
+                && count_log_records(&db.undo_file) == expected_undo
+            {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!(
+            "timed out waiting for {expected_redo} redo / {expected_undo} undo records to land"
+        );
     }
 
     fn make_db_with_two_tables() -> (Arc<TestDB>, TableIdType, TableIdType) {
@@ -2155,6 +2393,266 @@ mod tests {
         drop(t2);
     }
 
+    // --- log-based crash recovery replay (Db::load_logs / process_redo /
+    // process_undo) ---
+
+    // crash_clone (not close(), which now truncates the logs on any clean
+    // shutdown): the redo/undo logs still hold every record from these
+    // commits, so reopening genuinely exercises replay (process_redo
+    // re-applying committed Add ops via insert_if_needed) rather than
+    // replaying against already-truncated, empty logs.
+    #[test]
+    fn test_replay_redoes_committed_writes_on_reopen() {
+        let (db, tid) = make_db_with_table();
+        // Prime the header: table creation's page-count bump never gets
+        // written to the file until a checkpoint/close does so, and that
+        // write is itself fire-and-forget. Two checkpoints here (before any
+        // of the operations under test) guarantee the first one's header
+        // write has landed, so crash_clone's file snapshot has a durable
+        // page_count >= FIRST_USER_PAGE instead of the create-time 0 —
+        // without truncating anything the test cares about, since nothing
+        // relevant has happened yet.
+        db.checkpoint().unwrap();
+        db.checkpoint().unwrap();
+        for i in 0..10u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+
+        wait_for_durable_logs(&db, 20, 20);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let t = db2.begin().unwrap();
+        for i in 0..10u64 {
+            assert_eq!(
+                db2.find(tid, id(i), &t)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} missing after replay"))
+                    .data
+                    .to_vec(),
+                format!("v{i}").as_bytes()
+            );
+        }
+    }
+
+    // A transaction that never commits and is never dropped normally
+    // (mem::forget, so Transaction::drop's implicit rollback — and
+    // therefore close()'s own drain_aborting — never runs) can still have
+    // durably flushed its write to the main file: PageBuffer's flush
+    // timing is independent of transaction commit/rollback status. On
+    // reopen, process_undo must revert it: its undo log has entries but no
+    // Commit record, so it's excluded from process_redo's replay and
+    // explicitly reverted via revert_undo_ops (the same remove_if_txn/
+    // update_if_txn primitives normal rollback uses).
+    #[test]
+    fn test_replay_undoes_uncommitted_abandoned_writes_on_reopen() {
+        let (db, tid) = make_db_with_table();
+        // See test_replay_redoes_committed_writes_on_reopen: prime the
+        // header so crash_clone's file snapshot has a durable page_count.
+        db.checkpoint().unwrap();
+        db.checkpoint().unwrap();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"committed"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let uncommitted = db.begin().unwrap();
+        db.insert(tid, row(2, b"uncommitted"), &uncommitted)
+            .unwrap();
+        std::mem::forget(uncommitted);
+
+        wait_for_durable_logs(&db, 3, 3);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"committed"
+        );
+        assert!(
+            db2.find(tid, id(2), &t).unwrap().is_none(),
+            "an uncommitted, abandoned transaction's write must be reverted by undo replay"
+        );
+    }
+
+    // Exercises Mod and Del redo/undo, not just Add, and mixes committed
+    // and abandoned transactions in the same table.
+    #[test]
+    fn test_replay_handles_mixed_add_mod_del_across_committed_and_abandoned_txns() {
+        let (db, tid) = make_db_with_table();
+        // See test_replay_redoes_committed_writes_on_reopen: prime the
+        // header so crash_clone's file snapshot has a durable page_count.
+        db.checkpoint().unwrap();
+        db.checkpoint().unwrap();
+
+        // Row 1: inserted, then updated — both committed.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, b"v1-updated"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // Row 2: inserted, then removed — both committed.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(2, b"v2"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.remove(tid, id(2), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // Row 3: inserted and committed, then updated by an abandoned
+        // (never committed) transaction — the update must not stick.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(3, b"v3"), &t).unwrap();
+        db.commit(t).unwrap();
+        let abandoned = db.begin().unwrap();
+        db.update(tid, row(3, b"v3-should-not-stick"), &abandoned)
+            .unwrap();
+        std::mem::forget(abandoned);
+
+        wait_for_durable_logs(&db, 11, 11);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"v1-updated"
+        );
+        assert!(
+            db2.find(tid, id(2), &t).unwrap().is_none(),
+            "row 2's committed remove must survive replay"
+        );
+        assert_eq!(
+            db2.find(tid, id(3), &t).unwrap().unwrap().data.to_vec(),
+            b"v3",
+            "row 3's abandoned update must be reverted, restoring the pre-image"
+        );
+    }
+
+    // Replay must be safe to run more than once in a row: reopening a
+    // second time (no new writes in between) re-scans logs that already
+    // reflect reality and must not corrupt or duplicate anything.
+    #[test]
+    fn test_replay_is_idempotent_across_repeated_reopens() {
+        let (db, tid) = make_db_with_table();
+        // See test_replay_redoes_committed_writes_on_reopen: prime the
+        // header so crash_clone's file snapshot has a durable page_count.
+        // db2's file is a clone of db's, so it inherits this same valid
+        // header — no separate priming needed before the second crash.
+        db.checkpoint().unwrap();
+        db.checkpoint().unwrap();
+        for i in 0..5u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+
+        // First "crash": replay runs once against the original records.
+        wait_for_durable_logs(&db, 10, 10);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        // A second "crash", of db2, with nothing new having happened on
+        // it: process_redo/process_undo call the BPlusTree-level methods
+        // directly, never logger.log_redo/log_undo, so db2's redo/undo
+        // files still hold the exact same records from the original
+        // crash. Replaying them a second time (via db3) must be just as
+        // safe as the first.
+        wait_for_durable_logs(&db2, 10, 10);
+        let (f2, u2, r2) = crash_clone(&db2);
+        let db3 = TestDB::open_using("txn_test.db", f2, u2, r2).unwrap();
+
+        let t = db3.begin().unwrap();
+        for i in 0..5u64 {
+            assert_eq!(
+                db3.find(tid, id(i), &t).unwrap().unwrap().data.to_vec(),
+                format!("v{i}").as_bytes()
+            );
+        }
+    }
+
+    // The actual point of redo replay: reconstruct a write whose page
+    // never made it to the main file before a crash, using only the
+    // (already-durable) redo log. Constructed deterministically instead of
+    // racing real background flush timing: snapshot the main file's bytes
+    // right after a checkpoint (a known-consistent, fully-flushed state),
+    // then perform one more committed insert and take the CURRENT redo/
+    // undo logs (which, after the checkpoint's truncate, contain only that
+    // insert's own records) — but pair them with the OLD, pre-insert main
+    // file bytes instead of the real (already-flushed, in this test)
+    // current ones. This reconstructs exactly what a crash between "redo
+    // record durably logged" and "page flushed to the main file" would
+    // leave behind, without needing to catch that race in real time.
+    #[test]
+    fn test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file() {
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"pre-checkpoint"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.checkpoint().unwrap();
+        // checkpoint()'s own header write (PageBuffer::write_header) is
+        // fire-and-forget, same as the log truncate — it enqueues a
+        // BufMsg::WriteHeader and returns without waiting for the writer
+        // thread to actually apply it. A second checkpoint's OWN
+        // synchronous BufMsg::Checkpoint reply is queued strictly after
+        // that WriteHeader message (same channel, FIFO), so waiting for
+        // *this* checkpoint to return guarantees the first one's header
+        // write already landed — otherwise this snapshot could race it and
+        // capture a header whose page_count is still 0, which later fails
+        // to even load system tables on reopen.
+        db.checkpoint().unwrap();
+
+        // The last known-durable state before the "crash".
+        let stale_main_file_bytes = db.file.data();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(2, b"lost-on-crash"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // Simulate a crash right here: live clones of the (unclosed,
+        // untruncated) redo/undo logs — close() would now truncate them,
+        // since a clean close leaves nothing that needs replaying. Bounded
+        // (1) redo/undo channels make log_redo/log_undo block until the
+        // runner thread has actually received each record, so these
+        // clones reliably contain row 2's Add+Commit (logged after the
+        // checkpoint's truncate, so they're the only two records in it).
+        wait_for_durable_logs(&db, 2, 2);
+        let (_, undo_file, redo_file) = crash_clone(&db);
+
+        // Rebuild a "crashed" main file from the pre-insert snapshot —
+        // independent bytes, not sharing the live file's buffer.
+        let crashed_file = MemFile::new();
+        crashed_file.pwrite(&stale_main_file_bytes, 0).unwrap();
+
+        let db2 = TestDB::open_using("txn_test.db", crashed_file, undo_file, redo_file).unwrap();
+
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"pre-checkpoint",
+            "sanity: the pre-crash checkpointed row must still be there"
+        );
+        assert_eq!(
+            db2.find(tid, id(2), &t)
+                .unwrap()
+                .unwrap_or_else(|| panic!(
+                    "row 2 missing — redo replay failed to reconstruct a committed \
+                     write whose page flush never reached the main file"
+                ))
+                .data
+                .to_vec(),
+            b"lost-on-crash"
+        );
+    }
+
     #[test]
     fn test_checkpoint_then_close_then_reopen_preserves_data() {
         let (db, tid) = make_db_with_table();
@@ -2183,6 +2681,85 @@ mod tests {
             );
         }
         drop(t);
+    }
+
+    #[test]
+    fn test_checkpoint_truncates_redo_and_undo_log_files() {
+        let (db, tid) = make_db_with_table();
+        for i in 0..20u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, b"v"), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+
+        db.checkpoint().unwrap();
+        // close() calls logger.shutdown(), which sends ShutDown on the same
+        // (FIFO) channel checkpoint()'s truncate message went to, then
+        // blocks on the runner threads joining — so by the time close()
+        // returns, the truncate is guaranteed to have actually run.
+        // checkpoint() returning on its own only guarantees the truncate
+        // was *requested* (Logger::checkpoint is fire-and-forget), not
+        // that it's completed yet.
+        let (_, undo_file, redo_file) = db.close().unwrap();
+
+        assert_eq!(
+            undo_file.get_metadata().unwrap().len,
+            0,
+            "undo log must be truncated after a checkpoint"
+        );
+        assert_eq!(
+            redo_file.get_metadata().unwrap().len,
+            0,
+            "redo log must be truncated after a checkpoint"
+        );
+    }
+
+    // The whole point of truncating on checkpoint is to keep the log
+    // bounded over a long-lived database's life, not just to be empty
+    // once. Runs several commit+checkpoint rounds and checks the log
+    // never grows past what a SINGLE round would produce — if truncation
+    // silently stopped working (or only worked the first time), this
+    // would catch the log growing round over round instead.
+    #[test]
+    fn test_checkpoint_keeps_log_bounded_across_many_rounds() {
+        let (db, tid) = make_db_with_table();
+
+        // checkpoint()'s truncate is fire-and-forget (Logger::checkpoint
+        // just enqueues it — see test_checkpoint_truncates_redo_and_undo_
+        // log_files) — poll briefly for it to actually land before
+        // checking either file's size, or this races the runner threads
+        // and can observe a stale, pre-truncate length.
+        fn wait_for_logs_to_settle(db: &TestDB) {
+            let mut tries = 0;
+            while (db.redo_file.get_metadata().unwrap().len > 0
+                || db.undo_file.get_metadata().unwrap().len > 0)
+                && tries < 200
+            {
+                thread::sleep(Duration::from_millis(1));
+                tries += 1;
+            }
+        }
+
+        for round in 0..20u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(round, b"v"), &t).unwrap();
+            db.commit(t).unwrap();
+            db.checkpoint().unwrap();
+            wait_for_logs_to_settle(&db);
+
+            assert_eq!(
+                db.redo_file.get_metadata().unwrap().len,
+                0,
+                "round {round}: redo log must be empty once its checkpoint settles \
+                 — it must not accumulate round over round"
+            );
+            assert_eq!(
+                db.undo_file.get_metadata().unwrap().len,
+                0,
+                "round {round}: undo log must be empty once its checkpoint settles \
+                 — it must not accumulate round over round"
+            );
+        }
     }
 
     #[test]
@@ -2296,7 +2873,7 @@ mod tests {
         db.update(tid, row(1, &shrunk), &t).unwrap();
         db.commit(t).unwrap();
 
-        let freed_before: HashSet<PageId> = db.buffer.get_free_pages().into_iter().collect();
+        let freed_before = db.buffer.get_free_pages();
         assert!(
             !freed_before.is_empty(),
             "shrinking an 8-page object to 4 pages must free some overflow pages"
@@ -2304,7 +2881,7 @@ mod tests {
 
         let (f, u, r) = db.close().unwrap();
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
-        let freed_after: HashSet<PageId> = db2.buffer.get_free_pages().into_iter().collect();
+        let freed_after = db2.buffer.get_free_pages();
 
         assert_eq!(
             freed_after, freed_before,

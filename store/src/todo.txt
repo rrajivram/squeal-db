@@ -1,10 +1,9 @@
 Todo:
 Redo log should support add/drop table ( so replication can happen)
-arclock needs a thread to monitor how long locks have been kept and kill lock if too long
+Not needed: arclock needs a thread to monitor how long locks have been kept and kill lock if too long
 leaf_node should support external storage
 support hash indexes
-support range query
-dont write page to disk on every write - only when shutdown called or buffer clearing or checkpoint
+remember to change lsn marker after redo
 
 
 
@@ -20,3 +19,5 @@ done: next_page in Page should be option to be idiomatic
 done: add support for checkpoint
 done: store reclaimed pages on disk
 done: support table scan
+done: support range query
+done: dont write page to disk on every write - only when shutdown called or buffer clearing or checkpoint

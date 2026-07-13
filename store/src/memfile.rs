@@ -69,6 +69,11 @@ impl Opener for MemFile {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn truncate(&mut self) -> std::io::Result<()> {
+        self.data.write().clear();
+        Ok(())
+    }
 }
 
 impl Opener for std::fs::File {
@@ -92,6 +97,11 @@ impl Opener for std::fs::File {
 
     fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
         self.try_lock()
+    }
+
+    fn truncate(&mut self) -> std::io::Result<()> {
+        self.set_len(0)?;
+        Ok(())
     }
 
     #[cfg(unix)]

@@ -257,15 +257,34 @@ impl TransactionInner {
     }
 }
 
+// Compares both id and ts, not just id: the numeric id alone is only
+// unique within a single continuously-running session (the generator that
+// hands them out never repeats a value while it's live). On reopen after a
+// crash or a checkpoint-but-no-close, the persisted id sequence it resumes
+// from can be stale (it's only refreshed by write_system_tables, called at
+// table creation and at close()), so a freshly begun transaction can be
+// handed a numeric id that an old, already-committed transaction also
+// used. If equality only checked id, that old transaction would become
+// indistinguishable from the new one to anything keying off it — notably
+// TransactionManager::is_committed's active-set lookup, which would then
+// treat the old, legitimately-committed transaction's rows as "still in
+// flight" (invisible) for as long as the new, colliding transaction stays
+// active. ts is set once at creation (timestamp()) and never changes for a
+// given transaction, including across all of its Arc-shared clones and a
+// faithful deserialize-from-log round trip during replay, so two
+// transactions that are actually the same always still compare equal —
+// this only ever makes two *different* transactions compare unequal,
+// which is what should have been happening all along.
 impl PartialEq for TransactionInner {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.id == other.id && self.ts == other.ts
     }
 }
 
 impl Hash for TransactionInner {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.id.hash(state);
+        self.ts.hash(state);
     }
 }
 
@@ -280,15 +299,17 @@ impl Default for TransactionInner {
 
 impl Eq for TransactionInner {}
 
+// Delegates to TransactionInner's own (id, ts) comparison — see its doc
+// comment for why id alone isn't enough.
 impl PartialEq for TransactionId {
     fn eq(&self, other: &Self) -> bool {
-        self.0.id == other.0.id
+        *self.0 == *other.0
     }
 }
 
 impl Hash for TransactionId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.id.hash(state);
+        (*self.0).hash(state)
     }
 }
 

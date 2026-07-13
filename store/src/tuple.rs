@@ -268,8 +268,13 @@ mod tests {
         let mut t = Tuple::new(5, b"hello");
         assert!(t.txn_id.is_none());
         assert!(t.undo_id.is_none());
-        t.set_txn_id(TransactionId::from(99));
-        assert_eq!(t.txn_id, Some(TransactionId::from(99)));
+        // TransactionId::from(u64) mints a fresh timestamp on every call, so
+        // two separately-constructed instances for the same numeric id are
+        // not equal (identity includes ts, not just id) — reuse the same
+        // instance instead of deriving a second one to compare against.
+        let txn_id = TransactionId::from(99);
+        t.set_txn_id(txn_id.clone());
+        assert_eq!(t.txn_id, Some(txn_id));
         assert!(t.undo_id.is_none());
     }
 
@@ -295,11 +300,14 @@ mod tests {
     fn test_tuple_roundtrip_with_txn_id() {
         use crate::txn::TransactionId;
         let mut t = Tuple::new(10, b"payload");
-        t.set_txn_id(TransactionId::from(1));
+        // See test_tuple_set_txn_id: reuse the same instance rather than
+        // minting a second one, since identity now includes ts.
+        let txn_id = TransactionId::from(1);
+        t.set_txn_id(txn_id.clone());
         let b = t.to();
         let t2 = Tuple::from(&b).unwrap();
         assert_eq!(t2.id, DBIdType::Int(10));
         assert_eq!(t2.data.to_vec(), b"payload");
-        assert_eq!(t2.txn_id, Some(TransactionId::from(1)));
+        assert_eq!(t2.txn_id, Some(txn_id));
     }
 }
