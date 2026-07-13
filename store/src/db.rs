@@ -1116,7 +1116,7 @@ mod tests {
     use std::{sync::Arc, thread, time::Duration};
 
     use crate::{
-        db::{DEFAULT_PAGE_SIZE, Db, Opener, ZERO_PAGE_SIZE},
+        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
         logger::MsgType,
         memfile::MemFile,
@@ -1124,6 +1124,7 @@ mod tests {
         tuple::{DBIdType, Tuple},
     };
     use postcard::take_from_bytes;
+    use std::fs::File;
     type TestDB = Db<MemFile>;
 
     fn make_db_with_table() -> (Arc<TestDB>, TableIdType) {
@@ -1185,6 +1186,41 @@ mod tests {
         panic!(
             "timed out waiting for {expected_redo} redo / {expected_undo} undo records to land"
         );
+    }
+
+    // The file header's page_count is only ever (re)written to disk by an
+    // explicit write_header call — table creation and ordinary inserts bump
+    // the *live*, in-process page_count atomic but never touch the on-disk
+    // header. Db::open_using seeds ITS OWN live page_count purely from
+    // whatever the header bytes say at open time, so a crash_clone snapshot
+    // whose header is stale (e.g. from priming with a checkpoint at the
+    // *start* of a test, before the test's own operations allocated more
+    // pages) makes the reopened db under-count how many pages actually
+    // exist. Replay's own page allocations (insert_if_needed/update_if_needed
+    // falling back to a real insert/update) then start from that stale,
+    // too-low count and can hand out a page id that collides with one the
+    // original session already validly used for a *different* row —
+    // silently clobbering it. Symptom: a replay test's assertions fail on a
+    // seemingly random row, varying nondeterministically run to run.
+    //
+    // Fix: sync the header — with the CURRENT, live page_count — immediately
+    // before crash_clone, not once at the start. Uses PageBuffer::checkpoint
+    // (not Db::checkpoint) specifically so it does NOT touch
+    // Logger::checkpoint, which would truncate the redo/undo logs these
+    // tests need intact. write_header is itself fire-and-forget, but
+    // buffer.checkpoint()'s own synchronous reply is queued strictly after
+    // it on the same channel (FIFO) — waiting for that reply guarantees the
+    // header write already landed, the same trick
+    // test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file
+    // uses for its own double-checkpoint.
+    fn sync_header_without_truncating_logs<F>(db: &Db<F>)
+    where
+        F: crate::db::DBFile<Item = F> + 'static,
+    {
+        let mut hdr = (*db.header).clone();
+        hdr.page_count = db.page_count();
+        db.buffer.write_header(hdr).unwrap();
+        db.buffer.checkpoint().unwrap();
     }
 
     fn make_db_with_two_tables() -> (Arc<TestDB>, TableIdType, TableIdType) {
@@ -2404,16 +2440,6 @@ mod tests {
     #[test]
     fn test_replay_redoes_committed_writes_on_reopen() {
         let (db, tid) = make_db_with_table();
-        // Prime the header: table creation's page-count bump never gets
-        // written to the file until a checkpoint/close does so, and that
-        // write is itself fire-and-forget. Two checkpoints here (before any
-        // of the operations under test) guarantee the first one's header
-        // write has landed, so crash_clone's file snapshot has a durable
-        // page_count >= FIRST_USER_PAGE instead of the create-time 0 —
-        // without truncating anything the test cares about, since nothing
-        // relevant has happened yet.
-        db.checkpoint().unwrap();
-        db.checkpoint().unwrap();
         for i in 0..10u64 {
             let t = db.begin().unwrap();
             db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
@@ -2422,6 +2448,7 @@ mod tests {
         }
 
         wait_for_durable_logs(&db, 20, 20);
+        sync_header_without_truncating_logs(&db);
         let (f, u, r) = crash_clone(&db);
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
 
@@ -2450,10 +2477,6 @@ mod tests {
     #[test]
     fn test_replay_undoes_uncommitted_abandoned_writes_on_reopen() {
         let (db, tid) = make_db_with_table();
-        // See test_replay_redoes_committed_writes_on_reopen: prime the
-        // header so crash_clone's file snapshot has a durable page_count.
-        db.checkpoint().unwrap();
-        db.checkpoint().unwrap();
 
         let t = db.begin().unwrap();
         db.insert(tid, row(1, b"committed"), &t).unwrap();
@@ -2465,6 +2488,7 @@ mod tests {
         std::mem::forget(uncommitted);
 
         wait_for_durable_logs(&db, 3, 3);
+        sync_header_without_truncating_logs(&db);
         let (f, u, r) = crash_clone(&db);
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
 
@@ -2484,10 +2508,6 @@ mod tests {
     #[test]
     fn test_replay_handles_mixed_add_mod_del_across_committed_and_abandoned_txns() {
         let (db, tid) = make_db_with_table();
-        // See test_replay_redoes_committed_writes_on_reopen: prime the
-        // header so crash_clone's file snapshot has a durable page_count.
-        db.checkpoint().unwrap();
-        db.checkpoint().unwrap();
 
         // Row 1: inserted, then updated — both committed.
         let t = db.begin().unwrap();
@@ -2516,6 +2536,7 @@ mod tests {
         std::mem::forget(abandoned);
 
         wait_for_durable_logs(&db, 11, 11);
+        sync_header_without_truncating_logs(&db);
         let (f, u, r) = crash_clone(&db);
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
 
@@ -2541,12 +2562,6 @@ mod tests {
     #[test]
     fn test_replay_is_idempotent_across_repeated_reopens() {
         let (db, tid) = make_db_with_table();
-        // See test_replay_redoes_committed_writes_on_reopen: prime the
-        // header so crash_clone's file snapshot has a durable page_count.
-        // db2's file is a clone of db's, so it inherits this same valid
-        // header — no separate priming needed before the second crash.
-        db.checkpoint().unwrap();
-        db.checkpoint().unwrap();
         for i in 0..5u64 {
             let t = db.begin().unwrap();
             db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
@@ -2556,6 +2571,7 @@ mod tests {
 
         // First "crash": replay runs once against the original records.
         wait_for_durable_logs(&db, 10, 10);
+        sync_header_without_truncating_logs(&db);
         let (f, u, r) = crash_clone(&db);
         let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
 
@@ -2564,8 +2580,11 @@ mod tests {
         // directly, never logger.log_redo/log_undo, so db2's redo/undo
         // files still hold the exact same records from the original
         // crash. Replaying them a second time (via db3) must be just as
-        // safe as the first.
+        // safe as the first. db2's own header still needs syncing before
+        // ITS crash_clone — its page_count may have moved (replay itself
+        // can allocate pages) since db2 opened.
         wait_for_durable_logs(&db2, 10, 10);
+        sync_header_without_truncating_logs(&db2);
         let (f2, u2, r2) = crash_clone(&db2);
         let db3 = TestDB::open_using("txn_test.db", f2, u2, r2).unwrap();
 
@@ -2651,6 +2670,170 @@ mod tests {
                 .to_vec(),
             b"lost-on-crash"
         );
+    }
+
+    // --- log-based crash recovery replay, real File backend ---
+    //
+    // Everything above exercises MemFile's `load_logs` path (the buffer's
+    // `.data()` branch). `File`-backed logs go through a different branch
+    // (mmap over a real fd — see `load_logs`'s `as_any().downcast_ref::<File>`
+    // arm), previously covered by logger.rs's own
+    // test_load_logs_*_file_mmap/test_load_logs_accumulates_across_multiple_
+    // sessions tests directly against a bare `Logger`. Those were removed
+    // once `load_logs` moved from `Logger` to `Db` (a bare `Logger` can no
+    // longer apply redo/undo without table access) — ported here through the
+    // `Db`-level API so the mmap branch itself stays covered.
+
+    fn temp_db_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!(
+                "squeal_db_replay_test_{tag}_{}",
+                std::process::id()
+            ))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    // Same idea as crash_clone, but for the real File backend: File::
+    // try_clone (Opener::do_clone's impl) dups the fd, giving a second
+    // handle onto the same underlying open file — writes through either are
+    // visible via the other, just like MemFile's Arc-shared buffer.
+    fn crash_clone_file(db: &FileDB) -> (File, File, File) {
+        (
+            db.file.do_clone().unwrap(),
+            db.undo_file.do_clone().unwrap(),
+            db.redo_file.do_clone().unwrap(),
+        )
+    }
+
+    // Passive record count straight off disk, by path rather than through a
+    // shared fd — sidesteps any concern about interfering with the writer
+    // thread's own seek position (see Opener::pread's doc comment on why
+    // clones of the same fd share a cursor).
+    fn count_log_records_at_path(path: &str) -> usize {
+        let data = std::fs::read(path).unwrap_or_default();
+        let mut buf = &data[..];
+        let mut count = 0;
+        while !buf.is_empty() {
+            let (_msg, remaining) = take_from_bytes::<MsgType>(buf).unwrap();
+            buf = remaining;
+            count += 1;
+        }
+        count
+    }
+
+    // See wait_for_durable_logs (MemFile version) — same log_redo/log_undo
+    // send()-doesn't-imply-written race applies to the File backend too.
+    fn wait_for_durable_logs_file(db_name: &str, expected_redo: usize, expected_undo: usize) {
+        let redo_path = format!("{db_name}.redo");
+        let undo_path = format!("{db_name}.undo");
+        for _ in 0..1000 {
+            if count_log_records_at_path(&redo_path) == expected_redo
+                && count_log_records_at_path(&undo_path) == expected_undo
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!(
+            "timed out waiting for {expected_redo} redo / {expected_undo} undo file-backed \
+             records to land"
+        );
+    }
+
+    // mmap-ing a zero-length file is a classic edge case (some mmap
+    // implementations error on it), and it's the state of every brand-new
+    // database's log files before a single record has ever been written —
+    // not a corner case, the common one.
+    #[test]
+    fn test_replay_handles_empty_file_backed_logs_without_panicking() {
+        let db_name = temp_db_path("empty");
+        FileDB::delete(&db_name).unwrap_or_default();
+        let db = FileDB::create(&db_name).unwrap();
+        db.create_table("rows".to_string()).unwrap();
+
+        sync_header_without_truncating_logs(&db);
+        let (f, u, r) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        assert_eq!(db2.get_tables().unwrap().len(), 1);
+
+        FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    #[test]
+    fn test_replay_recovers_committed_writes_on_file_backed_db() {
+        let db_name = temp_db_path("recover");
+        FileDB::delete(&db_name).unwrap_or_default();
+        let db = FileDB::create(&db_name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+
+        for i in 0..10u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+
+        wait_for_durable_logs_file(&db_name, 20, 20);
+        sync_header_without_truncating_logs(&db);
+        let (f, u, r) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+
+        let t = db2.begin().unwrap();
+        for i in 0..10u64 {
+            assert_eq!(
+                db2.find(tid, id(i), &t)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} missing after file-backed replay"))
+                    .data
+                    .to_vec(),
+                format!("v{i}").as_bytes()
+            );
+        }
+        drop(t);
+
+        FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    // A restarted process reopens the same on-disk files rather than
+    // truncating them — replay must see everything from every prior
+    // session, not just the most recent one (mirrors the removed
+    // test_load_logs_accumulates_across_multiple_sessions, through the Db
+    // API instead of a bare Logger).
+    #[test]
+    fn test_replay_is_idempotent_across_repeated_reopens_file_backed() {
+        let db_name = temp_db_path("idempotent");
+        FileDB::delete(&db_name).unwrap_or_default();
+        let db = FileDB::create(&db_name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+
+        for i in 0..5u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+
+        wait_for_durable_logs_file(&db_name, 10, 10);
+        sync_header_without_truncating_logs(&db);
+        let (f, u, r) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+
+        wait_for_durable_logs_file(&db_name, 10, 10);
+        sync_header_without_truncating_logs(&db2);
+        let (f2, u2, r2) = crash_clone_file(&db2);
+        let db3 = FileDB::open_using(&db_name, f2, u2, r2).unwrap();
+
+        let t = db3.begin().unwrap();
+        for i in 0..5u64 {
+            assert_eq!(
+                db3.find(tid, id(i), &t).unwrap().unwrap().data.to_vec(),
+                format!("v{i}").as_bytes()
+            );
+        }
+        drop(t);
+
+        FileDB::delete(&db_name).unwrap_or_default();
     }
 
     #[test]
