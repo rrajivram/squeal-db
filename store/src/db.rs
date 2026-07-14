@@ -495,15 +495,6 @@ where
             }
             count += 1;
         }
-        // BUG (fixed): `extract_if` returns a lazy iterator — none of its
-        // matching entries are actually removed unless the iterator is
-        // driven (via `.next()`, a `for` loop, `.collect()`, etc). Binding
-        // it to `let _ = ...` drops it immediately without ever iterating,
-        // so this was a complete no-op: `operations` kept every
-        // transaction, committed ones included, and revert_undo_ops below
-        // reverted committed writes right back out. `retain` doesn't have
-        // that gotcha — it mutates directly, no separate consumption step
-        // needed.
         operations.retain(|k, _v| !committed.contains(k));
         operations
             .iter()
@@ -519,6 +510,12 @@ where
         // revert_txn_writes), so this is safe even if another thread is making
         // forward progress on the same keys.
         self.drain_aborting();
+        // Same opportunistic-cleanup pattern for committed transactions whose
+        // undo trail commit() had to defer (see Logger::discard_or_defer_undo)
+        // because some reader's snapshot might still have needed it. Cheap
+        // no-op when nothing is pending.
+        self.logger
+            .drain_ready_undo_discards(&self.tx_mgr.get_active_transactions()?);
         self.tx_mgr.begin()
     }
 
@@ -552,6 +549,14 @@ where
         let op = Operation::Commit(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
+        // Decide whether id's undo trail can be dropped now or must wait for
+        // every currently-active transaction that might have it in its own
+        // snapshot to finish first — see Logger::discard_or_defer_undo. Must
+        // capture the active set (excluding id itself, which is about to
+        // leave it on the very next line) before tx_mgr.commit changes it.
+        let mut still_active = self.tx_mgr.get_active_transactions()?;
+        still_active.remove(&id);
+        self.logger.discard_or_defer_undo(id.clone(), still_active);
         self.tx_mgr.commit(id.clone())?;
 
         // Best-effort tombstone reclamation. Errors here do not un-commit the
@@ -694,17 +699,19 @@ where
         id: DBIdType,
         txn: &Transaction,
     ) -> Result<Option<Tuple>, StoreError> {
-        let _txn_id = txn.id();
+        let txn_id = txn.id();
         let table = self.table_by_id(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
-            let committed = self.find_last_committed(&tuple).map(|t| t.into_owned());
+            let visible = self
+                .find_visible_to(&tuple, &txn_id)
+                .map(|t| t.into_owned());
             // A committed tombstone means the key was removed — it must be
             // invisible even if its physical row hasn't been reclaimed yet.
             // (commit reclaims tombstones best-effort AFTER its commit point, so
             // a committed-but-not-yet-reclaimed tombstone can legitimately still
             // be present in the tree.)
-            match committed {
+            match visible {
                 Some(t) if t.is_tombstoned() => Ok(None),
                 other => Ok(other),
             }
@@ -805,13 +812,20 @@ where
         RangeCursor::new(Arc::clone(self), tid, None, start, end)
     }
 
-    pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
+    // Shared undo-chain walk: returns the first version (this tuple, or an
+    // ancestor reached by walking the undo chain backward) for which
+    // `is_visible` holds. `find_last_committed` and `find_visible_to` are
+    // both this walk with a different visibility predicate — the former
+    // ("is anybody's write here durable/committed") for write paths that
+    // must act on the true latest state, the latter ("is this write visible
+    // to *this specific reader's* snapshot") for read paths.
+    fn resolve_visible<'a>(
+        &self,
+        tuple: &'a Tuple,
+        is_visible: impl Fn(&TransactionId) -> bool,
+    ) -> Option<Cow<'a, Tuple>> {
         if let Some(txn) = tuple.txn_id.clone() {
-            // Visible iff the writer COMMITTED — i.e. it is neither still active
-            // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
-            // in `aborting` and is therefore correctly invisible here even
-            // though it has left the active set.
-            if self.tx_mgr.is_committed(&txn) {
+            if is_visible(&txn) {
                 Some(Cow::Borrowed(tuple))
             } else {
                 let mut tuple = tuple.clone();
@@ -822,14 +836,14 @@ where
 
                     // Tolerate a missing undo record: an aborting txn's undo can
                     // be discarded concurrently once its rows are reverted. If we
-                    // can't walk further, treat the row as not-yet-committed
+                    // can't walk further, treat the row as not-yet-visible
                     // (invisible) rather than panicking.
                     let next_tuple = self.logger.find_undo_tuple(txn.clone(), undo_id)?;
                     let next_txn = next_tuple.txn_id.clone()?;
-                    if self.tx_mgr.is_committed(&next_txn) {
-                        // next_tuple is the committed ancestor we walked back
+                    if is_visible(&next_txn) {
+                        // next_tuple is the visible ancestor we walked back
                         // to — return it, not the in-flight `tuple` we started
-                        // from (which belongs to a non-committed txn and must
+                        // from (which belongs to a not-yet-visible txn and must
                         // stay invisible to other readers).
                         return Some(Cow::Owned(next_tuple));
                     }
@@ -840,6 +854,91 @@ where
         } else {
             panic!("Tuple does NOT have txn! {:?}", tuple.id);
         }
+    }
+
+    // Latest committed version, full stop — no snapshot filtering. Used
+    // internally by update()/remove() to resolve the current pre-image for
+    // undo-log construction: write paths must act against the true latest
+    // committed state (conflicting writers are already serialized via
+    // page-level locks — see ArcLock — so there's no lost-update risk to
+    // guard against here), not a reader's potentially-stale snapshot.
+    pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
+        // Visible iff the writer COMMITTED — i.e. it is neither still active
+        // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
+        // in `aborting` and is therefore correctly invisible here even
+        // though it has left the active set.
+        self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn))
+    }
+
+    // Snapshot-isolated visibility for reads (Db::find, TableCursor,
+    // RangeCursor): a version is visible to `reader` only if its writer
+    // committed strictly *before* `reader` began — not just "is committed
+    // right now". A writer that was still active when `reader` began (in
+    // `reader`'s captured snapshot set) stays invisible for `reader`'s
+    // entire lifetime even once it commits, and a writer that didn't even
+    // exist yet when `reader` began is excluded the same way, since
+    // `reader`'s snapshot — captured once, at begin() — couldn't have
+    // recorded it either way. Together these two checks are what makes a
+    // transaction's reads internally consistent (repeatable read):
+    // re-reading the same row twice within one transaction can no longer
+    // observe a concurrent commit that landed in between.
+    //
+    // This was previously dead scaffolding: TransactionManager captured a
+    // snapshot at every begin() and exposed it via
+    // TransactionManager::snapshot(), but nothing in the read path ever
+    // consulted it — every read used find_last_committed's live, "as of
+    // right now" check instead, regardless of when the reading transaction
+    // itself began.
+    //
+    // Making this actually hold also needed Logger::discard_or_defer_undo:
+    // without it, a commit discarded its entire undo trail immediately, so
+    // the pre-image needed to keep honoring an older reader's snapshot was
+    // gone by the time this function went looking for it — see the
+    // fallback below, which is now a rare defensive backstop for a narrow
+    // race (a new reader beginning in between this commit's active-set
+    // snapshot and the commit actually taking effect) rather than the
+    // common path.
+    pub(crate) fn find_visible_to<'a>(
+        &self,
+        tuple: &'a Tuple,
+        reader: &TransactionId,
+    ) -> Option<Cow<'a, Tuple>> {
+        // Cloned once up front rather than held as a lock guard for the
+        // whole (potentially multi-hop) undo-chain walk below. Full
+        // TransactionId (id + ts), not just the numeric id — see
+        // TransactionInner's own PartialEq comment on why the numeric id
+        // alone isn't a safe identity across a reopen.
+        let reader_snapshot: HashSet<TransactionId> = self
+            .tx_mgr
+            .snapshot(reader)
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let reader_ts = reader.ts();
+        if let Some(t) = self.resolve_visible(tuple, |txn| {
+            self.tx_mgr.is_committed(txn) && txn.ts() < reader_ts && !reader_snapshot.contains(txn)
+        }) {
+            return Some(t);
+        }
+        // No version satisfying `reader`'s exact snapshot survives in the
+        // retained undo history — fall back to the latest committed
+        // version instead of hiding a row that genuinely, currently
+        // exists. In the common case discard_or_defer_undo already keeps
+        // the needed pre-image around for exactly as long as `reader`
+        // could still be asking, so this path is rarely taken — but it can
+        // still be reached by a narrow race: Db::commit captures its
+        // "who's still active" waiter set with a plain (non-atomic, w.r.t.
+        // TransactionManager's own locks) read before actually committing,
+        // so a brand new reader beginning in that exact window wouldn't be
+        // counted as a waiter, and could see its undo trail discarded
+        // immediately if no one else was active at that moment. Confirmed
+        // the hard way that this fallback matters: an earlier version of
+        // this function returned None here entirely (before
+        // discard_or_defer_undo existed), which made Db::find incorrectly
+        // report a real, committed, currently-existing row as missing after
+        // a concurrent commit. The one guarantee that must hold
+        // unconditionally, even in that race window: a row that exists and
+        // is committed is never reported as absent.
+        self.find_last_committed(tuple)
     }
 
     pub fn create_table(&self, name: String) -> Result<TableIdType, StoreError> {
@@ -1126,6 +1225,7 @@ mod tests {
     use std::{sync::Arc, thread, time::Duration};
 
     use crate::{
+        cursor::Cursor,
         db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
         logger::MsgType,
@@ -1515,6 +1615,148 @@ mod tests {
         );
 
         db.commit(txn2).unwrap();
+    }
+
+    // Regression test for snapshot-isolation visibility (Db::find_visible_to)
+    // AND deferred undo discard (Logger::discard_or_defer_undo /
+    // drain_ready_undo_discards): a transaction's reads must stay internally
+    // consistent even when a concurrent transaction updates AND COMMITS the
+    // same row in between. Before find_visible_to existed, find()/
+    // table_scan/range_scan all used find_last_committed, which decides
+    // visibility live against whatever is committed "right now" — so a
+    // transaction could see a different answer to the same read depending
+    // purely on when, during its own lifetime, it happened to ask.
+    // TransactionManager already captured a snapshot of active transactions
+    // at begin() (and exposed it via TransactionManager::snapshot()) but
+    // nothing consulted it — dead scaffolding for a feature that wasn't
+    // actually wired up.
+    //
+    // Getting this right needed two parts, not one: find_visible_to alone
+    // isn't enough, because Logger::log_undo used to discard a committing
+    // transaction's ENTIRE undo trail unconditionally — so by the time a
+    // still-open reader asked again, the pre-image needed to keep honoring
+    // its snapshot was already gone (confirmed the hard way: an earlier
+    // version of this fix made a real, committed row incorrectly look
+    // missing after exactly this sequence). discard_or_defer_undo closes
+    // that gap by mirroring TransactionManager's aborting/drain_aborting
+    // pattern: a commit doesn't discard its undo trail if any other
+    // transaction is still active (and might have it in its own snapshot)
+    // — it parks the obligation and Db::begin's opportunistic drain finishes
+    // the job once every such transaction has actually finished.
+    #[test]
+    fn test_find_is_repeatable_within_a_transaction_across_a_concurrent_write_and_commit() {
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // Reader begins BEFORE the concurrent update below.
+        let reader = db.begin().unwrap();
+        let first_read = db
+            .find(tid, id(1), &reader)
+            .unwrap()
+            .expect("row must exist for the first read");
+        assert_eq!(first_read.data.to_vec(), b"v1");
+
+        // A fully separate, concurrent transaction updates but does NOT
+        // commit yet.
+        let writer = db.begin().unwrap();
+        db.update(tid, row(1, b"v2"), &writer).unwrap();
+
+        // The SAME reader, reading the SAME row again, must see the value it
+        // saw the first time — not the concurrent, still-uncommitted write.
+        let second_read = db
+            .find(tid, id(1), &reader)
+            .unwrap()
+            .expect("row must still be visible on the second read");
+        assert_eq!(
+            second_read.data.to_vec(),
+            b"v1",
+            "a transaction's own reads must stay consistent across a concurrent, uncommitted write"
+        );
+
+        // The writer now commits WHILE reader is still open — this is the
+        // part that needs deferred undo discard: without it, the pre-image
+        // "v1" would be gone by the next line.
+        db.commit(writer).unwrap();
+
+        let third_read = db
+            .find(tid, id(1), &reader)
+            .unwrap()
+            .expect("row must still be visible after the concurrent commit");
+        assert_eq!(
+            third_read.data.to_vec(),
+            b"v1",
+            "a transaction's reads must stay consistent even across a concurrent COMMIT, \
+             not just a concurrent still-active write"
+        );
+        drop(reader);
+
+        // A transaction that begins AFTER the writer committed must see the
+        // new value — this isn't a permanently-stuck-in-the-past view, just
+        // a per-transaction snapshot taken at begin() time.
+        let later_reader = db.begin().unwrap();
+        let later_read = db
+            .find(tid, id(1), &later_reader)
+            .unwrap()
+            .expect("row must exist for a fresh transaction");
+        assert_eq!(later_read.data.to_vec(), b"v2");
+        drop(later_reader);
+    }
+
+    // Same guarantee, exercised through table_scan rather than a point
+    // find() — the cursors resolve visibility the same way, so this
+    // confirms the fix isn't find()-specific.
+    #[test]
+    fn test_table_scan_is_repeatable_within_a_transaction_across_a_concurrent_write_and_commit() {
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.insert(tid, row(2, b"v2"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // table_scan(None) begins its own internal Transaction, held for the
+        // cursor's whole lifetime across every next() call — reading row 1
+        // here starts that transaction's snapshot.
+        let mut cursor = db.table_scan(tid).unwrap();
+        let first = cursor.next().unwrap().expect("row 1 must be scanned");
+        assert_eq!(first.data.to_vec(), b"v1");
+
+        // A fully separate, concurrent transaction updates row 2 (not yet
+        // reached by the scan) and commits, WHILE the cursor's transaction
+        // is still open.
+        let writer = db.begin().unwrap();
+        db.update(tid, row(2, b"v2-updated"), &writer).unwrap();
+        db.commit(writer).unwrap();
+
+        // Continuing the SAME cursor (same underlying transaction) must
+        // still see row 2's pre-commit value — the scan's snapshot was
+        // taken when the cursor was created, not re-taken per row, and
+        // deferred undo discard kept that pre-image reachable.
+        let second = cursor.next().unwrap().expect("row 2 must be scanned");
+        assert_eq!(
+            second.data.to_vec(),
+            b"v2",
+            "a scan's own transaction must not observe a commit that landed after it began"
+        );
+        assert!(cursor.next().unwrap().is_none());
+        drop(cursor);
+
+        // A fresh scan (fresh transaction) must see the update — confirms
+        // this isn't permanently stale, just snapshotted at begin() time.
+        let mut cursor2 = db.table_scan(tid).unwrap();
+        let row1_again = cursor2
+            .next()
+            .unwrap()
+            .expect("row 1 must still be scanned");
+        assert_eq!(row1_again.data.to_vec(), b"v1");
+        let row2_again = cursor2
+            .next()
+            .unwrap()
+            .expect("row 2 must still be scanned");
+        assert_eq!(row2_again.data.to_vec(), b"v2-updated");
     }
 
     #[test]
@@ -2218,6 +2460,66 @@ mod tests {
             "rolled-back large update must leave the committed value intact"
         );
         db.rollback(t).unwrap();
+    }
+
+    // A data page holding many small tuples, all updated at least once, must
+    // never have its next_page (the link to the next sibling data page)
+    // clobbered. update()'s replacement tuple is a few bytes larger than
+    // what insert() originally wrote (this sets undo_id, which insert
+    // leaves None) — on a page already packed to capacity, updating every
+    // row on it used to push page_used_size past usable_data_size, which
+    // handle_large_page_size misread as "this page needs a single-tuple
+    // overflow chain", overwriting next_page with an overflow-page id
+    // instead of the real next sibling. table_scan then silently
+    // undercounted or hit a deserialization error trying to read that
+    // "sibling" as an ordinary multi-tuple page. Found via a performance
+    // harness (examples/perf) hitting exactly this after a bulk update.
+    #[test]
+    fn test_table_scan_correct_after_updating_every_row_across_multiple_data_pages() {
+        let (db, tid) = make_db_with_table();
+        // Enough small rows to span multiple data pages at the default page
+        // size (empirically ~200 rows/page for a 64B value at 16KiB pages).
+        let n = 500u64;
+        let value = vec![b'v'; 64];
+        for i in 0..n {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, &value), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+
+        // Update every row once, in reverse order (touches pages in a
+        // different order than they were filled).
+        for i in (0..n).rev() {
+            let t = db.begin().unwrap();
+            db.update(tid, row(i, &value), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+
+        let mut scanned = 0u64;
+        let mut cursor = db.table_scan(tid).unwrap();
+        while cursor.next().unwrap().is_some() {
+            scanned += 1;
+        }
+        assert_eq!(
+            scanned, n,
+            "table_scan must see every row after all of them have been updated, \
+             not stop early or error partway through the data-page chain"
+        );
+
+        // Every row must also still be independently findable with the
+        // right value — relocation (if it happened) must have kept the
+        // index pointing at wherever the row actually landed.
+        let t = db.begin().unwrap();
+        for i in 0..n {
+            assert_eq!(
+                db.find(tid, id(i), &t)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} missing after update-all"))
+                    .data
+                    .to_vec(),
+                value
+            );
+        }
     }
 
     #[test]
@@ -3372,6 +3674,67 @@ mod tests {
         for thread_idx in 0..THREADS {
             for i in 0..ROWS_PER_THREAD {
                 let key = thread_idx * ROWS_PER_THREAD + i;
+                let found = db.find(tid, id(key), &t).unwrap();
+                assert_eq!(
+                    found
+                        .unwrap_or_else(|| panic!("row {key} missing"))
+                        .data
+                        .to_vec(),
+                    format!("v{key}").as_bytes()
+                );
+            }
+        }
+        drop(t);
+    }
+
+    // Regression test for todo.txt [16]: a non-root leaf (or, separately, a
+    // non-root inner node) filled to capacity by a concurrent insert in the
+    // window between a routing check and this thread's actual descent.
+    // Needs a small page size (few entries per page) and interleaved keys
+    // (not per-thread disjoint ranges) so many threads route through the
+    // *same* pages concurrently — the default page size's large fanout
+    // makes this window vanishingly unlikely to hit in practice. Before the
+    // fix: the leaf-level race panicked directly
+    // ("count == nodes- should not happen"); the inner-node-level race
+    // surfaced as an unhandled PageCapacityError (insert_index's retry loop
+    // for it was a stale, never-compiled comment). Both closed by
+    // split_if_needed carrying its already-held lock forward (no
+    // release-then-reacquire gap) and insert_index actually retrying on
+    // PageCapacityError. Confirmed both were reachable before the fix: 19/200
+    // and several more/100 runs respectively hit one or the other at this
+    // scale.
+    #[test]
+    fn test_concurrent_inserts_at_small_page_size_do_not_panic_or_lose_rows() {
+        const THREADS: u64 = 16;
+        const ROWS_PER_THREAD: u64 = 40;
+        let db: Arc<TestDB> = TestDB::create_with_page_size("small_page_race.db", 512).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for i in 0..ROWS_PER_THREAD {
+                    // Interleaved (not partitioned) keys so concurrent
+                    // threads route into the same leaf/inner pages, not
+                    // disjoint parts of the tree.
+                    let key = i * THREADS + thread_idx;
+                    let t = db.begin().unwrap();
+                    super::retry_on_contention(|| {
+                        db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
+                    })
+                    .unwrap();
+                    db.commit(t).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let t = db.begin().unwrap();
+        for i in 0..ROWS_PER_THREAD {
+            for thread_idx in 0..THREADS {
+                let key = i * THREADS + thread_idx;
                 let found = db.find(tid, id(key), &t).unwrap();
                 assert_eq!(
                     found

@@ -21,6 +21,13 @@ enum Node {
     Leaf(PageId),
 }
 
+// split_if_needed's result — see its own comment on why the no-split case
+// carries the already-held lock forward instead of dropping it.
+enum SplitOutcome {
+    Split(DBIdType, PageId),
+    NoSplitNeeded(WritePageHandle),
+}
+
 // Bit indices 0–3 are reserved (PINNED, INDEX_PAGE, …); user flags start at 4.
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
@@ -218,33 +225,43 @@ where
             Some(txn.clone()),
             None,
         );
-        // The root-split pre-check uses an unlocked read, so by the time
-        // insert_recursive holds the root lock the root may already be split.
-        let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
-        if handle.page.count()? == self.table.nodes_per_page - 1 {
-            self.split_root_page(handle, txn.clone(), &id_tuple.id)?;
-        } else {
-            drop(handle);
+        // insert_recursive's own inner-node routing returns PageCapacityError
+        // (rather than splitting on the spot) when a non-root inner node is
+        // already full on arrival: splitting *this* node needs its parent's
+        // lock to add a new separator, which is no longer held by the time
+        // we're routing through it (see its own comment). The fix is to
+        // retry the whole walk from the root: on the next pass, whichever
+        // ancestor is routing *into* this now-known-full node will call
+        // split_if_needed on it first (from a level that still holds the
+        // right locks to do so), instead of descending straight into a
+        // dead end again. This was previously an abandoned, uncompilable
+        // draft (moved id_tuple/txn without cloning them for the retry) —
+        // confirmed reachable under concurrent inserts at a small page size
+        // (~1 in 10-20 runs of a targeted 16-thread stress repro) before
+        // being wired up for real.
+        let mut retries = 0u32;
+        loop {
+            // The root-split pre-check uses an unlocked read, so by the time
+            // insert_recursive holds the root lock the root may already be split.
+            let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
+            if handle.page.count()? == self.table.nodes_per_page - 1 {
+                self.split_root_page(handle, txn.clone(), &id_tuple.id)?;
+            } else {
+                drop(handle);
+            }
+            match self.insert_recursive(
+                id_tuple.clone(),
+                txn.clone(),
+                self.table.first_index_page,
+                None,
+            ) {
+                Err(StoreError::PageCapacityError) if retries < 16 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_micros(50 * retries as u64));
+                }
+                other => return other,
+            }
         }
-        self.insert_recursive(id_tuple, txn, self.table.first_index_page, None)
-        /*         let mut retries = 0u32;
-               loop {
-                   let page = self.buffer.get_page(self.table.first_index_page)?;
-                   if page.count()? == self.table.nodes_per_page - 1 {
-                       self.split_root_page(
-                           self.buffer.get_page_mut(self.table.first_index_page)?,
-                           txn.clone(),
-                       )?;
-                   }
-                   match self.insert_recursive(id_tuple.clone(), txn.clone(), self.table.first_index_page) {
-                       Err(StoreError::PageCapacityError) if retries < 16 => {
-                           retries += 1;
-                           std::thread::sleep(std::time::Duration::from_micros(50));
-                       }
-                       other => return other,
-                   }
-               }
-        */
     }
 
     /// Place `tuple` on a data page and return that page's id. Locks each
@@ -305,9 +322,54 @@ where
             .find_page(id.clone(), self.table.first_index_page)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
         let mut h = self.buffer.get_page_mut(pid)?;
-        let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
-        self.buffer.write_locked_page(h)?;
-        Ok(old)
+        // Whether the replacement still fits alongside its siblings on this
+        // page. An ordinary multi-tuple page must never be allowed to
+        // exceed capacity via in-place replace: handle_large_page_size's
+        // overflow allocation is only valid for a genuinely oversized
+        // SINGLE tuple (see Page::can_store's own comment — that's the
+        // only way a page ends up needing an overflow chain in the first
+        // place). If a multi-tuple page's used_size crept over capacity
+        // here (e.g. this update setting undo_id, which insert leaves
+        // None, costs a few more serialized bytes per row), letting
+        // replace_tuple through would make handle_large_page_size wrongly
+        // treat this page as needing an overflow chain — clobbering its
+        // next_page (which points at the next SIBLING data page, not an
+        // overflow page) and permanently corrupting table_scan's walk.
+        // Confirmed via direct repro: insert enough rows to fill more than
+        // one data page, update() every row once, then table_scan silently
+        // undercounts or errors with SerializationError.
+        let header = h.page.header();
+        let old_size = h.page.get(id.clone())?.map(|t| t.size()).unwrap_or(0);
+        let fits_in_place = h.page.count()? <= 1
+            || header.used_size().saturating_sub(old_size) + tuple.size()
+                <= header.usable_data_size();
+        if fits_in_place {
+            let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
+            self.buffer.write_locked_page(h)?;
+            Ok(old)
+        } else {
+            // Doesn't fit alongside its siblings: relocate instead of
+            // exceeding capacity. Remove from the current page (freeing its
+            // slot), place via the same capacity-aware logic insert() uses
+            // (which may still land back on this same, now-lighter page),
+            // then repoint the index entry if it landed somewhere else.
+            let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+            self.buffer.write_locked_page(h)?;
+            let new_page_id = self.write_data(&tuple)?;
+            if new_page_id != pid {
+                let txn = tuple.txn_id.clone().unwrap_or_default();
+                retry_on_contention(|| {
+                    self.update_index_entry(
+                        id.clone(),
+                        new_page_id,
+                        txn.clone(),
+                        self.table.first_index_page,
+                        None,
+                    )
+                })?;
+            }
+            Ok(old)
+        }
     }
 
     // Redo-replay counterpart to update(), mirroring insert_if_needed:
@@ -632,6 +694,56 @@ where
         }
     }
 
+    // Repoints an existing index entry at a new data page, used when
+    // update() relocates a row that no longer fits on its current data
+    // page. Mirrors remove_index_entry's routing/locking exactly (same
+    // hand-over-hand crabbing rationale — see its comment), differing only
+    // in the leaf-level action: replace_tuple instead of remove_tuple. The
+    // index entry's own serialized size doesn't grow unpredictably the way
+    // a data tuple's does (it's always a bounded Node::Leaf(PageId)), so
+    // this can't itself trigger the same over-capacity issue update() is
+    // guarding against.
+    fn update_index_entry(
+        &self,
+        id: DBIdType,
+        new_page_id: PageId,
+        txn: TransactionId,
+        start: PageId,
+        parent: Option<WritePageHandle>,
+    ) -> Result<(), StoreError> {
+        let mut handle = self.buffer.get_page_mut(start)?;
+        drop(parent);
+        if handle.page.is_flag_set(INNER_NODE) {
+            let mut last_child: Option<PageId> = None;
+            for row in handle.page.iter() {
+                if id < row.id {
+                    if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
+                        return self.update_index_entry(id, new_page_id, txn, page_num, Some(handle));
+                    } else {
+                        panic!("Expected Inner. Found leaf! {:?}", row.id);
+                    }
+                }
+                if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
+                    last_child = Some(page_num);
+                }
+            }
+            if let Some(child) = last_child {
+                return self.update_index_entry(id, new_page_id, txn, child, Some(handle));
+            }
+            Ok(())
+        } else {
+            let new_entry = Tuple::new_with(
+                id.clone(),
+                &to_allocvec(&Node::Leaf(new_page_id))?,
+                Some(txn),
+                None,
+            );
+            Arc::make_mut(&mut handle.page).replace_tuple(&id, new_entry)?;
+            self.buffer.write_locked_page(handle)?;
+            Ok(())
+        }
+    }
+
     fn insert_recursive(
         &self,
         tuple: Tuple,
@@ -667,11 +779,24 @@ where
                     self.split_root_page(handle, txn_id.clone(), &tuple.id)?;
                     return self.insert_recursive(tuple, txn_id, start, None);
                 }
-                panic!("count == nodes- should not happen");
-                // A non-root leaf was concurrently filled to capacity after its
-                // parent's split_if_needed released the parent lock. Signal the
-                // caller to retry so the parent re-detects the full page.
-                //return Err(StoreError::PageCapacityError);
+                // This used to be reachable: a non-root leaf could be
+                // concurrently filled to capacity in the window between
+                // split_if_needed's parent-level capacity check releasing
+                // the child's lock and this call re-acquiring it fresh —
+                // confirmed under stress (~1/300 runs). split_if_needed now
+                // carries that lock forward continuously instead of
+                // releasing it (see SplitOutcome::NoSplitNeeded's comment),
+                // so nothing can fill this page between the check and this
+                // arrival. If this still fires, the invariant it depends on
+                // (every non-root descent holds this page's lock
+                // continuously from its own capacity check) has been
+                // broken somewhere new.
+                panic!(
+                    "non-root leaf {:?} unexpectedly at capacity on arrival — the \
+                     continuous-lock invariant split_if_needed relies on must have \
+                     been violated",
+                    start
+                );
             } else if handle.page.count()? < self.table.nodes_per_page
                 && handle.page.can_store(&tuple)
             {
@@ -724,47 +849,63 @@ where
             }
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
-                if let Some((separator, sibling)) = self.split_if_needed(p, &tuple)? {
-                    let page = Arc::make_mut(&mut handle.page);
-                    // `p` kept the smaller half (keys < separator); the larger half
-                    // (up to the old upper bound, row_id.id) moved to `sibling`. The
-                    // existing entry routed that whole range to `p`, so it must now
-                    // point at `sibling`; a new entry routes the smaller half to `p`.
-                    page.replace_tuple(
-                        &row_id.id,
-                        Tuple::new_with(
-                            row_id.id.clone(),
-                            &to_allocvec(&Node::Inner(sibling))?,
+                match self.split_if_needed(p, &tuple)? {
+                    SplitOutcome::Split(separator, sibling) => {
+                        let page = Arc::make_mut(&mut handle.page);
+                        // `p` kept the smaller half (keys < separator); the larger half
+                        // (up to the old upper bound, row_id.id) moved to `sibling`. The
+                        // existing entry routed that whole range to `p`, so it must now
+                        // point at `sibling`; a new entry routes the smaller half to `p`.
+                        page.replace_tuple(
+                            &row_id.id,
+                            Tuple::new_with(
+                                row_id.id.clone(),
+                                &to_allocvec(&Node::Inner(sibling))?,
+                                Some(txn_id.clone()),
+                                None,
+                            ),
+                        )?;
+                        page.add_tuple(Tuple::new_with(
+                            separator.clone(),
+                            &to_allocvec(&Node::Inner(p))?,
                             Some(txn_id.clone()),
                             None,
-                        ),
-                    )?;
-                    page.add_tuple(Tuple::new_with(
-                        separator.clone(),
-                        &to_allocvec(&Node::Inner(p))?,
-                        Some(txn_id.clone()),
-                        None,
-                    ))?;
-                    // Crab into the destination child: lock it *before* the
-                    // parent is written/released below, so no other thread can
-                    // re-split it out from under the routing decision we just
-                    // made. write_locked_page must still run (it persists the
-                    // new separator entries and releases the parent lock); the
-                    // pre-acquired child lock is reentrantly re-taken by the
-                    // recursive get_page_mut and dropped when `child` does.
-                    let target = if tuple.id < separator { p } else { sibling };
-                    let child = self.buffer.get_page_mut(target)?;
-                    // Must persist before recursing — handle.page was a
-                    // detached COW copy (the buffer's cache still held the
-                    // pre-split version), so without this write-back the
-                    // updated routing entries are silently dropped when
-                    // `handle` goes out of scope, corrupting the index.
-                    self.buffer.write_locked_page(handle)?;
-                    return self.insert_recursive(tuple, txn_id, target, Some(child));
+                        ))?;
+                        // Crab into the destination child: lock it *before* the
+                        // parent is written/released below, so no other thread can
+                        // re-split it out from under the routing decision we just
+                        // made. write_locked_page must still run (it persists the
+                        // new separator entries and releases the parent lock); the
+                        // pre-acquired child lock is reentrantly re-taken by the
+                        // recursive get_page_mut and dropped when `child` does.
+                        let target = if tuple.id < separator { p } else { sibling };
+                        let child = self.buffer.get_page_mut(target)?;
+                        // Must persist before recursing — handle.page was a
+                        // detached COW copy (the buffer's cache still held the
+                        // pre-split version), so without this write-back the
+                        // updated routing entries are silently dropped when
+                        // `handle` goes out of scope, corrupting the index.
+                        self.buffer.write_locked_page(handle)?;
+                        self.insert_recursive(tuple, txn_id, target, Some(child))
+                    }
+                    SplitOutcome::NoSplitNeeded(child) => {
+                        // `child` is `p`'s own lock, held continuously since
+                        // split_if_needed's own capacity check — never
+                        // released and re-acquired. That continuity is the
+                        // fix: a concurrent inserter targeting the same
+                        // child can no longer slip in between "we checked
+                        // it wasn't full" and "we act on it", because the
+                        // lock never drops to zero holders in between (see
+                        // split_if_needed's own comment for the race this
+                        // closes). Drop the parent now — the child is
+                        // already protected, so releasing the parent here
+                        // (rather than passing it down to be dropped inside
+                        // the recursive call) is the same hand-over-hand
+                        // order, just made explicit.
+                        drop(handle);
+                        self.insert_recursive(tuple, txn_id, p, Some(child))
+                    }
                 }
-                // Crab into the child: pass our still-held parent lock down so
-                // it is only released once the child lock has been acquired.
-                self.insert_recursive(tuple, txn_id, p, Some(handle))
             } else {
                 panic!("Expected inner - found leaf : {:?}", start);
             }
@@ -777,16 +918,37 @@ where
         &self,
         page_id: PageId,
         tuple: &Tuple,
-    ) -> Result<Option<(DBIdType, PageId)>, StoreError> {
+    ) -> Result<SplitOutcome, StoreError> {
         let handle = self.buffer.get_page_mut(page_id)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
                 panic!("Trying to split root in the wrong place");
             } else {
-                Ok(Some(self.split_non_root_page(handle, &tuple.id)?))
+                let (separator, sibling) = self.split_non_root_page(handle, &tuple.id)?;
+                Ok(SplitOutcome::Split(separator, sibling))
             }
         } else {
-            Ok(None)
+            // Not full: return the already-held lock instead of dropping it
+            // here. The caller (insert_recursive) used to let this handle
+            // go out of scope and re-acquire `page_id`'s lock fresh, later,
+            // via its own get_page_mut(start) — leaving a real window where
+            // nothing holds this page's lock at all, during which a
+            // concurrent insert targeting the same (non-root) page could
+            // fill it to exactly its capacity threshold. When that
+            // happened, insert_recursive's leaf-handling branch had no way
+            // to recover: splitting a non-root node needs to rewrite the
+            // *parent's* routing entry, and by the time this thread was
+            // back inside the child with nothing but the child's own lock,
+            // the parent context (and lock) was already gone — hence the
+            // `panic!("count == nodes- should not happen")` this used to
+            // hit, confirmed reachable under concurrent load (~1/300 in a
+            // targeted stress run). Carrying the lock forward instead of
+            // dropping it means the capacity check and the actual insert
+            // happen under one continuous hold — no other thread can ever
+            // observe this page as "not full" and then find it full by the
+            // time it gets a turn, because the turn never comes until this
+            // one is done with it.
+            Ok(SplitOutcome::NoSplitNeeded(handle))
         }
     }
 

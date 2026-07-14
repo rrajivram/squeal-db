@@ -31,7 +31,7 @@ pub struct TransactionInner {
 #[derive(Debug)]
 pub(crate) struct TransactionData {
     id: TransactionId,
-    snapshot: HashSet<u64>,
+    snapshot: HashSet<TransactionId>,
 }
 
 const TXN_GENERATOR_NANE: &str = "__system.transactions";
@@ -125,13 +125,8 @@ impl TransactionManager {
         self.active_transactions.read().len()
     }
 
-    pub(crate) fn get_active_transactions(&self) -> Result<HashSet<u64>, StoreError> {
-        Ok(self
-            .active_transactions
-            .read()
-            .iter()
-            .map(|t| t.0.id)
-            .collect::<HashSet<_>>())
+    pub(crate) fn get_active_transactions(&self) -> Result<HashSet<TransactionId>, StoreError> {
+        Ok(self.active_transactions.read().iter().cloned().collect())
     }
 
     pub(crate) fn create_transaction(&self) -> Result<TransactionId, StoreError> {
@@ -228,7 +223,7 @@ impl TransactionManager {
     pub(crate) fn snapshot(
         &self,
         id: &TransactionId,
-    ) -> Option<MappedRwLockReadGuard<'_, HashSet<u64>>> {
+    ) -> Option<MappedRwLockReadGuard<'_, HashSet<TransactionId>>> {
         if !self.transaction_data.read().contains_key(&id.0.id) {
             None
         } else {
@@ -245,6 +240,24 @@ impl TransactionId {
             id,
             ts: timestamp(),
         }))
+    }
+
+    /// The transaction's creation timestamp — used to order two
+    /// transactions by which began first. Deliberately `ts`, not the
+    /// numeric `id`: the id generator's persisted sequence isn't guaranteed
+    /// to have caught up to the true high-water mark right after a reopen
+    /// (it's only refreshed at checkpoint/close/table-creation, not on
+    /// every transaction), so comparing raw ids across a reopen boundary
+    /// can be wrong — confirmed via replay tests failing when
+    /// snapshot-isolation visibility first used raw_id() ordering instead
+    /// of this. `ts` has no such dependency: it's real wall-clock time
+    /// (`timestamp()`, at construction), so a transaction from a prior
+    /// session is always chronologically before any transaction in a later
+    /// one, regardless of what the id generator happens to resume from.
+    /// Used by `Db::find_visible_to` to determine whether a writer began
+    /// before or after a given reader.
+    pub(crate) fn ts(&self) -> u128 {
+        self.0.ts
     }
 }
 
@@ -408,8 +421,8 @@ mod tests {
         let t2 = mgr.create_transaction().unwrap();
         let ids = mgr.get_active_transactions().unwrap();
         assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&t1.0.id));
-        assert!(ids.contains(&t2.0.id));
+        assert!(ids.contains(&t1));
+        assert!(ids.contains(&t2));
     }
 
     #[test]
@@ -419,8 +432,8 @@ mod tests {
         let t2 = mgr.create_transaction().unwrap();
         mgr.commit(t1.clone()).unwrap();
         let ids = mgr.get_active_transactions().unwrap();
-        assert!(!ids.contains(&t1.0.id));
-        assert!(ids.contains(&t2.0.id));
+        assert!(!ids.contains(&t1));
+        assert!(ids.contains(&t2));
     }
 
     #[test]
@@ -468,8 +481,8 @@ mod tests {
         let mgr = make_mgr();
         let t1 = mgr.create_transaction().unwrap();
         let t2 = mgr.create_transaction().unwrap();
-        assert!(mgr.snapshot(&t2).unwrap().contains(&t1.0.id));
-        assert!(!mgr.snapshot(&t1).unwrap().contains(&t2.0.id));
+        assert!(mgr.snapshot(&t2).unwrap().contains(&t1));
+        assert!(!mgr.snapshot(&t1).unwrap().contains(&t2));
     }
 
     #[test]
@@ -478,7 +491,7 @@ mod tests {
         let t1 = mgr.create_transaction().unwrap();
         mgr.commit(t1.clone()).unwrap();
         let t2 = mgr.create_transaction().unwrap();
-        assert!(!mgr.snapshot(&t2).unwrap().contains(&t1.0.id));
+        assert!(!mgr.snapshot(&t2).unwrap().contains(&t1));
     }
 
     #[test]

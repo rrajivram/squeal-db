@@ -1,8 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::SeekFrom,
     sync::{Arc, atomic::AtomicU64},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use crossbeam::channel::{Receiver, Sender, bounded};
@@ -128,6 +129,15 @@ pub(crate) struct Logger {
     undo_tx: Option<Sender<MsgType>>,
     redo_tx: Option<Sender<MsgType>>,
     undo_txns: RwLock<HashMap<TransactionId, Vec<Operation>>>,
+    // Committed transactions whose undo trail can't be discarded YET —
+    // mirrors TransactionManager's aborting/drain_aborting pattern: don't
+    // clean up immediately if doing so could pull a still-open reader's
+    // snapshot out from under it, park the obligation and let a later,
+    // opportunistic drain (Db::begin, alongside drain_aborting) finish the
+    // job once every transaction that captured this one in its snapshot
+    // has itself finished. See Db::commit's discard_or_defer_undo call site
+    // and drain_ready_undo_discards's own comment for the full mechanism.
+    pending_undo_discards: RwLock<Vec<(TransactionId, HashSet<TransactionId>)>>,
     clock: Arc<LsnClock>,
 }
 
@@ -152,8 +162,19 @@ impl Logger {
         undo_file: impl DBFile + 'static,
         redo_file: impl DBFile + 'static,
     ) -> Result<(), StoreError> {
-        let (redo_tx, redo_rx) = bounded(1);
-        let (undo_tx, undo_rx) = bounded(1);
+        // Wide enough that group commit (see undo_log_runner/redo_log_runner)
+        // has something real to batch under concurrent load, instead of
+        // bounded(1)'s "at most one message ever queued" — which structurally
+        // prevented batching, since a sender blocks until the runner
+        // dequeues the previous message before a second one can even land in
+        // the channel. This does trade away bounded(1)'s "near-synchronous"
+        // property (log_redo/log_undo returning was previously a rough proxy
+        // for "the previous record is durable") — tests that need an actual
+        // durability guarantee use the explicit wait_for_durable_logs poll
+        // helper instead of relying on that timing coincidence.
+        const LOG_CHANNEL_CAPACITY: usize = 256;
+        let (redo_tx, redo_rx) = bounded(LOG_CHANNEL_CAPACITY);
+        let (undo_tx, undo_rx) = bounded(LOG_CHANNEL_CAPACITY);
         self.undo_tx = Some(undo_tx);
         self.redo_tx = Some(redo_tx);
 
@@ -200,11 +221,13 @@ impl Logger {
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
             // Now store record if available
         }
-        match &op {
-            Operation::Commit(id, _) | Operation::Rollback(id, _) => {
-                self.undo_txns.write().remove(id);
-            }
-            _ => {}
+        // Rollback physically reverts the transaction's writes before this
+        // op is even logged (see Db::rollback) — nothing is ever left
+        // "owned" by a rolled-back transaction for a concurrent reader to
+        // need to walk back through, so its undo trail is always safe to
+        // drop immediately, unlike Commit's (see discard_or_defer_undo).
+        if let Operation::Rollback(id, _) = &op {
+            self.undo_txns.write().remove(id);
         }
         Ok(())
     }
@@ -214,6 +237,52 @@ impl Logger {
     /// Commit/Rollback op, so its records aren't cleaned by log_undo above.
     pub(crate) fn discard_undo(&self, id: &TransactionId) {
         self.undo_txns.write().remove(id);
+    }
+
+    /// Called by Db::commit right after logging a Commit op: decides
+    /// whether `id`'s undo trail can be dropped now or must wait. Mirrors
+    /// TransactionManager's aborting/drain_aborting pattern — `others` is
+    /// every OTHER transaction that's still active at this exact commit
+    /// point (captured once, here, not re-checked later): any one of them
+    /// might have `id` in its own snapshot (captured at ITS begin()), which
+    /// means `id`'s pre-commit state must stay reachable via undo-walk for
+    /// as long as that reader could still ask for it. If none are active,
+    /// this is the common (low-concurrency) case and the old immediate-
+    /// discard behavior applies unchanged.
+    pub(crate) fn discard_or_defer_undo(&self, id: TransactionId, others: HashSet<TransactionId>) {
+        if others.is_empty() {
+            self.undo_txns.write().remove(&id);
+        } else {
+            self.pending_undo_discards.write().push((id, others));
+        }
+    }
+
+    /// Opportunistic maintenance for deferred undo discards (see
+    /// discard_or_defer_undo) — called alongside drain_aborting, e.g. at
+    /// Db::begin(). For each committed transaction whose discard was
+    /// deferred, drops it from the waiter set any transaction that has
+    /// since finished (committed or aborted, so it's no longer in
+    /// `currently_active`); once a transaction's waiter set is empty —
+    /// nothing that could still need its pre-commit state remains active —
+    /// its undo trail is actually removed.
+    pub(crate) fn drain_ready_undo_discards(&self, currently_active: &HashSet<TransactionId>) {
+        let mut pending = self.pending_undo_discards.write();
+        if pending.is_empty() {
+            return;
+        }
+        let mut still_pending = Vec::with_capacity(pending.len());
+        for (id, waiters) in pending.drain(..) {
+            let remaining: HashSet<TransactionId> = waiters
+                .into_iter()
+                .filter(|w| currently_active.contains(w))
+                .collect();
+            if remaining.is_empty() {
+                self.undo_txns.write().remove(&id);
+            } else {
+                still_pending.push((id, remaining));
+            }
+        }
+        *pending = still_pending;
     }
 
     pub(crate) fn next_undo_id(&self, id: TransactionId) -> Result<UndoId, StoreError> {
@@ -375,30 +444,92 @@ impl PartialEq<u64> for LsnId {
         self.0 == *other
     }
 }
+// Caps how many already-queued messages one batch pulls off the channel
+// before writing. Tried 10 (much smaller than the channel's own 256-slot
+// capacity, on the theory that it would bound worst-case per-message
+// latency) — measured DRAMATICALLY worse File-backend throughput instead
+// (~13-15k ops/s -> ~600-1400 ops/s on the perf harness's single-threaded
+// insert/update/find phases). Root cause: once fsync (a real, ~ms-scale
+// cost) is slower than production, the channel genuinely backs up with a
+// real backlog — not a linger artifact, the messages are already queued,
+// no waiting involved. A cap smaller than the channel's own capacity then
+// forces MANY separate drain-and-fsync cycles to clear one backlog instead
+// of one (e.g. a 200-message backlog needs 20 cycles at cap=10 vs 1 at
+// cap=256) — ~20x more fsync calls for the identical amount of work, which
+// is almost exactly the regression measured. The cap needs to be at least
+// as large as the channel capacity so one drain can always fully empty
+// whatever's already backlogged, regardless of how that backlog formed.
+const MAX_LOG_BATCH: usize = 256;
+
+// How long to linger after the first message, hoping a concurrent sender's
+// message lands in time to join the same batch (and thus the same fsync).
+// A plain non-blocking try_recv() (no linger at all) only ever catches a
+// message that happens to already be queued at the exact instant this
+// thread wakes up — under realistic per-operation latency (lock
+// acquisition, tree traversal, ...) that's rarely more than one, so nearly
+// every batch ends up size 1 regardless of how many threads are actually
+// concurrent. That defeats the entire point of batching before fsync
+// (do_sync is real, millisecond-scale disk I/O): confirmed via the `perf`
+// example — batching without a linger measured WORSE than no batching at
+// all on the File backend (insert dropped from ~41k to ~14k ops/s single-
+// threaded, since fsync now fires on nearly every record instead of never).
+// This linger is intentionally much smaller than a typical fsync latency,
+// so it costs little when nothing else is happening, but gives real
+// concurrent load a genuine window to accumulate into one batch instead of
+// paying its own separate fsync.
+const LOG_BATCH_LINGER: Duration = Duration::from_micros(200);
+
 fn undo_log_runner(file: impl DBFile, recv: Receiver<MsgType>) -> Result<(), StoreError> {
     let mut file = file;
     loop {
-        let msg = recv
+        // Block for the first message, then linger briefly for more to
+        // accumulate into the same batch (see LOG_BATCH_LINGER's own
+        // comment) — stopping at the first timeout, not retrying the full
+        // linger window MAX_LOG_BATCH times, so an isolated single message
+        // only ever pays one linger's worth of extra latency.
+        let first = recv
             .recv()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        match msg {
-            MsgType::ShutDown => {
-                break;
+        let mut batch: Vec<u8> = Vec::new();
+        let mut special: Option<MsgType> = None;
+        let mut pending = Some(first);
+        for _ in 0..MAX_LOG_BATCH {
+            let msg = match pending.take() {
+                Some(m) => m,
+                None => match recv.recv_timeout(LOG_BATCH_LINGER) {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+            };
+            match msg {
+                MsgType::ShutDown | MsgType::Checkpoint(_) => {
+                    // Stop batching here — flush what's accumulated so far
+                    // (preserving order: everything queued strictly before
+                    // this message lands on disk first), then handle this
+                    // message on its own once the batch write below runs.
+                    special = Some(msg);
+                    break;
+                }
+                MsgType::Undo(undo_op) => {
+                    // Write the full MsgType wrapper, not just the inner
+                    // UndoOperation: load_logs (and any future recovery
+                    // replay) needs a uniform, self-describing tag on every
+                    // record so it can tell Undo/Redo/Checkpoint entries
+                    // apart while scanning the file.
+                    batch.extend_from_slice(&to_allocvec(&MsgType::Undo(undo_op))?);
+                }
+                MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
             }
-            MsgType::Undo(undo_op) => {
-                // Write the full MsgType wrapper, not just the inner
-                // UndoOperation: load_logs (and any future recovery replay)
-                // needs a uniform, self-describing tag on every record so
-                // it can tell Undo/Redo/Checkpoint entries apart while
-                // scanning the file — Checkpoint already did this
-                // correctly; a plain UndoOperation on its own can't be
-                // told apart from one by a reader that doesn't already
-                // know where the record boundaries are.
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(&to_allocvec(&MsgType::Undo(undo_op))?)?;
-            }
-            MsgType::Redo(r) => panic!("Unexpected redo in undo loop {:?}", r),
-            MsgType::Checkpoint(_ts) => file.truncate()?,
+        }
+        if !batch.is_empty() {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&batch)?;
+            file.do_sync()?;
+        }
+        match special {
+            Some(MsgType::ShutDown) => break,
+            Some(MsgType::Checkpoint(_ts)) => file.truncate()?,
+            _ => {}
         }
     }
     Ok(())
@@ -411,23 +542,54 @@ fn redo_log_runner(
 ) -> Result<(), StoreError> {
     let mut file = file;
     loop {
-        let msg = recv
+        // See undo_log_runner's matching comment on LOG_BATCH_LINGER.
+        let first = recv
             .recv()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        match msg {
-            MsgType::ShutDown => {
-                break;
+        let mut batch: Vec<u8> = Vec::new();
+        let mut highest_lsn: Option<LsnId> = None;
+        let mut special: Option<MsgType> = None;
+        let mut pending = Some(first);
+        for _ in 0..MAX_LOG_BATCH {
+            let msg = match pending.take() {
+                Some(m) => m,
+                None => match recv.recv_timeout(LOG_BATCH_LINGER) {
+                    Ok(m) => m,
+                    Err(_) => break,
+                },
+            };
+            match msg {
+                MsgType::ShutDown | MsgType::Checkpoint(_) => {
+                    special = Some(msg);
+                    break;
+                }
+                MsgType::Redo(redo_op) => {
+                    // See undo_log_runner's matching comment: write the full
+                    // MsgType wrapper, not just the inner RedoOperation.
+                    highest_lsn = Some(match highest_lsn {
+                        Some(l) if l.0 >= redo_op.lsn_id.0 => l,
+                        _ => redo_op.lsn_id,
+                    });
+                    batch.extend_from_slice(&to_allocvec(&MsgType::Redo(redo_op))?);
+                }
+                MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
             }
-            MsgType::Redo(redo_op) => {
-                // See undo_log_runner's matching comment: write the full
-                // MsgType wrapper, not just the inner RedoOperation.
-                let lsn_id = redo_op.lsn_id;
-                file.seek(SeekFrom::End(0))?;
-                file.write_all(&to_allocvec(&MsgType::Redo(redo_op))?)?;
-                clock.mark_written(lsn_id);
+        }
+        if !batch.is_empty() {
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(&batch)?;
+            file.do_sync()?;
+            // Only after the whole batch is durable — mark_written signals
+            // "everything up to this lsn is safe to flush its page", which
+            // must not be true before the bytes actually landed.
+            if let Some(lsn) = highest_lsn {
+                clock.mark_written(lsn);
             }
-            MsgType::Undo(u) => panic!("Unexpected undo in redo loop {:?}", u),
-            MsgType::Checkpoint(_ts) => file.truncate()?,
+        }
+        match special {
+            Some(MsgType::ShutDown) => break,
+            Some(MsgType::Checkpoint(_ts)) => file.truncate()?,
+            _ => {}
         }
     }
     Ok(())

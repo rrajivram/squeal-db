@@ -243,6 +243,31 @@ where
         }
         let mut header = page.header();
         if header.used_size() > header.usable_data_size() {
+            // The overflow chain this branch builds is only valid for a
+            // genuinely oversized SINGLE tuple: Page::can_store's own
+            // "empty page always accepts" exception is the only way a page
+            // is meant to end up needing one, and a page in that state
+            // holds exactly that one tuple (count() == 1). A page holding
+            // more than one tuple must never reach here — BPlusTree::update
+            // guards against letting an ordinary multi-tuple page's
+            // used_size exceed capacity via in-place replace (see its own
+            // comment). If it ever does anyway (a bug elsewhere), building
+            // an overflow chain here would clobber this page's next_page —
+            // which points at the next SIBLING data page, not an overflow
+            // page — silently corrupting table_scan's walk instead of
+            // surfacing the bug. Fail loudly instead.
+            if page.count()? > 1 {
+                return Err(StoreError::UnknownError(format!(
+                    "handle_large_page_size: {:?} holds {} tuples (used={} > usable={}) — \
+                     a multi-tuple page must never need an overflow chain; refusing to \
+                     avoid corrupting its next_page (the data-chain link to the next \
+                     sibling page)",
+                    page_id,
+                    page.count()?,
+                    header.used_size(),
+                    header.usable_data_size()
+                )));
+            }
             let orig_next_page = page.get_next_page();
             // Number of overflow pages needed beyond the primary: ceil((used-1)/data_size).
             // This is (used_size - 1) / data_size in integer division.
@@ -762,7 +787,7 @@ impl Rem<PageId> for PageId {
 }
 
 fn writer<F: DBFile>(
-    file: F,
+    mut file: F,
     header: Arc<Header>,
     recv: Receiver<BufMsg>,
     clock: Arc<LsnClock>,
@@ -839,7 +864,7 @@ fn writer<F: DBFile>(
         // pending as last_lsn advances.
         match recv.recv_timeout(Duration::from_millis(1)) {
             Ok(BufMsg::Checkpoint(tx)) => {
-                let res = {
+                let res = (|| {
                     for m in pending.drain(..) {
                         write_page(
                             m.page_num,
@@ -850,8 +875,20 @@ fn writer<F: DBFile>(
                         )?;
                         m.page.set_dirty(false)?;
                     }
+                    // A checkpoint's entire point is "everything up to here is
+                    // durable" — the redo/undo logs get truncated right after
+                    // this returns (Db::checkpoint), on the assumption that
+                    // whatever they'd replay is already safely on disk. Without
+                    // an actual fsync, "on disk" only ever meant "handed to the
+                    // OS via write()" — recoverable across a process crash via
+                    // WAL replay, but not across a real power loss, since the
+                    // OS's own page cache might not have been flushed yet. This
+                    // closes that gap for the specific point where it matters
+                    // most: right before we discard the only other record of
+                    // this data.
+                    file.do_sync()?;
                     Ok(())
-                };
+                })();
                 let _ = tx.send(res);
             }
             Ok(BufMsg::Shutdowm) => {
@@ -867,6 +904,10 @@ fn writer<F: DBFile>(
                     )?;
                     m.page.set_dirty(false)?;
                 }
+                // Same rationale as Checkpoint above: close() truncates the
+                // WAL right after this returns, so this is the last point
+                // page data can be made durable before that happens.
+                file.do_sync()?;
                 break;
             }
             Ok(BufMsg::WritePage(msg)) => {

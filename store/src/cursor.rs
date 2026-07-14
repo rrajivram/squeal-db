@@ -162,6 +162,7 @@ where
             return Ok(None);
         }
         let table = self.db.table_by_id(self.table)?;
+        let reader = self.transaction.id();
         loop {
             match self.next_index_entry(&table)? {
                 Some(entry) => {
@@ -188,7 +189,7 @@ where
                     let Some(tuple) = table.resolve_index_entry(&entry)? else {
                         continue;
                     };
-                    match self.db.find_last_committed(&tuple) {
+                    match self.db.find_visible_to(&tuple, &reader) {
                         Some(committed) if !committed.is_tombstoned() => {
                             return Ok(Some(committed.into_owned()));
                         }
@@ -219,9 +220,10 @@ where
     //     committed remove's tombstone, matching Db::find's own check) —
     //     it must be treated as absent, the same way Db::find does.
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
+        let reader = self.transaction.id();
         loop {
             match self.next_tuple()? {
-                Some(t) => match self.db.find_last_committed(&t) {
+                Some(t) => match self.db.find_visible_to(&t, &reader) {
                     Some(committed) if !committed.is_tombstoned() => {
                         return Ok(Some(committed.into_owned()));
                     }
