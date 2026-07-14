@@ -403,12 +403,14 @@ where
         let mut buf = buffer;
         let (mut committed, mut inprogress, mut rollback) =
             (HashSet::new(), HashSet::new(), HashSet::new());
+        let mut lsn_id = None;
         while !buf.is_empty() {
             let (redo, remaining) = take_from_bytes::<MsgType>(buf)?;
             buf = remaining;
             match redo {
                 MsgType::Redo(redo) => {
                     let op = redo.operation;
+                    lsn_id = Some(redo.lsn_id);
                     match op {
                         Operation::Add(t, _r) | Operation::Mod(t, _r) | Operation::Del(t, _r) => {
                             inprogress.insert(t);
@@ -447,6 +449,14 @@ where
                     _ => {}
                 }
             };
+        }
+        if let Some(lsn_id) = lsn_id {
+            self.logger.clock().mark_written(lsn_id);
+            // See LsnClock::advance_counter_past's own doc comment: without
+            // this, the counter restarts at 0 on reopen, and the first new
+            // write's redo record landing regresses the watermark this just
+            // set right back down.
+            self.logger.clock().advance_counter_past(lsn_id);
         }
         Ok(count)
     }
@@ -1183,9 +1193,7 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        panic!(
-            "timed out waiting for {expected_redo} redo / {expected_undo} undo records to land"
-        );
+        panic!("timed out waiting for {expected_redo} redo / {expected_undo} undo records to land");
     }
 
     // The file header's page_count is only ever (re)written to disk by an
@@ -2834,6 +2842,94 @@ mod tests {
         drop(t);
 
         FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    // --- LSN watermark continuity across reopen ---
+    //
+    // process_redo now tracks the highest lsn_id seen while scanning the
+    // redo log and calls `self.logger.clock().mark_written(lsn_id)` after
+    // replay — intent: a freshly reopened Db's LsnClock (which otherwise
+    // starts cold, watermark = u64::MAX) picks up where the prior session's
+    // durable history left off, instead of forgetting it ever happened.
+
+    fn wait_for_watermark_at_least(db: &TestDB, min: u64) {
+        for _ in 0..1000 {
+            if db.logger.clock().last_written().0 >= min {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for the LSN watermark to reach at least {min}");
+    }
+
+    #[test]
+    fn test_replay_seeds_lsn_watermark_from_prior_session() {
+        let (db, tid) = make_db_with_table();
+        for i in 0..5u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+        // 5 Add + 5 Commit redo records, each with its own increasing lsn.
+        wait_for_durable_logs(&db, 10, 10);
+        let watermark_before_crash = db.logger.clock().last_written();
+        assert_ne!(
+            watermark_before_crash.0,
+            u64::MAX,
+            "sanity: the live session's own watermark must already be a real value, \
+             not the cold-start sentinel"
+        );
+
+        sync_header_without_truncating_logs(&db);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        assert_eq!(
+            db2.logger.clock().last_written(),
+            watermark_before_crash,
+            "replay must seed the reopened db's watermark from the highest lsn in the \
+             prior session's redo log, not leave it at the cold-start sentinel"
+        );
+    }
+
+    // The deeper claim in "so it doesn't regress": once seeded by replay,
+    // the watermark must never fall below where replay left it, even as
+    // brand-new writes land in the new session. If the new session's lsn
+    // *counter* isn't also resumed past the old session's highest value (a
+    // freshly reset counter mints 0, 1, 2, ... again), the very first new
+    // write's redo record durably landing calls mark_written with that low,
+    // reused lsn — regressing the watermark right back down, undoing what
+    // replay just established.
+    #[test]
+    fn test_lsn_watermark_does_not_regress_after_new_writes_post_reopen() {
+        let (db, tid) = make_db_with_table();
+        for i in 0..5u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+            db.commit(t).unwrap();
+        }
+        wait_for_durable_logs(&db, 10, 10);
+        sync_header_without_truncating_logs(&db);
+        let (f, u, r) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let watermark_after_replay = db2.logger.clock().last_written();
+
+        let t = db2.begin().unwrap();
+        db2.insert(tid, row(999, b"new-after-reopen"), &t).unwrap();
+        db2.commit(t).unwrap();
+        wait_for_watermark_at_least(&db2, watermark_after_replay.0);
+
+        assert!(
+            db2.logger.clock().last_written().0 >= watermark_after_replay.0,
+            "a new write's own redo record landing regressed the watermark from {} down to {} — \
+             the lsn counter must resume past the prior session's highest lsn, not just the \
+             watermark",
+            watermark_after_replay.0,
+            db2.logger.clock().last_written().0
+        );
     }
 
     #[test]

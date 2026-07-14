@@ -342,7 +342,7 @@ mod tests {
 
     use crate::{
         generator::Generator,
-        txn::{TransactionId, TransactionManager},
+        txn::{TransactionId, TransactionInner, TransactionManager},
     };
 
     fn make_mgr() -> TransactionManager {
@@ -436,10 +436,24 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_equality_by_id_ignores_ts() {
-        let t1 = TransactionId::new(42);
-        let t2 = TransactionId::new(42);
+    fn test_txn_equality_requires_matching_id_and_ts() {
+        // See TransactionInner's PartialEq doc comment: equality checks both
+        // id and ts, not just id, so two separately-constructed ids sharing
+        // a numeric id are NOT the same transaction unless they also share a
+        // ts (e.g. via clone()). Builds ts directly (rather than via
+        // TransactionId::new, which mints a fresh timestamp()) so the two
+        // "different transaction" instances below are deterministically
+        // guaranteed to differ, not dependent on two timestamp() calls
+        // landing on different nanoseconds.
+        let t1 = TransactionId(Arc::new(TransactionInner { id: 42, ts: 1 }));
+        let t2 = t1.clone();
         assert_eq!(t1, t2);
+
+        let t3 = TransactionId(Arc::new(TransactionInner { id: 42, ts: 2 }));
+        assert_ne!(
+            t1, t3,
+            "same numeric id but a different ts must not compare equal"
+        );
     }
 
     #[test]

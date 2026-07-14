@@ -60,6 +60,22 @@ impl LsnClock {
         self.last_written
             .store(lsn.0, std::sync::atomic::Ordering::Relaxed);
     }
+
+    /// Ensure `next_lsn()` never mints a value <= `lsn`. Used by replay
+    /// (process_redo) once it has scanned the prior session's redo log and
+    /// knows the highest lsn it used: a freshly reopened `Db`'s `LsnClock`
+    /// otherwise starts `counter` back at 0 (see `Default`), so the very
+    /// first new write after reopen would reuse an already-used lsn — and
+    /// once that write's own redo record durably lands, `mark_written`
+    /// would stamp the watermark with that low, reused value, regressing it
+    /// right back down from whatever replay just (correctly) set it to.
+    /// `fetch_max` (not a plain store) so this is safe to call even if
+    /// something has already advanced the counter past `lsn` by the time
+    /// this runs.
+    pub(crate) fn advance_counter_past(&self, lsn: LsnId) {
+        self.counter
+            .fetch_max(lsn.0 + 1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
