@@ -106,6 +106,20 @@ impl<T> PageType for T where T: PageTuple + Clone + PartialEq + std::fmt::Debug 
 
 impl Eq for PageId {}
 
+// The tuple store and its byte-accounting must change together — locking
+// them separately would let a reader observe a page_used_size that doesn't
+// match the data it just read (or vice versa). See Page's own doc comment
+// on why this is a lock, not an Arc<dyn PageTuple> mutated via
+// Arc::make_mut: a single-record insert/update/remove only ever touches one
+// key, so mutating in place under a write lock (what BTreeMap::insert/
+// remove already do internally, no cloning involved) is strictly cheaper
+// than cloning the whole store first just to get unique ownership.
+#[derive(Debug)]
+struct PageInner {
+    data: Box<dyn PageTuple>,
+    page_used_size: DBSizeType,
+}
+
 ///Page Invariants
 /// when written lsn = non-zero
 /// Rows added must have txn id and undo id set
@@ -114,11 +128,12 @@ impl Eq for PageId {}
 // PT doesn't need Serialize/Deserialize — PageDto handles that via to_bytes/from_bytes.
 //#[serde(bound = "PT: PageType")]
 pub(crate) struct Page {
-    data: Arc<dyn PageTuple>,
+    // See PageInner's own comment for why data and page_used_size are
+    // bundled behind one lock instead of Arc<dyn PageTuple> + a plain field.
+    inner: RwLock<PageInner>,
     next_page: AtomicU64,
     dirty: AtomicBool,
     page_data_size: DBSizeType,
-    page_used_size: DBSizeType,
     record_size: Option<usize>,
     lsn: RwLock<LsnId>,
     // This database's WAL clock, injected by the PageBuffer that owns the page.
@@ -152,17 +167,19 @@ impl Page {
     fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
         let ds = size - PAGE_OVERHEAD as DBSizeType;
         let ts = timestamp();
-        let pt: Arc<dyn PageTuple> = if let Some(record_size) = record_size {
-            Arc::new(FixedTuplePage::new(record_size))
+        let pt: Box<dyn PageTuple> = if let Some(record_size) = record_size {
+            Box::new(FixedTuplePage::new(record_size))
         } else {
-            Arc::new(AnyTuplePage::new())
+            Box::new(AnyTuplePage::new())
         };
         Self {
-            data: pt,
+            inner: RwLock::new(PageInner {
+                data: pt,
+                page_used_size: 0,
+            }),
             next_page: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
             page_data_size: ds,
-            page_used_size: 0,
             record_size,
             lsn: RwLock::new(LsnId(0)),
             lsn_clock: None,
@@ -177,7 +194,7 @@ impl Page {
         PageHeader {
             next_page: self.next_page.load(std::sync::atomic::Ordering::Relaxed),
             page_data_size: self.page_data_size,
-            page_used_size: self.page_used_size,
+            page_used_size: self.inner.read().unwrap().page_used_size,
             record_size: self.record_size,
             lsn: *self.lsn.read().unwrap(),
             flags: self.flags.load(std::sync::atomic::Ordering::Relaxed),
@@ -263,31 +280,26 @@ impl Page {
         self.lsn_clock = Some(clock);
     }
 
-    /// Mutable access to the tuple store. Sound because every mutating Page
-    /// method takes `&mut self`, only reachable after `Arc::make_mut(&mut
-    /// Arc<Page>)` has made this Page uniquely owned — so its `data` Arc has a
-    /// single strong ref and `get_mut` succeeds. A `None` here would mean that
-    /// copy-on-write invariant was violated, so it surfaces as an error rather
-    /// than silently corrupting a shared page.
-    fn data_mut(&mut self) -> Result<&mut (dyn PageTuple + 'static), StoreError> {
-        Arc::get_mut(&mut self.data).ok_or_else(|| {
-            StoreError::UnknownError(
-                "page tuple store aliased while mutating through &mut Page (COW invariant violated)"
-                    .into(),
-            )
-        })
-    }
-
-    pub(crate) fn clear(&mut self) -> Result<(), StoreError> {
-        self.data_mut()?.clear()?;
-        self.page_used_size = 0;
+    pub(crate) fn clear(&self) -> Result<(), StoreError> {
+        {
+            let mut inner = self.inner.write()?;
+            inner.data.clear()?;
+            inner.page_used_size = 0;
+        }
         self.set_dirty(true)?;
         Ok(())
     }
 
     pub(crate) fn iter(&self) -> PageTupleIterator {
         PageTupleIterator {
-            data: self.data.values().unwrap_or_default().into_iter(),
+            data: self
+                .inner
+                .read()
+                .unwrap()
+                .data
+                .values()
+                .unwrap_or_default()
+                .into_iter(),
         }
     }
 
@@ -316,10 +328,19 @@ impl Page {
         // chain. This keeps overflow off the common path: ordinary pages fill to
         // capacity and link to the next data page instead of every near-full
         // page spilling into (and rewriting) an overflow chain on each write.
-        self.page_used_size == 0 || self.page_used_size + tuple.size() <= self.usable_data_size()
+        let used = self.inner.read().unwrap().page_used_size;
+        used == 0 || used + tuple.size() <= self.usable_data_size()
     }
 
-    pub(crate) fn add_tuple(&mut self, tuple: Tuple) -> Result<(), StoreError> {
+    // &self, not &mut self: single-record mutation only needs a write lock on
+    // `inner`, not unique ownership of the whole Page. This is what lets a
+    // caller mutate a shared Arc<Page> directly (see WritePageHandle) instead
+    // of paying for Arc::make_mut's whole-store clone just to change one
+    // record — the per-page write lock callers already hold (see
+    // PageBuffer::get_page_mut) still serializes writers the same as before;
+    // this only removes the *extra* unique-ownership requirement layered on
+    // top of that.
+    pub(crate) fn add_tuple(&self, tuple: Tuple) -> Result<(), StoreError> {
         // Checked ahead of can_store(): can_store's fullness check is about
         // aggregate bytes used on this page, not any one tuple's own budget,
         // so once a fixed-record page (record_size = Some(n), i.e. backed by
@@ -338,49 +359,62 @@ impl Page {
             return Err(StoreError::PageCapacityError);
         }
         let sz = tuple.size();
-        self.data_mut()?.add(tuple)?;
-        self.page_used_size += sz;
+        {
+            let mut inner = self.inner.write()?;
+            inner.data.add(tuple)?;
+            inner.page_used_size += sz;
+        }
         self.set_dirty(true)?;
         Ok(())
     }
 
-    pub(crate) fn remove_tuple(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
-        let old = self.data_mut()?.remove(id)?;
-        // checked_sub: an underflow here would wrap page_used_size to ~u64::MAX,
-        // which then drives handle_large_page_size to allocate a giant overflow
-        // chain (observed: 21 GB file / OOM). Surface it as an error instead.
-        self.page_used_size = self.page_used_size.checked_sub(old.size()).ok_or_else(|| {
-            StoreError::UnknownError(format!(
-                "remove_tuple used_size underflow: used={} old={}",
-                self.page_used_size,
-                old.size()
-            ))
-        })?;
+    pub(crate) fn remove_tuple(&self, id: DBIdType) -> Result<Tuple, StoreError> {
+        let old = {
+            let mut inner = self.inner.write()?;
+            let old = inner.data.remove(id)?;
+            // checked_sub: an underflow here would wrap page_used_size to
+            // ~u64::MAX, which then drives handle_large_page_size to allocate
+            // a giant overflow chain (observed: 21 GB file / OOM). Surface it
+            // as an error instead.
+            inner.page_used_size =
+                inner.page_used_size.checked_sub(old.size()).ok_or_else(|| {
+                    StoreError::UnknownError(format!(
+                        "remove_tuple used_size underflow: used={} old={}",
+                        inner.page_used_size,
+                        old.size()
+                    ))
+                })?;
+            old
+        };
         self.set_dirty(true)?;
         Ok(old)
     }
 
-    pub(crate) fn replace_tuple(
-        &mut self,
-        id: &DBIdType,
-        tuple: Tuple,
-    ) -> Result<Tuple, StoreError> {
+    pub(crate) fn replace_tuple(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         let new_size = tuple.size();
-        let old = self.data_mut()?.replace(id, tuple)?;
-        let old_size = old.size();
-        self.page_used_size = self.page_used_size.checked_sub(old_size).ok_or_else(|| {
-            StoreError::UnknownError(format!(
-                "replace_tuple used_size underflow: used={} old={}",
-                self.page_used_size, old_size
-            ))
-        })?;
-        self.page_used_size += new_size;
+        let old = {
+            let mut inner = self.inner.write()?;
+            let old = inner.data.replace(id, tuple)?;
+            let old_size = old.size();
+            inner.page_used_size =
+                inner
+                    .page_used_size
+                    .checked_sub(old_size)
+                    .ok_or_else(|| {
+                        StoreError::UnknownError(format!(
+                            "replace_tuple used_size underflow: used={} old={}",
+                            inner.page_used_size, old_size
+                        ))
+                    })?;
+            inner.page_used_size += new_size;
+            old
+        };
         self.set_dirty(true)?;
         Ok(old)
     }
 
     pub(crate) fn count(&self) -> Result<usize, StoreError> {
-        self.data.count()
+        self.inner.read()?.data.count()
     }
 
     pub(crate) fn written(&self) {
@@ -397,28 +431,27 @@ impl Page {
     }
 
     pub(crate) fn contains(&self, id: DBIdType) -> Result<bool, StoreError> {
-        self.data.contains(&id)
+        self.inner.read()?.data.contains(&id)
     }
 
     pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
-        self.data.get(&id)
+        self.inner.read()?.data.get(&id)
     }
 
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        /*         let mut v = to_allocvec(&self).unwrap_or_default();
-               if v.len() < self.data_size as usize + PAGE_OVERHEAD {
-                   v.append(&mut vec![
-                       0u8;
-                       (self.data_size as usize + PAGE_OVERHEAD) - v.len()
-                   ]);
-               }
-               v
-        */
         let mut v = to_allocvec(&self.header()).unwrap_or_default();
         if v.len() < PAGE_OVERHEAD {
             v.append(&mut vec![0u8; PAGE_OVERHEAD - v.len()]);
         }
-        v.extend_from_slice(&self.data.to_bytes().unwrap_or_default());
+        v.extend_from_slice(
+            &self
+                .inner
+                .read()
+                .unwrap()
+                .data
+                .to_bytes()
+                .unwrap_or_default(),
+        );
         if v.len() < self.page_data_size as usize + PAGE_OVERHEAD {
             v.append(&mut vec![
                 0u8;
@@ -430,7 +463,7 @@ impl Page {
     }
 
     pub(crate) fn to_data_bytes(&self) -> Vec<u8> {
-        let mut v = self.data.to_bytes().unwrap_or_default();
+        let mut v = self.inner.read().unwrap().data.to_bytes().unwrap_or_default();
         if v.len() < self.page_data_size as usize {
             v.append(&mut vec![0u8; self.page_data_size as usize - v.len()]);
         }
@@ -444,17 +477,19 @@ impl Page {
         // Deserialize the tuple payload with `?` rather than routing through the
         // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
         // read into a panic instead of a recoverable StoreError.
-        let pt: Arc<dyn PageTuple> = if header.record_size.is_some() {
-            Arc::new(FixedTuplePage::from_bytes(data)?)
+        let pt: Box<dyn PageTuple> = if header.record_size.is_some() {
+            Box::new(FixedTuplePage::from_bytes(data)?)
         } else {
-            Arc::new(AnyTuplePage::from_bytes(data)?)
+            Box::new(AnyTuplePage::from_bytes(data)?)
         };
         Ok(Self {
-            data: pt,
+            inner: RwLock::new(PageInner {
+                data: pt,
+                page_used_size: header.page_used_size,
+            }),
             next_page: AtomicU64::new(header.next_page),
             dirty: AtomicBool::new(false),
             page_data_size: header.page_data_size,
-            page_used_size: header.page_used_size,
             record_size: header.record_size,
             flags: AtomicU16::new(header.flags),
             lsn: RwLock::new(header.lsn),
@@ -550,17 +585,19 @@ impl Iterator for PageTupleIterator {
 
 impl From<PageDto> for Page {
     fn from(value: PageDto) -> Self {
-        let pt: Arc<dyn PageTuple> = if let Some(_record_size) = value.record_size {
-            Arc::new(FixedTuplePage::from_bytes(&value.data).unwrap())
+        let pt: Box<dyn PageTuple> = if let Some(_record_size) = value.record_size {
+            Box::new(FixedTuplePage::from_bytes(&value.data).unwrap())
         } else {
-            Arc::new(AnyTuplePage::from_bytes(&value.data).unwrap())
+            Box::new(AnyTuplePage::from_bytes(&value.data).unwrap())
         };
         Self {
-            data: pt,
+            inner: RwLock::new(PageInner {
+                data: pt,
+                page_used_size: value.page_used_size,
+            }),
             next_page: AtomicU64::new(value.next_page),
             dirty: AtomicBool::new(false),
             page_data_size: value.page_data_size,
-            page_used_size: value.page_used_size,
             record_size: value.record_size,
             flags: AtomicU16::new(value.flags),
             lsn: RwLock::new(value.lsn),
@@ -574,32 +611,39 @@ impl From<PageDto> for Page {
 
 impl From<Page> for PageDto {
     fn from(value: Page) -> Self {
+        // into_inner(), not read(): value is owned here, so there's no other
+        // referent that could still hold the lock — this is a plain field
+        // access, not a real lock acquisition.
+        let inner = value.inner.into_inner().unwrap();
         Self {
             next_page: value.next_page.load(std::sync::atomic::Ordering::Relaxed),
             page_data_size: value.page_data_size,
-            page_used_size: value.page_used_size,
+            page_used_size: inner.page_used_size,
             record_size: value.record_size,
             lsn: *value.lsn.read().unwrap(),
             flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
-            data: value.data.to_bytes().unwrap(),
+            data: inner.data.to_bytes().unwrap(),
         }
     }
 }
 
 impl Clone for Page {
     fn clone(&self) -> Self {
+        // Deep-copy, not a shared pointer: independent Page values (e.g. a
+        // standalone test fixture, or PageBuffer::write_page's &Page ->
+        // owned-Page conversion) must not alias each other's tuple store.
+        // Ordinary in-place mutation of an already-shared Arc<Page> goes
+        // through add_tuple/remove_tuple/replace_tuple's own locking instead
+        // of this Clone impl — see their own comments.
+        let inner = self.inner.read().unwrap();
         Self {
-            // Deep-copy, not Arc::clone: a Page is mutated through `&mut Page`
-            // obtained via Arc::make_mut, which calls this clone when the page is
-            // shared. Sharing the inner Arc instead would let the freshly-cloned
-            // (now "unique") page still alias the original's store, leaking
-            // mutations back into the cached page or a page mid-serialization on
-            // the writer thread — corrupting used_size/data and losing updates.
-            data: self.data.deep_clone(),
+            inner: RwLock::new(PageInner {
+                data: inner.data.deep_clone(),
+                page_used_size: inner.page_used_size,
+            }),
             next_page: AtomicU64::new(self.next_page.load(std::sync::atomic::Ordering::Relaxed)),
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
             page_data_size: self.page_data_size,
-            page_used_size: self.page_used_size,
             record_size: self.record_size,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(*self.lsn.read().unwrap()),
@@ -613,7 +657,7 @@ impl Clone for Page {
 
 impl PartialEq for Page {
     fn eq(&self, rhs: &Self) -> bool {
-        self.page_used_size == rhs.page_used_size
+        self.inner.read().unwrap().page_used_size == rhs.inner.read().unwrap().page_used_size
             && self.page_data_size == rhs.page_data_size
             && self.next_page.load(std::sync::atomic::Ordering::Relaxed)
                 == rhs.next_page.load(std::sync::atomic::Ordering::Relaxed)
@@ -661,13 +705,13 @@ impl PageId {
     }
 }
 
-// SAFETY: needed only because `data: Arc<dyn PageTuple>` is a trait object
-// without Send+Sync bounds. The concrete stores (AnyTuplePage/FixedTuplePage)
-// are Send+Sync plain data. Sharing `&Page` across threads is sound: `&self`
-// methods only read the store (concurrent BTreeMap reads are fine) and the
-// genuinely-shared mutable fields are atomics / a lock. Mutation requires
-// `&mut Page`, which the copy-on-write model (Arc::make_mut) hands out only for
-// a uniquely-owned page, so no thread can observe a page while it is written.
+// SAFETY: needed only because `data: Box<dyn PageTuple>` (inside PageInner)
+// is a trait object without Send+Sync bounds. The concrete stores
+// (AnyTuplePage/FixedTuplePage) are Send+Sync plain data. Sharing `&Page`
+// across threads is sound: every mutating method (add_tuple/remove_tuple/
+// replace_tuple/clear) takes `&self` and mutates through `inner`'s own
+// RwLock, and the other genuinely-shared mutable fields are atomics / a
+// lock — there is no field left that's mutated without synchronization.
 unsafe impl Sync for Page {}
 unsafe impl Send for Page {}
 
@@ -684,7 +728,7 @@ mod tests {
 
     #[test]
     fn page_test_unique_id() {
-        let mut p = Page::new_data(2000);
+        let p = Page::new_data(2000);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert!(matches!(
@@ -703,7 +747,7 @@ mod tests {
         // doesn't see — see USABLE_DATA_MARGIN), so fitting 10 tuples with 1
         // byte to spare needs that margin folded into the requested page size.
         let page_size = tuple_sz * 10 + USABLE_DATA_MARGIN + PAGE_OVERHEAD as u64 + 1;
-        let mut p = Page::new_data(page_size);
+        let p = Page::new_data(page_size);
         for i in 0..10 {
             assert!(
                 p.add_tuple(Tuple::new(i, b"abcdef")).is_ok(),
@@ -729,7 +773,7 @@ mod tests {
 
     #[test]
     fn page_test_get_existing_and_missing() {
-        let mut p = Page::new_data(2000);
+        let p = Page::new_data(2000);
         p.add_tuple(Tuple::new(7, b"payload")).unwrap();
         let found = p.get(DBIdType::Int(7)).unwrap();
         assert!(found.is_some());
@@ -740,7 +784,7 @@ mod tests {
 
     #[test]
     fn page_test_contains() {
-        let mut p = Page::new_data(2000);
+        let p = Page::new_data(2000);
         p.add_tuple(Tuple::new(3, b"x")).unwrap();
         assert!(p.contains(DBIdType::Int(3)).unwrap());
         assert!(!p.contains(DBIdType::Int(4)).unwrap());
@@ -748,7 +792,7 @@ mod tests {
 
     #[test]
     fn page_test_iter_yields_all_tuples() {
-        let mut p = Page::new_data(4000);
+        let p = Page::new_data(4000);
         for i in 0..5u64 {
             p.add_tuple(Tuple::new(i, b"data")).unwrap();
         }
@@ -784,7 +828,7 @@ mod tests {
 
     #[test]
     fn page_test_roundtrip_preserves_tuples() {
-        let mut p = Page::new_data(2000);
+        let p = Page::new_data(2000);
         p.add_tuple(Tuple::new(1, b"first")).unwrap();
         p.add_tuple(Tuple::new(2, b"second")).unwrap();
         let bytes = p.to_bytes();
@@ -811,7 +855,7 @@ mod tests {
 
     #[test]
     fn page_iter_any_correct_data() {
-        let mut p = Page::new_data(4000);
+        let p = Page::new_data(4000);
         p.add_tuple(Tuple::new(1, b"alpha")).unwrap();
         p.add_tuple(Tuple::new(2, b"beta")).unwrap();
         p.add_tuple(Tuple::new(3, b"gamma")).unwrap();
@@ -823,7 +867,7 @@ mod tests {
 
     #[test]
     fn page_iter_any_after_roundtrip() {
-        let mut p = Page::new_data(2000);
+        let p = Page::new_data(2000);
         p.add_tuple(Tuple::new(10, b"x")).unwrap();
         p.add_tuple(Tuple::new(20, b"y")).unwrap();
         let p2 = Page::from_bytes(&p.to_bytes()).unwrap();
@@ -842,7 +886,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_correct_count() {
         let record_size = Tuple::new(0, b"data").size() as usize;
-        let mut p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size);
         for i in 0..4u64 {
             p.add_tuple(Tuple::new(i, b"data")).unwrap();
         }
@@ -852,7 +896,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_correct_data() {
         let record_size = Tuple::new(0, b"hello").size() as usize;
-        let mut p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size);
         p.add_tuple(Tuple::new(10, b"hello")).unwrap();
         p.add_tuple(Tuple::new(20, b"hello")).unwrap();
         assert!(p.iter().all(|t| t.data.to_vec() == b"hello"));
@@ -870,7 +914,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_oversized_rejected_iter_stays_empty() {
         let record_size = Tuple::new(0, b"hi").size() as usize;
-        let mut p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size);
         assert!(p.add_tuple(Tuple::new(1, b"way_too_long_payload")).is_err());
         assert_eq!(p.iter().count(), 0);
     }
@@ -878,7 +922,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_after_roundtrip() {
         let record_size = Tuple::new(0, b"abc").size() as usize;
-        let mut p = FixedPage::new_indexed(2000, record_size);
+        let p = FixedPage::new_indexed(2000, record_size);
         p.add_tuple(Tuple::new(1, b"abc")).unwrap();
         p.add_tuple(Tuple::new(2, b"abc")).unwrap();
         let p2 = FixedPage::from_bytes(&p.to_bytes()).unwrap();
@@ -894,7 +938,7 @@ mod tests {
 
     #[test]
     fn test_any_size_tuple_accepted_while_page_has_capacity() {
-        let mut p = Page::new_data(1000);
+        let p = Page::new_data(1000);
         let big_data = vec![0u8; 2000]; // much larger than page_data_size
         assert!(p.can_store(&Tuple::new(1, &big_data)));
         assert!(p.add_tuple(Tuple::new(1, &big_data)).is_ok());
@@ -902,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_used_size_tracks_tuple_size() {
-        let mut p = Page::new_data(1000);
+        let p = Page::new_data(1000);
         let t = Tuple::new(1, b"hello");
         let expected = t.size();
         p.add_tuple(t).unwrap();
@@ -911,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_can_store_false_after_oversized_tuple() {
-        let mut p = Page::new_data(1000);
+        let p = Page::new_data(1000);
         let big_data = vec![0u8; 2000]; // page_used_size will exceed page_data_size
         p.add_tuple(Tuple::new(1, &big_data)).unwrap();
         assert!(!p.can_store(&Tuple::new(2, b"x")));
@@ -919,7 +963,7 @@ mod tests {
 
     #[test]
     fn test_second_tuple_rejected_when_page_full() {
-        let mut p = Page::new_data(1000);
+        let p = Page::new_data(1000);
         let big_data = vec![0u8; 2000];
         p.add_tuple(Tuple::new(1, &big_data)).unwrap();
         assert!(matches!(
@@ -934,7 +978,7 @@ mod tests {
         // mimicking a too-small index_entry_size chosen for a BPlusTree's
         // index page.
         let record_size = Tuple::new(0, b"small").size() as usize;
-        let mut p = FixedPage::new_indexed(300, record_size);
+        let p = FixedPage::new_indexed(300, record_size);
         // Fill the page's aggregate byte budget with tuples that individually
         // stay within record_size, so page_used_size ends up close to
         // usable_data_size (can_store's own threshold) — the generic
@@ -966,7 +1010,7 @@ mod tests {
         // legitimate "no room right now" case for a tuple that fits its own
         // per-entry budget just fine.
         let record_size = Tuple::new(0, b"small").size() as usize;
-        let mut p = FixedPage::new_indexed(300, record_size);
+        let p = FixedPage::new_indexed(300, record_size);
         let mut i = 0u64;
         while p.can_store(&Tuple::new(i, b"small")) {
             p.add_tuple(Tuple::new(i, b"small")).unwrap();

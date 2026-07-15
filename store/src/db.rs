@@ -1104,7 +1104,7 @@ where
     }
 
     fn write_system_tables(&self) -> Result<(), StoreError> {
-        let mut page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size);
         let tables = self.tables.read();
         for (i, t) in tables.values().enumerate() {
             let bytes = to_allocvec(&t.table)?;
@@ -1113,10 +1113,10 @@ where
         }
         self.buffer.write_page(0usize.into(), &page)?;
         let gens = self.generator.get_values()?;
-        let mut page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
         self.buffer.write_page(1usize.into(), &page)?;
-        let mut page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size);
         page.add_tuple(Tuple::new(0, &to_allocvec(&self.buffer.get_free_pages())?))?;
         self.buffer.write_page(2usize.into(), &page)?;
 
