@@ -1269,7 +1269,7 @@ mod tests {
     fn test_write_and_read_normal_page() {
         let (buf, _, _) = make_buffer_ps(PAGE_SIZE, 0, 10);
         let page_id = buf.alloc_page(false).unwrap();
-        let mut page = Page::new_data(PAGE_SIZE);
+        let page = Page::new_data(PAGE_SIZE);
         page.add_tuple(Tuple::new(1, b"hello")).unwrap();
         buf.write_page(page_id, &page).unwrap();
         let cached = buf.get_page(page_id).unwrap();
@@ -1289,7 +1289,7 @@ mod tests {
         let count_after_alloc = page_counter.load(Ordering::Relaxed);
 
         let big_data = vec![42u8; page_size as usize]; // definitely larger than page_data_size
-        let mut page = Page::new_data(page_size);
+        let page = Page::new_data(page_size);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
@@ -1310,7 +1310,7 @@ mod tests {
         let page_id = buf.alloc_page(false).unwrap();
 
         let big_data = vec![7u8; page_size as usize];
-        let mut page = Page::new_data(page_size);
+        let page = Page::new_data(page_size);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
@@ -1329,7 +1329,7 @@ mod tests {
         let page_id = buf.alloc_page(false).unwrap();
 
         let big_data = vec![9u8; page_size as usize];
-        let mut page = Page::new_data(page_size);
+        let page = Page::new_data(page_size);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
         // shutdown flushes the writer thread, persisting all writes to the shared MemFile

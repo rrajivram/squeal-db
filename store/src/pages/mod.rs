@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use crate::{
     db::DBSizeType,
     error::StoreError,
@@ -14,13 +12,13 @@ pub type TupleType = Tuple;
 pub trait PageTuple {
     fn count(&self) -> Result<usize, StoreError>;
 
-    /// Deep-copy into a fresh allocation. `Page::clone` must use this (not
-    /// `Arc::clone`) so a cloned Page owns an independent tuple store. Mutation
-    /// happens through `&mut self` and is only reachable after
-    /// `Arc::make_mut(&mut Arc<Page>)` has made the Page uniquely owned, so a
-    /// shared Arc would otherwise let a copy-on-write clone leak mutations back
-    /// into the cached page or a page mid-serialization on the writer thread.
-    fn deep_clone(&self) -> Arc<dyn PageTuple>;
+    /// Deep-copy into a fresh allocation. `Page::clone` must use this (not a
+    /// shared pointer) so a cloned Page owns an independent tuple store —
+    /// `Page` guards its own copy behind a lock (see `PageInner`), so
+    /// ordinary mutation (`add`/`remove`/`replace`/`clear`) happens in place
+    /// under that lock rather than via this method; `deep_clone` exists for
+    /// the rarer case of needing a genuinely separate copy (`Page::clone`).
+    fn deep_clone(&self) -> Box<dyn PageTuple>;
 
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError>;
 

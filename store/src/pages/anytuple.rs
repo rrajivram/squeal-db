@@ -68,8 +68,8 @@ impl AnyTuplePage {
 }
 
 impl PageTuple for AnyTuplePage {
-    fn deep_clone(&self) -> std::sync::Arc<dyn PageTuple> {
-        std::sync::Arc::new(self.clone())
+    fn deep_clone(&self) -> Box<dyn PageTuple> {
+        Box::new(self.clone())
     }
 
     fn count(&self) -> Result<usize, StoreError> {
