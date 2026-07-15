@@ -238,8 +238,8 @@ where
             // goal already met. Any *other* error still propagates (real
             // corruption isn't swallowed).
             retry_on_contention(|| {
-                let mut h = self.buffer.get_page_mut(data_page_id)?;
-                match Arc::make_mut(&mut h.page).remove_tuple(tuple_id.clone()) {
+                let h = self.buffer.get_page_mut(data_page_id)?;
+                match h.page.remove_tuple(tuple_id.clone()) {
                     Ok(_) => self.buffer.write_locked_page(h),
                     Err(StoreError::KeyNotFound(_)) => Ok(()),
                     Err(e) => Err(e),
@@ -357,7 +357,7 @@ where
         let pid = self
             .find_page(id.clone(), self.table.first_index_page)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-        let mut h = self.buffer.get_page_mut(pid)?;
+        let h = self.buffer.get_page_mut(pid)?;
         // Whether the replacement still fits alongside its siblings on this
         // page. An ordinary multi-tuple page must never be allowed to
         // exceed capacity via in-place replace: handle_large_page_size's
@@ -380,7 +380,7 @@ where
             || header.used_size().saturating_sub(old_size) + tuple.size()
                 <= header.usable_data_size();
         if fits_in_place {
-            let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
+            let old = h.page.replace_tuple(&id, tuple)?;
             self.buffer.write_locked_page(h)?;
             Ok(old)
         } else {
@@ -389,7 +389,7 @@ where
             // slot), place via the same capacity-aware logic insert() uses
             // (which may still land back on this same, now-lighter page),
             // then repoint the index entry if it landed somewhere else.
-            let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+            let old = h.page.remove_tuple(id.clone())?;
             self.buffer.write_locked_page(h)?;
             let new_page_id = self.write_data(&tuple)?;
             if new_page_id != pid {
@@ -443,8 +443,8 @@ where
             Some(p) => p,
             None => return Ok(None),
         };
-        let mut h = self.buffer.get_page_mut(pid)?;
-        let old = match Arc::make_mut(&mut h.page).remove_tuple(id.clone()) {
+        let h = self.buffer.get_page_mut(pid)?;
+        let old = match h.page.remove_tuple(id.clone()) {
             Ok(t) => {
                 self.buffer.write_locked_page(h)?;
                 Some(t)
@@ -513,7 +513,7 @@ where
             Some(p) => p,
             None => return Ok(None),
         };
-        let mut h = self.buffer.get_page_mut(pid)?;
+        let h = self.buffer.get_page_mut(pid)?;
         let matches = matches!(
             h.page.get(id.clone())?,
             Some(cur) if cur.is_same_txn(expect_txn.clone())
@@ -521,7 +521,7 @@ where
         if !matches {
             return Ok(None);
         }
-        let old = Arc::make_mut(&mut h.page).replace_tuple(&id, tuple)?;
+        let old = h.page.replace_tuple(&id, tuple)?;
         self.buffer.write_locked_page(h)?;
         Ok(Some(old))
     }
@@ -554,12 +554,12 @@ where
             Some(p) => p,
             None => return Ok(None),
         };
-        let mut h = self.buffer.get_page_mut(pid)?;
+        let h = self.buffer.get_page_mut(pid)?;
         let current = h.page.get(id.clone())?;
         let old = match current {
             // Row is still here and still ours: remove it.
             Some(cur) if cur.is_same_txn(expect_txn.clone()) => {
-                let old = Arc::make_mut(&mut h.page).remove_tuple(id.clone())?;
+                let old = h.page.remove_tuple(id.clone())?;
                 self.buffer.write_locked_page(h)?;
                 Some(old)
             }
@@ -696,7 +696,7 @@ where
         // locked remove below — corrupting the index and orphaning unrelated
         // keys. Deciding leaf-vs-inner under the same lock we mutate under
         // closes that window.
-        let mut handle = self.buffer.get_page_mut(start)?;
+        let handle = self.buffer.get_page_mut(start)?;
         drop(parent);
         if handle.page.is_flag_set(INNER_NODE) {
             let mut last_child: Option<PageId> = None;
@@ -723,7 +723,7 @@ where
             // Tolerate an already-absent entry: a concurrent path may have
             // removed it, or a committed tombstone was reclaimed elsewhere.
             if handle.page.contains(id.clone())? {
-                Arc::make_mut(&mut handle.page).remove_tuple(id)?;
+                handle.page.remove_tuple(id)?;
                 self.buffer.write_locked_page(handle)?;
             }
             Ok(())
@@ -747,7 +747,7 @@ where
         start: PageId,
         parent: Option<WritePageHandle>,
     ) -> Result<(), StoreError> {
-        let mut handle = self.buffer.get_page_mut(start)?;
+        let handle = self.buffer.get_page_mut(start)?;
         drop(parent);
         if handle.page.is_flag_set(INNER_NODE) {
             let mut last_child: Option<PageId> = None;
@@ -774,7 +774,7 @@ where
                 Some(txn),
                 None,
             );
-            Arc::make_mut(&mut handle.page).replace_tuple(&id, new_entry)?;
+            handle.page.replace_tuple(&id, new_entry)?;
             self.buffer.write_locked_page(handle)?;
             Ok(())
         }
@@ -1263,9 +1263,7 @@ where
     }
 
     fn write_page(&self, handle: WritePageHandle, tuple: Tuple) -> Result<(), StoreError> {
-        let mut handle = handle;
-        let page = Arc::make_mut(&mut handle.page);
-        page.add_tuple(tuple)?;
+        handle.page.add_tuple(tuple)?;
         self.buffer.write_locked_page(handle)?;
         Ok(())
     }
