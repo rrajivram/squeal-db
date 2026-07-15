@@ -19,6 +19,7 @@ use crate::memfile::MemFile;
 use crate::page::Page;
 use crate::table::Table;
 use crate::table::TableIdType;
+use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
@@ -516,6 +517,11 @@ where
         // no-op when nothing is pending.
         self.logger
             .drain_ready_undo_discards(&self.tx_mgr.get_active_transactions()?);
+        if self.redo_file.get_metadata()?.len > 16 * 1024 * 1024
+            || self.undo_file.get_metadata()?.len > 16 * 1024 * 1024
+        {
+            self.checkpoint()?;
+        }
         self.tx_mgr.begin()
     }
 
@@ -941,7 +947,27 @@ where
         self.find_last_committed(tuple)
     }
 
+    /// Convenience wrapper around `create_table_with_index_entry_size` using
+    /// `crate::tables::bplustree::MAX_ENTRY_BYTES` as the index entry size —
+    /// sized for a plain `Int`/`Vec` key (see that constant's own comment).
+    /// If your table's primary key is a composite `Rec(IndexKey)` with
+    /// `Str`/`Blob` fields, this default is very likely too small: call
+    /// `create_table_with_index_entry_size` directly with a size you've
+    /// computed for your actual key shape instead of hoping this guess
+    /// covers it.
     pub fn create_table(&self, name: String) -> Result<TableIdType, StoreError> {
+        self.create_table_with_index_entry_size(name, bplustree::MAX_ENTRY_BYTES)
+    }
+
+    /// Like `create_table`, but takes the fixed per-entry byte budget for
+    /// this table's index pages explicitly instead of assuming a default —
+    /// see `BPlusTree::new`'s own doc comment for what this bounds and how
+    /// to size it for a given key shape.
+    pub fn create_table_with_index_entry_size(
+        &self,
+        name: String,
+        index_entry_size: DBSizeType,
+    ) -> Result<TableIdType, StoreError> {
         let table_id = {
             self.validate_table_name(&name)?;
             let mut tables = self.tables.write();
@@ -953,6 +979,7 @@ where
                 self.buffer.clone(),
                 self.tx_mgr.clone(),
                 self.logger.clone(),
+                index_entry_size,
             )?;
             let id = table.id();
             tables.insert(id, Arc::new(table));
@@ -1406,6 +1433,77 @@ mod tests {
         let r = db.create_table("table_1".to_string());
         assert!(matches!(r, Err(StoreError::DuplicateName(_))));
         //FileDB::delete(DB_NAME).unwrap_or_default()
+    }
+
+    // create_table's own index_entry_size is bplustree::MAX_ENTRY_BYTES —
+    // this is a plain regression test that the convenience wrapper still
+    // behaves exactly as it did before create_table_with_index_entry_size
+    // existed (a plain Int key round-trips through insert/find normally).
+    #[test]
+    fn test_create_table_default_index_entry_size_round_trips_normal_rows() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"hello"
+        );
+    }
+
+    // The concrete motivation for create_table_with_index_entry_size: a
+    // composite Rec(IndexKey) key with Str fields easily exceeds
+    // bplustree::MAX_ENTRY_BYTES (64, sized for a plain Int/Vec key) —
+    // create_table's default fails at insert time with a TupleTooLarge
+    // error that doesn't help you fix it up front. Sizing the table
+    // explicitly avoids that failure entirely.
+    #[test]
+    fn test_create_table_with_index_entry_size_supports_a_composite_key_default_size_cannot() {
+        use crate::valueitem::{IndexKey, ValueItem};
+
+        let db = TestDB::create("index_entry_size_test.db").unwrap();
+        let big_key = || -> DBIdType {
+            DBIdType::Rec(
+                IndexKey::new_from(&[
+                    ValueItem::Str(("alpha".repeat(9), 50)),
+                    ValueItem::Str(("beta".repeat(9), 50)),
+                ])
+                .unwrap(),
+            )
+        };
+
+        // Default-sized table: fails, doesn't silently corrupt anything.
+        let default_tid = db.create_table("default_sized".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        let err = db
+            .insert(default_tid, Tuple::new_with(big_key(), b"v", None, None), &t)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::TupleTooLarge(_, _)),
+            "got {err:?}"
+        );
+        drop(t);
+
+        // Deliberately sized table: the identical key/row round-trips.
+        let sized_tid = db
+            .create_table_with_index_entry_size("deliberately_sized".to_string(), 300)
+            .unwrap();
+        let t = db.begin().unwrap();
+        let key = big_key();
+        db.insert(
+            sized_tid,
+            Tuple::new_with(key.clone(), b"v", None, None),
+            &t,
+        )
+        .unwrap();
+        db.commit(t).unwrap();
+
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(sized_tid, key, &t).unwrap().unwrap().data.to_vec(),
+            b"v"
+        );
     }
 
     // ── transactional insert / find ───────────────────────────────────────────

@@ -120,10 +120,7 @@ where
     // leaf-to-leaf via the leaf sibling chain once the current leaf is
     // exhausted. Mirrors TableCursor::next_tuple's pattern, but over index
     // leaves instead of data pages.
-    fn next_index_entry(
-        &mut self,
-        table: &BPlusTree<F>,
-    ) -> Result<Option<Tuple>, StoreError> {
+    fn next_index_entry(&mut self, table: &BPlusTree<F>) -> Result<Option<Tuple>, StoreError> {
         let n = self.current_iter.next();
         if n.is_some() {
             Ok(n)
@@ -289,12 +286,7 @@ mod tests {
         }
         db.commit(t).unwrap();
 
-        let found = int_ids(&scan_range(
-            &db,
-            tid,
-            DBIdType::Int(3),
-            DBIdType::Int(7),
-        ));
+        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(3), DBIdType::Int(7)));
         assert_eq!(
             found,
             vec![3, 4, 5, 6],
@@ -318,12 +310,7 @@ mod tests {
         }
         db.commit(t).unwrap();
 
-        let found = int_ids(&scan_range(
-            &db,
-            tid,
-            DBIdType::Int(10),
-            DBIdType::Int(50),
-        ));
+        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(10), DBIdType::Int(50)));
         assert_eq!(found, (10u64..50).collect::<Vec<_>>());
     }
 
@@ -384,12 +371,7 @@ mod tests {
         // A range covering all three ids, with the lower bound (id 1)
         // happening to live on the same (later) data page the scan starts
         // from.
-        let found = int_ids(&scan_range(
-            &db,
-            tid,
-            DBIdType::Int(1),
-            DBIdType::Int(200),
-        ));
+        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(1), DBIdType::Int(200)));
         assert_eq!(
             found,
             vec![1, 100, 101],
@@ -425,12 +407,7 @@ mod tests {
             .unwrap();
         std::mem::forget(uncommitted_txn);
 
-        let found = int_ids(&scan_range(
-            &db,
-            tid,
-            DBIdType::Int(1),
-            DBIdType::Int(5),
-        ));
+        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(1), DBIdType::Int(5)));
         assert_eq!(
             found,
             vec![1, 3],
@@ -439,10 +416,7 @@ mod tests {
     }
 
     fn rec_key(a: i64, b: i64) -> DBIdType {
-        DBIdType::Rec(IndexKey::new_from(&[
-            ValueItem::Integer(a),
-            ValueItem::Integer(b),
-        ]))
+        DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(a), ValueItem::Integer(b)]).unwrap())
     }
 
     // Basic sanity that multi-key (DBIdType::Rec) ids work at all through
@@ -485,7 +459,7 @@ mod tests {
         let db = Db::<MemFile>::create("range_multikey_structural_order.db").unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
 
-        let key = |a: i64| DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(a)]));
+        let key = |a: i64| DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(a)]).unwrap());
 
         let t = db.begin().unwrap();
         for a in 0i64..=4 {

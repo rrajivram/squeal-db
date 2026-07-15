@@ -3,7 +3,10 @@ use std::{cmp::Ordering, fmt::Display, sync::Arc};
 use log::error;
 use serde::{Deserialize, Serialize};
 
-use crate::db::db_hash;
+use crate::{
+    db::{DBSizeType, db_hash},
+    error::StoreError,
+};
 
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
 #[repr(u8)]
@@ -24,10 +27,13 @@ pub struct IndexKey {
 }
 
 impl IndexKey {
-    pub fn new_from(data: &[ValueItem]) -> Self {
-        Self {
-            data: Arc::from(data),
+    pub fn new_from(data: &[ValueItem]) -> Result<Self, StoreError> {
+        for d in data {
+            d.validate()?;
         }
+        Ok(Self {
+            data: Arc::from(data),
+        })
     }
 
     pub fn size(&self) -> usize {
@@ -57,7 +63,7 @@ impl IndexKey {
             index += i;
             data.push(v);
         }
-        Self::new_from(&data)
+        Self::new_from(&data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap())
     }
 
     pub fn hash(&self) -> u64 {
@@ -94,13 +100,37 @@ impl Display for IndexKey {
 
 impl From<&[ValueItem]> for IndexKey {
     fn from(value: &[ValueItem]) -> Self {
-        Self::new_from(value)
+        Self::new_from(value).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap())
     }
 }
 
 impl Eq for IndexKey {}
 
 impl ValueItem {
+    pub(super) fn validate(&self) -> Result<(), StoreError> {
+        match self {
+            ValueItem::Integer(_) => Ok(()),
+            ValueItem::UInteger(_) => Ok(()),
+            ValueItem::Double(_) => Ok(()),
+            ValueItem::Datetime(_) => Ok(()),
+            ValueItem::Str(s) => {
+                if s.0.len() as u32 > s.1 {
+                    Err(StoreError::TupleTooLarge(s.1 as DBSizeType, s.0.len()))
+                } else {
+                    Ok(())
+                }
+            }
+            ValueItem::Blob(s) => {
+                if s.0.len() as u32 > s.1 {
+                    Err(StoreError::TupleTooLarge(s.1 as DBSizeType, s.0.len()))
+                } else {
+                    Ok(())
+                }
+            }
+            ValueItem::Null => Ok(()),
+        }
+    }
+
     pub(super) fn size(&self) -> usize {
         let sz = match self {
             ValueItem::Integer(_) => size_of::<i64>(),
@@ -706,12 +736,12 @@ mod indexkey_tests {
             size_of::<u64>(),
             "just the field-count prefix, no fields"
         );
-        assert_eq!(k, IndexKey::new_from(&[]));
+        assert_eq!(k, IndexKey::new_from(&[]).unwrap());
     }
 
     #[test]
     fn test_new_from_and_size_sums_fields_plus_count_prefix() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::UInteger(2)]);
+        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::UInteger(2)]).unwrap();
         assert_eq!(
             k.size(),
             size_of::<u64>() + ValueItem::Integer(1).size() + ValueItem::UInteger(2).size()
@@ -721,14 +751,17 @@ mod indexkey_tests {
     #[test]
     fn test_from_slice_matches_new_from() {
         let fields = [ValueItem::Integer(1), ValueItem::Str(("x".into(), 1))];
-        assert_eq!(IndexKey::from(&fields[..]), IndexKey::new_from(&fields));
+        assert_eq!(
+            IndexKey::from(&fields[..]),
+            IndexKey::new_from(&fields).unwrap()
+        );
     }
 
     #[test]
     fn test_eq_reflexive_and_field_sensitive() {
-        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
-        let c = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(3)]);
+        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
+        let b = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
+        let c = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(3)]).unwrap();
         assert_eq!(a, a.clone());
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -736,7 +769,7 @@ mod indexkey_tests {
 
     #[test]
     fn test_display_writes_one_line_per_field() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
+        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
         let s = format!("{k}");
         assert_eq!(s.lines().count(), 2);
     }
@@ -755,7 +788,7 @@ mod indexkey_tests {
 
     #[test]
     fn test_roundtrip_empty_key() {
-        let k = IndexKey::new_from(&[]);
+        let k = IndexKey::new_from(&[]).unwrap();
         let bytes = k.to_bytes();
         assert_eq!(bytes.len(), 8, "empty key is just the 8-byte zero count");
         assert_eq!(k, IndexKey::from_bytes(&bytes));
@@ -763,7 +796,7 @@ mod indexkey_tests {
 
     #[test]
     fn test_roundtrip_single_field_key() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(42)]);
+        let k = IndexKey::new_from(&[ValueItem::Integer(42)]).unwrap();
         let bytes = k.to_bytes();
         assert_eq!(
             k,
@@ -779,7 +812,8 @@ mod indexkey_tests {
             ValueItem::Str(("hello".into(), 5)), // no padding: capacity == len
             ValueItem::Double(1.25),
             ValueItem::UInteger(9),
-        ]);
+        ])
+        .unwrap();
         let bytes = k.to_bytes();
         assert_eq!(k, IndexKey::from_bytes(&bytes));
     }
@@ -795,7 +829,8 @@ mod indexkey_tests {
         let k = IndexKey::new_from(&[
             ValueItem::Str(("hi".into(), 20)), // reserves 20, uses 2
             ValueItem::Integer(42),
-        ]);
+        ])
+        .unwrap();
         let bytes = k.to_bytes();
         assert_eq!(k, IndexKey::from_bytes(&bytes));
     }
@@ -809,7 +844,7 @@ mod indexkey_tests {
     // actually doesn't fit look like it does.
     #[test]
     fn test_size_matches_actual_serialized_length() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
+        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
         assert_eq!(
             k.size(),
             k.to_bytes().len(),
@@ -821,22 +856,24 @@ mod indexkey_tests {
 
     #[test]
     fn test_partial_ord_first_field_decides() {
-        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(99)]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(2), ValueItem::Integer(0)]);
+        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(99)]).unwrap();
+        let b = IndexKey::new_from(&[ValueItem::Integer(2), ValueItem::Integer(0)]).unwrap();
         assert!(a < b);
     }
 
     #[test]
     fn test_partial_ord_ties_broken_by_next_field() {
-        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(1)]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
+        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(1)]).unwrap();
+        let b = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
         assert!(a < b);
     }
 
     #[test]
     fn test_partial_ord_equal_keys() {
-        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("x".into(), 1))]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("x".into(), 1))]);
+        let a =
+            IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("x".into(), 1))]).unwrap();
+        let b =
+            IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("x".into(), 1))]).unwrap();
         assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
     }
 
@@ -851,8 +888,8 @@ mod indexkey_tests {
     // triggers.
     #[test]
     fn test_partial_ord_shorter_key_that_is_a_prefix_compares_equal() {
-        let short = IndexKey::new_from(&[ValueItem::Integer(1)]);
-        let long = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
+        let short = IndexKey::new_from(&[ValueItem::Integer(1)]).unwrap();
+        let long = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
         assert_eq!(
             short.partial_cmp(&long),
             Some(std::cmp::Ordering::Equal),
@@ -863,7 +900,8 @@ mod indexkey_tests {
 
     #[test]
     fn test_hash_is_deterministic() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("a".into(), 1))]);
+        let k =
+            IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("a".into(), 1))]).unwrap();
         assert_eq!(k.hash(), k.hash());
     }
 
@@ -877,8 +915,8 @@ mod indexkey_tests {
     // (1|2 == 3).
     #[test]
     fn test_hash_mixes_field_order_not_just_bitwise_union() {
-        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]);
-        let b = IndexKey::new_from(&[ValueItem::Integer(2), ValueItem::Integer(1)]);
+        let a = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
+        let b = IndexKey::new_from(&[ValueItem::Integer(2), ValueItem::Integer(1)]).unwrap();
         assert_ne!(a, b, "structurally different keys (order matters)");
         assert_ne!(
             a.hash(),
@@ -897,8 +935,8 @@ mod indexkey_tests {
     #[test]
     #[should_panic(expected = "Blobs cannot be compared")]
     fn test_partial_ord_panics_when_a_field_is_blob() {
-        let a = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]);
-        let b = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]);
+        let a = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]).unwrap();
+        let b = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]).unwrap();
         let _ = a.partial_cmp(&b);
     }
 }

@@ -55,10 +55,7 @@ impl AnyTuplePage {
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<AnyTuplePage, StoreError> {
         let mut vec: Vec<Tuple> = from_bytes(bytes)?;
-        let data = vec
-            .drain(..)
-            .map(|t| (t.id.clone(), t))
-            .collect::<Vec<_>>();
+        let data = vec.drain(..).map(|t| (t.id.clone(), t)).collect::<Vec<_>>();
         let mut map: BTreeMap<DBIdType, Vec<Tuple>> = BTreeMap::new();
         for (id, t) in data {
             map.entry(id)
@@ -339,10 +336,13 @@ mod tests {
     }
 
     fn rec_id(a: i64, b: i64) -> DBIdType {
-        DBIdType::Rec(crate::valueitem::IndexKey::new_from(&[
-            crate::valueitem::ValueItem::Integer(a),
-            crate::valueitem::ValueItem::Integer(b),
-        ]))
+        DBIdType::Rec(
+            crate::valueitem::IndexKey::new_from(&[
+                crate::valueitem::ValueItem::Integer(a),
+                crate::valueitem::ValueItem::Integer(b),
+            ])
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -400,11 +400,10 @@ mod tests {
         use crate::valueitem::{IndexKey, ValueItem};
 
         let mut p = make_page();
-        let short = DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(1)]));
-        let long = DBIdType::Rec(IndexKey::new_from(&[
-            ValueItem::Integer(1),
-            ValueItem::Integer(2),
-        ]));
+        let short = DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(1)]).unwrap());
+        let long = DBIdType::Rec(
+            IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap(),
+        );
         assert_eq!(
             short.cmp(&long),
             std::cmp::Ordering::Equal,
@@ -417,7 +416,11 @@ mod tests {
         p.add(Tuple::new_with(long.clone(), b"long", None, None))
             .unwrap();
 
-        assert_eq!(p.count().unwrap(), 1, "both land in the same bucket (one map slot)");
+        assert_eq!(
+            p.count().unwrap(),
+            1,
+            "both land in the same bucket (one map slot)"
+        );
         assert_eq!(p.get(&short).unwrap().unwrap().data.to_vec(), b"short");
         assert_eq!(p.get(&long).unwrap().unwrap().data.to_vec(), b"long");
 

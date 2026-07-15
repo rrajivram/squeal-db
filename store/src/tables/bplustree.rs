@@ -32,14 +32,24 @@ enum SplitOutcome {
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
 
-// Postcard varint upper bounds per field:
+// NOT used inside BPlusTree::new anymore — index_entry_size is now a real
+// parameter callers must supply deliberately (see BPlusTree::new's own doc
+// comment), not an assumption baked into the tree's own construction. This
+// constant only sizes `Int`/`Vec`-keyed tables (`Db::create_table`'s
+// convenience default) and is used freely by this file's own tests, per the
+// estimate below. Anything else — in particular a composite `Rec(IndexKey)`
+// key with `Str`/`Blob` fields — should compute its own bound instead of
+// assuming this is enough; it easily isn't.
+//
+// Postcard varint upper bounds per field, for an Int/Vec-keyed entry:
 //   DBIdType::Int(u64::MAX)  → 1 (variant) + 10 (varint) = 11 B
 //   Option<TransactionId>    → 1 (Some) + 10 (u64 id) + 10 (u128 ts) = 21 B
 //   Option<UndoId>           → 1 (None)
 //   data Node::Inner(u64::MAX) as Vec<u8> → 1 (len) + 1 (variant) + 10 (varint) = 12 B
 //   flags                    → 1 B
-//   Total ≈ 46 B; 64 B gives comfortable headroom for any realistic payload.
-const MAX_ENTRY_BYTES: u64 = 64;
+//   Total ≈ 46 B; 64 B gives comfortable headroom for any realistic payload
+//   of *that* shape — not a general bound for every key shape.
+pub(crate) const MAX_ENTRY_BYTES: u64 = 64;
 
 pub(crate) struct BPlusTree<F: DBFile + 'static> {
     pub(crate) table: Table,
@@ -69,24 +79,44 @@ impl<F: DBFile> BPlusTree<F>
 where
     F: DBFile<Item = F> + 'static,
 {
+    /// `index_entry_size` is the fixed per-entry byte budget for this
+    /// table's index pages (`FixedTuplePage`-encoded) — every index entry
+    /// for this table, for its whole lifetime, must serialize to no more
+    /// than this many bytes. Callers must size this deliberately for their
+    /// actual key shape rather than relying on a guessed default: a plain
+    /// `Int`/`Vec` key comfortably fits the historical default
+    /// (`MAX_ENTRY_BYTES`, still available for tests and as `Db::
+    /// create_table`'s own convenience default), but a composite
+    /// `Rec(IndexKey)` key with several `Str`/`Blob` fields can easily need
+    /// more — see `IndexKey`/`ValueItem`'s own reserved-capacity fields for
+    /// how to compute an exact upper bound for a given key shape. Passing
+    /// too small a value doesn't fail here; it fails later, at insert time,
+    /// with a `PageCapacityError` that doesn't explain why.
     pub fn new(
         id: TableIdType,
         name: String,
         buffer: Arc<PageBuffer<F>>,
         txn_mgr: Arc<TransactionManager>,
         logger: Arc<Logger>,
+        index_entry_size: DBSizeType,
     ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
-        let count = pg / MAX_ENTRY_BYTES;
+        if index_entry_size == 0 {
+            return Err(StoreError::UnknownError(
+                "index_entry_size must be greater than 0".into(),
+            ));
+        }
+        let count = pg / index_entry_size;
 
         if count < 2 {
-            return Err(StoreError::UnknownError(
-                "Unable to fit index : count = {count}, size = {size}".into(),
-            ));
+            return Err(StoreError::UnknownError(format!(
+                "Unable to fit index: page_size = {pg}, index_entry_size = {index_entry_size} \
+                 gives count = {count}, need at least 2"
+            )));
         }
         let first_index_page = buffer.alloc_page(false)?;
         let first_data_page = buffer.alloc_page(false)?;
-        let mut index_page = Page::new_indexed(pg, MAX_ENTRY_BYTES as usize);
+        let mut index_page = Page::new_indexed(pg, index_entry_size as usize);
         // Adopt into this database's WAL clock before flagging (set_page_flags
         // dirties it, which stamps the lsn from the clock).
         index_page.set_clock(buffer.clock());
@@ -1218,6 +1248,7 @@ mod tests {
         page::{Page, PageId},
         tuple::{DBIdType, Tuple},
         txn::{TransactionId, TransactionManager},
+        valueitem::{IndexKey, ValueItem},
     };
 
     fn page_overhead(page_size: u64) -> u64 {
@@ -1267,8 +1298,20 @@ mod tests {
     }
 
     fn make_tree(page_size: u64) -> BPlusTree<MemFile> {
+        make_tree_with_entry_size(page_size, MAX_ENTRY_BYTES)
+    }
+
+    fn make_tree_with_entry_size(page_size: u64, index_entry_size: u64) -> BPlusTree<MemFile> {
         let buf = make_buffer(page_size);
-        BPlusTree::new(1.into(), "t".into(), buf, make_txn_mgr(), make_logger()).unwrap()
+        BPlusTree::new(
+            1.into(),
+            "t".into(),
+            buf,
+            make_txn_mgr(),
+            make_logger(),
+            index_entry_size,
+        )
+        .unwrap()
     }
 
     fn txn() -> TransactionId {
@@ -2222,5 +2265,150 @@ mod tests {
                 "id {i} must remain findable after 400 inserts across multiple splits"
             );
         }
+    }
+
+    // --- index_entry_size: BPlusTree::new takes it as a real parameter now,
+    // not an assumption baked in via MAX_ENTRY_BYTES ---
+
+    #[test]
+    fn test_new_rejects_zero_index_entry_size() {
+        let buf = make_buffer(BIG);
+        let result = BPlusTree::new(1.into(), "t".into(), buf, make_txn_mgr(), make_logger(), 0);
+        let err = match result {
+            Ok(_) => panic!("index_entry_size = 0 must be rejected, not silently divide by zero"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::UnknownError(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_new_rejects_index_entry_size_too_large_to_fit_two_entries() {
+        let page_size = 1000u64;
+        let index_entry_size = 600u64; // page_size / index_entry_size == 1 < 2
+        let buf = make_buffer(page_size);
+        let result = BPlusTree::new(
+            1.into(),
+            "t".into(),
+            buf,
+            make_txn_mgr(),
+            make_logger(),
+            index_entry_size,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "an index_entry_size that can't fit at least 2 entries per page must fail"
+            ),
+            Err(e) => e,
+        };
+        let StoreError::UnknownError(msg) = err else {
+            panic!("expected UnknownError, got {err:?}");
+        };
+        // The error used to be a string literal with unescaped {count}/{size}
+        // placeholders — never actually interpolated, so it printed that
+        // literal text instead of the real numbers. Assert the real values
+        // actually appear now.
+        assert!(
+            msg.contains(&page_size.to_string()) && msg.contains(&index_entry_size.to_string()),
+            "error message must include the actual page_size/index_entry_size \
+             that failed, not a template with unfilled placeholders: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn test_nodes_per_page_is_computed_from_the_supplied_index_entry_size() {
+        // Same page_size, two different index_entry_size choices, must
+        // produce different nodes_per_page — proving the parameter is what
+        // actually drives capacity, not a hardcoded constant.
+        let page_size = 1024u64;
+        let small_entries = make_tree_with_entry_size(page_size, 32);
+        let large_entries = make_tree_with_entry_size(page_size, 128);
+        assert_eq!(small_entries.table.nodes_per_page, (page_size / 32) as usize);
+        assert_eq!(large_entries.table.nodes_per_page, (page_size / 128) as usize);
+        assert!(
+            small_entries.table.nodes_per_page > large_entries.table.nodes_per_page,
+            "a smaller per-entry budget must pack strictly more entries per page"
+        );
+    }
+
+    #[test]
+    fn test_custom_index_entry_size_supports_normal_insert_find_remove_roundtrip() {
+        // Deliberately NOT MAX_ENTRY_BYTES-derived, and small enough to force
+        // several splits over the course of the test — exercises ordinary
+        // operation with a caller-chosen size end to end, not just table
+        // construction.
+        let tree = make_tree_with_entry_size(512, 40);
+        for i in 0u64..50 {
+            tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), txn())
+                .unwrap();
+        }
+        for i in 0u64..50 {
+            assert_eq!(
+                tree.find(DBIdType::Int(i)).unwrap().map(|t| t.data.to_vec()),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
+        let removed = tree.remove(DBIdType::Int(10)).unwrap();
+        assert!(removed.is_some());
+        assert!(tree.find(DBIdType::Int(10)).unwrap().is_none());
+    }
+
+    // The concrete motivation for this whole change: a composite Rec(IndexKey)
+    // key with Str fields easily exceeds MAX_ENTRY_BYTES (64) — the default
+    // guess sized for a plain Int/Vec key — and the failure mode without a
+    // deliberate size is an insert-time PageCapacityError with no indication
+    // *why*. A caller who computes their key's real upper bound and passes it
+    // as index_entry_size avoids that entirely.
+    #[test]
+    fn test_composite_key_too_big_for_default_entry_size_succeeds_with_a_larger_one() {
+        // Two Str fields reserving 50 bytes each: comfortably over
+        // MAX_ENTRY_BYTES (64) once IndexKey/Tuple framing is added, and
+        // comfortably under a 300-byte budget.
+        let big_key = || -> DBIdType {
+            DBIdType::Rec(
+                IndexKey::new_from(&[
+                    ValueItem::Str(("alpha".repeat(9), 50)),
+                    ValueItem::Str(("beta".repeat(9), 50)),
+                ])
+                .unwrap(),
+            )
+        };
+
+        // Default-sized index (MAX_ENTRY_BYTES): the same insert must fail,
+        // not silently corrupt something — confirming the failure mode this
+        // change is meant to let callers avoid via an explicit size instead.
+        // FixedTuplePage::add already checks the serialized entry against
+        // tuple_size and reports TupleTooLarge(actual, budget) — a much
+        // clearer failure than a generic PageCapacityError.
+        let default_sized = make_tree(BIG);
+        let err = default_sized
+            .insert(Tuple::new_with(big_key(), b"v", None, None), txn())
+            .expect_err(
+                "a composite key exceeding MAX_ENTRY_BYTES must fail on a \
+                 default-sized index, not silently succeed",
+            );
+        match err {
+            StoreError::TupleTooLarge(actual, budget) => {
+                assert_eq!(budget, MAX_ENTRY_BYTES as usize);
+                assert!(
+                    actual > budget as u64,
+                    "reported actual size must exceed the budget it failed against"
+                );
+            }
+            other => panic!("expected TupleTooLarge, got {other:?}"),
+        }
+
+        // Deliberately sized index: the identical insert now succeeds.
+        let deliberately_sized = make_tree_with_entry_size(BIG, 300);
+        let key = big_key();
+        deliberately_sized
+            .insert(Tuple::new_with(key.clone(), b"v", None, None), txn())
+            .unwrap();
+        assert_eq!(
+            deliberately_sized
+                .find(key)
+                .unwrap()
+                .map(|t| t.data.to_vec()),
+            Some(b"v".to_vec())
+        );
     }
 }
