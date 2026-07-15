@@ -74,6 +74,17 @@ impl IndexKey {
         }
         h
     }
+
+    // Extracts the content back out of a single-field, Str-only key — the
+    // shape `DBIdType::From<String>` builds. `None` for anything else (a
+    // composite key, or a lone field of a different type), so callers can
+    // fall back to a generic representation instead of misreporting one.
+    pub(crate) fn as_single_str(&self) -> Option<String> {
+        match self.data.as_ref() {
+            [ValueItem::Str((s, _))] => Some(s.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl PartialOrd for IndexKey {

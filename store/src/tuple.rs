@@ -5,11 +5,11 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    db::{DBSizeType, db_hash},
+    db::DBSizeType,
     error::StoreError,
     logger::UndoId,
     txn::TransactionId,
-    valueitem::IndexKey,
+    valueitem::{IndexKey, ValueItem},
 };
 
 const NONE: u8 = 0;
@@ -19,15 +19,13 @@ const TOMBSTONED: u8 = 2;
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum DBIdType {
     Int(u64),
-    Vec(Vec<u8>),
     Rec(IndexKey),
 }
 
-// Int/Vec order by `hashed()` rather than structurally, so that
-// comparisons here agree with `AnyTuplePage`'s (now id-keyed, see its own
-// comment) storage/iteration order — the B+ tree's navigation and split
-// logic rely on `<`/`>` matching iteration order, and for `Vec` ids the
-// derived (lexical) order would not.
+// Int orders by `hashed()` rather than structurally, so that comparisons
+// here agree with `AnyTuplePage`'s (now id-keyed, see its own comment)
+// storage/iteration order — the B+ tree's navigation and split logic rely
+// on `<`/`>` matching iteration order.
 //
 // Rec is the one exception: it orders structurally (field-by-field via
 // IndexKey::partial_cmp) instead. A hashed comparison — by design — loses
@@ -41,17 +39,17 @@ pub enum DBIdType {
 // returned almost none of them once the ids were wrapped in a
 // single-field IndexKey and ordered by hash.
 //
-// RISK: for Int/Vec, this still intentionally diverges from `Eq`/
-// `PartialEq`, which stay exact — two distinct ids whose hashes collide
-// compare as `Ordering::Equal` here while still being `!=` under
-// `PartialEq`/`Hash`. For Rec, the analogous (much narrower) risk is
-// IndexKey::partial_cmp's own documented quirks: a Str/Blob field whose
-// reserved capacity differs compares Equal despite being `!=` under
-// PartialEq, and a key that is a strict field-wise prefix of a longer key
-// compares Equal to it despite having a different field count. Either way,
-// `Ordering::Equal` here does NOT imply true equality — `AnyTuplePage`
-// already has to tolerate that (see its own doc comment on why it buckets
-// by full `DBIdType`, not just `.hashed()`).
+// RISK: for Int, this still intentionally diverges from `Eq`/`PartialEq`,
+// which stay exact — two distinct ids whose hashes collide compare as
+// `Ordering::Equal` here while still being `!=` under `PartialEq`/`Hash`.
+// For Rec, the analogous (much narrower) risk is IndexKey::partial_cmp's
+// own documented quirks: a Str/Blob field whose reserved capacity differs
+// compares Equal despite being `!=` under PartialEq, and a key that is a
+// strict field-wise prefix of a longer key compares Equal to it despite
+// having a different field count. Either way, `Ordering::Equal` here does
+// NOT imply true equality — `AnyTuplePage` already has to tolerate that
+// (see its own doc comment on why it buckets by full `DBIdType`, not just
+// `.hashed()`).
 impl PartialOrd for DBIdType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -188,15 +186,24 @@ impl Display for DBIdType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self {
             DBIdType::Int(i) => write!(f, "{}", i),
-            DBIdType::Vec(v) => write!(f, "{:?}", v),
             DBIdType::Rec(r) => write!(f, "{:?}", r),
         }
     }
 }
 
+// A plain string id is now a single-field Rec(IndexKey) instead of its own
+// variant — Rec already covers this shape (see the enum's own comment), so
+// there's no need for a second, narrower byte-vector id kind. Capacity is
+// set to exactly the content's length: `ValueItem::validate` requires
+// content.len() <= capacity, and a from-String conversion has no other
+// capacity to declare, so this can never fail validation.
 impl From<String> for DBIdType {
     fn from(value: String) -> Self {
-        Self::Vec(value.as_bytes().to_vec())
+        let len = value.len() as u32;
+        Self::Rec(
+            IndexKey::new_from(&[ValueItem::Str((value, len))])
+                .expect("capacity == content length can never fail ValueItem::validate"),
+        )
     }
 }
 
@@ -204,8 +211,7 @@ impl From<DBIdType> for String {
     fn from(value: DBIdType) -> Self {
         match value {
             DBIdType::Int(i) => i.to_string(),
-            DBIdType::Vec(v) => String::from_utf8(v).unwrap_or_default(),
-            DBIdType::Rec(r) => format!("{:?}", r),
+            DBIdType::Rec(r) => r.as_single_str().unwrap_or_else(|| format!("{:?}", r)),
         }
     }
 }
@@ -220,7 +226,6 @@ impl DBIdType {
     pub(crate) fn hashed(&self) -> u64 {
         match self {
             Self::Int(i) => *i,
-            Self::Vec(v) => db_hash(v),
             Self::Rec(r) => r.hash(),
         }
     }
@@ -247,8 +252,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tuple_vec_id() {
-        let id = DBIdType::Vec(b"my_key".to_vec());
+    fn test_tuple_string_id() {
+        let id = DBIdType::from("my_key".to_string());
         let t = Tuple {
             id: id.clone(),
             data: b"value".to_vec().into(),

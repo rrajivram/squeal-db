@@ -23,7 +23,7 @@ use crate::{
 // being true once DBIdType::Rec got a structural Ord (see tuple.rs) so that
 // range queries over multi-key ids mean something. Bucketing (the Vec) still
 // covers the same risk the old scheme had: DBIdType::cmp can say `Equal`
-// for ids that are `PartialEq`-distinct (hash collisions for Int/Vec;
+// for ids that are `PartialEq`-distinct (hash collisions for Int;
 // IndexKey's own documented ties — same content, different reserved
 // capacity, or a strict field-wise prefix — for Rec), and `is_present`/
 // `extract`/etc. below still disambiguate within a bucket via `PartialEq`.
@@ -326,9 +326,9 @@ mod tests {
     }
 
     #[test]
-    fn test_vec_id() {
+    fn test_string_id() {
         let mut p = make_page();
-        let id = DBIdType::Vec(b"my_key".to_vec());
+        let id = DBIdType::from("my_key".to_string());
         p.add(Tuple::new_with(id.clone(), b"payload", None, None))
             .unwrap();
         assert!(p.contains(&id.clone()).unwrap());

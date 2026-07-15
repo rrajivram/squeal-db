@@ -299,6 +299,16 @@ impl Page {
         self.page_data_size.saturating_sub(USABLE_DATA_MARGIN)
     }
 
+    // Some(n) for a fixed-record page (FixedTuplePage, record_size = n at
+    // construction — see new_indexed); None for a variable-size page
+    // (AnyTuplePage). Exposed so callers that pre-check a tuple's fate
+    // before descending into a page (e.g. BPlusTree's leaf-insert routing)
+    // can distinguish "will never fit here" from "no room right now"
+    // without duplicating record_size's own bookkeeping.
+    pub(crate) fn record_size(&self) -> Option<usize> {
+        self.record_size
+    }
+
     pub(crate) fn can_store(&self, tuple: &Tuple) -> bool {
         // Accept a tuple only if it actually fits. Exception: an empty page
         // always accepts, so a single tuple larger than a whole page still has
@@ -310,6 +320,20 @@ impl Page {
     }
 
     pub(crate) fn add_tuple(&mut self, tuple: Tuple) -> Result<(), StoreError> {
+        // Checked ahead of can_store(): can_store's fullness check is about
+        // aggregate bytes used on this page, not any one tuple's own budget,
+        // so once a fixed-record page (record_size = Some(n), i.e. backed by
+        // FixedTuplePage) is holding several entries, an oversized tuple can
+        // trip the aggregate check first — surfacing a generic
+        // PageCapacityError ("no room right now") instead of the real,
+        // permanent reason it can never fit here (TupleTooLarge). Checking
+        // record_size first means the more specific, actionable error always
+        // wins when both would apply.
+        if let Some(max) = self.record_size
+            && tuple.size() as usize > max
+        {
+            return Err(StoreError::TupleTooLarge(tuple.size(), max));
+        }
         if !self.can_store(&tuple) {
             return Err(StoreError::PageCapacityError);
         }
@@ -900,6 +924,56 @@ mod tests {
         p.add_tuple(Tuple::new(1, &big_data)).unwrap();
         assert!(matches!(
             p.add_tuple(Tuple::new(2, b"tiny")),
+            Err(StoreError::PageCapacityError)
+        ));
+    }
+
+    #[test]
+    fn test_add_tuple_prefers_tuple_too_large_over_capacity_error_on_fixed_page() {
+        // record_size deliberately sized for "small"-shaped tuples only,
+        // mimicking a too-small index_entry_size chosen for a BPlusTree's
+        // index page.
+        let record_size = Tuple::new(0, b"small").size() as usize;
+        let mut p = FixedPage::new_indexed(300, record_size);
+        // Fill the page's aggregate byte budget with tuples that individually
+        // stay within record_size, so page_used_size ends up close to
+        // usable_data_size (can_store's own threshold) — the generic
+        // fullness check will now say no to *any* further tuple, whether or
+        // not that tuple would also violate record_size.
+        let mut i = 0u64;
+        while p.can_store(&Tuple::new(i, b"small")) {
+            p.add_tuple(Tuple::new(i, b"small")).unwrap();
+            i += 1;
+        }
+        assert!(!p.can_store(&Tuple::new(i, b"small")));
+        // A tuple that ALSO violates record_size must be reported as
+        // TupleTooLarge — the specific, permanent reason — not the generic
+        // PageCapacityError that can_store's aggregate check would otherwise
+        // produce first.
+        let oversized = Tuple::new(i, b"this payload is far larger than record_size");
+        match p.add_tuple(oversized.clone()) {
+            Err(StoreError::TupleTooLarge(actual, budget)) => {
+                assert_eq!(budget, record_size);
+                assert_eq!(actual, oversized.size());
+            }
+            other => panic!("expected TupleTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_add_tuple_still_returns_capacity_error_for_within_budget_tuple_on_full_page() {
+        // Regression guard: the new record_size check must not swallow the
+        // legitimate "no room right now" case for a tuple that fits its own
+        // per-entry budget just fine.
+        let record_size = Tuple::new(0, b"small").size() as usize;
+        let mut p = FixedPage::new_indexed(300, record_size);
+        let mut i = 0u64;
+        while p.can_store(&Tuple::new(i, b"small")) {
+            p.add_tuple(Tuple::new(i, b"small")).unwrap();
+            i += 1;
+        }
+        assert!(matches!(
+            p.add_tuple(Tuple::new(i, b"small")),
             Err(StoreError::PageCapacityError)
         ));
     }

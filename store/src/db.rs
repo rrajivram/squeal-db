@@ -1454,7 +1454,7 @@ mod tests {
 
     // The concrete motivation for create_table_with_index_entry_size: a
     // composite Rec(IndexKey) key with Str fields easily exceeds
-    // bplustree::MAX_ENTRY_BYTES (64, sized for a plain Int/Vec key) —
+    // bplustree::MAX_ENTRY_BYTES (64, sized for a plain Int key) —
     // create_table's default fails at insert time with a TupleTooLarge
     // error that doesn't help you fix it up front. Sizing the table
     // explicitly avoids that failure entirely.

@@ -518,6 +518,29 @@ where
         }
     }
 
+    /// Like `alloc_page`, but for a fixed-record-size (index) page: always
+    /// writes a fresh `FixedTuplePage` with this exact `record_size`,
+    /// whether the slot is a brand-new page or one popped from the free
+    /// list. Unlike `alloc_page`'s reuse branch — which hands back a
+    /// popped id as-is, trusting that whoever freed it already reset it to
+    /// its target shape (see `reset_freed_page`) — a page's record_size
+    /// must match *this* caller's requirement exactly, not whatever the
+    /// slot happened to hold in a past life, so this always (re)writes it
+    /// rather than trusting the free list's prior content.
+    pub(crate) fn alloc_indexed_page(&self, record_size: usize) -> Result<PageId, StoreError> {
+        let page_num = match self.free_pages.write().pop() {
+            Some(page) => page,
+            None => self
+                .page_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .into(),
+        };
+        let mut p = Page::new_indexed(self.header.page_size, record_size);
+        p.set_clock(self.clock.clone());
+        self.write_page(page_num, &p)?;
+        Ok(page_num)
+    }
+
     pub(crate) fn get_page(&self, page_num: PageId) -> Result<Arc<Page>, StoreError> {
         let valid = page_num
             < self

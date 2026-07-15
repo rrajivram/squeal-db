@@ -35,13 +35,14 @@ const LEAF_NODE: usize = 5;
 // NOT used inside BPlusTree::new anymore — index_entry_size is now a real
 // parameter callers must supply deliberately (see BPlusTree::new's own doc
 // comment), not an assumption baked into the tree's own construction. This
-// constant only sizes `Int`/`Vec`-keyed tables (`Db::create_table`'s
-// convenience default) and is used freely by this file's own tests, per the
-// estimate below. Anything else — in particular a composite `Rec(IndexKey)`
-// key with `Str`/`Blob` fields — should compute its own bound instead of
+// constant only sizes `Int`-keyed tables (`Db::create_table`'s convenience
+// default) and is used freely by this file's own tests, per the estimate
+// below. Anything else — in particular a composite `Rec(IndexKey)` key with
+// `Str`/`Blob` fields (including a plain string id, which is now also
+// `Rec`-backed — see `DBIdType`) — should compute its own bound instead of
 // assuming this is enough; it easily isn't.
 //
-// Postcard varint upper bounds per field, for an Int/Vec-keyed entry:
+// Postcard varint upper bounds per field, for an Int-keyed entry:
 //   DBIdType::Int(u64::MAX)  → 1 (variant) + 10 (varint) = 11 B
 //   Option<TransactionId>    → 1 (Some) + 10 (u64 id) + 10 (u128 ts) = 21 B
 //   Option<UndoId>           → 1 (None)
@@ -84,14 +85,19 @@ where
     /// for this table, for its whole lifetime, must serialize to no more
     /// than this many bytes. Callers must size this deliberately for their
     /// actual key shape rather than relying on a guessed default: a plain
-    /// `Int`/`Vec` key comfortably fits the historical default
-    /// (`MAX_ENTRY_BYTES`, still available for tests and as `Db::
-    /// create_table`'s own convenience default), but a composite
-    /// `Rec(IndexKey)` key with several `Str`/`Blob` fields can easily need
-    /// more — see `IndexKey`/`ValueItem`'s own reserved-capacity fields for
-    /// how to compute an exact upper bound for a given key shape. Passing
-    /// too small a value doesn't fail here; it fails later, at insert time,
-    /// with a `PageCapacityError` that doesn't explain why.
+    /// `Int` key comfortably fits the historical default (`MAX_ENTRY_BYTES`,
+    /// still available for tests and as `Db::create_table`'s own convenience
+    /// default), but a composite `Rec(IndexKey)` key with several
+    /// `Str`/`Blob` fields — including a plain string id, which is also a
+    /// `Rec` under the hood (see `DBIdType`) — can easily need more; see
+    /// `IndexKey`/`ValueItem`'s own reserved-capacity fields for how to
+    /// compute an exact upper bound for a given key shape. Passing too small
+    /// a value doesn't fail here; it fails later, at insert time, with a
+    /// clear `TupleTooLarge(actual, budget)`. This holds for the whole
+    /// table's lifetime, not just before its first split:
+    /// `alloc_sibling_index_page` carries this same budget forward onto
+    /// every page a split creates, rather than letting it silently lapse
+    /// into an unbounded page the way `PageBuffer::alloc_page` would.
     pub fn new(
         id: TableIdType,
         name: String,
@@ -833,6 +839,24 @@ where
                 let id = handle.page_num;
                 self.write_page(handle, tuple)?;
                 Ok(id)
+            } else if let Some(max) = handle.page.record_size() {
+                // A tuple that will never fit this page's fixed per-entry
+                // budget (too small an index_entry_size for this key shape,
+                // see BPlusTree::new's own doc comment) is not the invariant
+                // violation the panic below guards against — it's a
+                // permanent, reportable condition. can_store's generic
+                // aggregate-bytes check can return false here for the same
+                // underlying reason (see Page::add_tuple's comment), so
+                // check this first rather than falling through to panic.
+                if tuple.size() as usize > max {
+                    Err(StoreError::TupleTooLarge(tuple.size(), max))
+                } else {
+                    panic!(
+                        "count == nodes {}, or too big {}",
+                        handle.page.count().unwrap(),
+                        tuple.size()
+                    );
+                }
             } else {
                 panic!(
                     "count == nodes {}, or too big {}",
@@ -1030,6 +1054,25 @@ where
         }
     }
 
+    // Splits must carry a fixed-record (index) page's per-entry budget
+    // forward instead of silently dropping to a variable-size AnyTuplePage
+    // (see BPlusTree::new's doc comment) — otherwise the TupleTooLarge
+    // protection in Page::add_tuple only ever covers a table before its
+    // first split. `sibling_of` is always the page actually being split
+    // (never yet mutated), so its own record_size is the exact same budget
+    // this table's index has used from the start; falls back to a plain
+    // AnyTuplePage only if that page has already lost its own record_size —
+    // on-disk data written before this fix existed. Every split from here on
+    // keeps propagating a real record_size forward, since the root is
+    // always FixedTuplePage-backed (BPlusTree::new) and every subsequent
+    // split's `sibling_of` was itself created by this same function.
+    fn alloc_sibling_index_page(&self, sibling_of: &Page) -> Result<PageId, StoreError> {
+        match sibling_of.record_size() {
+            Some(record_size) => self.buffer.alloc_indexed_page(record_size),
+            None => self.buffer.alloc_page(false),
+        }
+    }
+
     fn split_non_root_page(
         &self,
         handle: WritePageHandle,
@@ -1068,7 +1111,7 @@ where
         } else {
             new_vals[0].id.clone()
         };
-        let new_page_id = self.buffer.alloc_page(false)?;
+        let new_page_id = self.alloc_sibling_index_page(&current_handle.page)?;
         let mut new_handle = self.buffer.get_page_mut(new_page_id)?;
 
         let current_page = Arc::make_mut(&mut current_handle.page);
@@ -1188,8 +1231,8 @@ where
         } else {
             right_vals[0].id.clone()
         };
-        let left_page_id = self.buffer.alloc_page(false)?;
-        let right_page_id = self.buffer.alloc_page(false)?;
+        let left_page_id = self.alloc_sibling_index_page(&handle.page)?;
+        let right_page_id = self.alloc_sibling_index_page(&handle.page)?;
         let mut left_handle = self.buffer.get_page_mut(left_page_id)?;
         let mut right_handle = self.buffer.get_page_mut(right_page_id)?;
         // Flags on the COW copy, not the shared cached Arc (see update_root_page).
@@ -1756,6 +1799,73 @@ mod tests {
             } else {
                 panic!("inner root entry must be Node::Inner");
             }
+        }
+    }
+
+    #[test]
+    fn test_split_child_index_pages_preserve_record_size() {
+        // The whole point of alloc_sibling_index_page: a split-created index
+        // page must keep the same fixed per-entry budget as the page it
+        // split from (via the root's own record_size, propagated forward),
+        // not silently become an unbounded AnyTuplePage the way alloc_page
+        // used to hand back.
+        let index_entry_size = MAX_ENTRY_BYTES;
+        let page_size = index_entry_size * 4;
+        let tree = make_tree_with_entry_size(page_size, index_entry_size);
+
+        for i in 1u64..=4 {
+            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
+        }
+
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
+        let entries: Vec<_> = ip.iter().collect();
+        assert_eq!(entries.len(), 2, "root must have split into 2 routing entries");
+        for entry in &entries {
+            let node: Node = from_bytes(&entry.data).unwrap();
+            if let Node::Inner(child_page_id) = node {
+                let cp = tree.buffer.get_page(child_page_id).unwrap();
+                assert_eq!(
+                    cp.record_size(),
+                    Some(index_entry_size as usize),
+                    "split-created child page {:?} must keep the table's own \
+                     index_entry_size, not silently drop to a variable-size page",
+                    child_page_id
+                );
+            } else {
+                panic!("inner root entry must be Node::Inner");
+            }
+        }
+    }
+
+    #[test]
+    fn test_oversized_insert_after_split_still_returns_tuple_too_large() {
+        // Regression test: before alloc_sibling_index_page, a split sibling
+        // was always allocated as a variable-size AnyTuplePage with no
+        // per-entry budget at all — an oversized entry that routed there
+        // would bypass TupleTooLarge entirely, since that protection only
+        // ever covered a table's very first, pre-split index page. Force a
+        // split first, then confirm the budget still holds no matter which
+        // leaf the next insert actually lands on.
+        let index_entry_size = MAX_ENTRY_BYTES;
+        let page_size = index_entry_size * 4;
+        let tree = make_tree_with_entry_size(page_size, index_entry_size);
+
+        for i in 1u64..=4 {
+            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
+        }
+
+        let big_key = DBIdType::Rec(
+            IndexKey::new_from(&[ValueItem::Str(("z".repeat(90), 90))]).unwrap(),
+        );
+        match tree.insert(Tuple::new_with(big_key, b"v", None, None), txn()) {
+            Err(StoreError::TupleTooLarge(actual, budget)) => {
+                assert_eq!(budget, index_entry_size as usize);
+                assert!(
+                    actual > budget as u64,
+                    "reported actual size must exceed the budget it failed against"
+                );
+            }
+            other => panic!("expected TupleTooLarge, got {other:?}"),
         }
     }
 
@@ -2354,10 +2464,10 @@ mod tests {
 
     // The concrete motivation for this whole change: a composite Rec(IndexKey)
     // key with Str fields easily exceeds MAX_ENTRY_BYTES (64) — the default
-    // guess sized for a plain Int/Vec key — and the failure mode without a
-    // deliberate size is an insert-time PageCapacityError with no indication
-    // *why*. A caller who computes their key's real upper bound and passes it
-    // as index_entry_size avoids that entirely.
+    // guess sized for a plain Int key — and the failure mode without a
+    // deliberate size is a clear insert-time TupleTooLarge. A caller who
+    // computes their key's real upper bound and passes it as
+    // index_entry_size avoids that entirely.
     #[test]
     fn test_composite_key_too_big_for_default_entry_size_succeeds_with_a_larger_one() {
         // Two Str fields reserving 50 bytes each: comfortably over
@@ -2410,5 +2520,64 @@ mod tests {
                 .map(|t| t.data.to_vec()),
             Some(b"v".to_vec())
         );
+    }
+
+    #[test]
+    fn test_oversized_insert_on_nonempty_leaf_returns_tuple_too_large_not_panic() {
+        // Regression test for the masking bug fixed alongside this: once a
+        // fixed-record leaf page already holds other entries,
+        // insert_recursive's own can_store precheck (an aggregate-bytes
+        // fullness check, unrelated to any one tuple's size) could go false
+        // for an oversized tuple *before* write_page/add_tuple was ever
+        // called — falling into the "count == nodes, or too big" branch,
+        // which used to unconditionally panic. That branch now checks the
+        // page's record_size first and returns TupleTooLarge when that's the
+        // real cause, so this must return a clean error, not panic. Fill the
+        // leaf directly (bypassing insert(), which would trigger a root
+        // split long before the page is byte-full, moving traffic onto a
+        // split sibling — a variable-size AnyTuplePage with no record_size
+        // at all, see BPlusTree::new's doc comment) so nodes_per_page-based
+        // count stays low while the page's real aggregate bytes fill up.
+        // 30 comfortably fits a real Int-keyed leaf entry (28 bytes) but,
+        // combined with a small page, leaves an aggregate byte budget that
+        // runs out at a lower count than nodes_per_page assumes — the exact
+        // mismatch the fix guards against.
+        let index_entry_size = 30u64;
+        let tree = make_tree_with_entry_size(180, index_entry_size);
+        {
+            let mut handle = tree
+                .buffer
+                .get_page_mut(tree.table.first_index_page)
+                .unwrap();
+            let page = Arc::make_mut(&mut handle.page);
+            let mut i = 0u64;
+            let filler =
+                |i: u64| Tuple::new_with(DBIdType::Int(i), b"pay", Some(txn()), None);
+            while page.can_store(&filler(i)) {
+                page.add_tuple(filler(i)).unwrap();
+                i += 1;
+            }
+            assert!(
+                i < tree.table.nodes_per_page as u64 - 1,
+                "test setup assumption broken: the page filled by count, not aggregate \
+                 bytes (i={i}, nodes_per_page={}) — this no longer exercises the \
+                 aggregate-vs-record_size masking case",
+                tree.table.nodes_per_page
+            );
+            tree.buffer.write_locked_page(handle).unwrap();
+        }
+        let big_key = DBIdType::Rec(
+            IndexKey::new_from(&[ValueItem::Str(("z".repeat(60), 60))]).unwrap(),
+        );
+        match tree.insert(Tuple::new_with(big_key, b"v", None, None), txn()) {
+            Err(StoreError::TupleTooLarge(actual, budget)) => {
+                assert_eq!(budget, index_entry_size as usize);
+                assert!(
+                    actual > budget as u64,
+                    "reported actual size must exceed the budget it failed against"
+                );
+            }
+            other => panic!("expected TupleTooLarge, got {other:?}"),
+        }
     }
 }
