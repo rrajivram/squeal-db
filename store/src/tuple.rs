@@ -114,7 +114,15 @@ impl Tuple {
             undo_id,
             ..Default::default()
         };
-        s.serialized_size = to_allocvec(&s).map(|v| v.len()).unwrap_or(0) as DBSizeType;
+        // serialized_size() over to_allocvec().len(): every Tuple construction
+        // needs only the byte count, not the bytes themselves — to_allocvec
+        // allocated and immediately discarded a full copy of the encoded
+        // tuple just to measure it. postcard's Size flavor computes the same
+        // exact count by walking the same Serialize impl without writing
+        // anything, so this is zero-allocation on what's likely the hottest
+        // single call site in the whole write path (every insert/update/
+        // remove constructs at least one Tuple).
+        s.serialized_size = postcard::experimental::serialized_size(&s).unwrap_or(0) as DBSizeType;
         s
     }
 
@@ -166,8 +174,10 @@ impl Tuple {
         if self.serialized_size > 0 {
             self.serialized_size
         } else {
-            // Deserialized tuples have serialized_size=0 (serde skips it); compute on demand.
-            to_allocvec(self).map(|v| v.len()).unwrap_or(0) as DBSizeType
+            // Deserialized tuples have serialized_size=0 (serde skips it); compute
+            // on demand. See new_with's comment on why serialized_size (not
+            // to_allocvec) is used here too.
+            postcard::experimental::serialized_size(self).unwrap_or(0) as DBSizeType
         }
     }
 
