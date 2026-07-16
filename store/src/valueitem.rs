@@ -14,7 +14,6 @@ pub enum ValueItem {
     #[default]
     Null = 0,
     Integer(i64) = 5,
-    UInteger(u64) = 6,
     Double(f64) = 10,
     Datetime(u64) = 15,
     Str((String, u32)) = 20,
@@ -121,7 +120,6 @@ impl ValueItem {
     pub(super) fn validate(&self) -> Result<(), StoreError> {
         match self {
             ValueItem::Integer(_) => Ok(()),
-            ValueItem::UInteger(_) => Ok(()),
             ValueItem::Double(_) => Ok(()),
             ValueItem::Datetime(_) => Ok(()),
             ValueItem::Str(s) => {
@@ -145,7 +143,6 @@ impl ValueItem {
     pub(super) fn size(&self) -> usize {
         let sz = match self {
             ValueItem::Integer(_) => size_of::<i64>(),
-            ValueItem::UInteger(_) => size_of::<u64>(),
             ValueItem::Double(_) => size_of::<f64>(),
             ValueItem::Datetime(_) => size_of::<u64>(),
             ValueItem::Str(s) => s.1 as usize + size_of::<u32>() * 2,
@@ -158,7 +155,6 @@ impl ValueItem {
     pub(super) fn size_of_empty(&self) -> usize {
         let sz = match self {
             ValueItem::Integer(_) => size_of::<i64>(),
-            ValueItem::UInteger(_) => size_of::<u64>(),
             ValueItem::Double(_) => size_of::<f64>(),
             ValueItem::Datetime(_) => size_of::<u64>(),
             ValueItem::Str(_) => size_of::<u32>() * 2,
@@ -173,7 +169,6 @@ impl ValueItem {
         let value = match self {
             ValueItem::Null => 0u8,
             ValueItem::Integer(_) => 5,
-            ValueItem::UInteger(_) => 6,
             ValueItem::Double(_) => 10,
             ValueItem::Datetime(_) => 15,
             ValueItem::Str(_) => 20,
@@ -182,7 +177,6 @@ impl ValueItem {
         bytes.push(value);
         match self {
             ValueItem::Integer(i) => bytes.extend_from_slice(&i.to_le_bytes()),
-            ValueItem::UInteger(u) => bytes.extend_from_slice(&u.to_le_bytes()),
             ValueItem::Double(f) => bytes.extend_from_slice(&f.to_le_bytes()),
             ValueItem::Datetime(d) => bytes.extend_from_slice(&d.to_le_bytes()),
             ValueItem::Str(s) => {
@@ -210,7 +204,6 @@ impl ValueItem {
         match self {
             ValueItem::Null => 0,
             ValueItem::Integer(i) => *i as u64,
-            ValueItem::UInteger(i) => *i,
             ValueItem::Double(f) => f.abs() as u64,
             ValueItem::Datetime(d) => *d,
             ValueItem::Str((s, _l)) => db_hash(s.as_bytes()),
@@ -233,12 +226,6 @@ impl ValueItem {
                     i64::from_le_bytes(bytes[index..index + size_of::<i64>()].try_into().unwrap());
                 index += size_of::<i64>();
                 ValueItem::Integer(v)
-            }
-            6 => {
-                let v =
-                    u64::from_le_bytes(bytes[index..index + size_of::<i64>()].try_into().unwrap());
-                index += size_of::<u64>();
-                ValueItem::UInteger(v)
             }
             10 => {
                 let v =
@@ -302,7 +289,6 @@ impl Display for ValueItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ValueItem::Integer(i) => write!(f, "{}", i),
-            ValueItem::UInteger(i) => write!(f, "{}", i),
             ValueItem::Double(d) => write!(f, "{}", d),
             ValueItem::Datetime(dt) => write!(f, "{}", dt),
             ValueItem::Str(s) => write!(f, "{}", s.0),
@@ -319,7 +305,6 @@ impl PartialOrd for ValueItem {
         }
         match (self, other) {
             (ValueItem::Integer(a), ValueItem::Integer(b)) => a.partial_cmp(b),
-            (ValueItem::UInteger(a), ValueItem::UInteger(b)) => a.partial_cmp(b),
             (ValueItem::Double(a), ValueItem::Double(b)) => a.partial_cmp(b),
             (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.partial_cmp(b),
             (ValueItem::Str(a), ValueItem::Str(b)) => a.0.partial_cmp(&b.0),
@@ -327,7 +312,6 @@ impl PartialOrd for ValueItem {
 
             (_, ValueItem::Null) => Some(std::cmp::Ordering::Greater),
             (ValueItem::Integer(_), _) => panic!("Invalid comparison. I"),
-            (ValueItem::UInteger(_), _) => panic!("Invalid comparison. I"),
             (ValueItem::Double(_), _) => panic!("Invalid comparison. F "),
             (ValueItem::Datetime(_), _) => panic!("Invalid comparison. D"),
             (ValueItem::Str(_), _) => panic!("Invalid comparison. S"),
@@ -367,10 +351,10 @@ mod valueitem_tests {
     }
 
     #[test]
-    fn test_cmp_uinteger_double_datetime() {
-        assert!(ValueItem::UInteger(0) < ValueItem::UInteger(1));
-        assert!(ValueItem::UInteger(u64::MAX) > ValueItem::UInteger(0));
-        assert!(ValueItem::UInteger(5) == ValueItem::UInteger(5));
+    fn test_cmp_integer_double_datetime() {
+        assert!(ValueItem::Integer(0) < ValueItem::Integer(1));
+        assert!(ValueItem::Integer(i64::MAX) > ValueItem::Integer(0));
+        assert!(ValueItem::Integer(5) == ValueItem::Integer(5));
 
         assert!(ValueItem::Double(1.5) < ValueItem::Double(2.5));
         assert!(ValueItem::Double(-1.5) < ValueItem::Double(0.0));
@@ -482,7 +466,7 @@ mod valueitem_tests {
         assert_eq!(ValueItem::Null.size_of_empty(), 1);
 
         assert_eq!(ValueItem::Integer(42).size(), 1 + size_of::<i64>());
-        assert_eq!(ValueItem::UInteger(42).size(), 1 + size_of::<u64>());
+        assert_eq!(ValueItem::Integer(42).size(), 1 + size_of::<u64>());
         assert_eq!(ValueItem::Double(1.0).size(), 1 + size_of::<f64>());
         assert_eq!(ValueItem::Datetime(1).size(), 1 + size_of::<u64>());
         assert_eq!(
@@ -554,8 +538,8 @@ mod valueitem_tests {
             ValueItem::Integer(i64::MIN),
             ValueItem::Integer(i64::MAX),
             ValueItem::Integer(0),
-            ValueItem::UInteger(0),
-            ValueItem::UInteger(u64::MAX),
+            ValueItem::Integer(0),
+            ValueItem::Integer(i64::MAX),
             ValueItem::Datetime(0),
             ValueItem::Datetime(u64::MAX),
             ValueItem::Str(("".into(), 0)),
@@ -620,7 +604,7 @@ mod valueitem_tests {
         );
     }
 
-    // BUG (now fixed): the fixed-width branches (Integer/UInteger/Double/
+    // BUG (now fixed): the fixed-width branches (Integer/Integer/Double/
     // Datetime) never advanced `index` past the discriminant byte, so the
     // returned index was always short by the value's own width whenever a
     // fixed-width value was anything but the last one read from a buffer.
@@ -628,7 +612,7 @@ mod valueitem_tests {
     fn test_from_bytes_many_index_advances_past_fixed_width_values() {
         for a in [
             ValueItem::Integer(-7),
-            ValueItem::UInteger(7),
+            ValueItem::Integer(7),
             ValueItem::Double(1.25),
             ValueItem::Datetime(99),
         ] {
@@ -676,7 +660,7 @@ mod valueitem_tests {
         for v in [
             ValueItem::Null,
             ValueItem::Integer(-42),
-            ValueItem::UInteger(42),
+            ValueItem::Integer(42),
             ValueItem::Double(1.5),
             ValueItem::Datetime(123),
             ValueItem::Str(("hello".into(), 10)),
@@ -701,7 +685,7 @@ mod valueitem_tests {
     #[test]
     fn test_display() {
         assert_eq!(format!("{}", ValueItem::Integer(-5)), "-5");
-        assert_eq!(format!("{}", ValueItem::UInteger(5)), "5");
+        assert_eq!(format!("{}", ValueItem::Integer(5)), "5");
         assert_eq!(format!("{}", ValueItem::Double(1.5)), "1.5");
         assert_eq!(format!("{}", ValueItem::Datetime(100)), "100");
         assert_eq!(format!("{}", ValueItem::Str(("hi".into(), 10))), "hi");
@@ -716,7 +700,6 @@ mod valueitem_tests {
     fn test_discriminant_matches_wire_tag() {
         assert_eq!(ValueItem::Null.discriminant(), 0);
         assert_eq!(ValueItem::Integer(0).discriminant(), 5);
-        assert_eq!(ValueItem::UInteger(0).discriminant(), 6);
         assert_eq!(ValueItem::Double(0.0).discriminant(), 10);
         assert_eq!(ValueItem::Datetime(0).discriminant(), 15);
         assert_eq!(ValueItem::Str(("".into(), 0)).discriminant(), 20);
@@ -752,10 +735,10 @@ mod indexkey_tests {
 
     #[test]
     fn test_new_from_and_size_sums_fields_plus_count_prefix() {
-        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::UInteger(2)]).unwrap();
+        let k = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
         assert_eq!(
             k.size(),
-            size_of::<u64>() + ValueItem::Integer(1).size() + ValueItem::UInteger(2).size()
+            size_of::<u64>() + ValueItem::Integer(1).size() + ValueItem::Integer(2).size()
         );
     }
 
@@ -822,7 +805,7 @@ mod indexkey_tests {
             ValueItem::Integer(-7),
             ValueItem::Str(("hello".into(), 5)), // no padding: capacity == len
             ValueItem::Double(1.25),
-            ValueItem::UInteger(9),
+            ValueItem::Integer(9),
         ])
         .unwrap();
         let bytes = k.to_bytes();

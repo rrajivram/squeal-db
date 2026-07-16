@@ -1,5 +1,5 @@
 [workspace]
-members=["store"]
+members=["squeal-sql","store"]
 resolver="3"
 
 [profile.release]

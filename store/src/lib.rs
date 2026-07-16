@@ -14,7 +14,7 @@ mod buffer;
 mod constant;
 pub mod db;
 pub mod error;
-mod generator;
+pub mod generator;
 mod logger;
 pub mod memfile;
 

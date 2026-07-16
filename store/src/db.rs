@@ -244,6 +244,10 @@ where
         Ok(Arc::new(sf))
     }
 
+    pub fn get_generator(self: &Arc<Self>) -> Arc<Generator> {
+        self.generator.clone()
+    }
+
     pub fn open<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
         let uf_name = name.as_ref().to_string() + ".undo";
         let rf_name = name.as_ref().to_string() + ".redo";
@@ -681,6 +685,18 @@ where
             .get(&id)
             .map(Arc::clone)
             .ok_or(StoreError::TableNotFound(id.to_string()))
+    }
+
+    pub fn table_id_by_name<S: AsRef<str>>(
+        &self,
+        name: S,
+    ) -> Result<Option<TableIdType>, StoreError> {
+        Ok(self
+            .tables
+            .read()
+            .values()
+            .find(|t| t.table.name == name.as_ref())
+            .map(|t| t.id()))
     }
 
     pub fn insert(
@@ -1477,7 +1493,11 @@ mod tests {
         let default_tid = db.create_table("default_sized".to_string()).unwrap();
         let t = db.begin().unwrap();
         let err = db
-            .insert(default_tid, Tuple::new_with(big_key(), b"v", None, None), &t)
+            .insert(
+                default_tid,
+                Tuple::new_with(big_key(), b"v", None, None),
+                &t,
+            )
             .unwrap_err();
         assert!(
             matches!(err, StoreError::TupleTooLarge(_, _)),

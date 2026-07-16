@@ -6,7 +6,7 @@ use std::{
 use crate::{db::DBSizeType, error::StoreError};
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct Generator {
+pub struct Generator {
     gens: Arc<RwLock<HashMap<String, AtomicU64>>>,
 }
 
@@ -17,7 +17,7 @@ impl Generator {
         }
     }
 
-    pub(crate) fn create_generator<S: AsRef<str>>(
+    pub fn create_generator<S: AsRef<str>>(
         &self,
         name: S,
         start: Option<DBSizeType>,
@@ -34,7 +34,7 @@ impl Generator {
         Ok(())
     }
 
-    pub(crate) fn gen_key<S: AsRef<str>>(&self, name: S) -> Result<DBSizeType, StoreError> {
+    pub fn gen_key<S: AsRef<str>>(&self, name: S) -> Result<DBSizeType, StoreError> {
         let name = name.as_ref().to_string();
         Ok(self
             .gens
