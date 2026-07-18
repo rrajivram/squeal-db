@@ -34,3 +34,9 @@ impl Display for TableIdType {
         write!(f, "{}", self.0)
     }
 }
+
+impl TableIdType {
+    pub fn none() -> Self {
+        Self(0)
+    }
+}

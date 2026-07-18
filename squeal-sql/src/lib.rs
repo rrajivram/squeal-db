@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+pub(crate) mod constant;
 pub mod datatype;
 pub mod error;
 pub mod schema;

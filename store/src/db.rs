@@ -1005,6 +1005,48 @@ where
         Ok(table_id)
     }
 
+    /// Drops a table and reclaims every page it owns (its whole index tree
+    /// and its whole data chain, including any overflow continuation
+    /// pages) back to the free list, so later `create_table` calls can
+    /// reuse that space instead of the file only ever growing.
+    ///
+    /// Not transactional, like `create_table`/`create_table_with_index_
+    /// entry_size` themselves — this is DDL, not a row-level operation
+    /// tracked by a `Transaction`'s undo log, so there's no `&Transaction`
+    /// parameter and nothing here can be rolled back once called.
+    ///
+    /// Not safe against a concurrent operation already in flight against
+    /// this table: this only removes it from the name/id registry and
+    /// frees its pages — anything that already holds its own reference
+    /// (obtained before this call) keeps working against pages that are
+    /// now back on the free list and may be reused underneath it. Callers
+    /// are responsible for knowing nothing else is using the table (e.g.
+    /// squeal-sql's own use — cleaning up a table's own just-created,
+    /// not-yet-published indices after a failed CREATE TABLE — holds,
+    /// since nothing else can have discovered them yet).
+    pub fn drop_table<S: AsRef<str>>(&self, name: S) -> Result<(), StoreError> {
+        let name = name.as_ref();
+        let table = {
+            let mut tables = self.tables.write();
+            let id = tables
+                .values()
+                .find(|t| t.table.name == name)
+                .map(|t| t.id())
+                .ok_or_else(|| StoreError::TableNotFound(name.to_string()))?;
+            // Always Some: id was just read from this same map under the
+            // same held write lock.
+            tables.remove(&id).unwrap()
+        };
+        for page_id in table.all_index_page_ids()? {
+            let record_size = self.buffer.get_page(page_id)?.record_size();
+            self.buffer.reset_and_free_page(page_id, record_size)?;
+        }
+        self.buffer.free_page_chain(table.table.first_data_page)?;
+        self.generator.remove_generator(name)?;
+        self.write_system_tables()?;
+        Ok(())
+    }
+
     fn setup_needed_modules(
         header: Arc<Header>,
         gens: Arc<Generator>,
@@ -1269,7 +1311,7 @@ mod tests {
 
     use crate::{
         cursor::Cursor,
-        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
+        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE, db_hash},
         error::StoreError,
         logger::MsgType,
         memfile::MemFile,
@@ -1524,6 +1566,151 @@ mod tests {
             db.find(sized_tid, key, &t).unwrap().unwrap().data.to_vec(),
             b"v"
         );
+    }
+
+    // ── drop_table ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_drop_table_removes_it_from_the_table_list() {
+        let (db, tid) = make_db_with_table();
+        assert_eq!(db.get_tables().unwrap().len(), 1);
+        db.drop_table("rows").unwrap();
+        assert_eq!(db.get_tables().unwrap().len(), 0);
+        assert_eq!(db.table_id_by_name("rows").unwrap(), None);
+        // The dropped id must actually be gone, not just unnamed — using it
+        // (with a caller-held stale TableIdType, exactly the "don't do this
+        // concurrently" case drop_table's own doc comment calls out) must
+        // fail cleanly, not panic.
+        let t = db.begin().unwrap();
+        let err = db.find(tid, id(1), &t).unwrap_err();
+        assert!(matches!(err, StoreError::TableNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_drop_table_missing_name_returns_table_not_found() {
+        let (db, _tid) = make_db_with_table();
+        let err = db.drop_table("does_not_exist").unwrap_err();
+        assert!(matches!(err, StoreError::TableNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn test_drop_table_frees_the_name_for_reuse() {
+        let (db, _tid) = make_db_with_table();
+        db.drop_table("rows").unwrap();
+        // Both the table registry (DuplicateName check) and the generator
+        // (create_generator's own DuplicateName check) must have let go of
+        // the name — creating "rows" again must succeed, not error, and
+        // the new table must work normally.
+        let new_tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        db.insert(new_tid, row(1, b"fresh"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(
+            db.find(new_tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"fresh"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_reuses_its_initial_pages_immediately() {
+        let (db, _tid) = make_db_with_table();
+        let page_count_before = db.page_count();
+        db.drop_table("rows").unwrap();
+        // A freshly created table's own initial 2 pages (first_index_page,
+        // first_data_page) must come from what drop_table just freed
+        // (alloc_page's free-list-pop path), not grow the file further.
+        db.create_table("rows2".to_string()).unwrap();
+        assert_eq!(
+            db.page_count(),
+            page_count_before,
+            "a table created right after a drop must reuse its pages instead \
+             of growing the file"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_frees_every_page_a_multi_split_table_owned() {
+        // Direct page-count accounting instead of "does a same-shaped table
+        // fit back in the same space" (tried that first — it doesn't hold:
+        // reusing pages off a LIFO free list can shift exactly where later
+        // splits land, so an identical insert sequence into a fresh table
+        // isn't guaranteed to produce an identical page count, only a
+        // comparable one). What must hold precisely is that every page the
+        // dropped table owned — not most of them — ends up on the free list.
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        for i in 0..500u64 {
+            db.insert(tid, row(i, b"some reasonably sized payload"), &t)
+                .unwrap();
+        }
+        db.commit(t).unwrap();
+        assert_eq!(
+            db.buffer.get_free_pages().len(),
+            0,
+            "nothing should be on the free list yet"
+        );
+        // The only pages that exist at this point are the 3 fixed system
+        // pages (tables list / generators / free-page list, see
+        // create_system_tables) plus everything "rows" itself allocated.
+        let table_page_count = db.page_count() - 3;
+
+        db.drop_table("rows").unwrap();
+
+        assert_eq!(
+            db.buffer.get_free_pages().len(),
+            table_page_count as usize,
+            "dropping the table must free every page it owned, not just some \
+             of them"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_reclaims_overflow_pages() {
+        // Mirrors test_reused_freed_overflow_page_is_safe_to_write_fresh_data_into's
+        // setup: a single row large enough to spill across an overflow
+        // chain, not just its own primary data page. Same precise
+        // free-list accounting as the multi-split test above — the point
+        // here specifically is that the *overflow continuation* pages are
+        // included in that count, not just the primary index/data pages.
+        let (db, tid) = make_db_with_table();
+        let page_sz = DEFAULT_PAGE_SIZE as usize;
+        let big = vec![b'x'; 5 * page_sz];
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, &big), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(db.buffer.get_free_pages().len(), 0);
+        let table_page_count = db.page_count() - 3;
+
+        db.drop_table("rows").unwrap();
+
+        assert_eq!(
+            db.buffer.get_free_pages().len(),
+            table_page_count as usize,
+            "dropping the table must free its overflow continuation pages \
+             too, not just its primary index/data pages"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_persists_across_close_and_reopen() {
+        let db_name = temp_db_path("drop_table_persists");
+        FileDB::delete(&db_name).unwrap_or_default();
+
+        let db = FileDB::create(&db_name).unwrap();
+        db.create_table("rows".to_string()).unwrap();
+        db.drop_table("rows").unwrap();
+        assert_eq!(db.get_tables().unwrap().len(), 0);
+        let (f, u, r) = db.close().unwrap();
+
+        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        assert_eq!(db2.get_tables().unwrap().len(), 0);
+        assert_eq!(db2.table_id_by_name("rows").unwrap(), None);
+        // The name must still be free after reopen too — proves the
+        // generator removal itself persisted, not just the table list.
+        db2.create_table("rows".to_string()).unwrap();
+
+        FileDB::delete(&db_name).unwrap_or_default();
     }
 
     // ── transactional insert / find ───────────────────────────────────────────
@@ -3936,5 +4123,84 @@ mod tests {
             }
         }
         drop(t);
+    }
+
+    // Regression test for a confirmed race in BPlusTree::find_page/
+    // route_to_leaf: both do a fully unlocked, multi-step descent (route,
+    // then separately read the leaf landed on), with no protection against
+    // a concurrent split moving the target key to a new sibling in between.
+    // That produces a spurious KeyNotFound for a key that genuinely exists
+    // — and since KeyNotFound isn't LockContentionError, retry_on_contention
+    // never retries it, so a remove/update attempt that hits this mid-flight
+    // just fails outright, leaving the row's prior (un-removed) state as
+    // the permanent, incorrect "final" value. Confirmed via direct,
+    // instrumented reproduction: caught cases where a fresh find_page call
+    // failed for a key whose existence had just been confirmed microseconds
+    // earlier by a separate lookup in the very same call, with no
+    // intervening removal — and where the eventual "resurrected" value's
+    // own transaction timestamp was hundreds of milliseconds away from the
+    // reader's (ruling out any timestamp-ordering ambiguity as the cause).
+    // Runs several rounds since the race needs concurrent structural
+    // splits to manifest — tolerant of individual operation failures (logs
+    // them) so one early miss doesn't abort the whole run before the final
+    // "every key must be absent" check, which is the actual assertion.
+    #[test]
+    fn test_concurrent_insert_remove_under_splits_does_not_resurrect_stale_value() {
+        const THREADS: u64 = 16;
+        const KEYS_PER_THREAD: u64 = 20;
+        const CYCLES: u64 = 20;
+        const ROUNDS: u32 = 20;
+        let mut resurrections = 0u32;
+        for _round in 0..ROUNDS {
+            let (db, tid) = make_db_with_table();
+            let mut handles = Vec::new();
+            for thread_idx in 0..THREADS {
+                let db = Arc::clone(&db);
+                handles.push(thread::spawn(move || {
+                    for cycle in 0..CYCLES {
+                        for i in 0..KEYS_PER_THREAD {
+                            let key = thread_idx * KEYS_PER_THREAD + i;
+                            let value = format!("v{key}-{cycle}");
+                            let Ok(t) = db.begin() else { continue };
+                            if super::retry_on_contention(|| {
+                                db.insert(tid, row(key, value.as_bytes()), &t)
+                            })
+                            .is_err()
+                            {
+                                continue;
+                            }
+                            if db.commit(t).is_err() {
+                                continue;
+                            }
+
+                            let Ok(t) = db.begin() else { continue };
+                            if super::retry_on_contention(|| db.remove(tid, id(key), &t)).is_err()
+                            {
+                                continue;
+                            }
+                            let _ = db.commit(t);
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+
+            let t = db.begin().unwrap();
+            for thread_idx in 0..THREADS {
+                for i in 0..KEYS_PER_THREAD {
+                    let key = thread_idx * KEYS_PER_THREAD + i;
+                    if db.find(tid, id(key), &t).unwrap().is_some() {
+                        resurrections += 1;
+                    }
+                }
+            }
+            drop(t);
+        }
+        assert_eq!(
+            resurrections, 0,
+            "{resurrections} keys resurrected across {ROUNDS} rounds"
+        );
     }
 }

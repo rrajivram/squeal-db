@@ -42,6 +42,14 @@ pub enum StoreError {
     UndoLogError(String),
     #[error("Table not found : {0}")]
     TableNotFound(String),
+    // The writer thread caught a page's live Arc mid-transition: a foreground
+    // write has already grown its content past page_data_size but hasn't yet
+    // (a separate, later lock acquisition) flipped has_overflow/next_page to
+    // match. Transient by construction — the window is a couple of lock
+    // acquisitions wide — so callers should retry rather than treat this as
+    // real corruption. See buffer.rs's write_page and writer's own comments.
+    #[error("Page {0:?} read mid-overflow-transition, retry")]
+    PageTransientlyInconsistent(crate::page::PageId),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

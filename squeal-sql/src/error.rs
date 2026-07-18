@@ -17,6 +17,8 @@ pub enum SchemaError {
     UserError(String),
     #[error("Unknown error: {0}")]
     UnknownError(String),
+    #[error("Parse error")]
+    ParseError(#[from] sqlparser::parser::ParserError),
 }
 
 impl From<StoreError> for SchemaError {
@@ -31,6 +33,7 @@ impl From<StoreError> for SchemaError {
             | StoreError::UndoLogError(_)
             | StoreError::MissingKey(_)
             | StoreError::TupleTooLarge(_, _)
+            | StoreError::PageTransientlyInconsistent(_)
             | StoreError::LockContentionError => Self::InternalError(value),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),

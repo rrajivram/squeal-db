@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+log = "0.4.33"
 parking_lot = "0.12.5"
 postcard = "1.1.3"
 serde = "1.0.228"

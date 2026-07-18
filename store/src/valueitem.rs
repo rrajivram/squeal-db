@@ -140,7 +140,7 @@ impl ValueItem {
         }
     }
 
-    pub(super) fn size(&self) -> usize {
+    pub fn size(&self) -> usize {
         let sz = match self {
             ValueItem::Integer(_) => size_of::<i64>(),
             ValueItem::Double(_) => size_of::<f64>(),

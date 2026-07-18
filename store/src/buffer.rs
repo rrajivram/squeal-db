@@ -37,6 +37,13 @@ enum BufMsg {
 struct WriteMsg {
     page_num: PageId,
     page: Arc<Page>,
+    // Counts retries specifically due to StoreError::PageTransientlyInconsistent
+    // (see write_page's own comment) — bounds how long the writer thread will
+    // wait out an in-progress overflow transition on this exact message
+    // before treating it as a genuine, un-retryable bug. Not touched for the
+    // ordinary "LSN not durable yet" deferral, which isn't bounded the same
+    // way since it's driven by an always-progressing external watermark.
+    transient_retries: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -219,9 +226,11 @@ where
         self.handle_large_page_size(page_num, &page)?;
         self.cache_strong(page_num, page.clone())?;
         // _lock drops here, releasing the per-page lock after cache is updated.
-        Ok(self
-            .write_tx
-            .send(BufMsg::WritePage(WriteMsg { page_num, page }))?)
+        Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
+            page_num,
+            page,
+            transient_retries: 0,
+        }))?)
     }
 
     fn handle_large_page_size(&self, page_id: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
@@ -438,6 +447,57 @@ where
         // earlier queued old write into `pending` before it sees this discard.
         self.write_tx.send(BufMsg::DiscardPending(page))?;
         self.free_pages.write().push(page);
+        Ok(())
+    }
+
+    // reset_freed_page + free_page, exposed together: a page must be reset
+    // to a genuinely blank state *before* it goes on the free list (see
+    // reset_freed_page's own doc comment) — this is the general-purpose
+    // pairing for any caller freeing a page outright (e.g. Db::drop_table),
+    // as opposed to free_overflow_pages' narrower case of collapsing one
+    // page's own overflow chain while the page itself survives.
+    pub(crate) fn reset_and_free_page(
+        &self,
+        page_id: PageId,
+        record_size: Option<usize>,
+    ) -> Result<(), StoreError> {
+        self.reset_freed_page(page_id, record_size)?;
+        self.free_page(page_id)
+    }
+
+    // Frees every page in a raw next_page-linked chain starting at `head`,
+    // resetting each one first (see reset_and_free_page). Deliberately does
+    // not use data_chain_next/overflow_terminator's "skip over an overflow
+    // detour to find the real next sibling" logic: those exist to let a
+    // page's *content* survive a shrink while its overflow chain collapses,
+    // which doesn't apply here — dropping a table needs every page in the
+    // chain gone, including overflow continuation pages, so a plain
+    // follow-next_page-until-invalid walk already visits (and frees)
+    // exactly the right set: overflow continuation pages are linked via
+    // this same next_page field, just with IS_OVERFLOW set, so nothing
+    // about them needs special-casing when everything gets freed anyway.
+    //
+    // Reads through get_page (the cache), not read_page_header (a raw disk
+    // read) — confirmed the hard way: page writes go through the async
+    // writer thread, and cache_strong() updates the in-memory cache
+    // synchronously before that write is even queued (see
+    // write_locked_page), so the cache is always current but the on-disk
+    // file can briefly lag behind it. Db::drop_table calling this right
+    // after a burst of inserts hit exactly that window — read_page_header
+    // saw a page's stale, pre-split content and the chain walk ended one
+    // page short of the table's real last page, leaking it.
+    pub(crate) fn free_page_chain(&self, head: PageId) -> Result<(), StoreError> {
+        let mut cur = head;
+        loop {
+            let page = self.get_page(cur)?;
+            let next = page.get_next_page();
+            let record_size = page.record_size();
+            self.reset_and_free_page(cur, record_size)?;
+            if !next.is_valid_next_page() {
+                break;
+            }
+            cur = next;
+        }
         Ok(())
     }
 
@@ -809,6 +869,48 @@ impl Rem<PageId> for PageId {
     }
 }
 
+// Past this many retries, a StoreError::PageTransientlyInconsistent hit on
+// the same message is no longer "caught mid-overflow-transition" (a window a
+// couple of lock acquisitions wide, microseconds) — it's a genuine
+// page_used_size accounting bug and must surface loudly instead of retrying
+// forever. At the writer loop's ~1ms outer cadence this is still well under
+// a second, nowhere near long enough to look like a hang.
+const MAX_TRANSIENT_RETRIES: u32 = 100;
+
+// Increments `msg`'s transient-retry counter (see WriteMsg's own comment) and
+// turns it into a hard failure once MAX_TRANSIENT_RETRIES is exceeded.
+fn bump_transient_retries(msg: &mut WriteMsg, page_id: PageId) -> Result<(), StoreError> {
+    msg.transient_retries += 1;
+    if msg.transient_retries > MAX_TRANSIENT_RETRIES {
+        return Err(StoreError::PageTransientlyInconsistent(page_id));
+    }
+    Ok(())
+}
+
+// Bounded retry-with-sleep variant of write_page for Checkpoint/Shutdown's
+// drain loops: unlike the main pending-drain loop (which just leaves a
+// transiently-inconsistent message in `pending` for the next ~1ms outer
+// pass), these two loops consume `pending` via drain(..) and must finish
+// this one pass before returning/exiting, so they retry inline instead.
+fn write_page_with_bounded_retry<F: DBFile>(
+    page_id: PageId,
+    page: &Arc<Page>,
+    file: &F,
+    page_size: DBSizeType,
+    first_offset: DBSizeType,
+) -> Result<(), StoreError> {
+    let mut attempt = 0u32;
+    loop {
+        match write_page(page_id, page, file, page_size, first_offset) {
+            Err(StoreError::PageTransientlyInconsistent(_)) if attempt < MAX_TRANSIENT_RETRIES => {
+                attempt += 1;
+                thread::sleep(Duration::from_micros(200 * attempt as u64));
+            }
+            other => return other,
+        }
+    }
+}
+
 fn writer<F: DBFile>(
     mut file: F,
     header: Arc<Header>,
@@ -828,15 +930,29 @@ fn writer<F: DBFile>(
         let mut i = 0;
         while i < pending.len() {
             if pending[i].page.is_pinned() || pending[i].page.lsn_id()? < clock.last_written() {
-                let m = pending.swap_remove(i);
-                write_page(
-                    m.page_num,
-                    &m.page,
+                match write_page(
+                    pending[i].page_num,
+                    &pending[i].page,
                     &file,
                     header.page_size,
                     header.first_page_offset,
-                )?;
-                m.page.set_dirty(false)?;
+                ) {
+                    Ok(()) => {
+                        let m = pending.swap_remove(i);
+                        m.page.set_dirty(false)?;
+                        // Don't advance i: swap_remove pulled a new element
+                        // into this position.
+                    }
+                    Err(StoreError::PageTransientlyInconsistent(pid)) => {
+                        bump_transient_retries(&mut pending[i], pid)?;
+                        // Leave it in place — retried on the next outer pass
+                        // (~1ms later, see recv_timeout below), which gives
+                        // the in-progress foreground transition plenty of
+                        // time to finish without this thread busy-spinning.
+                        i += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 i += 1;
             }
@@ -889,7 +1005,7 @@ fn writer<F: DBFile>(
             Ok(BufMsg::Checkpoint(tx)) => {
                 let res = (|| {
                     for m in pending.drain(..) {
-                        write_page(
+                        write_page_with_bounded_retry(
                             m.page_num,
                             &m.page,
                             &file,
@@ -918,7 +1034,7 @@ fn writer<F: DBFile>(
                 // Flush everything still waiting before exit — all committed
                 // operations' redo records are already durable by now.
                 for m in pending.drain(..) {
-                    write_page(
+                    write_page_with_bounded_retry(
                         m.page_num,
                         &m.page,
                         &file,
@@ -933,7 +1049,7 @@ fn writer<F: DBFile>(
                 file.do_sync()?;
                 break;
             }
-            Ok(BufMsg::WritePage(msg)) => {
+            Ok(BufMsg::WritePage(mut msg)) => {
                 // This write supersedes any still-deferred write of the same
                 // slot: an older snapshot must never reach disk after this one.
                 // `pending` is drained with swap_remove (out of order) and at
@@ -941,14 +1057,22 @@ fn writer<F: DBFile>(
                 // repeatedly-mutated page could flush last and clobber it.
                 pending.retain(|m| m.page_num != msg.page_num);
                 if msg.page.is_pinned() || msg.page.lsn_id()? < clock.last_written() {
-                    write_page(
+                    match write_page(
                         msg.page_num,
                         &msg.page,
                         &file,
                         header.page_size,
                         header.first_page_offset,
-                    )?;
-                    msg.page.set_dirty(false)?;
+                    ) {
+                        Ok(()) => msg.page.set_dirty(false)?,
+                        Err(StoreError::PageTransientlyInconsistent(pid)) => {
+                            bump_transient_retries(&mut msg, pid)?;
+                            // Defer instead of retrying inline — same
+                            // treatment as "LSN not durable yet" below.
+                            pending.push(msg);
+                        }
+                        Err(e) => return Err(e),
+                    }
                 } else {
                     pending.push(msg);
                 }
@@ -1032,62 +1156,76 @@ fn write_page(
     page_size: DBSizeType,
     first_offset: DBSizeType,
 ) -> Result<(), StoreError> {
-    let header = page.header();
+    // One atomic read of header+data together (see Page::to_bytes_snapshot's
+    // own comment), not three separate top-level calls (header(),
+    // to_data_bytes(), to_bytes()) the way this used to be written. Each of
+    // those was individually consistent, but nothing held `inner` locked
+    // across all three — so a concurrent mutation landing between them
+    // (exactly what the async writer thread is exposed to: it runs here
+    // *after* the per-page write lock that produced this message has
+    // already been released, so a second, unrelated write to the same page
+    // can already be interleaving its own update) could make this function
+    // act on a header from one moment and data from another. Confirmed as
+    // the cause of a real "page_used_size has drifted" panic under load —
+    // has_overflow read as false (from a newer write that had already
+    // cleared it) alongside leftover oversized content an older write's
+    // to_bytes() call captured moments later. One snapshot closes the gap.
+    let (header, data) = page.to_bytes_snapshot();
     let start_offset = page_offset(page_id, page_size, first_offset);
+    let mut header_bytes = to_allocvec(&header).unwrap_or_default();
+    if header_bytes.len() < PAGE_OVERHEAD {
+        header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
+    }
     if header.has_overflow() {
-        let bytes = page.to_data_bytes();
         // Re-write the HAS_OVERFLOW header at the primary page slot. An async
         // init_page write (queued by alloc_page before handle_large_page_size
         // ran) may arrive in the writer thread before this message and clobber
         // the header that handle_large_page_size already wrote synchronously.
         // Writing it here — inside the writer thread with the data —
         // eliminates the race window.
-        let page_bytes = page.to_bytes();
-        pwrite_all(file, &page_bytes[..PAGE_OVERHEAD], start_offset)?; // header with HAS_OVERFLOW
-        let first_end = (header.page_data_size as usize).min(bytes.len());
+        pwrite_all(file, &header_bytes, start_offset)?; // header with HAS_OVERFLOW
+        let first_end = (header.page_data_size as usize).min(data.len());
         pwrite_all(
             file,
-            &bytes[..first_end],
+            &data[..first_end],
             start_offset + PAGE_OVERHEAD as u64,
         )?;
         let mut start = first_end;
-        if start < bytes.len() {
+        if start < data.len() {
             let mut cur_page_id = header.next_page();
             loop {
                 let cur_offset = page_offset(cur_page_id, page_size, first_offset);
                 let cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
-                let end = (start + cur_header.page_data_size as usize).min(bytes.len());
-                pwrite_all(file, &bytes[start..end], cur_offset + PAGE_OVERHEAD as u64)?;
+                let end = (start + cur_header.page_data_size as usize).min(data.len());
+                pwrite_all(file, &data[start..end], cur_offset + PAGE_OVERHEAD as u64)?;
                 start = end;
                 // Stop when all data is written or when we've written to the terminator page.
-                if !cur_header.is_overflow() || start >= bytes.len() {
+                if !cur_header.is_overflow() || start >= data.len() {
                     break;
                 }
                 cur_page_id = cur_header.next_page();
             }
         }
     } else {
-        let bytes = page.to_bytes();
+        let mut bytes = header_bytes;
+        bytes.extend_from_slice(&data);
         // This page isn't flagged has_overflow, so its slot is exactly
         // `page_size` bytes — writing more would silently spill into the next
-        // page's slot. That can only happen if page_used_size (a sum of
-        // per-tuple Tuple::size() values) has drifted from the tuple store's
-        // true serialized length — an accounting bug, not a normal condition
-        // (a legitimately oversized single object goes through the has_overflow
-        // branch above instead). Fail loudly here rather than corrupt silently.
-        assert!(
-            bytes.len() <= page_size as usize,
-            "write_page: page {:?} serialized to {} bytes, exceeding its {} byte \
-             slot without has_overflow set — page_used_size has drifted from the \
-             tuple store's actual size. header={:?} data_bytes_len={} count={:?} index_page={}",
-            page_id,
-            bytes.len(),
-            page_size,
-            header,
-            page.to_data_bytes().len(),
-            page.count(),
-            page.is_index_page(),
-        );
+        // page's slot. This is expected to be transient, not corruption: this
+        // Arc<Page> is shared with the cache and any other write in flight
+        // for the same page_num (see write_locked_page's comment on why Arc
+        // identity is preserved), so this call can catch it mid-transition —
+        // content already grown by a newer, concurrent write on the same
+        // live page, has_overflow not yet flipped to match because that's a
+        // separate, later lock acquisition inside handle_large_page_size.
+        // The caller (writer's own retry loop) is responsible for treating
+        // this as "not yet", not "corrupt" — see its own comment and the
+        // bounded-retry counter that turns a genuinely stuck case (an actual
+        // page_used_size accounting bug, not a transition) into a hard error
+        // instead of retrying forever.
+        if bytes.len() > page_size as usize {
+            return Err(StoreError::PageTransientlyInconsistent(page_id));
+        }
         pwrite_all(file, &bytes, start_offset)?;
     }
 

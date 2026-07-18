@@ -598,35 +598,72 @@ where
     // resolves its Node::Leaf pointer to a data page) and find_leaf_page
     // (which returns the leaf itself, for a range scan's positional
     // "first key >= id" starting point — no exact match required).
-    fn route_to_leaf(&self, id: &DBIdType, start: PageId) -> Result<PageId, StoreError> {
-        let page = self.buffer.get_page(start)?;
-        if !page.is_flag_set(INNER_NODE) {
-            return Ok(start);
-        }
-        let mut last_child: Option<PageId> = None;
-        for row in page.iter() {
-            if *id < row.id {
+    //
+    // B-link tree traversal: at every page visited (inner or leaf), before
+    // trusting its own entries/fallthrough, check whether `id` still falls
+    // within its high_key. A concurrent split can move part of a page's
+    // range to a new right sibling after some ancestor already decided to
+    // route here — without this check, that leaves a lookup landing on a
+    // now-too-narrow page and missing a key that genuinely exists (silent
+    // KeyNotFound), or panicking on a routing invariant a split briefly
+    // invalidated. If `id >= high_key`, follow next_page and re-check there
+    // instead of using this page's own entries — repeating as needed
+    // through however many splits raced with this lookup.
+    //
+    // Returns the leaf's already-fetched Arc<Page> directly, not just its
+    // PageId: a caller re-fetching by id afterward would reopen the exact
+    // same window (a split landing between this function's own read and
+    // the caller's separate one), defeating the whole point of the check
+    // above. Returning the same reference the check already validated
+    // closes that gap entirely.
+    fn route_to_leaf(&self, id: &DBIdType, start: PageId) -> Result<Arc<Page>, StoreError> {
+        let mut current = start;
+        loop {
+            let page = self.buffer.get_page(current)?;
+            if let Some(high_key) = page.high_key()
+                && *id >= high_key
+            {
+                let next = page.get_next_page();
+                if next.is_valid_next_page() {
+                    current = next;
+                    continue;
+                }
+                // No sibling despite a bound that says there should be one —
+                // structurally shouldn't happen (splits always wire up
+                // next_page and high_key together). Fall through and use
+                // this page's own entries as a last resort rather than
+                // getting stuck.
+            }
+            if !page.is_flag_set(INNER_NODE) {
+                return Ok(page);
+            }
+            let mut last_child: Option<PageId> = None;
+            let mut matched_child: Option<PageId> = None;
+            for row in page.iter() {
+                if *id < row.id {
+                    let node = from_bytes::<Node>(&row.data)?;
+                    if let Node::Inner(page_num) = node {
+                        matched_child = Some(page_num);
+                        break;
+                    } else {
+                        panic!("Expected Inner. Found leaf ! {:?}", row.id);
+                    }
+                }
                 let node = from_bytes::<Node>(&row.data)?;
                 if let Node::Inner(page_num) = node {
-                    return self.route_to_leaf(id, page_num);
-                } else {
-                    panic!("Expected Inner. Found leaf ! {:?}", row.id);
+                    last_child = Some(page_num);
                 }
             }
-            let node = from_bytes::<Node>(&row.data)?;
-            if let Node::Inner(page_num) = node {
-                last_child = Some(page_num);
-            }
-        }
-        // id >= all entry bounds: route to the last child.
-        // Non-root inner nodes have no u64::MAX sentinel; the last child
-        // covers all keys from its separator up to the parent's upper bound.
-        match last_child {
-            Some(child) => self.route_to_leaf(id, child),
-            // An INNER_NODE page always has at least one Node::Inner entry
-            // (routing pages are never created empty) — this is here so
-            // the match is exhaustive, not because it's expected to happen.
-            None => Ok(start),
+            // id >= all entry bounds: route to the last child.
+            // Non-root inner nodes have no u64::MAX sentinel; the last child
+            // covers all keys from its separator up to the parent's upper bound.
+            current = match matched_child.or(last_child) {
+                Some(child) => child,
+                // An INNER_NODE page always has at least one Node::Inner entry
+                // (routing pages are never created empty) — this is here so
+                // the match is exhaustive, not because it's expected to happen.
+                None => return Ok(page),
+            };
         }
     }
 
@@ -636,8 +673,7 @@ where
     // "start here and walk forward via the leaf chain," not "this exact
     // key must exist."
     pub(crate) fn find_leaf_page(&self, id: &DBIdType) -> Result<Arc<Page>, StoreError> {
-        let leaf_id = self.route_to_leaf(id, self.table.first_index_page)?;
-        self.buffer.get_page(leaf_id)
+        self.route_to_leaf(id, self.table.first_index_page)
     }
 
     // Given a leaf index page, returns its sibling in the leaf chain (see
@@ -655,6 +691,32 @@ where
         }
     }
 
+    // Every index page this table's tree currently owns (root, every inner
+    // node, every leaf) — used by Db::drop_table to know exactly which
+    // pages to free. A full structural traversal, not a walk of the leaf
+    // sibling chain: inner nodes aren't reachable that way at all (that
+    // chain only links leaves; an inner node is only reachable via its
+    // parent's own Node::Inner routing entry), so visiting every page
+    // means following those entries recursively from the root, same as
+    // route_to_leaf's descent but branching into every child instead of
+    // just the one a specific key would route to.
+    pub(crate) fn all_index_page_ids(&self) -> Result<Vec<PageId>, StoreError> {
+        let mut out = vec![];
+        let mut stack = vec![self.table.first_index_page];
+        while let Some(pid) = stack.pop() {
+            out.push(pid);
+            let page = self.buffer.get_page(pid)?;
+            if page.is_flag_set(INNER_NODE) {
+                for row in page.iter() {
+                    if let Node::Inner(child) = from_bytes::<Node>(&row.data)? {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     // Resolves an index leaf entry (a Tuple whose `.data` is a serialized
     // Node::Leaf pointer, not real row content — see insert_index) to the
     // actual row it points to.
@@ -667,8 +729,7 @@ where
 
     #[allow(clippy::bind_instead_of_map)]
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
-        let leaf_id = self.route_to_leaf(&id, start)?;
-        let page = self.buffer.get_page(leaf_id)?;
+        let page = self.route_to_leaf(&id, start)?;
         page.get(id)?
             .and_then(|t| {
                 let id = from_bytes::<Node>(&t.data);
@@ -1123,17 +1184,30 @@ where
             new_page.set_page_flags(INNER_NODE)?;
         } else {
             new_page.set_page_flags(LEAF_NODE)?;
-            // Maintain the leaf-level sibling chain that RangeCursor walks
-            // for range scans — the same idea as the data-page chain
-            // (write_data/set_data_chain_next), just for index leaves.
-            // The new sibling inherits whatever this leaf pointed to
-            // before the split (captured before current_page.clear(),
-            // though clear() only touches the tuple data, not next_page —
-            // reading it here regardless keeps this correct even if that
-            // ever changes), and this leaf now points at the new sibling.
-            new_page.set_next_page(current_page.get_next_page())?;
-            current_page.set_next_page(new_page_id)?;
         }
+        // B-link tree sibling chain + high key, maintained the same way for
+        // both leaf and inner splits (this used to be leaf-only — see
+        // route_to_leaf's own comment on why that left inner-node splits
+        // racy against concurrent lookups). Captured before either page's
+        // own fields are overwritten below.
+        //
+        // separator_id is exactly the right new high_key for current_page
+        // in both cases: for a leaf it's new_vals[0].id, the first key now
+        // exclusively in new_page; for an inner node it's
+        // current_vals.last().id — the same value already established
+        // above as the true external bound of current_page's own routing
+        // (see this function's earlier comment on why that's the correct
+        // separator, not new_vals[0].id). Either way, "current_page's
+        // fallthrough/entries are only trustworthy below separator_id, must
+        // follow next_page beyond that" is exactly what a high key means.
+        // new_page inherits whatever bound current_page had before this
+        // split — it now owns everything from separator_id up to that.
+        let old_next_page = current_page.get_next_page();
+        let old_high_key = current_page.high_key();
+        new_page.set_next_page(old_next_page)?;
+        current_page.set_next_page(new_page_id)?;
+        new_page.set_high_key(old_high_key)?;
+        current_page.set_high_key(Some(separator_id.clone()))?;
         current_page.clear()?;
         current_vals
             .iter()
@@ -1240,16 +1314,17 @@ where
         let right_page = Arc::make_mut(&mut right_handle.page);
         left_page.set_page_flags(flags)?;
         right_page.set_page_flags(flags)?;
-        if flags == LEAF_NODE {
-            // See split_non_root_page's matching comment: maintain the
-            // leaf-level sibling chain. The old root (about to become an
-            // inner routing page via update_root_page) was itself the
-            // only leaf so far, so right inherits whatever it pointed to
-            // (normally nothing, but preserved for consistency regardless)
-            // and left now points at right.
-            right_page.set_next_page(handle.page.get_next_page())?;
-            left_page.set_next_page(right_page_id)?;
-        }
+        // See split_non_root_page's matching comment: maintain the B-link
+        // sibling chain and high key for both leaf and inner roots. The old
+        // root (about to become an inner routing page via update_root_page)
+        // was itself the only page at its level so far, so right inherits
+        // whatever it pointed to / was bounded by (normally nothing/None,
+        // but preserved for consistency regardless) and left now points at
+        // right, bounded by separator_id.
+        right_page.set_next_page(handle.page.get_next_page())?;
+        left_page.set_next_page(right_page_id)?;
+        right_page.set_high_key(handle.page.high_key())?;
+        left_page.set_high_key(Some(separator_id.clone()))?;
         left_vals
             .iter()
             .try_for_each(|t| left_page.add_tuple(t.clone()))?;

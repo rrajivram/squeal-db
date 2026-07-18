@@ -4,7 +4,7 @@
  */
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, AtomicU16, AtomicU64},
+    atomic::{AtomicBool, AtomicU16},
 };
 
 use portable_atomic::AtomicU128;
@@ -33,6 +33,13 @@ pub(crate) struct PageHeader {
     pub(crate) record_size: Option<usize>,
     pub(crate) lsn: LsnId,
     pub(crate) flags: u16,
+    // B-link tree high key: the exclusive upper bound of keys this index
+    // page's subtree currently covers. `None` means unbounded — this page
+    // has never had its upper range split away (the common case for a
+    // never-split page, or the rightmost page at its level). See
+    // PageInner's own comment for why this is bundled with next_page rather
+    // than tracked separately.
+    pub(crate) high_key: Option<DBIdType>,
 }
 
 impl PageHeader {
@@ -59,6 +66,7 @@ struct PageDto {
     record_size: Option<usize>,
     lsn: LsnId,
     flags: u16,
+    high_key: Option<DBIdType>,
     data: Vec<u8>,
 }
 
@@ -114,10 +122,49 @@ impl Eq for PageId {}
 // key, so mutating in place under a write lock (what BTreeMap::insert/
 // remove already do internally, no cloning involved) is strictly cheaper
 // than cloning the whole store first just to get unique ownership.
+//
+// has_overflow and next_page live here too, not in the `flags`/`next_page`
+// atomics alongside the other independent bits (PINNED, LEAF/INNER_NODE,
+// ...) — they have the exact same must-change-together coupling with
+// page_used_size/data as those two have with each other: HAS_OVERFLOW=true
+// means "the tuple store's real content is bigger than one page, split
+// across a chain starting at next_page," which is a statement *about*
+// page_used_size/data, not an independent fact — and next_page's meaning
+// (overflow-chain head vs. data-chain sibling) flips on has_overflow, so
+// the two can never be read or written correctly one at a time. Tracking
+// either as a separately-atomic field let a reader observe e.g.
+// has_overflow=false (just cleared by a newer write) alongside
+// page_used_size/data — or next_page — still holding an older, stale
+// snapshot (not yet updated by that same newer write) — a real, confirmed
+// bug: the writer thread's write_page reads a page's state *after* its
+// per-page write lock has already been released (that's the whole point of
+// writing asynchronously), so by the time it runs, a second, unrelated
+// write to the same page can already be interleaving its own
+// has_overflow/next_page/content update. Before Page became interior-mutable
+// (see above), this was impossible — Arc::make_mut cloned the whole page on
+// any concurrent access, so the writer thread's queued Arc was always a
+// frozen, independent snapshot. Bundling has_overflow and next_page into
+// this same lock restores that "one coherent snapshot" guarantee for the
+// pieces of state that specifically need it. See
+// handle_large_page_size in buffer.rs, which sets these two in either
+// order (next_page then has_overflow, or has_overflow then next_page)
+// across two separate calls — exactly the shape that produced the
+// has_overflow bug and, until this field moved here too, still could for
+// next_page.
+//
+// high_key (an index page's B-link tree upper bound — see PageHeader's own
+// comment) lives here for the same reason: it changes in lockstep with
+// next_page during a split (see BPlusTree::split_non_root_page), and a
+// reader combining a stale high_key with a fresher next_page (or vice
+// versa) would misnavigate exactly the way the has_overflow/next_page pair
+// used to.
 #[derive(Debug)]
 struct PageInner {
     data: Box<dyn PageTuple>,
     page_used_size: DBSizeType,
+    has_overflow: bool,
+    next_page: DBSizeType,
+    high_key: Option<DBIdType>,
 }
 
 ///Page Invariants
@@ -128,10 +175,9 @@ struct PageInner {
 // PT doesn't need Serialize/Deserialize — PageDto handles that via to_bytes/from_bytes.
 //#[serde(bound = "PT: PageType")]
 pub(crate) struct Page {
-    // See PageInner's own comment for why data and page_used_size are
-    // bundled behind one lock instead of Arc<dyn PageTuple> + a plain field.
+    // See PageInner's own comment for why data, page_used_size, has_overflow,
+    // and next_page are bundled behind one lock instead of separate fields.
     inner: RwLock<PageInner>,
-    next_page: AtomicU64,
     dirty: AtomicBool,
     page_data_size: DBSizeType,
     record_size: Option<usize>,
@@ -176,8 +222,10 @@ impl Page {
             inner: RwLock::new(PageInner {
                 data: pt,
                 page_used_size: 0,
+                has_overflow: false,
+                next_page: 0,
+                high_key: None,
             }),
-            next_page: AtomicU64::new(0),
             dirty: AtomicBool::new(true),
             page_data_size: ds,
             record_size,
@@ -190,15 +238,35 @@ impl Page {
         }
     }
 
-    pub(crate) fn header(&self) -> PageHeader {
+    // Builds a PageHeader from an already-held `inner` read guard, folding
+    // has_overflow (tracked in `inner`, see PageInner's own comment) into
+    // the other, still-atomic flag bits into the one combined `u16` the
+    // on-disk format expects, and reading next_page from `inner` too.
+    // Shared by header()/to_bytes_snapshot() so both — and anyone combining
+    // a header with `inner`'s data, like buffer.rs's write_page — read
+    // has_overflow, next_page, and page_used_size/data from the exact same
+    // locked view, never several separate ones.
+    fn header_from_inner(&self, inner: &PageInner) -> PageHeader {
+        let mut flags = self.flags.load(std::sync::atomic::Ordering::Relaxed);
+        if inner.has_overflow {
+            flags |= HAS_OVERFLOW;
+        } else {
+            flags &= !HAS_OVERFLOW;
+        }
         PageHeader {
-            next_page: self.next_page.load(std::sync::atomic::Ordering::Relaxed),
+            next_page: inner.next_page,
             page_data_size: self.page_data_size,
-            page_used_size: self.inner.read().unwrap().page_used_size,
+            page_used_size: inner.page_used_size,
             record_size: self.record_size,
             lsn: *self.lsn.read().unwrap(),
-            flags: self.flags.load(std::sync::atomic::Ordering::Relaxed),
+            flags,
+            high_key: inner.high_key.clone(),
         }
+    }
+
+    pub(crate) fn header(&self) -> PageHeader {
+        let inner = self.inner.read().unwrap();
+        self.header_from_inner(&inner)
     }
 
     pub(crate) fn get_data_size(&self) -> DBSizeType {
@@ -218,22 +286,15 @@ impl Page {
     }
 
     pub(crate) fn has_overflow(&self) -> bool {
-        self.flags.load(std::sync::atomic::Ordering::Relaxed) & HAS_OVERFLOW != 0
+        self.inner.read().unwrap().has_overflow
     }
 
     pub(crate) fn set_overflow(&self, of: bool) {
-        let mut flags = self.flags.load(std::sync::atomic::Ordering::Relaxed);
-        if of {
-            flags |= HAS_OVERFLOW;
-        } else {
-            flags &= !HAS_OVERFLOW;
-        }
-        self.flags
-            .store(flags, std::sync::atomic::Ordering::Relaxed);
+        self.inner.write().unwrap().has_overflow = of;
     }
 
     pub(crate) fn get_next_page(&self) -> PageId {
-        PageId(self.next_page.load(std::sync::atomic::Ordering::Relaxed))
+        PageId(self.inner.read().unwrap().next_page)
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -241,8 +302,19 @@ impl Page {
     }
 
     pub(crate) fn set_next_page(&self, next_page: PageId) -> Result<(), StoreError> {
-        self.next_page
-            .store(next_page.0, std::sync::atomic::Ordering::Relaxed);
+        self.inner.write().unwrap().next_page = next_page.0;
+        self.set_dirty(true)?;
+        Ok(())
+    }
+
+    // B-link tree high key — see PageHeader's own comment. `None` means
+    // unbounded.
+    pub(crate) fn high_key(&self) -> Option<DBIdType> {
+        self.inner.read().unwrap().high_key.clone()
+    }
+
+    pub(crate) fn set_high_key(&self, high_key: Option<DBIdType>) -> Result<(), StoreError> {
+        self.inner.write().unwrap().high_key = high_key;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -438,20 +510,32 @@ impl Page {
         self.inner.read()?.data.get(&id)
     }
 
+    // The one atomic read anything that needs *both* a header and the raw
+    // data bytes together should go through — including buffer.rs's
+    // write_page, which used to call header()/to_data_bytes()/to_bytes() as
+    // three *separate* top-level calls. Each was internally consistent on
+    // its own, but nothing held `inner` locked across all three, so a
+    // concurrent mutation between them (exactly what the async writer
+    // thread is exposed to — see PageInner's own comment) could still make
+    // write_page act on a header from one moment and data from another.
+    // One lock acquisition here closes that the rest of the way.
+    pub(crate) fn to_bytes_snapshot(&self) -> (PageHeader, Vec<u8>) {
+        let inner = self.inner.read().unwrap();
+        let header = self.header_from_inner(&inner);
+        let mut data = inner.data.to_bytes().unwrap_or_default();
+        if data.len() < self.page_data_size as usize {
+            data.append(&mut vec![0u8; self.page_data_size as usize - data.len()]);
+        }
+        (header, data)
+    }
+
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let mut v = to_allocvec(&self.header()).unwrap_or_default();
+        let (header, data) = self.to_bytes_snapshot();
+        let mut v = to_allocvec(&header).unwrap_or_default();
         if v.len() < PAGE_OVERHEAD {
             v.append(&mut vec![0u8; PAGE_OVERHEAD - v.len()]);
         }
-        v.extend_from_slice(
-            &self
-                .inner
-                .read()
-                .unwrap()
-                .data
-                .to_bytes()
-                .unwrap_or_default(),
-        );
+        v.extend_from_slice(&data);
         if v.len() < self.page_data_size as usize + PAGE_OVERHEAD {
             v.append(&mut vec![
                 0u8;
@@ -463,11 +547,7 @@ impl Page {
     }
 
     pub(crate) fn to_data_bytes(&self) -> Vec<u8> {
-        let mut v = self.inner.read().unwrap().data.to_bytes().unwrap_or_default();
-        if v.len() < self.page_data_size as usize {
-            v.append(&mut vec![0u8; self.page_data_size as usize - v.len()]);
-        }
-        v
+        self.to_bytes_snapshot().1
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
@@ -482,16 +562,24 @@ impl Page {
         } else {
             Box::new(AnyTuplePage::from_bytes(data)?)
         };
+        // has_overflow is decoded out of the on-disk flags bit and into
+        // PageInner (see its own comment); masked out of what's stored in
+        // the atomic so there's exactly one live source of truth for it,
+        // not a stale second copy nothing ever reads. next_page moves into
+        // PageInner too, for the same reason.
+        let has_overflow = header.flags & HAS_OVERFLOW != 0;
         Ok(Self {
             inner: RwLock::new(PageInner {
                 data: pt,
                 page_used_size: header.page_used_size,
+                has_overflow,
+                next_page: header.next_page,
+                high_key: header.high_key,
             }),
-            next_page: AtomicU64::new(header.next_page),
             dirty: AtomicBool::new(false),
             page_data_size: header.page_data_size,
             record_size: header.record_size,
-            flags: AtomicU16::new(header.flags),
+            flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(header.lsn),
             lsn_clock: None,
             accessed: AtomicU128::new(timestamp()),
@@ -590,16 +678,22 @@ impl From<PageDto> for Page {
         } else {
             Box::new(AnyTuplePage::from_bytes(&value.data).unwrap())
         };
+        // See Page::from_bytes's matching comment: has_overflow decodes out
+        // of the wire flags and into PageInner, masked out of the atomic.
+        // next_page moves into PageInner too, for the same reason.
+        let has_overflow = value.flags & HAS_OVERFLOW != 0;
         Self {
             inner: RwLock::new(PageInner {
                 data: pt,
                 page_used_size: value.page_used_size,
+                has_overflow,
+                next_page: value.next_page,
+                high_key: value.high_key,
             }),
-            next_page: AtomicU64::new(value.next_page),
             dirty: AtomicBool::new(false),
             page_data_size: value.page_data_size,
             record_size: value.record_size,
-            flags: AtomicU16::new(value.flags),
+            flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(value.lsn),
             lsn_clock: None,
             accessed: AtomicU128::new(timestamp()),
@@ -615,13 +709,23 @@ impl From<Page> for PageDto {
         // referent that could still hold the lock — this is a plain field
         // access, not a real lock acquisition.
         let inner = value.inner.into_inner().unwrap();
+        // Recombine has_overflow (from `inner`) with the other, still-atomic
+        // flag bits into the one on-disk `u16` — the inverse of from_bytes/
+        // From<PageDto>'s split.
+        let mut flags = value.flags.load(std::sync::atomic::Ordering::Relaxed);
+        if inner.has_overflow {
+            flags |= HAS_OVERFLOW;
+        } else {
+            flags &= !HAS_OVERFLOW;
+        }
         Self {
-            next_page: value.next_page.load(std::sync::atomic::Ordering::Relaxed),
+            next_page: inner.next_page,
             page_data_size: value.page_data_size,
             page_used_size: inner.page_used_size,
             record_size: value.record_size,
             lsn: *value.lsn.read().unwrap(),
-            flags: value.flags.load(std::sync::atomic::Ordering::Relaxed),
+            flags,
+            high_key: inner.high_key,
             data: inner.data.to_bytes().unwrap(),
         }
     }
@@ -640,8 +744,10 @@ impl Clone for Page {
             inner: RwLock::new(PageInner {
                 data: inner.data.deep_clone(),
                 page_used_size: inner.page_used_size,
+                has_overflow: inner.has_overflow,
+                next_page: inner.next_page,
+                high_key: inner.high_key.clone(),
             }),
-            next_page: AtomicU64::new(self.next_page.load(std::sync::atomic::Ordering::Relaxed)),
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
             page_data_size: self.page_data_size,
             record_size: self.record_size,
@@ -657,10 +763,13 @@ impl Clone for Page {
 
 impl PartialEq for Page {
     fn eq(&self, rhs: &Self) -> bool {
-        self.inner.read().unwrap().page_used_size == rhs.inner.read().unwrap().page_used_size
+        let inner = self.inner.read().unwrap();
+        let rhs_inner = rhs.inner.read().unwrap();
+        inner.page_used_size == rhs_inner.page_used_size
+            && inner.has_overflow == rhs_inner.has_overflow
+            && inner.next_page == rhs_inner.next_page
+            && inner.high_key == rhs_inner.high_key
             && self.page_data_size == rhs.page_data_size
-            && self.next_page.load(std::sync::atomic::Ordering::Relaxed)
-                == rhs.next_page.load(std::sync::atomic::Ordering::Relaxed)
             && self.flags.load(std::sync::atomic::Ordering::Relaxed)
                 == rhs.flags.load(std::sync::atomic::Ordering::Relaxed)
             && self.record_size == rhs.record_size
@@ -1020,5 +1129,121 @@ mod tests {
             p.add_tuple(Tuple::new(i, b"small")),
             Err(StoreError::PageCapacityError)
         ));
+    }
+
+    // Runs a mutator thread doing realistic, production-ordered overflow
+    // transitions (content settles before the flag does, on both the grow
+    // and shrink side — exactly how buffer.rs's handle_large_page_size
+    // sequences it: it only flips has_overflow after the content it
+    // describes has already landed). Returns the join handle and a stop
+    // flag so callers can sample concurrently and then shut it down.
+    fn spawn_overflow_transition_mutator(
+        page: std::sync::Arc<Page>,
+    ) -> (
+        std::thread::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let big_data = vec![0u8; 2000]; // exceeds page_data_size, see other tests above
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    page.add_tuple(Tuple::new(i, &big_data)).unwrap();
+                    page.set_overflow(true);
+                    page.clear().unwrap();
+                    page.set_overflow(false);
+                    i += 1;
+                }
+            })
+        };
+        (handle, stop)
+    }
+
+    #[test]
+    fn test_separate_header_and_data_calls_can_observe_a_mismatched_pair() {
+        // Characterizes the actual historical bug: buffer.rs's write_page
+        // used to call header() and to_data_bytes() as two independent
+        // top-level calls, each acquiring `inner` on its own. Even with
+        // has_overflow bundled into `inner` (this session's fix — each call
+        // is individually coherent), a full content+overflow transition
+        // landing *between* the two separate calls still produces a pair
+        // that never co-existed at any single instant. This is exactly why
+        // write_page was rewritten to call to_bytes_snapshot() once instead
+        // — see the next test for the corresponding positive case.
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let page = Arc::new(Page::new_data(1000));
+        let (mutator, stop) = spawn_overflow_transition_mutator(Arc::clone(&page));
+
+        let mut saw_mismatch = false;
+        for _ in 0..50_000 {
+            let header = page.header();
+            std::thread::yield_now();
+            let data = page.to_data_bytes();
+            if !header.has_overflow() && data.len() > header.page_data_size as usize {
+                saw_mismatch = true;
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        mutator.join().unwrap();
+
+        assert!(
+            saw_mismatch,
+            "expected header()+to_data_bytes() called as two separate acquisitions \
+             to observe at least one mismatched pair across 50,000 samples"
+        );
+    }
+
+    #[test]
+    fn test_to_bytes_snapshot_never_observes_a_mismatched_pair() {
+        // The fix: to_bytes_snapshot's single `inner.read()` acquisition
+        // returns page_used_size (in `header`) and `data` from the exact
+        // same instant, so they can never disagree about whether content is
+        // present — unlike the previous test's two-call pattern, which can
+        // pair page_used_size from one generation with data from another
+        // arbitrarily later one.
+        //
+        // Note this does *not* assert has_overflow always agrees with
+        // content size: add_tuple/clear and set_overflow are still separate
+        // calls (Page has no combined "replace content and overflow flag
+        // atomically" method), so a snapshot legitimately landing between
+        // them — e.g. right after content has grown oversized but before
+        // set_overflow(true) has run — will truthfully report has_overflow
+        // still false. That's an accurate read of a real, if momentary,
+        // state, not a torn one — buffer.rs's handle_large_page_size runs
+        // that whole sequence under the page's ArcLock so no *other
+        // foreground* caller can observe it. A concurrent reader unbound by
+        // that lock (the pre-existing async writer-thread design) still
+        // can, which to_bytes_snapshot alone cannot close — see the report
+        // to the user for that residual, narrower concern.
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        let page = Arc::new(Page::new_data(1000));
+        let (mutator, stop) = spawn_overflow_transition_mutator(Arc::clone(&page));
+
+        for _ in 0..50_000 {
+            let (header, data) = page.to_bytes_snapshot();
+            let content_present = data.len() > header.page_data_size as usize;
+            assert_eq!(
+                header.page_used_size > 0,
+                content_present,
+                "torn snapshot observed via to_bytes_snapshot: page_used_size={} but \
+                 data.len()={} (page_data_size={})",
+                header.page_used_size,
+                data.len(),
+                header.page_data_size
+            );
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        mutator.join().unwrap();
     }
 }

@@ -34,6 +34,11 @@ impl Generator {
         Ok(())
     }
 
+    pub fn remove_generator<S: AsRef<str>>(&self, name: S) -> Result<(), StoreError> {
+        self.gens.write()?.remove(name.as_ref());
+        Ok(())
+    }
+
     pub fn gen_key<S: AsRef<str>>(&self, name: S) -> Result<DBSizeType, StoreError> {
         let name = name.as_ref().to_string();
         Ok(self
@@ -74,6 +79,25 @@ mod tests {
         assert!(g.create_generator("test", None).is_err());
         assert!(g.gen_key("test").is_ok());
         assert!(g.gen_key("test1").is_err());
+    }
+
+    #[test]
+    fn test_remove_generator_allows_recreating_the_same_name() {
+        let g = Generator::new();
+        g.create_generator("test", None).unwrap();
+        g.remove_generator("test").unwrap();
+        // Gone: no longer usable...
+        assert!(g.gen_key("test").is_err());
+        // ...and the name is free again, starting fresh (not resuming the
+        // old sequence).
+        g.create_generator("test", None).unwrap();
+        assert_eq!(g.gen_key("test").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_remove_generator_missing_name_is_a_no_op() {
+        let g = Generator::new();
+        assert!(g.remove_generator("nope").is_ok());
     }
 
     #[test]

@@ -1,5 +1,11 @@
+use std::sync::Arc;
+
+use log::warn;
 use serde::{Deserialize, Serialize};
+use sqlparser::ast::CharacterLength;
 use store::valueitem::ValueItem;
+
+use crate::constant::DEFAULT_VAR_SIZE;
 
 /// A column's declared type — distinct from `ValueItem`, which describes a
 /// stored *value*. There is deliberately no `Null` variant: null isn't a
@@ -12,6 +18,7 @@ pub enum DataType {
     Datetime,
     Str(u32),
     Blob(u32),
+    Unsupported,
 }
 
 impl DataType {
@@ -41,6 +48,54 @@ impl DataType {
             (DataType::Str(cap), ValueItem::Str((_, vcap))) => vcap <= cap,
             (DataType::Blob(cap), ValueItem::Blob((_, vcap))) => vcap <= cap,
             _ => false,
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        match self {
+            DataType::Integer => ValueItem::Integer(0).size(),
+            DataType::Double => ValueItem::Double(0.).size(),
+            DataType::Datetime => ValueItem::Datetime(0).size(),
+            DataType::Str(l) => ValueItem::Str(("".into(), *l)).size(),
+            DataType::Blob(l) => ValueItem::Blob((Arc::new([0u8]), *l)).size(),
+            DataType::Unsupported => 0,
+        }
+    }
+}
+
+impl From<sqlparser::ast::DataType> for DataType {
+    fn from(value: sqlparser::ast::DataType) -> Self {
+        match value {
+            sqlparser::ast::DataType::Int(_) | sqlparser::ast::DataType::Integer(_) => {
+                DataType::Integer
+            }
+            sqlparser::ast::DataType::Double(_) => DataType::Double,
+            sqlparser::ast::DataType::Datetime(_) | sqlparser::ast::DataType::Date => {
+                DataType::Datetime
+            }
+            sqlparser::ast::DataType::String(l) => {
+                DataType::Str(l.unwrap_or(DEFAULT_VAR_SIZE as u64) as u32)
+            }
+            sqlparser::ast::DataType::Text => DataType::Str(DEFAULT_VAR_SIZE as u32),
+            sqlparser::ast::DataType::Varchar(l) => {
+                let l = l.unwrap_or(CharacterLength::IntegerLength {
+                    length: 32,
+                    unit: None,
+                });
+                match l {
+                    CharacterLength::IntegerLength { length, unit: _ } => {
+                        DataType::Str(length as u32)
+                    }
+                    _ => DataType::Str(32),
+                }
+            }
+            sqlparser::ast::DataType::Blob(l) => {
+                DataType::Blob(l.unwrap_or(DEFAULT_VAR_SIZE as u64) as u32)
+            }
+            _ => {
+                warn!("unsupported datatype: {:?}", value);
+                DataType::Unsupported
+            }
         }
     }
 }
