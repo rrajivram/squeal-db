@@ -11,3 +11,5 @@ serde = "1.0.228"
 sqlparser = "0.62.0"
 store= {path="../store"}
 thiserror = "2.0.18"
+macros ={path="../macros"}
+either = "1.16.0"
