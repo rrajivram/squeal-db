@@ -30,11 +30,42 @@ pub struct TokenStruct<'src> {
 pub enum StringStyle {
     SingleQuoted(Option<char>),
     DoubleQuoted(Option<char>),
+    Unquoted,
 }
 
 impl<'src> Token<'src> {
     pub fn is_whitespace(c: char) -> bool {
         matches!(c, ' ' | '\r' | '\n' | '\t')
+    }
+}
+
+impl<'src> From<Token<'src>> for String {
+    fn from(value: Token<'src>) -> Self {
+        match value {
+            Token::Decimal {
+                is_neg,
+                part1,
+                period,
+                part2,
+            } => {
+                let neg = if is_neg { '-' } else { ' ' };
+                if period {
+                    format!("{neg}{part1}.{part2}")
+                } else {
+                    format!("{neg}{part1}")
+                }
+            }
+            Token::Word { raw, keyword: _ } => String::from(raw),
+            Token::String { raw, kind } => match kind {
+                StringStyle::SingleQuoted(c) | StringStyle::DoubleQuoted(c) if c.is_some() => {
+                    let c = c.unwrap();
+                    format!("{c}{raw}{c}")
+                }
+                _ => String::from(raw),
+            },
+            Token::Space => String::from(" "),
+            Token::Punctuation(punctuation) => String::from(punctuation.to_char()),
+        }
     }
 }
 

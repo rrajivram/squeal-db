@@ -1,9 +1,13 @@
+extern crate macros;
+use macros::SQLParser;
+
 use crate::{
     keyword::{Create, Double, Int, Null, Table, Uint64},
     literal::StringLiteral,
+    token::Punctuation,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, SQLParser)]
 pub enum Statement {
     CreateTable {
         create: Create,
@@ -14,15 +18,18 @@ pub enum Statement {
 }
 
 #[derive(Debug, Clone)]
-pub struct ColumnDefList(pub Vec<ColumnDef>);
+pub struct ColumnDefList {
+    //    pub left: Punctuation
+    pub colums: Vec<ColumnDef>,
+}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, SQLParser)]
 pub struct ColumnDef {
     name: StringLiteral,
     datatype: DataType,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, SQLParser)]
 enum DataType {
     Null(Null),
     Int(Int),

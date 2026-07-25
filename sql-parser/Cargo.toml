@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 chumsky = "0.13.0"
 either = "1.16.0"
+macros = { path="../macros"}

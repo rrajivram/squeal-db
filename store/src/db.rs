@@ -1311,7 +1311,7 @@ mod tests {
 
     use crate::{
         cursor::Cursor,
-        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE, db_hash},
+        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
         logger::MsgType,
         memfile::MemFile,
@@ -4174,8 +4174,7 @@ mod tests {
                             }
 
                             let Ok(t) = db.begin() else { continue };
-                            if super::retry_on_contention(|| db.remove(tid, id(key), &t)).is_err()
-                            {
+                            if super::retry_on_contention(|| db.remove(tid, id(key), &t)).is_err() {
                                 continue;
                             }
                             let _ = db.commit(t);

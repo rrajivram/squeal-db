@@ -2,17 +2,17 @@ use std::ops::RangeFrom;
 
 use chumsky::{
     Parser,
-    error::Rich,
     extra::ParserExtra,
-    input::{ExactSizeInput, Input, InputRef, ValueInput},
+    input::{ExactSizeInput, Input, ValueInput},
     label::LabelError,
     prelude::{any, custom, just},
 };
 
 use crate::{
     keyword::{Create, Keyword, Table},
+    literal::StringLiteral,
     parser::SQLParser,
-    statement::{ColumnDefList, Statement},
+    statement::Statement,
     token::{Token, TokenStruct},
 };
 
@@ -34,20 +34,54 @@ where
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parse(_args: ()) -> impl Parser<'src, I, Self, E> {
-        /*
-        just(Token::Word {
-            raw: "",
-            keyword: Some(Keyword::Create),
-        })
-        .then(
-            just(Token::Word {
-                raw: "",
-                keyword: Some(Keyword::Table),
+    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> {
+        // just(Token::Word { .. }) can't work here: `just` matches an exact
+        // value against the input's own token type, which is TokenStruct
+        // (not Token) per this impl's own `I::Token = TokenStruct<'src>`
+        // bound — filtering on `.token` (as the string check below already
+        // does) is the right shape, not a literal match.
+        any()
+            .filter(|t: &TokenStruct| {
+                matches!(
+                    t.token,
+                    Token::Word {
+                        keyword: Some(Keyword::Create),
+                        ..
+                    }
+                )
             })
-            .then(just(Token::String { raw: name, kind: _ })),
-        )
-        */
+            .map(|t: TokenStruct| Create::new(t.span))
+            .then(
+                any()
+                    .filter(|t: &TokenStruct| {
+                        matches!(
+                            t.token,
+                            Token::Word {
+                                keyword: Some(Keyword::Table),
+                                ..
+                            }
+                        )
+                    })
+                    .map(|t: TokenStruct| Table::new(t.span))
+                    .then(
+                        any()
+                            .filter(|t: &TokenStruct| {
+                                matches!(t.token, Token::Word { keyword: None, .. })
+                            })
+                            .map(|t: TokenStruct| StringLiteral {
+                                value: String::from(t.token),
+                            }),
+                    ),
+            )
+            // .then().then() nests, it doesn't flatten: this produces
+            // (Create, (Table, StringLiteral)), not a flat 3-tuple.
+            .map(|(c, (t, tn))| Statement::CreateTable {
+                create: c,
+                table: t,
+                name: Some(tn),
+                columns: None,
+            })
+        /*
         custom(move |stmt: &mut chumsky::input::InputRef<'src, '_, I, E>| {
             let begin = stmt.cursor();
             if let Some(c) = stmt.next()
@@ -79,20 +113,8 @@ where
                 None,
                 stmt.span_from(RangeFrom { start: &begin }),
             ))
-        })
+        })*/
     }
-}
-
-fn parse_columndef<'src, I, E>(
-    input: &mut InputRef<'src, '_, I, E>,
-) -> Result<ColumnDefList, E::Error>
-where
-    I: Input<'src>,
-    E: ParserExtra<'src, I>,
-{
-    let begin = input.cursor();
-
-    todo!()
 }
 
 #[cfg(test)]
@@ -102,14 +124,18 @@ mod tests {
     use crate::lexer::lexer;
 
     use super::*;
+    use chumsky::error::Rich;
 
     type TestExtra<'src> = extra::Err<Rich<'src, TokenStruct<'src>>>;
 
     #[test]
     fn test_simple() {
-        let t = &lexer().parse("Create table ").into_result().unwrap()[..];
+        let t = &lexer()
+            .parse("Create table table_name")
+            .into_result()
+            .unwrap()[..];
         // let s = <Statement as SQLParser<_, TestExtra>>::parse(()).parse(t);
-        let s = <Statement as SQLParser<_, TestExtra>>::parse(()).parse(t);
+        let s = <Statement as SQLParser<_, TestExtra>>::parser(()).parse(t);
         println!("{:?}", s);
     }
 }

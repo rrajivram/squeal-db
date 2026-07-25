@@ -4,7 +4,7 @@ use chumsky::{
     IterParser, Parser,
     error::Rich,
     extra::{self, SimpleState},
-    input::{Input, MapExtra, SliceInput, StrInput, ValueInput},
+    input::{Input, SliceInput, StrInput, ValueInput},
     prelude::{any, choice, custom, end, just},
     span::SimpleSpan,
     text,
@@ -224,7 +224,7 @@ mod tests {
     fn test_lexer1() {
         let l = lexer()
             //.lazy()
-            .parse("create table table1 (id int, name varchar(128)) 128");
+            .parse("create table table_name (id int, name varchar(128)) 128");
         println!("{:?}", l);
     }
 
