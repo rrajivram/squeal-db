@@ -34,6 +34,8 @@ impl From<StoreError> for SchemaError {
             | StoreError::MissingKey(_)
             | StoreError::TupleTooLarge(_, _)
             | StoreError::PageTransientlyInconsistent(_)
+            | StoreError::UnknownPageContentKind(_)
+            | StoreError::DuplicatePageContentKind(_)
             | StoreError::LockContentionError => Self::InternalError(value),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),

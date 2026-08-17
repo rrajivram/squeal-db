@@ -1395,6 +1395,7 @@ mod tests {
                 256,
                 Arc::new(crate::logger::LsnClock::default()),
                 1024,
+                Arc::new(crate::pages::content::PageContentRegistry::builtin()),
             )
             .unwrap(),
         )

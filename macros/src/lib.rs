@@ -1,3 +1,4 @@
+#![allow(dead_code, unused)]
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
@@ -12,8 +13,8 @@ enum SQLField {
     Either(Ident, Ident),
     Option(Box<SQLField>),
     Vec(Box<SQLField>),
-    Tuple(Box<Vec<SQLField>>),
-    Variant(Box<Vec<(String, SQLField)>>),
+    Tuple(Vec<SQLField>),
+    Variant(Vec<(String, SQLField)>),
 }
 
 extern crate proc_macro;
@@ -51,12 +52,11 @@ pub fn derive_parser(inp: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
+#[allow(clippy::single_match, clippy::collapsible_match)]
 fn generate_parser(field: &SQLField) -> String {
     let mut s = "".to_string();
     match field {
-        SQLField::Regular(f) => if f == "StringLiteral" {
-            
-        },
+        SQLField::Regular(f) => if f == "StringLiteral" {},
         _ => {}
     }
 
@@ -91,7 +91,7 @@ fn handle_variant(v: &Variant) -> SQLField {
             panic!("unit field:{:?} ", v.ident)
         }
     }
-    SQLField::Variant(Box::new(items))
+    SQLField::Variant(items)
 }
 
 fn derive_struct(_id: &Ident, st: &DataStruct) -> Vec<(String, SQLField)> {
@@ -189,7 +189,7 @@ fn handle_tuple(t: &TypeTuple) -> SQLField {
             items.push(SQLField::Regular(it));
         }
     }
-    SQLField::Tuple(Box::new(items))
+    SQLField::Tuple(items)
 }
 
 fn handle_either(type_path: &TypePath) -> SQLField {

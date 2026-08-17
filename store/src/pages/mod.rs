@@ -5,6 +5,7 @@ use crate::{
 };
 
 pub mod anytuple;
+pub mod content;
 pub mod fixedtuple;
 
 pub type TupleType = Tuple;

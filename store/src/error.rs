@@ -50,6 +50,10 @@ pub enum StoreError {
     // real corruption. See buffer.rs's write_page and writer's own comments.
     #[error("Page {0:?} read mid-overflow-transition, retry")]
     PageTransientlyInconsistent(crate::page::PageId),
+    #[error("No PageContent factory registered for kind {0}")]
+    UnknownPageContentKind(u16),
+    #[error("PageContent kind {0} is already registered")]
+    DuplicatePageContentKind(u16),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

@@ -1061,6 +1061,10 @@ where
         // Buffer shares the logger's WAL clock, so page-flush deferral and redo
         // LSNs are scoped to this one database (not a process global).
         let clock = logger.clock();
+        // Defaults to the two built-in kinds — Db::open/create don't yet
+        // expose a way for a caller to supply custom kinds; that's a
+        // natural follow-up once something actually needs to register one.
+        let content_registry = Arc::new(crate::pages::content::PageContentRegistry::builtin());
         let buffer = Arc::new(PageBuffer::new(
             header.page_size,
             page_counter,
@@ -1069,6 +1073,7 @@ where
             1024,
             clock,
             max_pending_writes,
+            content_registry,
         )?);
         let nm = NeededObjects {
             buffer,

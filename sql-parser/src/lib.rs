@@ -1,5 +1,8 @@
 #![allow(dead_code)]
 
+mod combo;
+mod datatype;
+mod ident;
 mod keyword;
 mod lexer;
 mod literal;

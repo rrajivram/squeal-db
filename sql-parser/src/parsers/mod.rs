@@ -1,11 +1,9 @@
-use std::ops::RangeFrom;
-
 use chumsky::{
     Parser,
     extra::ParserExtra,
     input::{ExactSizeInput, Input, ValueInput},
     label::LabelError,
-    prelude::{any, custom, just},
+    prelude::any,
 };
 
 use crate::{
@@ -34,7 +32,7 @@ where
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> {
+    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
         // just(Token::Word { .. }) can't work here: `just` matches an exact
         // value against the input's own token type, which is TokenStruct
         // (not Token) per this impl's own `I::Token = TokenStruct<'src>`

@@ -6,5 +6,5 @@ where
     E: ParserExtra<'a, I>,
     E::Error: LabelError<'a, I, String>,
 {
-    fn parser(args: A) -> impl Parser<'a, I, Self, E>;
+    fn parser(args: A) -> impl Parser<'a, I, Self, E> + Clone;
 }

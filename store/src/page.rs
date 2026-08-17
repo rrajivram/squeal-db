@@ -16,7 +16,12 @@ use crate::{
     db::DBSizeType,
     error::StoreError,
     logger::{LsnClock, LsnId},
-    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage},
+    pages::{
+        PageTuple,
+        anytuple::AnyTuplePage,
+        content::{PageContentKind, PageContentRegistry},
+        fixedtuple::FixedTuplePage,
+    },
     tuple::{DBIdType, Tuple},
 };
 use atomic_bitfield::AtomicBitField as _;
@@ -40,6 +45,13 @@ pub(crate) struct PageHeader {
     // PageInner's own comment for why this is bundled with next_page rather
     // than tracked separately.
     pub(crate) high_key: Option<DBIdType>,
+    // Which registered PageContentRegistry factory built this page's
+    // content, so it can be rebuilt from raw bytes without Page's own
+    // machinery needing to know about specific content types. Always one of
+    // the two built-in kinds today; ANY_TUPLE/FIXED_TUPLE are reserved so
+    // pages written before this field existed still decode the same way
+    // `record_size.is_some()` used to pick between them.
+    pub(crate) content_kind: PageContentKind,
 }
 
 impl PageHeader {
@@ -67,6 +79,7 @@ struct PageDto {
     lsn: LsnId,
     flags: u16,
     high_key: Option<DBIdType>,
+    content_kind: PageContentKind,
     data: Vec<u8>,
 }
 
@@ -181,6 +194,13 @@ pub(crate) struct Page {
     dirty: AtomicBool,
     page_data_size: DBSizeType,
     record_size: Option<usize>,
+    // Which PageContentRegistry kind built `inner.data` — set once at
+    // construction (Page::new picks it from record_size; from_bytes reads
+    // it back off the wire) and never mutated afterward, so — unlike
+    // has_overflow/next_page/high_key — it doesn't need to live inside
+    // PageInner's lock; nothing can observe it torn against content that
+    // never changes independently of it.
+    content_kind: PageContentKind,
     lsn: RwLock<LsnId>,
     // This database's WAL clock, injected by the PageBuffer that owns the page.
     // `set_dirty` stamps `lsn` from it (was a process-global before). `None` for
@@ -211,16 +231,36 @@ impl Page {
     }
 
     fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
+        let (pt, content_kind): (Box<dyn PageTuple>, PageContentKind) =
+            if let Some(record_size) = record_size {
+                (
+                    Box::new(FixedTuplePage::new(record_size)),
+                    PageContentKind::FIXED_TUPLE,
+                )
+            } else {
+                (Box::new(AnyTuplePage::new()), PageContentKind::ANY_TUPLE)
+            };
+        Self::new_with_content(size, flags, record_size, pt, content_kind)
+    }
+
+    // Lets a caller supply its own PageTuple implementor for a registered
+    // custom content kind (see PageContentRegistry) directly, rather than
+    // through the two built-in constructors above. Constructing a *new*
+    // page never needs the registry itself — only reconstructing one from
+    // raw bytes (Page::from_bytes) does — since whoever's allocating a page
+    // of a given kind already knows its own concrete type.
+    pub(crate) fn new_with_content(
+        size: DBSizeType,
+        flags: u16,
+        record_size: Option<usize>,
+        content: Box<dyn PageTuple>,
+        content_kind: PageContentKind,
+    ) -> Self {
         let ds = size - PAGE_OVERHEAD as DBSizeType;
         let ts = timestamp();
-        let pt: Box<dyn PageTuple> = if let Some(record_size) = record_size {
-            Box::new(FixedTuplePage::new(record_size))
-        } else {
-            Box::new(AnyTuplePage::new())
-        };
         Self {
             inner: RwLock::new(PageInner {
-                data: pt,
+                data: content,
                 page_used_size: 0,
                 has_overflow: false,
                 next_page: 0,
@@ -229,6 +269,7 @@ impl Page {
             dirty: AtomicBool::new(true),
             page_data_size: ds,
             record_size,
+            content_kind,
             lsn: RwLock::new(LsnId(0)),
             lsn_clock: None,
             flags: AtomicU16::new(flags),
@@ -261,6 +302,7 @@ impl Page {
             lsn: *self.lsn.read().unwrap(),
             flags,
             high_key: inner.high_key.clone(),
+            content_kind: self.content_kind,
         }
     }
 
@@ -550,18 +592,25 @@ impl Page {
         self.to_bytes_snapshot().1
     }
 
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+    // Takes the registry explicitly rather than defaulting to
+    // PageContentRegistry::builtin() internally: this runs on every
+    // cache-miss page read, so silently constructing a fresh registry per
+    // call here would mean allocating a new HashMap (and losing any
+    // caller-registered custom kinds) on a hot path. Callers that only ever
+    // deal in the two built-in kinds can pass `&PageContentRegistry::builtin()`
+    // explicitly (see this module's own tests) or, in production, share the
+    // one PageBuffer already holds.
+    pub(crate) fn from_bytes(
+        bytes: &[u8],
+        registry: &PageContentRegistry,
+    ) -> Result<Self, StoreError> {
         let header = &bytes[..PAGE_OVERHEAD];
         let header = from_bytes::<PageHeader>(header)?;
         let data = &bytes[PAGE_OVERHEAD..];
         // Deserialize the tuple payload with `?` rather than routing through the
         // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
         // read into a panic instead of a recoverable StoreError.
-        let pt: Box<dyn PageTuple> = if header.record_size.is_some() {
-            Box::new(FixedTuplePage::from_bytes(data)?)
-        } else {
-            Box::new(AnyTuplePage::from_bytes(data)?)
-        };
+        let pt = registry.resolve(header.content_kind, data)?;
         // has_overflow is decoded out of the on-disk flags bit and into
         // PageInner (see its own comment); masked out of what's stored in
         // the atomic so there's exactly one live source of truth for it,
@@ -579,6 +628,7 @@ impl Page {
             dirty: AtomicBool::new(false),
             page_data_size: header.page_data_size,
             record_size: header.record_size,
+            content_kind: header.content_kind,
             flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(header.lsn),
             lsn_clock: None,
@@ -673,10 +723,22 @@ impl Iterator for PageTupleIterator {
 
 impl From<PageDto> for Page {
     fn from(value: PageDto) -> Self {
-        let pt: Box<dyn PageTuple> = if let Some(_record_size) = value.record_size {
-            Box::new(FixedTuplePage::from_bytes(&value.data).unwrap())
-        } else {
-            Box::new(AnyTuplePage::from_bytes(&value.data).unwrap())
+        // This impl exists only to satisfy #[serde(from = "PageDto")] on
+        // Page's own Serialize/Deserialize derive — nothing in this crate
+        // actually calls Page's generic Deserialize path (Page::from_bytes
+        // is the real, exercised entry point, and it takes a
+        // PageContentRegistry precisely because `From::from` can't accept
+        // extra parameters). So this stays hardcoded to the two built-in
+        // kinds, matching its own pre-existing .unwrap()-panics-on-bad-data
+        // style, rather than threading a registry through a trait that
+        // structurally can't carry one.
+        let pt: Box<dyn PageTuple> = match value.content_kind {
+            PageContentKind::FIXED_TUPLE => Box::new(FixedTuplePage::from_bytes(&value.data).unwrap()),
+            PageContentKind::ANY_TUPLE => Box::new(AnyTuplePage::from_bytes(&value.data).unwrap()),
+            other => panic!(
+                "From<PageDto> for Page only supports the built-in content kinds, got {other:?} — \
+                 use Page::from_bytes with a PageContentRegistry for custom kinds"
+            ),
         };
         // See Page::from_bytes's matching comment: has_overflow decodes out
         // of the wire flags and into PageInner, masked out of the atomic.
@@ -693,6 +755,7 @@ impl From<PageDto> for Page {
             dirty: AtomicBool::new(false),
             page_data_size: value.page_data_size,
             record_size: value.record_size,
+            content_kind: value.content_kind,
             flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(value.lsn),
             lsn_clock: None,
@@ -726,6 +789,7 @@ impl From<Page> for PageDto {
             lsn: *value.lsn.read().unwrap(),
             flags,
             high_key: inner.high_key,
+            content_kind: value.content_kind,
             data: inner.data.to_bytes().unwrap(),
         }
     }
@@ -751,6 +815,7 @@ impl Clone for Page {
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
             page_data_size: self.page_data_size,
             record_size: self.record_size,
+            content_kind: self.content_kind,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(*self.lsn.read().unwrap()),
             lsn_clock: self.lsn_clock.clone(),
@@ -773,6 +838,7 @@ impl PartialEq for Page {
             && self.flags.load(std::sync::atomic::Ordering::Relaxed)
                 == rhs.flags.load(std::sync::atomic::Ordering::Relaxed)
             && self.record_size == rhs.record_size
+            && self.content_kind == rhs.content_kind
     }
 }
 
@@ -830,10 +896,15 @@ mod tests {
     use crate::{
         error::StoreError,
         page::{PAGE_OVERHEAD, Page, USABLE_DATA_MARGIN},
+        pages::content::PageContentRegistry,
         tuple::{DBIdType, Tuple},
     };
 
     type FixedPage = Page;
+
+    fn registry() -> PageContentRegistry {
+        PageContentRegistry::builtin()
+    }
 
     #[test]
     fn page_test_unique_id() {
@@ -865,7 +936,7 @@ mod tests {
         }
         let b = p.to_bytes();
         assert_eq!(b.len(), page_size as usize);
-        let p1 = Page::from_bytes(&b);
+        let p1 = Page::from_bytes(&b, &registry());
         assert!(p1.is_ok());
         let p1 = p1.unwrap();
         assert_eq!(p1, p);
@@ -876,7 +947,7 @@ mod tests {
         let p = Page::new_data(1024);
         let b = p.to_bytes();
         assert_eq!(b.len(), 1024);
-        let p1 = Page::from_bytes(&b).unwrap();
+        let p1 = Page::from_bytes(&b, &registry()).unwrap();
         assert_eq!(p, p1);
     }
 
@@ -941,7 +1012,7 @@ mod tests {
         p.add_tuple(Tuple::new(1, b"first")).unwrap();
         p.add_tuple(Tuple::new(2, b"second")).unwrap();
         let bytes = p.to_bytes();
-        let p2 = Page::from_bytes(&bytes).unwrap();
+        let p2 = Page::from_bytes(&bytes, &registry()).unwrap();
         assert!(p2.contains(DBIdType::Int(1)).unwrap());
         assert!(p2.contains(DBIdType::Int(2)).unwrap());
         assert_eq!(
@@ -979,7 +1050,7 @@ mod tests {
         let p = Page::new_data(2000);
         p.add_tuple(Tuple::new(10, b"x")).unwrap();
         p.add_tuple(Tuple::new(20, b"y")).unwrap();
-        let p2 = Page::from_bytes(&p.to_bytes()).unwrap();
+        let p2 = Page::from_bytes(&p.to_bytes(), &registry()).unwrap();
         assert_eq!(p2.iter().count(), 2);
     }
 
@@ -1034,7 +1105,7 @@ mod tests {
         let p = FixedPage::new_indexed(2000, record_size);
         p.add_tuple(Tuple::new(1, b"abc")).unwrap();
         p.add_tuple(Tuple::new(2, b"abc")).unwrap();
-        let p2 = FixedPage::from_bytes(&p.to_bytes()).unwrap();
+        let p2 = FixedPage::from_bytes(&p.to_bytes(), &registry()).unwrap();
         assert_eq!(p2.iter().count(), 2);
         assert!(p2.iter().all(|t| t.data.to_vec() == b"abc"));
     }

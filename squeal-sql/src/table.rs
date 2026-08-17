@@ -9,7 +9,7 @@ use store::table::TableIdType;
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::datatype::DataType;
 use crate::error::SchemaError;
-use crate::schema::Schema;
+use crate::schema_ops::schema::Schema;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlTable {

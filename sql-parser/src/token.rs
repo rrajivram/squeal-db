@@ -1,4 +1,5 @@
 use crate::{keyword::Keyword, span::TokenSpan};
+use chumsky::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token<'src> {
@@ -145,6 +146,72 @@ macro_rules! create_punctuation {
 }
 
 create_punctuation!(
+    (0x21, '!', ExclamationMark),
+    (0x23, '#', NumberSign),
+    (0x24, '$', Dollar),
+    (0x25, '%', Percent),
+    (0x26, '&', Ampersand),
+    (0x28, '(', LeftParenthesis),
+    (0x29, ')', RightParenthesis),
+    (0x2A, '*', Asterisk),
+    (0x2B, '+', Plus),
+    (0x2C, ',', Comma),
+    (0x2D, '-', Minus),
+    (0x2E, '.', Period),
+    (0x2F, '/', Slash),
+    (0x3A, ':', Colon),
+    (0x3B, ';', Semicolon),
+    (0x3C, '<', LessThan),
+    (0x3D, '=', Equals),
+    (0x3E, '>', GreaterThan),
+    (0x3F, '?', QuestionMark),
+    (0x40, '@', At),
+    (0x5B, '[', LeftBracket),
+    (0x5C, '\\', Backslash),
+    (0x5D, ']', RightBracket),
+    (0x5E, '^', Caret),
+    (0x7B, '{', LeftBrace),
+    (0x7C, '|', VerticalBar),
+    (0x7D, '}', RightBrace),
+    (0x7E, '~', Tilde),
+);
+
+// Mirrors keyword.rs's create_keywords! — one span-carrying struct per
+// punctuation variant, for the same reason Create/Table exist alongside
+// the Keyword enum: a parser can match a specific punctuation character
+// and wrap the matched token's own span in a distinctly-typed value,
+// rather than carrying a bare Punctuation enum value with no span.
+macro_rules! define_punctuation {
+    ($(($x:expr,$c:literal,$i:ident)),*$(,)?) => {
+        $(
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            pub struct $i {
+                pub span: crate::span::TokenSpan,
+            }
+
+            impl $i {
+                pub fn new(span: crate::span::TokenSpan) -> Self {
+                    Self { span }
+                }
+            }
+
+            impl<'src, I, E> crate::parser::SQLParser<'src, I, E> for $i
+            where
+                I: chumsky::input::Input<'src, Token = TokenStruct<'src>> + chumsky::input::ValueInput<'src> + chumsky::input::ExactSizeInput<'src>,
+                E: chumsky::extra::ParserExtra<'src, I>,
+                E::Error: chumsky::label::LabelError<'src, I, String>,
+            {
+                fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+                    chumsky::prelude::any()
+                        .filter(|t: &TokenStruct| matches!(t.token, Token::Punctuation(Punctuation::$i)))
+                        .map(|t| $i { span: t.span })
+                }
+            }
+        )*
+    };
+}
+
+define_punctuation!(
     (0x21, '!', ExclamationMark),
     (0x23, '#', NumberSign),
     (0x24, '$', Dollar),

@@ -18,6 +18,7 @@ use crate::{
     error::StoreError,
     logger::LsnClock,
     page::{PAGE_OVERHEAD, Page, PageHeader, PageId},
+    pages::content::PageContentRegistry,
     utils::shardedpq::ShardedPQ,
 };
 
@@ -93,12 +94,18 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // LSN when submitting it for writing, and by the writer thread to decide
     // flush-now vs defer. Per-Db, not a process global.
     clock: Arc<LsnClock>,
+    // Per-Db-instance (see its own doc comment for why not a process
+    // global), used to reconstruct a page's content from raw bytes on a
+    // cache-miss read without Page/PageBuffer needing to know about
+    // specific content kinds.
+    content_registry: Arc<PageContentRegistry>,
 }
 
 impl<F: DBFile> PageBuffer<F>
 where
     F: DBFile<Item = F> + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         page_size: DBSizeType,
         page_counter: Arc<AtomicU64>,
@@ -107,6 +114,7 @@ where
         max_entries: usize,
         clock: Arc<LsnClock>,
         max_pending_writes: usize,
+        content_registry: Arc<PageContentRegistry>,
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let writer_file = db_file.do_clone()?;
@@ -150,6 +158,7 @@ where
             locks: ArcLock::new(),
             free_pages: RwLock::new(vec![]),
             clock,
+            content_registry,
         })
     }
 
@@ -650,6 +659,7 @@ where
             &*file,
             self.header.page_size,
             self.header.first_page_offset,
+            &self.content_registry,
         )?;
         drop(file);
         // Adopt the freshly-loaded page into this database's WAL clock before it
@@ -1237,6 +1247,7 @@ fn read_page(
     file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
+    content_registry: &PageContentRegistry,
 ) -> Result<Page, StoreError> {
     let header = read_page_header(page_id, file, page_size, first_offset)?;
     if header.has_overflow() {
@@ -1293,7 +1304,7 @@ fn read_page(
         let mut full_bytes = primary_header.to_bytes()?;
         full_bytes.resize(PAGE_OVERHEAD, 0);
         full_bytes.extend_from_slice(&all_data);
-        Ok(Page::from_bytes(&full_bytes)?)
+        Ok(Page::from_bytes(&full_bytes, content_registry)?)
     } else {
         // Read the full page slot so Page::from_bytes gets the complete
         // serialized data. Single pread, not pread_exact: if the async writer
@@ -1301,7 +1312,7 @@ fn read_page(
         // zero-initialized buffer acts as padding.
         let mut bytes = vec![0u8; page_size as usize];
         file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
-        Ok(Page::from_bytes(&bytes)?)
+        Ok(Page::from_bytes(&bytes, content_registry)?)
     }
 }
 
@@ -1323,6 +1334,8 @@ mod tests {
 
     use postcard::from_bytes;
 
+    use crate::db::DBSizeType;
+    use crate::error::StoreError;
     use crate::page::Page;
     use crate::tuple::{DBIdType, Tuple};
     use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
@@ -1367,6 +1380,7 @@ mod tests {
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
             1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
         )
         .unwrap();
         (buf, page_counter)
@@ -1398,6 +1412,7 @@ mod tests {
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
             1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
         )
         .unwrap();
         (buf, page_counter, file_clone)
@@ -1486,6 +1501,7 @@ mod tests {
             10,
             Arc::new(crate::logger::LsnClock::default()),
             1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
         )
         .unwrap();
 
@@ -1586,6 +1602,7 @@ mod tests {
                 10,
                 clock.clone(),
                 MAX_PENDING,
+                Arc::new(crate::pages::content::PageContentRegistry::builtin()),
             )
             .unwrap(),
         );
@@ -1644,5 +1661,209 @@ mod tests {
         sender.join().unwrap();
 
         let _ = Arc::try_unwrap(buf).unwrap().shutdown();
+    }
+
+    // A minimal third PageTuple kind, standing in for something like a
+    // hash-join bucket: unordered, append-only, no notion of a positional
+    // key. Exists only to prove PageContentRegistry can round-trip a kind
+    // it didn't ship with, not to be a realistic implementation.
+    #[derive(Debug, Clone, Default, PartialEq)]
+    struct TestBucketPage {
+        tuples: Vec<Tuple>,
+    }
+
+    impl crate::pages::PageTuple for TestBucketPage {
+        fn count(&self) -> Result<usize, StoreError> {
+            Ok(self.tuples.len())
+        }
+
+        fn deep_clone(&self) -> Box<dyn crate::pages::PageTuple> {
+            Box::new(self.clone())
+        }
+
+        fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
+            self.tuples.push(tuple);
+            Ok(())
+        }
+
+        fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
+            Ok(self.tuples.iter().any(|t| &t.id == id))
+        }
+
+        fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+            Ok(self.tuples.iter().find(|t| &t.id == id).cloned())
+        }
+
+        fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
+            let pos = self
+                .tuples
+                .iter()
+                .position(|t| &t.id == id)
+                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+            Ok(std::mem::replace(&mut self.tuples[pos], tuple))
+        }
+
+        fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
+            let pos = self
+                .tuples
+                .iter()
+                .position(|t| t.id == id)
+                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+            Ok(self.tuples.remove(pos))
+        }
+
+        fn values(&self) -> Result<Vec<Tuple>, StoreError> {
+            Ok(self.tuples.clone())
+        }
+
+        fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
+            // No positional key exists for an unordered bucket; an honest
+            // empty answer rather than a fabricated one.
+            Ok(vec![])
+        }
+
+        fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
+            Ok(postcard::to_allocvec(&self.tuples)?)
+        }
+
+        fn clear(&mut self) -> Result<(), StoreError> {
+            self.tuples.clear();
+            Ok(())
+        }
+
+        fn first(&self) -> Result<Option<Tuple>, StoreError> {
+            Ok(self.tuples.first().cloned())
+        }
+
+        fn last(&self) -> Result<Option<Tuple>, StoreError> {
+            Ok(self.tuples.last().cloned())
+        }
+    }
+
+    impl TestBucketPage {
+        fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+            Ok(Self {
+                tuples: postcard::from_bytes(bytes)?,
+            })
+        }
+    }
+
+    const TEST_BUCKET_KIND: crate::pages::content::PageContentKind =
+        crate::pages::content::PageContentKind(2);
+
+    fn registry_with_test_bucket() -> crate::pages::content::PageContentRegistry {
+        let mut registry = crate::pages::content::PageContentRegistry::builtin();
+        registry
+            .register(
+                TEST_BUCKET_KIND,
+                Arc::new(|bytes| {
+                    Ok(Box::new(TestBucketPage::from_bytes(bytes)?) as Box<dyn crate::pages::PageTuple>)
+                }),
+            )
+            .unwrap();
+        registry
+    }
+
+    #[test]
+    fn test_custom_content_kind_roundtrips_through_disk() {
+        let page_size = PAGE_SIZE;
+        let mut mem = MemFile::new();
+        let file_clone = mem.clone();
+        mem.seek(SeekFrom::Start(0)).unwrap();
+        let page_counter = Arc::new(AtomicU64::new(0));
+        let header =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+
+        let buf = PageBuffer::new(
+            page_size,
+            page_counter.clone(),
+            mem,
+            header,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(registry_with_test_bucket()),
+        )
+        .unwrap();
+
+        let page_id = buf.alloc_page(false).unwrap();
+        let page = Page::new_with_content(
+            page_size,
+            0,
+            None,
+            Box::new(TestBucketPage::default()),
+            TEST_BUCKET_KIND,
+        );
+        page.add_tuple(Tuple::new(1, b"bucket-entry")).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+        // shutdown flushes the writer thread, persisting all writes to the shared MemFile
+        buf.shutdown().unwrap();
+
+        // Re-open with a fresh buffer over the shared backing storage and a
+        // fresh registry (not the same Arc the first buffer used) — this is
+        // what actually forces Page::from_bytes -> PageContentRegistry::resolve
+        // to run the custom factory, rather than reading a cached Arc<Page>
+        // the first buffer already had in memory.
+        let page_count = page_counter.load(Ordering::Relaxed);
+        let page_counter2 = Arc::new(AtomicU64::new(page_count));
+        let header2 =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size)).unwrap());
+        let buf2 = PageBuffer::new(
+            page_size,
+            page_counter2,
+            file_clone,
+            header2,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(registry_with_test_bucket()),
+        )
+        .unwrap();
+
+        let retrieved = buf2.get_page(page_id).unwrap();
+        assert_eq!(retrieved.count().unwrap(), 1);
+        let tuple = retrieved.get(DBIdType::Int(1)).unwrap().unwrap();
+        assert_eq!(tuple.data.to_vec(), b"bucket-entry");
+        let _ = buf2.shutdown();
+    }
+
+    #[test]
+    fn test_custom_content_kind_unresolvable_without_registration() {
+        // Same write as above, but reading it back with a registry that never
+        // learned about kind 2 must fail loudly (UnknownPageContentKind)
+        // rather than silently misdecoding the bytes as a built-in kind.
+        let page_size = PAGE_SIZE;
+        let mut mem = MemFile::new();
+        mem.seek(SeekFrom::Start(0)).unwrap();
+        let page_counter = Arc::new(AtomicU64::new(0));
+        let header =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+        let buf = PageBuffer::new(
+            page_size,
+            page_counter.clone(),
+            mem,
+            header,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(registry_with_test_bucket()),
+        )
+        .unwrap();
+
+        buf.alloc_page(false).unwrap();
+        let page = Page::new_with_content(
+            page_size,
+            0,
+            None,
+            Box::new(TestBucketPage::default()),
+            TEST_BUCKET_KIND,
+        );
+        page.add_tuple(Tuple::new(1, b"bucket-entry")).unwrap();
+        let raw_bytes = page.to_bytes();
+
+        let unregistered = crate::pages::content::PageContentRegistry::builtin();
+        let err = Page::from_bytes(&raw_bytes, &unregistered).unwrap_err();
+        assert!(matches!(err, StoreError::UnknownPageContentKind(2)));
+        let _ = buf.shutdown();
     }
 }
