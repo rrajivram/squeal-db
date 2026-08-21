@@ -1,0 +1,9 @@
+[package]
+name = "squeal-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+comfy-table = "8.0.0"
+rustyline = "18.0.1"
+squeal-sql = {path="../squeal-sql"}

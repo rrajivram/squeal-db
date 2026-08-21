@@ -2,11 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
-use sqlparser::{
-    ast::Statement,
-    dialect::{Dialect, GenericDialect},
-    parser::Parser,
-};
+use sqlparser::{dialect::GenericDialect, parser::Parser};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
@@ -29,7 +25,7 @@ pub struct Schema<F: DBFile> {
     tables: Arc<RwLock<HashMap<String, SqlTable>>>,
     sys_tables: Arc<RwLock<HashMap<String, TableIdType>>>,
     generator: Arc<Generator>,
-    dialect: Arc<dyn Dialect>,
+    dialect: Arc<GenericDialect>,
 }
 
 #[cfg(test)]
@@ -40,7 +36,7 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub fn create(name: String) -> Result<Arc<Self>, SchemaError> {
+    pub fn create_database(name: String) -> Result<Arc<Self>, SchemaError> {
         let db = Db::create(&name)?;
         let mut s = Self {
             name,
@@ -60,7 +56,7 @@ where
         Ok(())
     }
 
-    fn close(self: Arc<Self>) -> Result<(F, F, F), SchemaError> {
+    fn close_database(self: Arc<Self>) -> Result<(F, F, F), SchemaError> {
         let tid = *self.sys_tables.read().get(SYSTEM_SCHEMA).unwrap();
         let tx = self.db.begin()?;
         for (n, t) in self.tables.read().iter() {
@@ -115,12 +111,15 @@ where
         Ok(())
     }
 
-    fn exec_statement(self: &Arc<Self>, stmt: &Statement) -> Result<(), SchemaError> {
+    fn exec_statement(
+        self: &Arc<Self>,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<(), SchemaError> {
         match stmt {
-            Statement::CreateTable(c) => {
+            sqlparser::ast::Statement::CreateTable(c) => {
                 self.create_table(SqlTable::from_sql(self, c.clone())?)?;
             }
-            Statement::AlterCollation(_) => {
+            sqlparser::ast::Statement::AlterCollation(_) => {
                 todo!()
             }
             _ => {}
@@ -213,29 +212,29 @@ where
     }
 
     #[allow(unused_variables)]
-    fn dummy_stmt(stmt: Statement) {
+    fn dummy_stmt(stmt: sqlparser::ast::Statement) {
         match stmt {
-            Statement::Analyze(analyze) => todo!(),
-            Statement::Set(set) => todo!(),
-            Statement::Truncate(truncate) => todo!(),
-            Statement::Msck(msck) => todo!(),
-            Statement::Query(query) => todo!(),
-            Statement::Insert(insert) => todo!(),
-            Statement::Install { extension_name } => todo!(),
-            Statement::Load { extension_name } => todo!(),
-            Statement::Directory {
+            sqlparser::ast::Statement::Analyze(analyze) => todo!(),
+            sqlparser::ast::Statement::Set(set) => todo!(),
+            sqlparser::ast::Statement::Truncate(truncate) => todo!(),
+            sqlparser::ast::Statement::Msck(msck) => todo!(),
+            sqlparser::ast::Statement::Query(query) => todo!(),
+            sqlparser::ast::Statement::Insert(insert) => todo!(),
+            sqlparser::ast::Statement::Install { extension_name } => todo!(),
+            sqlparser::ast::Statement::Load { extension_name } => todo!(),
+            sqlparser::ast::Statement::Directory {
                 overwrite,
                 local,
                 path,
                 file_format,
                 source,
             } => todo!(),
-            Statement::Case(case_statement) => todo!(),
-            Statement::If(if_statement) => todo!(),
-            Statement::While(while_statement) => todo!(),
-            Statement::Raise(raise_statement) => todo!(),
-            Statement::Call(function) => todo!(),
-            Statement::Copy {
+            sqlparser::ast::Statement::Case(case_statement) => todo!(),
+            sqlparser::ast::Statement::If(if_statement) => todo!(),
+            sqlparser::ast::Statement::While(while_statement) => todo!(),
+            sqlparser::ast::Statement::Raise(raise_statement) => todo!(),
+            sqlparser::ast::Statement::Call(function) => todo!(),
+            sqlparser::ast::Statement::Copy {
                 source,
                 to,
                 target,
@@ -243,7 +242,7 @@ where
                 legacy_options,
                 values,
             } => todo!(),
-            Statement::CopyIntoSnowflake {
+            sqlparser::ast::Statement::CopyIntoSnowflake {
                 kind,
                 into,
                 into_columns,
@@ -259,21 +258,21 @@ where
                 validation_mode,
                 partition,
             } => todo!(),
-            Statement::Open(open_statement) => todo!(),
-            Statement::Close { cursor } => todo!(),
-            Statement::Update(update) => todo!(),
-            Statement::Delete(delete) => todo!(),
-            Statement::CreateView(create_view) => todo!(),
-            Statement::CreateTable(create_table) => todo!(),
-            Statement::CreateVirtualTable {
+            sqlparser::ast::Statement::Open(open_statement) => todo!(),
+            sqlparser::ast::Statement::Close { cursor } => todo!(),
+            sqlparser::ast::Statement::Update(update) => todo!(),
+            sqlparser::ast::Statement::Delete(delete) => todo!(),
+            sqlparser::ast::Statement::CreateView(create_view) => todo!(),
+            sqlparser::ast::Statement::CreateTable(create_table) => todo!(),
+            sqlparser::ast::Statement::CreateVirtualTable {
                 name,
                 if_not_exists,
                 module_name,
                 module_args,
             } => todo!(),
-            Statement::CreateIndex(create_index) => todo!(),
-            Statement::CreateRole(create_role) => todo!(),
-            Statement::CreateSecret {
+            sqlparser::ast::Statement::CreateIndex(create_index) => todo!(),
+            sqlparser::ast::Statement::CreateRole(create_role) => todo!(),
+            sqlparser::ast::Statement::CreateSecret {
                 or_replace,
                 temporary,
                 if_not_exists,
@@ -282,57 +281,57 @@ where
                 secret_type,
                 options,
             } => todo!(),
-            Statement::CreateServer(create_server_statement) => todo!(),
-            Statement::CreatePolicy(create_policy) => todo!(),
-            Statement::CreateConnector(create_connector) => todo!(),
-            Statement::CreateOperator(create_operator) => todo!(),
-            Statement::CreateOperatorFamily(create_operator_family) => todo!(),
-            Statement::CreateOperatorClass(create_operator_class) => todo!(),
-            Statement::AlterTable(alter_table) => todo!(),
-            Statement::AlterSchema(alter_schema) => todo!(),
-            Statement::AlterIndex { name, operation } => todo!(),
-            Statement::AlterView {
+            sqlparser::ast::Statement::CreateServer(create_server_statement) => todo!(),
+            sqlparser::ast::Statement::CreatePolicy(create_policy) => todo!(),
+            sqlparser::ast::Statement::CreateConnector(create_connector) => todo!(),
+            sqlparser::ast::Statement::CreateOperator(create_operator) => todo!(),
+            sqlparser::ast::Statement::CreateOperatorFamily(create_operator_family) => todo!(),
+            sqlparser::ast::Statement::CreateOperatorClass(create_operator_class) => todo!(),
+            sqlparser::ast::Statement::AlterTable(alter_table) => todo!(),
+            sqlparser::ast::Statement::AlterSchema(alter_schema) => todo!(),
+            sqlparser::ast::Statement::AlterIndex { name, operation } => todo!(),
+            sqlparser::ast::Statement::AlterView {
                 name,
                 columns,
                 query,
                 with_options,
             } => todo!(),
-            Statement::AlterFunction(alter_function) => todo!(),
-            Statement::AlterType(alter_type) => todo!(),
-            Statement::AlterCollation(alter_collation) => todo!(),
-            Statement::AlterOperator(alter_operator) => todo!(),
-            Statement::AlterOperatorFamily(alter_operator_family) => todo!(),
-            Statement::AlterOperatorClass(alter_operator_class) => todo!(),
-            Statement::AlterRole { name, operation } => todo!(),
-            Statement::AlterPolicy(alter_policy) => todo!(),
-            Statement::AlterConnector {
+            sqlparser::ast::Statement::AlterFunction(alter_function) => todo!(),
+            sqlparser::ast::Statement::AlterType(alter_type) => todo!(),
+            sqlparser::ast::Statement::AlterCollation(alter_collation) => todo!(),
+            sqlparser::ast::Statement::AlterOperator(alter_operator) => todo!(),
+            sqlparser::ast::Statement::AlterOperatorFamily(alter_operator_family) => todo!(),
+            sqlparser::ast::Statement::AlterOperatorClass(alter_operator_class) => todo!(),
+            sqlparser::ast::Statement::AlterRole { name, operation } => todo!(),
+            sqlparser::ast::Statement::AlterPolicy(alter_policy) => todo!(),
+            sqlparser::ast::Statement::AlterConnector {
                 name,
                 properties,
                 url,
                 owner,
             } => todo!(),
-            Statement::AlterSession {
+            sqlparser::ast::Statement::AlterSession {
                 set,
                 session_params,
             } => todo!(),
-            Statement::AttachDatabase {
+            sqlparser::ast::Statement::AttachDatabase {
                 schema_name,
                 database_file_name,
                 database,
             } => todo!(),
-            Statement::AttachDuckDBDatabase {
+            sqlparser::ast::Statement::AttachDuckDBDatabase {
                 if_not_exists,
                 database,
                 database_path,
                 database_alias,
                 attach_options,
             } => todo!(),
-            Statement::DetachDuckDBDatabase {
+            sqlparser::ast::Statement::DetachDuckDBDatabase {
                 if_exists,
                 database,
                 database_alias,
             } => todo!(),
-            Statement::Drop {
+            sqlparser::ast::Statement::Drop {
                 object_type,
                 if_exists,
                 names,
@@ -342,35 +341,35 @@ where
                 temporary,
                 table,
             } => todo!(),
-            Statement::DropFunction(drop_function) => todo!(),
-            Statement::DropDomain(drop_domain) => todo!(),
-            Statement::DropProcedure {
+            sqlparser::ast::Statement::DropFunction(drop_function) => todo!(),
+            sqlparser::ast::Statement::DropDomain(drop_domain) => todo!(),
+            sqlparser::ast::Statement::DropProcedure {
                 if_exists,
                 proc_desc,
                 drop_behavior,
             } => todo!(),
-            Statement::DropSecret {
+            sqlparser::ast::Statement::DropSecret {
                 if_exists,
                 temporary,
                 name,
                 storage_specifier,
             } => todo!(),
-            Statement::DropPolicy(drop_policy) => todo!(),
-            Statement::DropConnector { if_exists, name } => todo!(),
-            Statement::Declare { stmts } => todo!(),
-            Statement::CreateExtension(create_extension) => todo!(),
-            Statement::CreateCollation(create_collation) => todo!(),
-            Statement::DropExtension(drop_extension) => todo!(),
-            Statement::DropOperator(drop_operator) => todo!(),
-            Statement::DropOperatorFamily(drop_operator_family) => todo!(),
-            Statement::DropOperatorClass(drop_operator_class) => todo!(),
-            Statement::Fetch {
+            sqlparser::ast::Statement::DropPolicy(drop_policy) => todo!(),
+            sqlparser::ast::Statement::DropConnector { if_exists, name } => todo!(),
+            sqlparser::ast::Statement::Declare { stmts } => todo!(),
+            sqlparser::ast::Statement::CreateExtension(create_extension) => todo!(),
+            sqlparser::ast::Statement::CreateCollation(create_collation) => todo!(),
+            sqlparser::ast::Statement::DropExtension(drop_extension) => todo!(),
+            sqlparser::ast::Statement::DropOperator(drop_operator) => todo!(),
+            sqlparser::ast::Statement::DropOperatorFamily(drop_operator_family) => todo!(),
+            sqlparser::ast::Statement::DropOperatorClass(drop_operator_class) => todo!(),
+            sqlparser::ast::Statement::Fetch {
                 name,
                 direction,
                 position,
                 into,
             } => todo!(),
-            Statement::Flush {
+            sqlparser::ast::Statement::Flush {
                 object_type,
                 location,
                 channel,
@@ -378,44 +377,44 @@ where
                 export,
                 tables,
             } => todo!(),
-            Statement::Discard { object_type } => todo!(),
-            Statement::ShowFunctions { filter } => todo!(),
-            Statement::ShowVariable { variable } => todo!(),
-            Statement::ShowStatus {
+            sqlparser::ast::Statement::Discard { object_type } => todo!(),
+            sqlparser::ast::Statement::ShowFunctions { filter } => todo!(),
+            sqlparser::ast::Statement::ShowVariable { variable } => todo!(),
+            sqlparser::ast::Statement::ShowStatus {
                 filter,
                 global,
                 session,
             } => todo!(),
-            Statement::ShowVariables {
+            sqlparser::ast::Statement::ShowVariables {
                 filter,
                 global,
                 session,
             } => todo!(),
-            Statement::ShowCreate { obj_type, obj_name } => todo!(),
-            Statement::ShowColumns {
+            sqlparser::ast::Statement::ShowCreate { obj_type, obj_name } => todo!(),
+            sqlparser::ast::Statement::ShowColumns {
                 extended,
                 full,
                 show_options,
             } => todo!(),
-            Statement::ShowCatalogs {
+            sqlparser::ast::Statement::ShowCatalogs {
                 terse,
                 history,
                 show_options,
             } => todo!(),
-            Statement::ShowDatabases {
+            sqlparser::ast::Statement::ShowDatabases {
                 terse,
                 history,
                 show_options,
             } => todo!(),
-            Statement::ShowProcessList { full } => todo!(),
-            Statement::ShowSchemas {
+            sqlparser::ast::Statement::ShowProcessList { full } => todo!(),
+            sqlparser::ast::Statement::ShowSchemas {
                 terse,
                 history,
                 show_options,
             } => todo!(),
-            Statement::ShowCharset(show_charset) => todo!(),
-            Statement::ShowObjects(show_objects) => todo!(),
-            Statement::ShowTables {
+            sqlparser::ast::Statement::ShowCharset(show_charset) => todo!(),
+            sqlparser::ast::Statement::ShowObjects(show_objects) => todo!(),
+            sqlparser::ast::Statement::ShowTables {
                 terse,
                 history,
                 extended,
@@ -423,14 +422,14 @@ where
                 external,
                 show_options,
             } => todo!(),
-            Statement::ShowViews {
+            sqlparser::ast::Statement::ShowViews {
                 terse,
                 materialized,
                 show_options,
             } => todo!(),
-            Statement::ShowCollation { filter } => todo!(),
-            Statement::Use(_) => todo!(),
-            Statement::StartTransaction {
+            sqlparser::ast::Statement::ShowCollation { filter } => todo!(),
+            sqlparser::ast::Statement::Use(_) => todo!(),
+            sqlparser::ast::Statement::StartTransaction {
                 modes,
                 begin,
                 transaction,
@@ -439,19 +438,19 @@ where
                 exception,
                 has_end_keyword,
             } => todo!(),
-            Statement::Comment {
+            sqlparser::ast::Statement::Comment {
                 object_type,
                 object_name,
                 comment,
                 if_exists,
             } => todo!(),
-            Statement::Commit {
+            sqlparser::ast::Statement::Commit {
                 chain,
                 end,
                 modifier,
             } => todo!(),
-            Statement::Rollback { chain, savepoint } => todo!(),
-            Statement::CreateSchema {
+            sqlparser::ast::Statement::Rollback { chain, savepoint } => todo!(),
+            sqlparser::ast::Statement::CreateSchema {
                 schema_name,
                 if_not_exists,
                 with,
@@ -459,7 +458,7 @@ where
                 default_collate_spec,
                 clone,
             } => todo!(),
-            Statement::CreateDatabase {
+            sqlparser::ast::Statement::CreateDatabase {
                 db_name,
                 if_not_exists,
                 location,
@@ -483,24 +482,24 @@ where
                 with_tags,
                 with_contacts,
             } => todo!(),
-            Statement::CreateFunction(create_function) => todo!(),
-            Statement::CreateTrigger(create_trigger) => todo!(),
-            Statement::DropTrigger(drop_trigger) => todo!(),
-            Statement::CreateProcedure {
+            sqlparser::ast::Statement::CreateFunction(create_function) => todo!(),
+            sqlparser::ast::Statement::CreateTrigger(create_trigger) => todo!(),
+            sqlparser::ast::Statement::DropTrigger(drop_trigger) => todo!(),
+            sqlparser::ast::Statement::CreateProcedure {
                 or_alter,
                 name,
                 params,
                 language,
                 body,
             } => todo!(),
-            Statement::CreateMacro {
+            sqlparser::ast::Statement::CreateMacro {
                 or_replace,
                 temporary,
                 name,
                 args,
                 definition,
             } => todo!(),
-            Statement::CreateStage {
+            sqlparser::ast::Statement::CreateStage {
                 or_replace,
                 temporary,
                 if_not_exists,
@@ -511,12 +510,12 @@ where
                 copy_options,
                 comment,
             } => todo!(),
-            Statement::Assert { condition, message } => todo!(),
-            Statement::Grant(grant) => todo!(),
-            Statement::Deny(deny_statement) => todo!(),
-            Statement::Revoke(revoke) => todo!(),
-            Statement::Deallocate { name, prepare } => todo!(),
-            Statement::Execute {
+            sqlparser::ast::Statement::Assert { condition, message } => todo!(),
+            sqlparser::ast::Statement::Grant(grant) => todo!(),
+            sqlparser::ast::Statement::Deny(deny_statement) => todo!(),
+            sqlparser::ast::Statement::Revoke(revoke) => todo!(),
+            sqlparser::ast::Statement::Deallocate { name, prepare } => todo!(),
+            sqlparser::ast::Statement::Execute {
                 name,
                 parameters,
                 has_parentheses,
@@ -526,19 +525,19 @@ where
                 output,
                 default,
             } => todo!(),
-            Statement::Prepare {
+            sqlparser::ast::Statement::Prepare {
                 name,
                 data_types,
                 statement,
             } => todo!(),
-            Statement::Kill { modifier, id } => todo!(),
-            Statement::ExplainTable {
+            sqlparser::ast::Statement::Kill { modifier, id } => todo!(),
+            sqlparser::ast::Statement::ExplainTable {
                 describe_alias,
                 hive_format,
                 has_table_keyword,
                 table_name,
             } => todo!(),
-            Statement::Explain {
+            sqlparser::ast::Statement::Explain {
                 describe_alias,
                 analyze,
                 verbose,
@@ -548,21 +547,21 @@ where
                 format,
                 options,
             } => todo!(),
-            Statement::Savepoint { name } => todo!(),
-            Statement::ReleaseSavepoint { name } => todo!(),
-            Statement::Merge(merge) => todo!(),
-            Statement::Cache {
+            sqlparser::ast::Statement::Savepoint { name } => todo!(),
+            sqlparser::ast::Statement::ReleaseSavepoint { name } => todo!(),
+            sqlparser::ast::Statement::Merge(merge) => todo!(),
+            sqlparser::ast::Statement::Cache {
                 table_flag,
                 table_name,
                 has_as,
                 options,
                 query,
             } => todo!(),
-            Statement::UNCache {
+            sqlparser::ast::Statement::UNCache {
                 table_name,
                 if_exists,
             } => todo!(),
-            Statement::CreateSequence {
+            sqlparser::ast::Statement::CreateSequence {
                 temporary,
                 if_not_exists,
                 name,
@@ -570,16 +569,16 @@ where
                 sequence_options,
                 owned_by,
             } => todo!(),
-            Statement::CreateDomain(create_domain) => todo!(),
-            Statement::CreateType {
+            sqlparser::ast::Statement::CreateDomain(create_domain) => todo!(),
+            sqlparser::ast::Statement::CreateType {
                 name,
                 representation,
             } => todo!(),
-            Statement::Pragma { name, value, is_eq } => todo!(),
-            Statement::Lock(lock) => todo!(),
-            Statement::LockTables { tables } => todo!(),
-            Statement::UnlockTables => todo!(),
-            Statement::Unload {
+            sqlparser::ast::Statement::Pragma { name, value, is_eq } => todo!(),
+            sqlparser::ast::Statement::Lock(lock) => todo!(),
+            sqlparser::ast::Statement::LockTables { tables } => todo!(),
+            sqlparser::ast::Statement::UnlockTables => todo!(),
+            sqlparser::ast::Statement::Unload {
                 query,
                 query_text,
                 to,
@@ -587,7 +586,7 @@ where
                 with,
                 options,
             } => todo!(),
-            Statement::OptimizeTable {
+            sqlparser::ast::Statement::OptimizeTable {
                 name,
                 has_table_keyword,
                 on_cluster,
@@ -597,10 +596,10 @@ where
                 predicate,
                 zorder,
             } => todo!(),
-            Statement::LISTEN { channel } => todo!(),
-            Statement::UNLISTEN { channel } => todo!(),
-            Statement::NOTIFY { channel, payload } => todo!(),
-            Statement::LoadData {
+            sqlparser::ast::Statement::LISTEN { channel } => todo!(),
+            sqlparser::ast::Statement::UNLISTEN { channel } => todo!(),
+            sqlparser::ast::Statement::NOTIFY { channel, payload } => todo!(),
+            sqlparser::ast::Statement::LoadData {
                 local,
                 inpath,
                 overwrite,
@@ -608,25 +607,25 @@ where
                 partitioned,
                 table_format,
             } => todo!(),
-            Statement::RenameTable(rename_tables) => todo!(),
-            Statement::List(file_staging_command) => todo!(),
-            Statement::Remove(file_staging_command) => todo!(),
-            Statement::RaisError {
+            sqlparser::ast::Statement::RenameTable(rename_tables) => todo!(),
+            sqlparser::ast::Statement::List(file_staging_command) => todo!(),
+            sqlparser::ast::Statement::Remove(file_staging_command) => todo!(),
+            sqlparser::ast::Statement::RaisError {
                 message,
                 severity,
                 state,
                 arguments,
                 options,
             } => todo!(),
-            Statement::Throw(throw_statement) => todo!(),
-            Statement::Print(print_statement) => todo!(),
-            Statement::WaitFor(wait_for_statement) => todo!(),
-            Statement::Return(return_statement) => todo!(),
-            Statement::ExportData(export_data) => todo!(),
-            Statement::CreateUser(create_user) => todo!(),
-            Statement::AlterUser(alter_user) => todo!(),
-            Statement::Vacuum(vacuum_statement) => todo!(),
-            Statement::Reset(reset_statement) => todo!(),
+            sqlparser::ast::Statement::Throw(throw_statement) => todo!(),
+            sqlparser::ast::Statement::Print(print_statement) => todo!(),
+            sqlparser::ast::Statement::WaitFor(wait_for_statement) => todo!(),
+            sqlparser::ast::Statement::Return(return_statement) => todo!(),
+            sqlparser::ast::Statement::ExportData(export_data) => todo!(),
+            sqlparser::ast::Statement::CreateUser(create_user) => todo!(),
+            sqlparser::ast::Statement::AlterUser(alter_user) => todo!(),
+            sqlparser::ast::Statement::Vacuum(vacuum_statement) => todo!(),
+            sqlparser::ast::Statement::Reset(reset_statement) => todo!(),
         }
     }
     //    pub fn create_table(self: Arc<Self>, table: Table) -> Result<(), SchemaError> {}

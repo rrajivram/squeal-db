@@ -19,6 +19,10 @@ pub enum SchemaError {
     UnknownError(String),
     #[error("Parse error")]
     ParseError(#[from] sqlparser::parser::ParserError),
+    #[error("Schema already in use : {0}")]
+    SchemaAlreadyInUseError(String),
+    #[error("Schema in use : {0}")]
+    SchemaInUseError(String),
 }
 
 impl From<StoreError> for SchemaError {

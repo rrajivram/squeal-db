@@ -13,3 +13,4 @@ store= {path="../store"}
 thiserror = "2.0.18"
 macros ={path="../macros"}
 either = "1.16.0"
+uuid = {version="1.24.1", features=["v4"]}
