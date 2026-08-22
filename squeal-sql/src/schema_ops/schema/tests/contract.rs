@@ -1,9 +1,10 @@
-// Schema's public API guarantees: execute()/create()/open()/close()/
-// table_exists()/get_table() behavior — rejecting invalid input with the
-// right error, persisting across close/reopen, and not leaking partial
-// state on failure. Not interested in SQL-to-object mapping details here
-// (see `mapping`).
-use std::fs::File;
+// Schema's public API guarantees: execute()/table_exists()/get_table()
+// behavior — rejecting invalid input with the right error, persisting
+// across close/reopen (via the owning Database), schema-qualified
+// naming not colliding across schemas, and not leaking partial state on
+// failure. Not interested in SQL-to-object mapping details here (see
+// `mapping`).
+use store::named_memfile::NamedMemFile;
 
 use crate::datatype::DataType;
 
@@ -97,16 +98,19 @@ fn test_execute_silently_ignores_non_create_table_statements() {
 
 // The actual ask: does created state really persist through a close +
 // reopen, not just live in the in-memory maps for the lifetime of the
-// current Schema? MemFile can't answer this — its `open()` always hands
-// back a fresh, empty buffer regardless of the name given, so
-// "reopening" it never proves anything was written to durable storage. A
-// real file-backed Schema is the only way to exercise this honestly.
+// current Schema? Plain MemFile can't answer this — its `open()` always
+// hands back a fresh, empty buffer regardless of the name given, so
+// "reopening" it never proves anything was written to durable storage.
+// NamedMemFile can: it's backed by a process-wide, name-keyed registry,
+// so a fresh `open()` for the same name genuinely sees what a prior
+// `create()`/session wrote — no real disk I/O involved.
 #[test]
 fn test_schema_state_survives_close_and_reopen() {
     let path = temp_schema_path("close_reopen_roundtrip");
-    Db::<File>::delete(&path).unwrap_or_default();
+    NamedMemFile::delete(&path);
 
-    let s = Schema::<File>::create_database(path.clone()).unwrap();
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
     s.execute(
         "create table users (id integer not null, email varchar(50) not null, \
          primary key(id), unique(email))"
@@ -115,56 +119,64 @@ fn test_schema_state_survives_close_and_reopen() {
     .unwrap();
     let before = s.get_table("users").unwrap();
     assert_eq!(before.indices.len(), 2);
-    s.close_database().unwrap();
+    // Database::close requires unique ownership of its shared Db<F> —
+    // this test's own `s` clone (on top of the one Database itself
+    // holds) must be dropped first.
+    drop(s);
+    db.close().unwrap();
 
-    let s2 = Schema::<File>::open(path.clone()).unwrap();
+    let db2 = Database::<NamedMemFile>::open(path.clone()).unwrap();
+    let s2 = db2.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
     assert!(
         s2.table_exists("users"),
         "table created before close() must still exist after reopen"
     );
     let after = s2.get_table("users").unwrap();
 
-    // Table/field shape round-trips via the system schema table...
+    // Table/field shape round-trips via the schema's own system table...
     assert_eq!(before.name, after.name);
     assert_eq!(after.fields.len(), 2);
     assert_eq!(field(&after, "id").datatype, DataType::Integer);
     assert_eq!(field(&after, "email").datatype, DataType::Str(50));
 
-    // ...and so does each index's own metadata, plus its *separate*
-    // backing store table — two different persistence paths (the
-    // SqlTable metadata row vs. store's own table registry) that both
-    // need to survive.
+    // ...and so does each index's own metadata, plus its *separate*,
+    // schema-qualified backing store table — two different persistence
+    // paths (the SqlTable metadata row vs. store's own table registry)
+    // that both need to survive.
     assert_eq!(after.indices.len(), 2);
     assert_eq!(before.indices[0].db_table_id, after.indices[0].db_table_id);
     assert_eq!(before.indices[1].db_table_id, after.indices[1].db_table_id);
-    assert!(s2.db.table_id_by_name("users0").unwrap().is_some());
-    assert!(s2.db.table_id_by_name("users1").unwrap().is_some());
+    assert!(s2.db.table_id_by_name("default.users0").unwrap().is_some());
+    assert!(s2.db.table_id_by_name("default.users1").unwrap().is_some());
 
-    Db::<File>::delete(&path).unwrap_or_default();
+    NamedMemFile::delete(&path);
 }
 
 #[test]
 fn test_reopened_schema_rejects_recreating_an_existing_table() {
     // A more targeted version of the round-trip test above: confirms
-    // load_schema() actually repopulates `tables` on open (not just that
+    // Schema::load actually repopulates `tables` on open (not just that
     // get_table happens to still return something), by relying on the
     // duplicate-table-name check to fail for a genuinely fresh Schema
     // instance.
     let path = temp_schema_path("reopen_dup_check");
-    Db::<File>::delete(&path).unwrap_or_default();
+    NamedMemFile::delete(&path);
 
-    let s = Schema::<File>::create_database(path.clone()).unwrap();
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
     s.execute("create table t (id integer)".to_string())
         .unwrap();
-    s.close_database().unwrap();
+    drop(s);
+    db.close().unwrap();
 
-    let s2 = Schema::<File>::open(path.clone()).unwrap();
+    let db2 = Database::<NamedMemFile>::open(path.clone()).unwrap();
+    let s2 = db2.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
     let err = s2
         .execute("create table t (id integer)".to_string())
         .unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 
-    Db::<File>::delete(&path).unwrap_or_default();
+    NamedMemFile::delete(&path);
 }
 
 #[test]
@@ -181,27 +193,29 @@ fn test_create_table_with_no_indices_creates_no_backing_store_tables() {
 fn test_index_backing_table_naming() {
     struct Case {
         sql: &'static str,
-        // (index position, expected backing store table name, expected index.name)
+        // (index position, expected schema-qualified backing store table
+        // name, expected index.name)
         expected: &'static [(usize, &'static str, Option<&'static str>)],
     }
     let cases = [
-        // A single unnamed index falls back to format!("{table}{count}").
+        // A single unnamed index falls back to format!("{table}{count}"),
+        // then gets schema-qualified for the actual store-level name.
         Case {
             sql: "create table t (id integer not null, primary key(id))",
-            expected: &[(0, "t0", None)],
+            expected: &[(0, "default.t0", None)],
         },
         // Multiple unnamed indices get distinct, incrementing fallback
         // names, in declaration order (table-level constraints first).
         Case {
             sql: "create table t (id integer not null, email varchar(50) not null, \
                   primary key(id), unique(email))",
-            expected: &[(0, "t0", None), (1, "t1", None)],
+            expected: &[(0, "default.t0", None), (1, "default.t1", None)],
         },
-        // An explicit constraint name is used for the backing table
-        // instead of the auto-generated fallback.
+        // An explicit constraint name is used (still schema-qualified)
+        // for the backing table instead of the auto-generated fallback.
         Case {
             sql: "create table t (id integer not null, constraint my_pk primary key(id))",
-            expected: &[(0, "my_pk", Some("my_pk"))],
+            expected: &[(0, "default.my_pk", Some("my_pk"))],
         },
     ];
     for c in cases {
@@ -288,7 +302,7 @@ fn test_colliding_index_name_rejects_create_table_and_leaks_nothing() {
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
     assert!(!s.table_exists("t2"), "t2 must not be persisted");
     assert!(
-        s.db.table_id_by_name("idx_a").unwrap().is_none(),
+        s.db.table_id_by_name("default.idx_a").unwrap().is_none(),
         "idx_a must never be created at all, not created-then-orphaned"
     );
 }
@@ -314,7 +328,7 @@ fn test_failed_second_index_creation_drops_the_first_instead_of_leaking_it() {
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
     assert!(!s.table_exists("t"), "t must not be persisted");
     assert!(
-        s.db.table_id_by_name("ok_idx").unwrap().is_none(),
+        s.db.table_id_by_name("default.ok_idx").unwrap().is_none(),
         "ok_idx succeeded before the second index failed — it must have \
          been dropped by the cleanup path, not left as an orphaned store table"
     );
@@ -325,9 +339,11 @@ fn test_create_table_rejects_index_name_colliding_with_an_unrelated_store_table(
     // Same validate-first check, from the angle of an index name
     // colliding with something that isn't even a squeal-sql table's
     // index — any name already registered in the underlying store::Db
-    // must be rejected the same way.
+    // must be rejected the same way. Created directly at the qualified
+    // name a same-named constraint in this schema would resolve to, to
+    // simulate a genuine collision post-qualification.
     let s = schema();
-    s.db.create_table("taken".to_string()).unwrap();
+    s.db.create_table("default.taken".to_string()).unwrap();
 
     let err = s
         .execute(

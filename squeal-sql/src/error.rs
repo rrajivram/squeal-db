@@ -19,10 +19,12 @@ pub enum SchemaError {
     UnknownError(String),
     #[error("Parse error")]
     ParseError(#[from] sqlparser::parser::ParserError),
-    #[error("Schema already in use : {0}")]
-    SchemaAlreadyInUseError(String),
-    #[error("Schema in use : {0}")]
+    #[error("Database already in use : {0}")]
+    DatabaseInUseError(String),
+    #[error("Schema already exists : {0}")]
     SchemaInUseError(String),
+    #[error("Schema not found : {0}")]
+    SchemaNotFound(String),
 }
 
 impl From<StoreError> for SchemaError {

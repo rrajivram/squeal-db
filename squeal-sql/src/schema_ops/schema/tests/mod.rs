@@ -16,9 +16,11 @@ use std::sync::Arc;
 use store::memfile::MemFile;
 
 use super::*;
+use crate::{constant::DEFAULT_SCHEMA_NAME, schema_ops::database::Database};
 
 fn schema() -> Arc<Schema<MemFile>> {
-    Schema::create_database("test_schema".to_string()).unwrap()
+    let db = Database::<MemFile>::create("test_schema".to_string()).unwrap();
+    db.get_schema(DEFAULT_SCHEMA_NAME).unwrap()
 }
 
 // Runs `sql` against a fresh in-memory schema and returns the table

@@ -17,6 +17,7 @@ pub mod error;
 pub mod generator;
 mod logger;
 pub mod memfile;
+pub mod named_memfile;
 
 //
 

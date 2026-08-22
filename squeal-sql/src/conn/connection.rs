@@ -1,15 +1,15 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
+    collections::HashMap,
+    collections::HashSet,
     fs::File,
-    hash::Hash,
     sync::{Arc, LazyLock},
 };
 
 use parking_lot::RwLock;
 use store::{db::DBFile, txn::TransactionId};
+use uuid::Uuid;
 
-use crate::{error::SchemaError, schema_ops::schema::Schema, stmt::Statement};
+use crate::{error::SchemaError, schema_ops::database::Database, schema_ops::schema::Schema, stmt::Statement};
 
 #[cfg(test)]
 mod tests;
@@ -26,21 +26,25 @@ static CON_MANAGER: LazyLock<ConMgr<File>> = LazyLock::new(|| Arc::new(Connectio
 
 pub type ConMgr<F> = Arc<ConnectionManager<F>>;
 
+// A Connection is 1-1 with a Database (not, as before, with each Schema
+// individually) — Database itself now hosts multiple Schemas, so a
+// Connection only ever needs to track which one it's currently pointed
+// at, not a whole map of separately-opened "schemas".
 pub struct ConnectionManager<F: DBFile + 'static> {
     active_conns: RwLock<HashSet<Arc<Connection<F>>>>,
-    open_dbs: RwLock<HashMap<String, Arc<Schema<F>>>>,
+    open_databases: RwLock<HashMap<String, Arc<Database<F>>>>,
 }
 
 pub struct Connection<F: DBFile + 'static> {
-    open_dbs: RwLock<HashMap<String, ConnectedSchema<F>>>,
+    id: Uuid,
+    #[allow(dead_code)]
     mgr: ConMgr<F>,
-    default_schema: RwLock<Option<String>>,
-}
-
-struct ConnectedSchema<F: DBFile + 'static> {
-    name: String,
-    current_txn: Option<TransactionId>,
-    schema: Arc<Schema<F>>,
+    database: Arc<Database<F>>,
+    current_schema: RwLock<Option<Arc<Schema<F>>>>,
+    // Not yet wired to anything (no transaction support lands until
+    // row-level statement execution does) — carried forward from the
+    // old per-schema ConnectedSchema so it doesn't need re-adding later.
+    current_txn: RwLock<Option<TransactionId>>,
 }
 
 impl<F> ConnectionManager<F>
@@ -51,33 +55,52 @@ where
     fn new() -> Self {
         Self {
             active_conns: RwLock::new(HashSet::new()),
-            open_dbs: RwLock::new(HashMap::new()),
+            open_databases: RwLock::new(HashMap::new()),
         }
     }
 
-    pub fn new_connection(self: Arc<Self>) -> Arc<Connection<F>> {
-        let conn = Arc::new(Connection::new(self.clone()));
+    // Opens (or reuses an already-open) database and hands back a new
+    // connection to it.
+    pub fn connect(self: &Arc<Self>, db_name: &str) -> Result<Arc<Connection<F>>, SchemaError> {
+        let database = self.open_or_get_database(db_name)?;
+        Ok(self.new_connection(database))
+    }
+
+    // Creates a brand-new database and hands back a connection to it.
+    pub fn create_and_connect(
+        self: &Arc<Self>,
+        db_name: &str,
+    ) -> Result<Arc<Connection<F>>, SchemaError> {
+        let database = self.create_database(db_name)?;
+        Ok(self.new_connection(database))
+    }
+
+    fn new_connection(self: &Arc<Self>, database: Arc<Database<F>>) -> Arc<Connection<F>> {
+        let conn = Arc::new(Connection::new(self.clone(), database));
         self.active_conns.write().insert(conn.clone());
         conn
     }
 
-    #[allow(clippy::ptr_arg)]
-    fn use_schema(self: &Arc<Self>, name: &String) -> Result<Arc<Schema<F>>, SchemaError> {
-        let mut dbs = self.open_dbs.write();
-
-        let schema = dbs
-            .entry(name.clone())
-            .or_insert(Schema::<F>::open(name.clone())?);
-        Ok(schema.clone())
+    fn open_or_get_database(&self, name: &str) -> Result<Arc<Database<F>>, SchemaError> {
+        if let Some(db) = self.open_databases.read().get(name) {
+            return Ok(db.clone());
+        }
+        let db = Database::<F>::open(name.to_string())?;
+        self.open_databases
+            .write()
+            .insert(name.to_string(), db.clone());
+        Ok(db)
     }
 
-    fn create_schema(self: &Arc<Self>, name: &String) -> Result<Arc<Schema<F>>, SchemaError> {
-        if self.open_dbs.read().contains_key(name) {
-            return Err(SchemaError::SchemaInUseError(name.clone()));
+    fn create_database(&self, name: &str) -> Result<Arc<Database<F>>, SchemaError> {
+        if self.open_databases.read().contains_key(name) {
+            return Err(SchemaError::DatabaseInUseError(name.to_string()));
         }
-        let schema = Schema::<F>::create_database(name.clone())?;
-        self.open_dbs.write().insert(name.clone(), schema.clone());
-        Ok(schema)
+        let db = Database::<F>::create(name.to_string())?;
+        self.open_databases
+            .write()
+            .insert(name.to_string(), db.clone());
+        Ok(db)
     }
 }
 
@@ -92,32 +115,25 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn new(mgr: ConMgr<F>) -> Self {
+    fn new(mgr: ConMgr<F>, database: Arc<Database<F>>) -> Self {
         Self {
-            open_dbs: RwLock::new(HashMap::new()),
+            id: Uuid::new_v4(),
             mgr,
-            default_schema: RwLock::new(None),
+            database,
+            current_schema: RwLock::new(None),
+            current_txn: RwLock::new(None),
         }
     }
 
-    pub fn use_schema(self: Arc<Self>, name: &String) -> Result<(), SchemaError> {
-        if self.open_dbs.read().contains_key(name) {
-            return Err(SchemaError::SchemaAlreadyInUseError(name.clone()));
-        }
-        let schema = self.mgr.use_schema(name)?;
-        self.open_dbs
-            .write()
-            .insert(name.clone(), ConnectedSchema::new(name, schema));
-        self.default_schema.write().replace(name.clone());
+    pub fn use_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        let schema = self.database.get_schema(name)?;
+        self.current_schema.write().replace(schema);
         Ok(())
     }
 
-    pub fn create_schema(self: Arc<Self>, name: &String) -> Result<(), SchemaError> {
-        let schema = self.mgr.create_schema(name)?;
-        self.open_dbs
-            .write()
-            .insert(name.clone(), ConnectedSchema::new(name, schema));
-        self.default_schema.write().replace(name.clone());
+    pub fn create_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        let schema = self.database.create_schema(name)?;
+        self.current_schema.write().replace(schema);
         Ok(())
     }
 
@@ -126,41 +142,38 @@ where
     }
 }
 
-impl<F> ConnectedSchema<F>
-where
-    F: DBFile + 'static,
-    F: DBFile<Item = F>,
-{
-    fn new(name: &str, schema: Arc<Schema<F>>) -> Self {
-        Self {
-            name: name.to_string(),
-            current_txn: None,
-            schema,
-        }
-    }
-}
-
-impl<F> Display for Connection<F>
+// store::Db (via Database) doesn't implement Debug, so this can't be
+// derived — a minimal manual impl (id + database name) is enough for
+// {:?} logging and for Result<Arc<Connection<F>>, _>::unwrap_err() in
+// tests.
+impl<F> std::fmt::Debug for Connection<F>
 where
     F: DBFile + 'static,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "Open dbs in connection:")?;
-        for a in self.open_dbs.read().keys() {
-            writeln!(f, "{}", a)?;
-        }
-        Ok(())
+        f.debug_struct("Connection")
+            .field("id", &self.id)
+            .field("database", &self.database.name())
+            .finish_non_exhaustive()
     }
 }
 
-impl<F> Hash for Connection<F>
+impl<F> std::fmt::Display for Connection<F>
+where
+    F: DBFile + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Connection {} (database: ", self.id)?;
+        write!(f, "{})", self.database.name())
+    }
+}
+
+impl<F> std::hash::Hash for Connection<F>
 where
     F: DBFile + 'static,
 {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        for d in self.open_dbs.read().keys() {
-            d.hash(state);
-        }
+        self.id.hash(state);
     }
 }
 
@@ -169,55 +182,8 @@ where
     F: DBFile + 'static,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.open_dbs.read().keys().eq(other.open_dbs.read().keys())
-    }
-}
-
-impl<F> PartialOrd for Connection<F>
-where
-    F: DBFile + 'static,
-{
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+        self.id == other.id
     }
 }
 
 impl<F> Eq for Connection<F> where F: DBFile + 'static {}
-
-impl<F> Ord for Connection<F>
-where
-    F: DBFile + 'static,
-{
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.open_dbs
-            .read()
-            .keys()
-            .cmp(other.open_dbs.read().keys())
-    }
-}
-
-impl<F> Clone for Connection<F>
-where
-    F: DBFile + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            open_dbs: RwLock::new(self.open_dbs.read().clone()),
-            mgr: self.mgr.clone(),
-            default_schema: RwLock::new(self.default_schema.read().clone()),
-        }
-    }
-}
-
-impl<F> Clone for ConnectedSchema<F>
-where
-    F: DBFile + 'static,
-{
-    fn clone(&self) -> Self {
-        Self {
-            current_txn: self.current_txn.clone(),
-            name: self.name.clone(),
-            schema: self.schema.clone(),
-        }
-    }
-}
