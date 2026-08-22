@@ -25,6 +25,8 @@ pub enum SchemaError {
     SchemaInUseError(String),
     #[error("Schema not found : {0}")]
     SchemaNotFound(String),
+    #[error("No schema selected on this connection")]
+    NoSchemaSelected,
 }
 
 impl From<StoreError> for SchemaError {

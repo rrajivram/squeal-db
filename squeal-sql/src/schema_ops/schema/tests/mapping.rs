@@ -46,9 +46,9 @@ fn test_create_table_maps_datatypes() {
 
 #[test]
 fn test_create_table_name_is_case_insensitive() {
-    let s = schema();
-    s.execute("create table Users (id integer)".to_string())
-        .unwrap();
+    let c = conn();
+    execute(&c, "create table Users (id integer)").unwrap();
+    let s = c.current_schema().unwrap();
     for variant in ["users", "Users", "USERS"] {
         assert!(
             s.table_exists(variant),

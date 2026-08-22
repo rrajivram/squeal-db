@@ -1,10 +1,20 @@
 use std::{fmt::Display, sync::Arc};
 
-use sqlparser::dialect::GenericDialect;
+// GenericDialect doesn't recognize the DATABASE/SCHEMA keywords after
+// USE at all (confirmed directly against sqlparser's own parse_use:
+// only Hive/Databricks/Snowflake dialects special-case them) — Snowflake
+// is the one actually used for parsing now, specifically so `USE
+// DATABASE`/`USE SCHEMA` parse. Verified this doesn't change how any
+// existing CREATE TABLE SQL in this crate parses (same ColumnDef/
+// TableConstraint shapes come out either way).
+use sqlparser::dialect::SnowflakeDialect;
 use store::db::DBFile;
 use uuid::Uuid;
 
-use crate::{conn::connection::Connection, error::SchemaError, rslt::resultset::ResultType};
+use crate::{
+    conn::connection::Connection, error::SchemaError, rslt::resultset::ResultType,
+    table::SqlTable,
+};
 
 pub struct Statement<F: DBFile> {
     id: uuid::Uuid,
@@ -15,7 +25,21 @@ pub struct Statement<F: DBFile> {
     current_result: Option<usize>,
 }
 
+#[cfg(test)]
 mod tests;
+
+// Connection (via Database, via store::Db) doesn't implement Debug, so
+// this can't be derived — a minimal manual impl (id + sql) is enough
+// for {:?} logging and for Result<Statement<F>, _>::unwrap_err() in
+// tests.
+impl<F: DBFile> std::fmt::Debug for Statement<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Statement")
+            .field("id", &self.id)
+            .field("sql", &self.sql)
+            .finish_non_exhaustive()
+    }
+}
 
 impl<F> Statement<F>
 where
@@ -23,7 +47,8 @@ where
     F: DBFile<Item = F>,
 {
     pub(crate) fn new(sql: &str, conn: Arc<Connection<F>>) -> Result<Self, SchemaError> {
-        let stmts = sqlparser::parser::Parser::parse_sql(&GenericDialect, sql)?;
+        let stmts = sqlparser::parser::Parser::parse_sql(&SnowflakeDialect, sql)?;
+        Self::semantic_validate(&stmts)?;
         Ok(Self {
             id: Uuid::new_v4(),
             sql: sql.to_string(),
@@ -34,9 +59,281 @@ where
         })
     }
 
-    pub fn execute(&mut self) -> Result<(), SchemaError> {
+    // Static checks derivable purely from the parsed AST — no schema
+    // lookup, so this can't (and doesn't try to) check things like "does
+    // this table/column actually exist." Runs over *every* statement in
+    // the batch up front, before any of them execute — so a structurally
+    // broken statement later in a multi-statement batch is caught before
+    // earlier ones in the same batch have already run, not partway
+    // through. Some of what it checks (name length, duplicate columns,
+    // VALUES arity) is also re-checked deeper in execute() — intentional
+    // duplication, not an oversight: this is what buys the "whole batch
+    // validated before any of it runs" guarantee execute()'s own
+    // per-statement checks can't provide on their own.
+    fn semantic_validate(stmts: &[sqlparser::ast::Statement]) -> Result<(), SchemaError> {
+        for stmt in stmts {
+            match stmt {
+                sqlparser::ast::Statement::CreateTable(c) => validate_create_table(c)?,
+                sqlparser::ast::Statement::CreateDatabase { db_name, .. } => {
+                    validate_identifier("database name", &db_name.to_string())?;
+                }
+                sqlparser::ast::Statement::CreateSchema { schema_name, .. } => {
+                    validate_identifier("schema name", &schema_name_string(schema_name)?)?;
+                }
+                sqlparser::ast::Statement::Insert(insert) => validate_insert(insert)?,
+                _ => {}
+            }
+        }
         Ok(())
     }
+
+    pub fn execute(&mut self) -> Result<(), SchemaError> {
+        for stmt in &self.stmts {
+            match stmt {
+                sqlparser::ast::Statement::CreateTable(c) => {
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let table_name = c.name.to_string();
+                    schema.create_table(SqlTable::from_sql(&schema, c.clone())?)?;
+                    self.results
+                        .push(ResultType::ResultString(format!("Table '{table_name}' created")));
+                }
+                sqlparser::ast::Statement::CreateDatabase {
+                    db_name,
+                    if_not_exists,
+                    ..
+                } => {
+                    let name = db_name.to_string().to_lowercase();
+                    let message = match self.conn.create_database(&name) {
+                        Ok(()) => format!("Database '{name}' created"),
+                        // IF NOT EXISTS on a name that's already open must
+                        // still land the connection on it, same end state
+                        // as the "didn't exist yet" path above — not a
+                        // silent no-op that leaves the old database
+                        // selected.
+                        Err(SchemaError::DatabaseInUseError(_)) if *if_not_exists => {
+                            self.conn.use_database(&name)?;
+                            format!("Database '{name}' already exists")
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    self.results.push(ResultType::ResultString(message));
+                }
+                sqlparser::ast::Statement::CreateSchema {
+                    schema_name,
+                    if_not_exists,
+                    ..
+                } => {
+                    let name = schema_name_string(schema_name)?;
+                    let message = match self.conn.create_schema(&name) {
+                        Ok(()) => format!("Schema '{name}' created"),
+                        Err(SchemaError::SchemaInUseError(_)) if *if_not_exists => {
+                            self.conn.use_schema(&name)?;
+                            format!("Schema '{name}' already exists")
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    self.results.push(ResultType::ResultString(message));
+                }
+                sqlparser::ast::Statement::Use(u) => match u {
+                    sqlparser::ast::Use::Database(name) => {
+                        let name = name.to_string().to_lowercase();
+                        self.conn.use_database(&name)?;
+                        self.results
+                            .push(ResultType::ResultString(format!("Using database '{name}'")));
+                    }
+                    sqlparser::ast::Use::Schema(name) => {
+                        let name = name.to_string().to_lowercase();
+                        self.conn.use_schema(&name)?;
+                        self.results
+                            .push(ResultType::ResultString(format!("Using schema '{name}'")));
+                    }
+                    // Other USE targets (catalog/warehouse/role/...) have
+                    // no equivalent concept here yet — silently ignored,
+                    // no result entry, same as an unhandled statement
+                    // (see the wildcard fallback below).
+                    _ => {}
+                },
+                sqlparser::ast::Statement::Insert(insert) => {
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let table_name = match &insert.table {
+                        sqlparser::ast::TableObject::TableName(name) => {
+                            name.to_string().to_lowercase()
+                        }
+                        other => {
+                            return Err(SchemaError::UserError(format!(
+                                "unsupported INSERT target: {other:?}"
+                            )));
+                        }
+                    };
+                    let table = schema.get_table(&table_name).ok_or_else(|| {
+                        SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+                    })?;
+                    let rows = table.rows_from_insert(insert)?;
+                    let count = schema.insert_rows(&table_name, rows)?;
+                    self.results.push(ResultType::Count(count));
+                }
+                sqlparser::ast::Statement::AlterCollation(_) => {
+                    todo!()
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    // Returns the "current" result, initializing the cursor to the first
+    // one on first call — idempotent otherwise (repeated calls return the
+    // same result until get_nextresult advances it). None if there are no
+    // results at all, or the cursor has been advanced past the last one.
+    pub fn get_results(&mut self) -> Result<Option<ResultType<F>>, SchemaError> {
+        let i = *self.current_result.get_or_insert(0);
+        Ok(self.results.get(i).cloned())
+    }
+
+    // Advances the cursor to the next result and returns it, or None if
+    // there isn't one — the cursor is left unchanged in that case, so a
+    // following get_results() still returns the last valid result rather
+    // than nothing.
+    pub fn get_nextresult(&mut self) -> Result<Option<ResultType<F>>, SchemaError> {
+        let next = self.current_result.map_or(0, |i| i + 1);
+        match self.results.get(next) {
+            Some(r) => {
+                self.current_result = Some(next);
+                Ok(Some(r.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+// CREATE SCHEMA's name can also be an AUTHORIZATION clause (Postgres-
+// style: `CREATE SCHEMA AUTHORIZATION role` or `CREATE SCHEMA name
+// AUTHORIZATION role`) — there's no role/authorization concept here, so
+// only the plain-name form is supported.
+fn schema_name_string(name: &sqlparser::ast::SchemaName) -> Result<String, SchemaError> {
+    match name {
+        sqlparser::ast::SchemaName::Simple(obj) => Ok(obj.to_string().to_lowercase()),
+        sqlparser::ast::SchemaName::UnnamedAuthorization(_)
+        | sqlparser::ast::SchemaName::NamedAuthorization(_, _) => Err(SchemaError::UserError(
+            "CREATE SCHEMA ... AUTHORIZATION is not supported".into(),
+        )),
+    }
+}
+
+fn validate_identifier(what: &str, name: &str) -> Result<(), SchemaError> {
+    if name.is_empty() {
+        return Err(SchemaError::UserError(format!("{what} cannot be empty")));
+    }
+    if name.len() > crate::constant::MAX_TABLE_NAME_LEN {
+        return Err(SchemaError::UserError(format!(
+            "{what} cannot be longer than {} characters",
+            crate::constant::MAX_TABLE_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
+// Table names specifically use BadTableName (not UserError, unlike
+// every other identifier this module validates) — matching
+// TableBuilder::build's own existing convention, since that's the
+// other place an over-length/missing table name gets caught (for a
+// name that reaches execute() without going through semantic_validate
+// first, e.g. any future caller that skips it).
+fn validate_table_name(name: &str) -> Result<(), SchemaError> {
+    if name.is_empty() {
+        return Err(SchemaError::BadTableName("table name cannot be empty".into()));
+    }
+    if name.len() > crate::constant::MAX_TABLE_NAME_LEN {
+        return Err(SchemaError::BadTableName(format!(
+            "table name cannot be longer than {} characters",
+            crate::constant::MAX_TABLE_NAME_LEN
+        )));
+    }
+    Ok(())
+}
+
+fn validate_create_table(c: &sqlparser::ast::CreateTable) -> Result<(), SchemaError> {
+    validate_table_name(&c.name.to_string())?;
+
+    let mut seen = std::collections::HashSet::with_capacity(c.columns.len());
+    for col in &c.columns {
+        let name = col.name.value.to_lowercase();
+        validate_identifier("column name", &name)?;
+        if !seen.insert(name.clone()) {
+            return Err(SchemaError::UserError(format!(
+                "duplicate column name: {name}"
+            )));
+        }
+    }
+
+    for constraint in &c.constraints {
+        let fields: Vec<String> = match constraint {
+            sqlparser::ast::TableConstraint::Unique(u) => u
+                .columns
+                .iter()
+                .map(|c| c.column.to_string().to_lowercase())
+                .collect(),
+            sqlparser::ast::TableConstraint::PrimaryKey(p) => p
+                .columns
+                .iter()
+                .map(|c| c.column.to_string().to_lowercase())
+                .collect(),
+            _ => vec![],
+        };
+        for f in fields {
+            if !seen.contains(&f) {
+                return Err(SchemaError::UserError(format!(
+                    "constraint references unknown column: {f}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_insert(insert: &sqlparser::ast::Insert) -> Result<(), SchemaError> {
+    // Nothing downstream reads the alias yet (no SELECT/JOIN support to
+    // attach it to) — just checked for being a well-formed identifier.
+    if let Some(alias) = &insert.table_alias {
+        validate_identifier("table alias", &alias.alias.value)?;
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(insert.columns.len());
+    for col in &insert.columns {
+        let name = col.to_string().to_lowercase();
+        validate_identifier("column name", &name)?;
+        if !seen.insert(name.clone()) {
+            return Err(SchemaError::UserError(format!(
+                "duplicate column name in INSERT column list: {name}"
+            )));
+        }
+    }
+
+    // Row width vs. an *explicit* column list is checkable without a
+    // schema lookup; against the implicit "every field, in declared
+    // order" form (empty column list) it isn't — that's deferred to
+    // rows_from_insert, which has the actual table to check against.
+    if !insert.columns.is_empty()
+        && let Some(query) = &insert.source
+        && let sqlparser::ast::SetExpr::Values(values) = query.body.as_ref()
+    {
+        for row in &values.rows {
+            if row.content.len() != insert.columns.len() {
+                return Err(SchemaError::UserError(format!(
+                    "INSERT column list has {} column(s) but a VALUES row has {}",
+                    insert.columns.len(),
+                    row.content.len()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl<F> Display for Statement<F>
@@ -55,7 +352,7 @@ mod dummy_tests {
     use super::*;
 
     fn exec(sql: &str) {
-        let stmt = sqlparser::parser::Parser::parse_sql(&GenericDialect, sql).unwrap();
+        let stmt = sqlparser::parser::Parser::parse_sql(&SnowflakeDialect, sql).unwrap();
         for s in stmt {
             println!("{:?}", s);
         }

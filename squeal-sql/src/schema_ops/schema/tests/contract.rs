@@ -1,9 +1,9 @@
-// Schema's public API guarantees: execute()/table_exists()/get_table()
-// behavior — rejecting invalid input with the right error, persisting
-// across close/reopen (via the owning Database), schema-qualified
-// naming not colliding across schemas, and not leaking partial state on
-// failure. Not interested in SQL-to-object mapping details here (see
-// `mapping`).
+// Schema's public API guarantees: execute (via Connection+Statement now
+// — see stmt.rs)/table_exists()/get_table() behavior — rejecting invalid
+// input with the right error, persisting across close/reopen (via the
+// owning Database), schema-qualified naming not colliding across
+// schemas, and not leaking partial state on failure. Not interested in
+// SQL-to-object mapping details here (see `mapping`).
 use store::named_memfile::NamedMemFile;
 
 use crate::datatype::DataType;
@@ -18,6 +18,28 @@ fn is_bad_table_name(e: &SchemaError) -> bool {
 }
 fn is_parse_error(e: &SchemaError) -> bool {
     matches!(e, SchemaError::ParseError(_))
+}
+
+// Only the two close/reopen persistence tests below need this: they
+// construct their own file-backed Schema directly (not through the
+// shared conn()/execute() helpers, which are MemFile-only) and are
+// testing Schema/Database's own persistence guarantees specifically —
+// independent of whichever higher-level dispatcher (Statement) calls
+// into create_table.
+fn try_create_table_directly(
+    s: &Arc<Schema<NamedMemFile>>,
+    sql: &str,
+) -> Result<(), SchemaError> {
+    let stmts =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect, sql).unwrap();
+    let sqlparser::ast::Statement::CreateTable(c) = &stmts[0] else {
+        panic!("expected a CREATE TABLE statement, got: {stmts:?}");
+    };
+    s.create_table(SqlTable::from_sql(s, c.clone())?)
+}
+
+fn create_table_directly(s: &Arc<Schema<NamedMemFile>>, sql: &str) {
+    try_create_table_directly(s, sql).unwrap();
 }
 
 #[test]
@@ -76,23 +98,25 @@ fn test_execute_rejects_invalid_schema_definitions() {
         },
     ];
     for c in cases {
-        let s = schema();
+        let conn = conn();
         if let Some(setup) = c.setup {
-            s.execute(setup.to_string()).unwrap();
+            execute(&conn, setup).unwrap();
         }
-        let err = s.execute(c.sql.clone()).unwrap_err();
+        let err = execute(&conn, &c.sql).unwrap_err();
         assert!((c.matches)(&err), "{}: got {err:?}", c.desc);
     }
 }
 
 #[test]
 fn test_execute_silently_ignores_non_create_table_statements() {
-    // Documents current dispatch behavior: exec_statement only handles
-    // Statement::CreateTable (and panics via todo!() on AlterCollation);
-    // anything else, including an ordinary SELECT, falls through its
-    // wildcard arm as a silent no-op rather than an error.
-    let s = schema();
-    s.execute("select 1".to_string()).unwrap();
+    // Documents current dispatch behavior: Statement::execute only
+    // handles Statement::CreateTable (and panics via todo!() on
+    // AlterCollation); anything else, including an ordinary SELECT,
+    // falls through its wildcard arm as a silent no-op rather than an
+    // error.
+    let conn = conn();
+    execute(&conn, "select 1").unwrap();
+    let s = conn.current_schema().unwrap();
     assert!(!s.table_exists("t"));
 }
 
@@ -111,12 +135,11 @@ fn test_schema_state_survives_close_and_reopen() {
 
     let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
     let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
-    s.execute(
+    create_table_directly(
+        &s,
         "create table users (id integer not null, email varchar(50) not null, \
-         primary key(id), unique(email))"
-            .to_string(),
-    )
-    .unwrap();
+         primary key(id), unique(email))",
+    );
     let before = s.get_table("users").unwrap();
     assert_eq!(before.indices.len(), 2);
     // Database::close requires unique ownership of its shared Db<F> —
@@ -164,16 +187,13 @@ fn test_reopened_schema_rejects_recreating_an_existing_table() {
 
     let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
     let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
-    s.execute("create table t (id integer)".to_string())
-        .unwrap();
+    create_table_directly(&s, "create table t (id integer)");
     drop(s);
     db.close().unwrap();
 
     let db2 = Database::<NamedMemFile>::open(path.clone()).unwrap();
     let s2 = db2.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
-    let err = s2
-        .execute("create table t (id integer)".to_string())
-        .unwrap_err();
+    let err = try_create_table_directly(&s2, "create table t (id integer)").unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 
     NamedMemFile::delete(&path);
@@ -219,8 +239,9 @@ fn test_index_backing_table_naming() {
         },
     ];
     for c in cases {
-        let s = schema();
-        s.execute(c.sql.to_string()).unwrap();
+        let conn = conn();
+        execute(&conn, c.sql).unwrap();
+        let s = conn.current_schema().unwrap();
         let t = s.get_table("t").unwrap();
         assert_eq!(t.indices.len(), c.expected.len(), "for `{}`", c.sql);
         for &(i, backing_name, index_name) in c.expected {
@@ -248,11 +269,14 @@ fn test_index_backing_table_size_reflects_field_datatypes() {
     // in the right ballpark for a Str(100) key (must be materially
     // larger than a bare Integer key's budget), rather than asserting an
     // exact byte count tied to ValueItem's own wire format.
-    let s = schema();
-    s.execute("create table small (id integer not null, primary key(id))".to_string())
-        .unwrap();
-    s.execute("create table big (email varchar(100) not null, primary key(email))".to_string())
-        .unwrap();
+    let conn = conn();
+    execute(&conn, "create table small (id integer not null, primary key(id))").unwrap();
+    execute(
+        &conn,
+        "create table big (email varchar(100) not null, primary key(email))",
+    )
+    .unwrap();
+    let s = conn.current_schema().unwrap();
     let small = s.get_table("small").unwrap();
     let big = s.get_table("big").unwrap();
     assert!(
@@ -286,20 +310,21 @@ fn test_colliding_index_name_rejects_create_table_and_leaks_nothing() {
     // one that collides with t1's) — in declaration order. Both names
     // are checked before either is created, so "idx_a" must never be
     // created at all, not created-then-orphaned.
-    let s = schema();
-    s.execute(
-        "create table t1 (id integer not null, constraint shared_name primary key(id))".to_string(),
+    let conn = conn();
+    execute(
+        &conn,
+        "create table t1 (id integer not null, constraint shared_name primary key(id))",
     )
     .unwrap();
 
-    let err = s
-        .execute(
-            "create table t2 (id integer not null, val varchar(20) not null, \
-             constraint idx_a unique(val), constraint shared_name primary key(id))"
-                .to_string(),
-        )
-        .unwrap_err();
+    let err = execute(
+        &conn,
+        "create table t2 (id integer not null, val varchar(20) not null, \
+         constraint idx_a unique(val), constraint shared_name primary key(id))",
+    )
+    .unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+    let s = conn.current_schema().unwrap();
     assert!(!s.table_exists("t2"), "t2 must not be persisted");
     assert!(
         s.db.table_id_by_name("default.idx_a").unwrap().is_none(),
@@ -317,15 +342,18 @@ fn test_failed_second_index_creation_drops_the_first_instead_of_leaking_it() {
     // succeeded: an index name that's individually invalid (too long),
     // which validate-first's "does this exact name already exist" check
     // can't catch, since nothing else has it yet.
-    let s = schema();
+    let conn = conn();
     let too_long_name = "a".repeat(200);
-    let err = s
-        .execute(format!(
+    let err = execute(
+        &conn,
+        &format!(
             "create table t (id integer not null, val varchar(20) not null, \
              constraint ok_idx unique(id), constraint {too_long_name} unique(val))"
-        ))
-        .unwrap_err();
+        ),
+    )
+    .unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+    let s = conn.current_schema().unwrap();
     assert!(!s.table_exists("t"), "t must not be persisted");
     assert!(
         s.db.table_id_by_name("default.ok_idx").unwrap().is_none(),
@@ -342,14 +370,15 @@ fn test_create_table_rejects_index_name_colliding_with_an_unrelated_store_table(
     // must be rejected the same way. Created directly at the qualified
     // name a same-named constraint in this schema would resolve to, to
     // simulate a genuine collision post-qualification.
-    let s = schema();
+    let conn = conn();
+    let s = conn.current_schema().unwrap();
     s.db.create_table("default.taken".to_string()).unwrap();
 
-    let err = s
-        .execute(
-            "create table t (id integer not null, constraint taken primary key(id))".to_string(),
-        )
-        .unwrap_err();
+    let err = execute(
+        &conn,
+        "create table t (id integer not null, constraint taken primary key(id))",
+    )
+    .unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
     assert!(!s.table_exists("t"));
 }

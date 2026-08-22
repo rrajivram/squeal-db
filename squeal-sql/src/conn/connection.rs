@@ -37,9 +37,12 @@ pub struct ConnectionManager<F: DBFile + 'static> {
 
 pub struct Connection<F: DBFile + 'static> {
     id: Uuid,
-    #[allow(dead_code)]
     mgr: ConMgr<F>,
-    database: Arc<Database<F>>,
+    // A RwLock, not a plain field: CREATE DATABASE/USE DATABASE (see
+    // Statement::execute) can repoint an *existing* connection at a
+    // different database, unlike before where a Connection's database
+    // was fixed at construction.
+    database: RwLock<Arc<Database<F>>>,
     current_schema: RwLock<Option<Arc<Schema<F>>>>,
     // Not yet wired to anything (no transaction support lands until
     // row-level statement execution does) — carried forward from the
@@ -52,7 +55,7 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             active_conns: RwLock::new(HashSet::new()),
             open_databases: RwLock::new(HashMap::new()),
@@ -119,21 +122,48 @@ where
         Self {
             id: Uuid::new_v4(),
             mgr,
-            database,
+            database: RwLock::new(database),
             current_schema: RwLock::new(None),
             current_txn: RwLock::new(None),
         }
     }
 
+    pub(crate) fn current_schema(&self) -> Option<Arc<Schema<F>>> {
+        self.current_schema.read().clone()
+    }
+
+    pub(crate) fn database_name(&self) -> String {
+        self.database.read().name().to_string()
+    }
+
     pub fn use_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
-        let schema = self.database.get_schema(name)?;
+        let schema = self.database.read().get_schema(name)?;
         self.current_schema.write().replace(schema);
         Ok(())
     }
 
     pub fn create_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
-        let schema = self.database.create_schema(name)?;
+        let schema = self.database.read().create_schema(name)?;
         self.current_schema.write().replace(schema);
+        Ok(())
+    }
+
+    // Repoints this connection at a different (already-open, or newly
+    // opened) database — the current schema selection belonged to the
+    // old database, so it's cleared, not carried over.
+    pub(crate) fn use_database(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        let database = self.mgr.open_or_get_database(name)?;
+        *self.database.write() = database;
+        self.current_schema.write().take();
+        Ok(())
+    }
+
+    // Like use_database, but creates a brand-new database rather than
+    // opening an existing one.
+    pub(crate) fn create_database(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        let database = self.mgr.create_database(name)?;
+        *self.database.write() = database;
+        self.current_schema.write().take();
         Ok(())
     }
 
@@ -153,7 +183,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
             .field("id", &self.id)
-            .field("database", &self.database.name())
+            .field("database", &self.database.read().name())
             .finish_non_exhaustive()
     }
 }
@@ -164,7 +194,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Connection {} (database: ", self.id)?;
-        write!(f, "{})", self.database.name())
+        write!(f, "{})", self.database.read().name())
     }
 }
 

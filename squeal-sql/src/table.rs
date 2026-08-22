@@ -5,17 +5,36 @@ use serde::{Deserialize, Serialize};
 use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable};
 use store::db::DBFile;
 use store::table::TableIdType;
+use store::valueitem::ValueItem;
 
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::datatype::DataType;
 use crate::error::SchemaError;
 use crate::schema_ops::schema::Schema;
 
+// A store-level Tuple wraps whatever's actually stored (row or index
+// entry) with its own key (DBIdType — a Rec(IndexKey) key costs more
+// than the raw field bytes alone: an enum tag, the IndexKey's own
+// Vec-length prefix, and one enum tag per ValueItem), Option<TransactionId>,
+// Option<UndoId>, a flags byte, and postcard's own length-prefix on the
+// data field — none of which the raw sum of ValueItem::size() calls
+// below accounts for. Since store's own historical default entry
+// budget for a plain Int key is 64 bytes (MAX_ENTRY_BYTES), padding by
+// the same order of magnitude keeps composite Rec keys (which cost
+// more per field than a bare Int) comfortably covered without needing
+// to hand-derive postcard's exact encoding overhead.
+const ENTRY_OVERHEAD_BYTES: usize = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlTable {
     pub(crate) name: String,
     pub(crate) fields: Vec<Arc<Field>>,
     pub(crate) indices: Vec<SqlIndex>,
+    // The table's own row-storage backing table — distinct from each
+    // index's own db_table_id below. Set by Schema::create_table once
+    // the backing table actually exists; TableIdType::none() until then
+    // (mirrors SqlIndex::db_table_id's own convention).
+    pub(crate) db_table_id: TableIdType,
 }
 
 /* #[derive(Debug, Clone)]
@@ -169,6 +188,7 @@ impl TableBuilder {
             name: self.name.as_ref().unwrap().clone(),
             fields,
             indices: vec![],
+            db_table_id: TableIdType::none(),
         };
         for i in &self.indices {
             let mut index = SqlIndex {
@@ -288,11 +308,169 @@ impl SqlTable {
 
         tb.build()
     }
+
+    pub(crate) fn primary_key(&self) -> Option<&SqlIndex> {
+        self.indices.iter().find(|i| i.is_primary)
+    }
+
+    // Every field's byte budget, summed (plus ENTRY_OVERHEAD_BYTES —
+    // see its own comment) — the row-storage table's own
+    // index_entry_size, mirroring SqlIndex::size() (indexed fields only)
+    // but over the whole row, since the full row is what's stored there.
+    pub(crate) fn row_size(&self) -> usize {
+        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
+    }
+
+    // The position of `field` within this table's own declared field
+    // order — used to pull a PRIMARY KEY/index's values back out of a
+    // full row (built in that same order by rows_from_insert).
+    fn field_position(&self, field: &Field) -> Option<usize> {
+        self.fields.iter().position(|f| f.name == field.name)
+    }
+
+    // Extracts just the values for `fields` (e.g. a PRIMARY KEY or other
+    // index's own field list) out of a full row, in `fields`' order.
+    pub(crate) fn extract_field_values(
+        &self,
+        fields: &[Arc<Field>],
+        row: &[ValueItem],
+    ) -> Vec<ValueItem> {
+        fields
+            .iter()
+            .map(|f| {
+                let pos = self
+                    .field_position(f)
+                    .expect("index/primary-key fields are always a subset of the table's own fields");
+                row[pos].clone()
+            })
+            .collect()
+    }
+
+    // Builds full rows (one Vec<ValueItem> per VALUES row, in this
+    // table's own field order — not `insert`'s column order) from an
+    // INSERT statement's AST. Columns omitted from an explicit column
+    // list are filled with Null (rejected below if that column isn't
+    // nullable).
+    pub(crate) fn rows_from_insert(
+        &self,
+        insert: &sqlparser::ast::Insert,
+    ) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
+        let target_fields: Vec<&Arc<Field>> = if insert.columns.is_empty() {
+            self.fields.iter().collect()
+        } else {
+            insert
+                .columns
+                .iter()
+                .map(|c| {
+                    let name = c.to_string().to_lowercase();
+                    self.fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                        SchemaError::UserError(format!(
+                            "Table {:?} has no column named {name:?}",
+                            self.name
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?
+        };
+
+        let query = insert.source.as_ref().ok_or_else(|| {
+            SchemaError::UserError("INSERT without a VALUES clause is not supported".into())
+        })?;
+        let values = match query.body.as_ref() {
+            sqlparser::ast::SetExpr::Values(v) => v,
+            _ => {
+                return Err(SchemaError::UserError(
+                    "Only INSERT ... VALUES (...) is supported".into(),
+                ));
+            }
+        };
+
+        let mut rows = Vec::with_capacity(values.rows.len());
+        for row in &values.rows {
+            let exprs = &row.content;
+            if exprs.len() != target_fields.len() {
+                return Err(SchemaError::UserError(format!(
+                    "Expected {} value(s), got {}",
+                    target_fields.len(),
+                    exprs.len()
+                )));
+            }
+            let mut by_name: HashMap<&str, ValueItem> = HashMap::with_capacity(exprs.len());
+            for (field, expr) in target_fields.iter().zip(exprs) {
+                let item = expr_to_value_item(expr, field.datatype)?;
+                if item == ValueItem::Null && !field.nullable {
+                    return Err(SchemaError::UserError(format!(
+                        "Column {:?} cannot be null",
+                        field.name
+                    )));
+                }
+                by_name.insert(field.name.as_str(), item);
+            }
+            let mut full_row = Vec::with_capacity(self.fields.len());
+            for f in &self.fields {
+                match by_name.remove(f.name.as_str()) {
+                    Some(v) => full_row.push(v),
+                    None if f.nullable => full_row.push(ValueItem::Null),
+                    None => {
+                        return Err(SchemaError::UserError(format!(
+                            "Column {:?} has no value and is not nullable",
+                            f.name
+                        )));
+                    }
+                }
+            }
+            rows.push(full_row);
+        }
+        Ok(rows)
+    }
+}
+
+// Converts a single VALUES-clause literal into a ValueItem matching
+// `datatype` — only plain literal expressions are supported (no
+// function calls, subqueries, arithmetic, ...). Reserved-capacity
+// validation for Str/Blob (does the literal actually fit within the
+// column's declared length) happens later, in IndexKey::new_from.
+fn expr_to_value_item(
+    expr: &sqlparser::ast::Expr,
+    datatype: DataType,
+) -> Result<ValueItem, SchemaError> {
+    let value = match expr {
+        sqlparser::ast::Expr::Value(v) => &v.value,
+        _ => {
+            return Err(SchemaError::UserError(format!(
+                "unsupported expression in VALUES: {expr}"
+            )));
+        }
+    };
+    match (value, datatype) {
+        (sqlparser::ast::Value::Null, _) => Ok(ValueItem::Null),
+        (sqlparser::ast::Value::Number(s, _), DataType::Integer) => s
+            .parse()
+            .map(ValueItem::Integer)
+            .map_err(|_| SchemaError::UserError(format!("invalid integer literal: {s}"))),
+        (sqlparser::ast::Value::Number(s, _), DataType::Double) => s
+            .parse()
+            .map(ValueItem::Double)
+            .map_err(|_| SchemaError::UserError(format!("invalid double literal: {s}"))),
+        (sqlparser::ast::Value::Number(s, _), DataType::Datetime) => s
+            .parse()
+            .map(ValueItem::Datetime)
+            .map_err(|_| SchemaError::UserError(format!("invalid datetime literal: {s}"))),
+        (
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s),
+            DataType::Str(cap),
+        ) => Ok(ValueItem::Str((s.clone(), cap))),
+        _ => Err(SchemaError::UserError(format!(
+            "value {value} does not match column type {datatype:?}"
+        ))),
+    }
 }
 
 impl SqlIndex {
+    // Plus ENTRY_OVERHEAD_BYTES — see its own comment on SqlTable::row_size.
     pub(crate) fn size(&self) -> usize {
-        self.fields.iter().map(|f| f.datatype.size()).sum()
+        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
     }
 }
 

@@ -2,7 +2,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
-use sqlparser::{dialect::GenericDialect, parser::Parser};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
@@ -23,7 +22,6 @@ pub struct Schema<F: DBFile> {
     db: Arc<Db<F>>,
     tables: Arc<RwLock<HashMap<String, SqlTable>>>,
     sys_table_id: TableIdType,
-    dialect: Arc<GenericDialect>,
 }
 
 #[cfg(test)]
@@ -55,7 +53,6 @@ where
             db,
             tables: Arc::new(RwLock::new(HashMap::new())),
             sys_table_id,
-            dialect: Arc::new(GenericDialect),
         }))
     }
 
@@ -68,7 +65,6 @@ where
             db,
             tables: Arc::new(RwLock::new(HashMap::new())),
             sys_table_id,
-            dialect: Arc::new(GenericDialect),
         };
         s.load_tables()?;
         Ok(Arc::new(s))
@@ -114,41 +110,45 @@ where
         Ok(())
     }
 
-    pub fn execute(self: &Arc<Self>, sql: String) -> Result<(), SchemaError> {
-        let dialect = GenericDialect;
-        let statements = Parser::parse_sql(&dialect, sql.as_str())?;
-        statements.iter().try_for_each(|s| self.exec_statement(s))?;
-
-        Ok(())
+    // The name of the auto-increment sequence backing a primary-key-less
+    // table's row ids — only created (see create_table) and consulted
+    // (see insert_rows) when the table has no PRIMARY KEY of its own to
+    // key rows by instead.
+    fn rowid_seq_name(&self, table_name: &str) -> String {
+        format!("{}.rowid", self.qualify(table_name))
     }
 
-    fn exec_statement(
-        self: &Arc<Self>,
-        stmt: &sqlparser::ast::Statement,
-    ) -> Result<(), SchemaError> {
-        match stmt {
-            sqlparser::ast::Statement::CreateTable(c) => {
-                self.create_table(SqlTable::from_sql(self, c.clone())?)?;
-            }
-            sqlparser::ast::Statement::AlterCollation(_) => {
-                todo!()
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn create_table(self: &Arc<Self>, table: SqlTable) -> Result<(), SchemaError> {
+    // Statement dispatch (parsing SQL, matching on the statement kind)
+    // lives in Statement::execute (stmt.rs) — this is just the actual
+    // table-creation work, called from there for the CreateTable case.
+    //
+    // Besides the table's own metadata row (in this schema's system
+    // table) and each index's own backing table, this also creates the
+    // table's *row-storage* backing table — a BPlusTree exactly like an
+    // index's, just holding full rows instead of indexed columns — and,
+    // for a table with no PRIMARY KEY, the auto-increment sequence used
+    // to key rows in it.
+    pub(crate) fn create_table(self: &Arc<Self>, table: SqlTable) -> Result<(), SchemaError> {
         let mut table = table;
+        let row_table_name = self.qualify(&table.name);
+        let rowid_seq_name = self.rowid_seq_name(&table.name);
+        let has_primary_key = table.primary_key().is_some();
 
-        // Resolve every index's target (schema-qualified) name up front
-        // and fail before creating anything if one's already taken, so
-        // the loop below only runs once none of them can collide —
+        // Resolve every store-level name this needs up front — the row
+        // table itself, plus each index's backing table — and fail
+        // before creating anything if any is already taken, so the
+        // creation step below only runs once none of them can collide —
         // closes the one failure mode that was actually reachable here
         // (see drop_table's own doc comment for why
         // create_table_with_index_entry_size isn't undone by
         // self.db.rollback(txn): it's DDL, not a row-level, undo-logged
         // operation the way insert/update/remove are).
+        if self.db.table_id_by_name(&row_table_name)?.is_some() {
+            return Err(SchemaError::BadTableName(format!(
+                "Table name {} is already in use",
+                table.name
+            )));
+        }
         let mut index_names = Vec::with_capacity(table.indices.len());
         for (count, i) in table.indices.iter().enumerate() {
             let iname = i
@@ -179,32 +179,51 @@ where
             ),
             &txn,
         )?;
-        // Tracks names as they're actually created (not just planned), so a
-        // later failure in this same loop — a transient I/O error or lock
-        // contention on some create_table_with_index_entry_size call, now
-        // that a name collision can't happen here anymore — can be cleaned
-        // up via drop_table instead of leaking. Safe to call unconditionally
-        // here: nothing else can have discovered these tables yet (the
-        // SqlTable row isn't in self.tables, and table_exists/get_table
-        // can't see it either, until the whole create_table call succeeds).
-        let mut created_names: Vec<String> = Vec::with_capacity(table.indices.len());
-        let res: Result<(), SchemaError> =
+        // Tracks names/generators as they're actually created (not just
+        // planned), so a later failure in this same sequence — a
+        // transient I/O error or lock contention on some
+        // create_table_with_index_entry_size call, now that a name
+        // collision can't happen here anymore — can be cleaned up
+        // instead of leaking. Safe to call unconditionally here: nothing
+        // else can have discovered these tables yet (the SqlTable row
+        // isn't in self.tables, and table_exists/get_table can't see it
+        // either, until the whole create_table call succeeds).
+        let mut created_names: Vec<String> = Vec::with_capacity(table.indices.len() + 1);
+        let mut created_generator = false;
+        let res: Result<(), SchemaError> = (|| {
+            let row_table_id = self
+                .db
+                .create_table_with_index_entry_size(row_table_name.clone(), table.row_size() as u64)?;
+            created_names.push(row_table_name.clone());
+            table.db_table_id = row_table_id;
+
+            if !has_primary_key {
+                self.db
+                    .get_generator()
+                    .create_generator(&rowid_seq_name, Some(0))?;
+                created_generator = true;
+            }
+
             table
                 .indices
                 .iter_mut()
-                .zip(index_names)
+                .zip(&index_names)
                 .try_for_each(|(i, qualified)| {
                     let size = i.size();
                     let iid = self
                         .db
                         .create_table_with_index_entry_size(qualified.clone(), size as u64)?;
                     i.db_table_id = iid;
-                    created_names.push(qualified);
+                    created_names.push(qualified.clone());
                     Ok(())
-                });
+                })
+        })();
         if res.is_err() {
             for name in &created_names {
                 self.db.drop_table(name)?;
+            }
+            if created_generator {
+                self.db.get_generator().remove_generator(&rowid_seq_name)?;
             }
             self.db.rollback(txn)?;
             return res;
@@ -221,5 +240,101 @@ where
 
     pub(crate) fn get_table(self: &Arc<Self>, name: &str) -> Option<SqlTable> {
         self.tables.read().get(&name.to_lowercase()).cloned()
+    }
+
+    // The DBIdType a full row (in table-field order) should be keyed by
+    // in the table's own row-storage backing table: the PRIMARY KEY's
+    // values if it has one, else the next value from its auto-increment
+    // rowid sequence (see create_table).
+    fn row_key(&self, table: &SqlTable, row: &[ValueItem]) -> Result<DBIdType, SchemaError> {
+        match table.primary_key() {
+            Some(pk) => {
+                let values = table.extract_field_values(&pk.fields, row);
+                Ok(DBIdType::Rec(IndexKey::new_from(&values)?))
+            }
+            None => {
+                let id = self
+                    .db
+                    .get_generator()
+                    .gen_key(self.rowid_seq_name(&table.name))?;
+                Ok(DBIdType::Int(id))
+            }
+        }
+    }
+
+    // Statement dispatch for Insert lives in Statement::execute, same
+    // split as create_table — this does the actual work: writing each
+    // full row into the table's own backing table, and a corresponding
+    // entry into every index's backing table (so PRIMARY KEY/UNIQUE
+    // constraints are enforced immediately, by the same duplicate-key
+    // rejection store already gives every BPlusTree table for free —
+    // not deferred to some later index-build step). All in one
+    // transaction per call: a violation on any row, or any index entry,
+    // rolls the whole batch back — undo-logged row-level inserts, unlike
+    // create_table's own DDL, so a plain rollback(txn) is enough here.
+    pub(crate) fn insert_rows(
+        self: &Arc<Self>,
+        table_name: &str,
+        rows: Vec<Vec<ValueItem>>,
+    ) -> Result<usize, SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+
+        let txn = self.db.begin()?;
+        let res: Result<usize, SchemaError> = (|| {
+            let mut count = 0usize;
+            for row in &rows {
+                let row_key = self.row_key(&table, row)?;
+                let row_data = IndexKey::new_from(row)?;
+                self.db.insert(
+                    table.db_table_id,
+                    Tuple::new_with(
+                        row_key.clone(),
+                        &to_allocvec(&row_data)?,
+                        Some(txn.id()),
+                        None,
+                    ),
+                    &txn,
+                )?;
+
+                // What every index's entry points back to: the row's own
+                // key, itself encoded as an IndexKey — the PRIMARY KEY's
+                // own IndexKey when there is one (so an index lookup can
+                // go straight to DBIdType::Rec of it), or a single-value
+                // IndexKey wrapping the auto-generated id otherwise.
+                let identity = match &row_key {
+                    DBIdType::Rec(ik) => ik.clone(),
+                    DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+                };
+                for index in &table.indices {
+                    let values = table.extract_field_values(&index.fields, row);
+                    let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+                    self.db.insert(
+                        index.db_table_id,
+                        Tuple::new_with(
+                            index_key,
+                            &to_allocvec(&identity)?,
+                            Some(txn.id()),
+                            None,
+                        ),
+                        &txn,
+                    )?;
+                }
+                count += 1;
+            }
+            Ok(count)
+        })();
+
+        match res {
+            Ok(count) => {
+                self.db.commit(txn)?;
+                Ok(count)
+            }
+            Err(e) => {
+                self.db.rollback(txn)?;
+                Err(e)
+            }
+        }
     }
 }

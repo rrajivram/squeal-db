@@ -39,6 +39,10 @@ impl IndexKey {
         size_of::<u64>() + self.data.iter().map(|d| d.size()).sum::<usize>()
     }
 
+    pub fn values(&self) -> &[ValueItem] {
+        &self.data
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
         bytes.extend_from_slice(&self.data.len().to_le_bytes());

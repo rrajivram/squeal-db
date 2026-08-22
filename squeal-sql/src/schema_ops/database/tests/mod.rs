@@ -1,7 +1,29 @@
+use std::sync::Arc;
+
+use store::db::DBFile;
 use store::memfile::MemFile;
 
 use super::Database;
 use crate::schema_ops::schema::Schema;
+use crate::table::SqlTable;
+
+// These tests are exercising Database/Schema's own multi-schema
+// isolation and persistence guarantees, not statement dispatch (see
+// stmt.rs's own tests for that) — so they call Schema::create_table
+// directly rather than going through Connection+Statement.
+fn create_table_directly<F>(s: &Arc<Schema<F>>, sql: &str)
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    let stmts =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect, sql).unwrap();
+    let sqlparser::ast::Statement::CreateTable(c) = &stmts[0] else {
+        panic!("expected a CREATE TABLE statement, got: {stmts:?}");
+    };
+    s.create_table(SqlTable::from_sql(s, c.clone()).unwrap())
+        .unwrap();
+}
 
 fn temp_db_path(tag: &str) -> String {
     std::env::temp_dir()
@@ -37,10 +59,14 @@ fn test_tables_in_different_schemas_do_not_collide() {
     let s1 = db.create_schema("schema1").unwrap();
     let s2 = db.create_schema("schema2").unwrap();
 
-    s1.execute("create table customers (id integer not null, primary key(id))".to_string())
-        .unwrap();
-    s2.execute("create table customers (id integer not null, name varchar(50))".to_string())
-        .unwrap();
+    create_table_directly(
+        &s1,
+        "create table customers (id integer not null, primary key(id))",
+    );
+    create_table_directly(
+        &s2,
+        "create table customers (id integer not null, name varchar(50))",
+    );
 
     assert!(s1.table_exists("customers"));
     assert!(s2.table_exists("customers"));
@@ -63,8 +89,7 @@ fn test_database_state_survives_close_and_reopen() {
 
     let db = super::Database::<NamedMemFile>::create(path.clone()).unwrap();
     let s1 = db.create_schema("schema1").unwrap();
-    s1.execute("create table t (id integer not null, primary key(id))".to_string())
-        .unwrap();
+    create_table_directly(&s1, "create table t (id integer not null, primary key(id))");
     // Database::close requires unique ownership of its shared Db<F> —
     // this test's own `s1` clone (on top of the one Database itself
     // holds) must be dropped first.
