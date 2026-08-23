@@ -248,6 +248,12 @@ where
                         AlterColumnOp::Rename(old, new) => {
                             schema.rename_column(&table_name, &old, &new)?
                         }
+                        AlterColumnOp::AddForeignKey(fk) => {
+                            schema.add_foreign_key(&table_name, fk)?
+                        }
+                        AlterColumnOp::DropForeignKey(name) => {
+                            schema.drop_foreign_key(&table_name, &name)?
+                        }
                     }
                     self.results
                         .push(ResultType::ResultString(format!("Table {table_name:?} altered")));
@@ -358,6 +364,14 @@ fn validate_create_table(c: &sqlparser::ast::CreateTable) -> Result<(), SchemaEr
                 .iter()
                 .map(|c| c.column.to_string().to_lowercase())
                 .collect(),
+            // Reuses the same conversion from_sql itself calls later —
+            // rejects composite keys/ON DELETE/ON UPDATE/etc. here too,
+            // not just once execute() actually gets there, and its
+            // `column` is what needs checking against `seen` below,
+            // same as Unique/PrimaryKey's own local columns.
+            sqlparser::ast::TableConstraint::ForeignKey(fk) => {
+                vec![crate::table::foreign_key_from_constraint(fk, None)?.column]
+            }
             _ => vec![],
         };
         for f in fields {
@@ -473,30 +487,34 @@ fn parse_select_star(query: &sqlparser::ast::Query) -> Result<String, SchemaErro
 
 // What Statement::execute's AlterTable arm actually dispatches on —
 // parse_alter_table's own output, carrying just enough to call the
-// matching Schema::add_column/drop_column/rename_column. Column names
-// are already lowercased here, matching every other identifier in this
-// crate (see e.g. rows_from_insert's own column lookups).
+// matching Schema::add_column/drop_column/rename_column/
+// add_foreign_key/drop_foreign_key. Column names are already lowercased
+// here, matching every other identifier in this crate (see e.g.
+// rows_from_insert's own column lookups).
 enum AlterColumnOp {
     Add(crate::table::Field),
     Drop(String),
     Rename(String, String),
+    AddForeignKey(crate::table::SqlForeignKey),
+    DropForeignKey(String),
 }
 
 // Deliberately strict, same spirit as parse_select_star: accepts
-// exactly one ADD COLUMN / DROP COLUMN / RENAME COLUMN operation per
-// ALTER TABLE statement and rejects everything else sqlparser's
-// AlterTableOperation can represent (constraints, projections,
-// partitions, RENAME TABLE, IF EXISTS/IF NOT EXISTS, CASCADE/RESTRICT,
-// dropping more than one column at once, MySQL's FIRST/AFTER column
-// position, ...) with a specific message rather than silently doing
-// something other than what the SQL asked for.
+// exactly one ADD COLUMN / DROP COLUMN / RENAME COLUMN / ADD [CONSTRAINT
+// <name>] FOREIGN KEY / DROP CONSTRAINT operation per ALTER TABLE
+// statement and rejects everything else sqlparser's AlterTableOperation
+// can represent (other constraint kinds, projections, partitions,
+// RENAME TABLE, IF EXISTS/IF NOT EXISTS, CASCADE/RESTRICT, dropping
+// more than one column at once, MySQL's FIRST/AFTER column position,
+// ...) with a specific message rather than silently doing something
+// other than what the SQL asked for.
 fn parse_alter_table(
     alter: &sqlparser::ast::AlterTable,
 ) -> Result<(String, AlterColumnOp), SchemaError> {
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
-            "ALTER TABLE only supports a single ADD COLUMN / DROP COLUMN / RENAME COLUMN \
-             right now — {what} is not supported yet"
+            "ALTER TABLE only supports a single ADD COLUMN / DROP COLUMN / RENAME COLUMN / \
+             ADD FOREIGN KEY / DROP CONSTRAINT right now — {what} is not supported yet"
         )))
     };
     if alter.if_exists {
@@ -554,6 +572,28 @@ fn parse_alter_table(
             old_column_name.value.to_lowercase(),
             new_column_name.value.to_lowercase(),
         ),
+        [sqlparser::ast::AlterTableOperation::AddConstraint {
+            constraint: sqlparser::ast::TableConstraint::ForeignKey(fk),
+            not_valid,
+        }] => {
+            if *not_valid {
+                return unsupported("ADD CONSTRAINT ... NOT VALID");
+            }
+            AlterColumnOp::AddForeignKey(crate::table::foreign_key_from_constraint(fk, None)?)
+        }
+        [sqlparser::ast::AlterTableOperation::DropConstraint {
+            if_exists,
+            name,
+            drop_behavior,
+        }] => {
+            if *if_exists {
+                return unsupported("DROP CONSTRAINT IF EXISTS");
+            }
+            if drop_behavior.is_some() {
+                return unsupported("CASCADE/RESTRICT");
+            }
+            AlterColumnOp::DropForeignKey(name.value.to_lowercase())
+        }
         [] => return unsupported("ALTER TABLE with no operations"),
         [_] => return unsupported("this ALTER TABLE operation"),
         _ => return unsupported("multiple operations in one ALTER TABLE statement"),

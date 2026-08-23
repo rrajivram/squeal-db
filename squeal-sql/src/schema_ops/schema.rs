@@ -15,7 +15,7 @@ use crate::{
     constant::MAX_TABLE_NAME_LEN,
     error::SchemaError,
     rslt::resultset::ResultSet,
-    table::{Field, SqlTable, VersionedRow},
+    table::{Field, SqlForeignKey, SqlTable, VersionedRow},
 };
 
 #[derive(Clone)]
@@ -169,6 +169,30 @@ where
             }
             index_names.push(qualified);
         }
+        // Self-referential foreign keys (ref_table == this table) were
+        // already fully validated inside TableBuilder::build(), which
+        // has this table's own shape in hand but no access to the rest
+        // of the schema — anything referencing a *different* table can
+        // only be checked here, once that table's own SqlTable is
+        // available via self.get_table.
+        for fk in &table.foreign_keys {
+            if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                continue;
+            }
+            let ref_table = self.get_table(&fk.ref_table).ok_or_else(|| {
+                SchemaError::UserError(format!(
+                    "Foreign key references unknown table: {:?}",
+                    fk.ref_table
+                ))
+            })?;
+            let column_datatype = table
+                .fields()
+                .iter()
+                .find(|f| f.name == fk.column)
+                .expect("TableBuilder::build already checked this column exists")
+                .datatype;
+            ref_table.validate_foreign_key_target(&fk.ref_column, column_datatype)?;
+        }
 
         let txn = self.db.begin()?;
         let ik = IndexKey::new_from(&[ValueItem::Str((
@@ -320,6 +344,7 @@ where
     ) -> Result<usize, SchemaError> {
         let mut count = 0usize;
         for row in rows {
+            self.check_foreign_keys(table, row, txn)?;
             let row_key = self.row_key(table, row)?;
             // Stamped with the table's CURRENT version — every new
             // insert is always written in the table's latest shape;
@@ -361,6 +386,56 @@ where
             count += 1;
         }
         Ok(count)
+    }
+
+    // For each of `table`'s foreign keys, checks `row`'s value for that
+    // key's column against the referenced table's target index — a
+    // NULL value is always allowed through (standard SQL: a foreign key
+    // only constrains non-NULL values), matching the same read-your-
+    // own-writes transaction `txn` the row itself is being inserted
+    // under, so a batch can reference an earlier row in the very same
+    // INSERT statement (not a later one — that row doesn't exist yet).
+    fn check_foreign_keys(
+        self: &Arc<Self>,
+        table: &SqlTable,
+        row: &[ValueItem],
+        txn: &Transaction,
+    ) -> Result<(), SchemaError> {
+        for fk in &table.foreign_keys {
+            let pos = table
+                .fields()
+                .iter()
+                .position(|f| f.name == fk.column)
+                .expect("a table's own foreign_keys always reference one of its own fields");
+            let value = &row[pos];
+            if *value == ValueItem::Null {
+                continue;
+            }
+            let ref_table = self.get_table(&fk.ref_table).ok_or_else(|| {
+                SchemaError::UnknownError(format!(
+                    "foreign key on {:?}.{} references unknown table {:?}",
+                    table.name, fk.column, fk.ref_table
+                ))
+            })?;
+            let index = ref_table.unique_index_on(&fk.ref_column).ok_or_else(|| {
+                SchemaError::UnknownError(format!(
+                    "foreign key on {:?}.{} references {:?}.{}, which is no longer a \
+                     PRIMARY KEY/UNIQUE column",
+                    table.name, fk.column, fk.ref_table, fk.ref_column
+                ))
+            })?;
+            let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
+            if self.db.find(index.db_table_id, key, txn)?.is_none() {
+                return Err(SchemaError::UserError(format!(
+                    "insert on table {:?} violates foreign key {:?}: no row in {:?} with {} = {value:?}",
+                    table.name,
+                    fk.name.as_deref().unwrap_or("<unnamed>"),
+                    fk.ref_table,
+                    fk.ref_column
+                )));
+            }
+        }
+        Ok(())
     }
 
     // Statement dispatch for SELECT lives in Statement::execute, same
@@ -418,6 +493,12 @@ where
         table_name: &str,
         column_name: &str,
     ) -> Result<(), SchemaError> {
+        // SqlTable::alter_drop_column only guards against `column_name`
+        // being this table's own LOCAL foreign-key column — it has no
+        // way to see another table's (or, for a self-referential key,
+        // this same table's own) foreign key pointing at it as a
+        // *target*, so that side of the check has to happen here.
+        self.check_not_a_foreign_key_target(table_name, column_name)?;
         self.alter_table(table_name, |t| t.alter_drop_column(column_name))
     }
 
@@ -427,7 +508,100 @@ where
         old_name: &str,
         new_name: &str,
     ) -> Result<(), SchemaError> {
+        self.check_not_a_foreign_key_target(table_name, old_name)?;
         self.alter_table(table_name, |t| t.alter_rename_column(old_name, new_name))
+    }
+
+    fn check_not_a_foreign_key_target(
+        self: &Arc<Self>,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), SchemaError> {
+        let name = table_name.to_lowercase();
+        for (other_name, other) in self.tables.read().iter() {
+            if let Some(fk) = other
+                .foreign_keys
+                .iter()
+                .find(|fk| fk.ref_table.eq_ignore_ascii_case(&name) && fk.ref_column == column_name)
+            {
+                return Err(SchemaError::UserError(format!(
+                    "Column {column_name:?} on table {table_name:?} is referenced by foreign key \
+                     {:?} on table {other_name:?} — drop that foreign key first",
+                    fk.name.clone().unwrap_or_else(|| "<unnamed>".into())
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn add_foreign_key(
+        self: &Arc<Self>,
+        table_name: &str,
+        fk: SqlForeignKey,
+    ) -> Result<(), SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let ref_table = self.get_table(&fk.ref_table).ok_or_else(|| {
+            SchemaError::UserError(format!(
+                "Foreign key references unknown table: {:?}",
+                fk.ref_table
+            ))
+        })?;
+        let column_datatype = table
+            .fields()
+            .iter()
+            .find(|f| f.name == fk.column)
+            .ok_or_else(|| {
+                SchemaError::UserError(format!(
+                    "Table {table_name:?} has no column named {:?}",
+                    fk.column
+                ))
+            })?
+            .datatype;
+        ref_table.validate_foreign_key_target(&fk.ref_column, column_datatype)?;
+        let index = ref_table
+            .unique_index_on(&fk.ref_column)
+            .expect("validate_foreign_key_target above already confirmed this exists");
+
+        // Existing rows must already satisfy the constraint — no NOT
+        // VALID escape hatch in this engine yet (see
+        // foreign_key_holder's own doc comment on what ALTER TABLE ADD
+        // FOREIGN KEY deliberately doesn't support). A plain autocommit
+        // read: nothing here writes anything, so there's no partial
+        // state to roll back on a violation.
+        let txn = self.db.begin()?;
+        let mut cursor = self.db.table_scan_in_txn(table.db_table_id, &txn)?;
+        while let Some(tuple) = cursor.next()? {
+            let versioned = from_bytes::<VersionedRow>(tuple.data())?;
+            let row = table.reproject(&versioned)?;
+            let pos = table
+                .fields()
+                .iter()
+                .position(|f| f.name == fk.column)
+                .expect("checked present above");
+            let value = &row[pos];
+            if *value != ValueItem::Null {
+                let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
+                if self.db.find(index.db_table_id, key, &txn)?.is_none() {
+                    return Err(SchemaError::UserError(format!(
+                        "cannot add foreign key: existing row in {table_name:?} has {} = \
+                         {value:?}, which does not exist in {:?}.{}",
+                        fk.column, fk.ref_table, fk.ref_column
+                    )));
+                }
+            }
+        }
+
+        self.alter_table(table_name, |t| t.alter_add_foreign_key(fk))
+    }
+
+    pub(crate) fn drop_foreign_key(
+        self: &Arc<Self>,
+        table_name: &str,
+        constraint_name: &str,
+    ) -> Result<(), SchemaError> {
+        self.alter_table(table_name, |t| t.alter_drop_foreign_key(constraint_name))
     }
 
     fn alter_table(

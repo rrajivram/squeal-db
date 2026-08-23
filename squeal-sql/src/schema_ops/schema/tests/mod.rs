@@ -18,9 +18,14 @@
 //   written before a column existed, and the "column used by an index"
 //   guard. ALTER TABLE *dispatch* (parsing, result reporting) is tested
 //   in stmt.rs, same split as CREATE TABLE/INSERT.
+// - `foreign_key`: SqlForeignKey validation at CREATE TABLE and ALTER
+//   TABLE ADD/DROP time, and enforcement at INSERT time. Statement
+//   dispatch for the ALTER TABLE ADD/DROP FOREIGN KEY forms is tested
+//   in stmt.rs, same split as everything else ALTER-shaped.
 mod alter;
 mod contract;
 mod dml;
+mod foreign_key;
 mod mapping;
 
 use std::sync::Arc;

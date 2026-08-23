@@ -38,6 +38,7 @@ pub struct SqlTable {
     // entry here — only at read time (see Schema::select_all).
     pub(crate) versions: Vec<SchemaVersion>,
     pub(crate) indices: Vec<SqlIndex>,
+    pub(crate) foreign_keys: Vec<SqlForeignKey>,
     // The table's own row-storage backing table — distinct from each
     // index's own db_table_id below. Set by Schema::create_table once
     // the backing table actually exists; TableIdType::none() until then
@@ -71,11 +72,6 @@ pub(crate) struct VersionedRow {
     pub(crate) values: IndexKey,
 }
 
-/* #[derive(Debug, Clone)]
-pub struct ForeignKey<'a,'b> {
-
-}
- */
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlIndex {
     pub(crate) name: Option<String>,
@@ -83,6 +79,22 @@ pub struct SqlIndex {
     pub(crate) is_primary: bool,
     pub(crate) is_unique: bool,
     pub(crate) fields: Vec<Arc<Field>>,
+}
+
+// A single-column foreign key — this table's `column` must, for every
+// non-NULL value, match some row's `ref_column` in `ref_table` (see
+// Schema::insert_rows_in_txn's own enforcement and
+// Schema::add_foreign_key's existing-row backfill check). Not
+// versioned, unlike Field/SchemaVersion — like SqlIndex, it's simpler
+// to just require dropping the constraint before renaming/dropping
+// either column it touches (see SqlTable::fk_referencing_column) than
+// to track its own history across a rename.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlForeignKey {
+    pub(crate) name: Option<String>,
+    pub(crate) column: String,
+    pub(crate) ref_table: String,
+    pub(crate) ref_column: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -122,6 +134,7 @@ pub struct TableBuilder {
     name: Option<String>,
     fields: Vec<Field>,
     indices: Vec<IndexHolder>,
+    foreign_keys: Vec<SqlForeignKey>,
 }
 
 impl Field {
@@ -173,6 +186,7 @@ impl TableBuilder {
             name: None,
             fields: vec![],
             indices: vec![],
+            foreign_keys: vec![],
         }
     }
 
@@ -183,6 +197,22 @@ impl TableBuilder {
 
     pub fn with_field(&mut self, field: &Field) -> &mut Self {
         self.fields.push(field.clone());
+        self
+    }
+
+    pub fn with_foreign_key(
+        &mut self,
+        column: String,
+        name: Option<String>,
+        ref_table: String,
+        ref_column: String,
+    ) -> &mut Self {
+        self.foreign_keys.push(SqlForeignKey {
+            name,
+            column,
+            ref_table,
+            ref_column,
+        });
         self
     }
 
@@ -256,6 +286,29 @@ impl TableBuilder {
                 )));
             }
         }
+        // Only the LOCAL side is checkable here — from_sql doesn't know
+        // about any other table. A foreign key referencing another
+        // table gets its ref_table/ref_column validated by
+        // Schema::create_table instead, before this table is actually
+        // persisted; a self-referential one (ref_table == this table)
+        // is fully validated below, once this table's own fields/
+        // indices are built.
+        let mut fk_names: HashMap<String, ()> = HashMap::with_capacity(self.foreign_keys.len());
+        for fk in &self.foreign_keys {
+            if !field_names.contains_key(&fk.column) {
+                return Err(SchemaError::UserError(format!(
+                    "Foreign key references unknown column: {}",
+                    fk.column
+                )));
+            }
+            if let Some(name) = &fk.name
+                && fk_names.insert(name.clone(), ()).is_some()
+            {
+                return Err(SchemaError::UserError(format!(
+                    "Duplicate foreign key constraint name: {name}"
+                )));
+            }
+        }
 
         // Ids assigned by position here, 0..N — this is the one place a
         // brand-new table's fields get their permanent identity (see
@@ -273,6 +326,7 @@ impl TableBuilder {
             name: self.name.as_ref().unwrap().clone(),
             versions: vec![SchemaVersion { fields }],
             indices: vec![],
+            foreign_keys: vec![],
             db_table_id: TableIdType::none(),
             next_field_id,
         };
@@ -290,6 +344,22 @@ impl TableBuilder {
                 }
             }
             table.indices.push(index);
+        }
+        for fk in &self.foreign_keys {
+            // Case-insensitive: table names are lowercased everywhere
+            // else in this crate (see e.g. Statement's own table-name
+            // handling), so "REFERENCES Users" naming this same table
+            // by a different case must still count as self-referential.
+            if fk.ref_table.eq_ignore_ascii_case(&table.name) {
+                let column_datatype = table
+                    .fields()
+                    .iter()
+                    .find(|f| f.name == fk.column)
+                    .expect("checked present in field_names above")
+                    .datatype;
+                table.validate_foreign_key_target(&fk.ref_column, column_datatype)?;
+            }
+            table.foreign_keys.push(fk.clone());
         }
         Ok(table)
     }
@@ -352,6 +422,71 @@ fn inline_indices(column: &ColumnDef) -> Vec<IndexHolder> {
         .collect()
 }
 
+// Converts a parsed FOREIGN KEY constraint (table-level or, via
+// `implicit_column`, the inline column form — see inline_foreign_key)
+// into a SqlForeignKey, rejecting every form this crate doesn't support
+// yet: composite (multi-column) keys, ON DELETE/ON UPDATE (moot
+// anyway — this engine has no UPDATE/DELETE to cascade/restrict
+// against), MATCH, characteristics (e.g. DEFERRABLE), and MySQL's
+// separate index_name. Shared with Statement::execute's ALTER TABLE ADD
+// CONSTRAINT/ADD FOREIGN KEY parsing (see stmt.rs's parse_alter_table),
+// so both entry points reject exactly the same unsupported forms.
+pub(crate) fn foreign_key_from_constraint(
+    fk: &sqlparser::ast::ForeignKeyConstraint,
+    implicit_column: Option<&str>,
+) -> Result<SqlForeignKey, SchemaError> {
+    let unsupported = |what: &str| {
+        Err(SchemaError::UserError(format!(
+            "FOREIGN KEY only supports a single-column reference right now — {what} is not \
+             supported yet"
+        )))
+    };
+    if fk.index_name.is_some() {
+        return unsupported("a MySQL-style index name");
+    }
+    if fk.on_delete.is_some() || fk.on_update.is_some() {
+        return unsupported("ON DELETE/ON UPDATE");
+    }
+    if fk.match_kind.is_some() {
+        return unsupported("MATCH FULL/PARTIAL/SIMPLE");
+    }
+    if fk.characteristics.is_some() {
+        return unsupported("constraint characteristics (e.g. DEFERRABLE)");
+    }
+    let column = match (implicit_column, fk.columns.as_slice()) {
+        (Some(c), []) => c.to_string(),
+        (None, [c]) => c.value.clone(),
+        _ => return unsupported("multiple columns"),
+    };
+    let ref_column = match fk.referred_columns.as_slice() {
+        [c] => c.value.clone(),
+        _ => return unsupported("multiple referenced columns"),
+    };
+    Ok(SqlForeignKey {
+        // Lowercased, matching every other identifier in this crate
+        // (table/column names) — DROP CONSTRAINT's own name lookup
+        // lowercases too (see stmt.rs's parse_alter_table), so this has
+        // to agree or a mixed-case constraint name would never match.
+        name: fk.name.clone().map(|n| n.to_string().to_lowercase()),
+        column,
+        ref_table: fk.foreign_table.to_string().to_lowercase(),
+        ref_column,
+    })
+}
+
+// Mirrors inline_indices: a column's own inline REFERENCES (e.g.
+// `customer_id INTEGER REFERENCES customers(id)`) parses to the same
+// ForeignKeyConstraint as a table-level FOREIGN KEY(...) clause, but
+// with an empty `columns` — the column is implicit ("this one").
+fn inline_foreign_key(column: &ColumnDef) -> Option<Result<SqlForeignKey, SchemaError>> {
+    column.options.iter().find_map(|o| match &o.option {
+        ColumnOption::ForeignKey(fk) => {
+            Some(foreign_key_from_constraint(fk, Some(&column.name.value)))
+        }
+        _ => None,
+    })
+}
+
 impl SqlTable {
     pub(crate) fn from_sql<F>(db: &Arc<Schema<F>>, value: CreateTable) -> Result<Self, SchemaError>
     where
@@ -390,6 +525,21 @@ impl SqlTable {
         for c in &value.columns {
             indices.extend(inline_indices(c));
         }
+        let mut foreign_keys = value
+            .constraints
+            .iter()
+            .filter_map(|t| match t {
+                sqlparser::ast::TableConstraint::ForeignKey(fk) => {
+                    Some(foreign_key_from_constraint(fk, None))
+                }
+                _ => None,
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for c in &value.columns {
+            if let Some(fk) = inline_foreign_key(c) {
+                foreign_keys.push(fk?);
+            }
+        }
         let mut tb = TableBuilder::new();
         tb.with_name(name);
         for f in &fields {
@@ -398,12 +548,77 @@ impl SqlTable {
         for i in indices {
             tb.with_index(&i.fields, i.name, i.is_primary, i.is_unique);
         }
+        for fk in foreign_keys {
+            tb.with_foreign_key(fk.column, fk.name, fk.ref_table, fk.ref_column);
+        }
 
         tb.build()
     }
 
     pub(crate) fn primary_key(&self) -> Option<&SqlIndex> {
         self.indices.iter().find(|i| i.is_primary)
+    }
+
+    // A single-column PRIMARY KEY or UNIQUE index on exactly `column` —
+    // what a foreign key's ref_column must resolve to (standard SQL
+    // requirement: you can only reference a column with a uniqueness
+    // guarantee, otherwise "the referenced row" isn't well-defined).
+    // Deliberately doesn't match a multi-column index whose fields
+    // merely *include* `column` — v1 foreign keys are single-column
+    // only, so the reference has to be resolvable from that one column
+    // alone.
+    pub(crate) fn unique_index_on(&self, column: &str) -> Option<&SqlIndex> {
+        self.indices
+            .iter()
+            .find(|i| (i.is_primary || i.is_unique) && i.fields.len() == 1 && i.fields[0].name == column)
+    }
+
+    // Validates `ref_column` as a foreign key target on THIS table
+    // (i.e. `self` is the referenced table): it must exist, be backed
+    // by a single-column PRIMARY KEY/UNIQUE index (see unique_index_on),
+    // and match `column_datatype` — a referencing column can't
+    // meaningfully compare against a target of a different type.
+    // Shared by TableBuilder::build (self-referential FKs, validated
+    // locally) and Schema::create_table/add_foreign_key (FKs against a
+    // different table, validated once that table's own SqlTable is in
+    // hand).
+    pub(crate) fn validate_foreign_key_target(
+        &self,
+        ref_column: &str,
+        column_datatype: DataType,
+    ) -> Result<(), SchemaError> {
+        let field = self
+            .fields()
+            .iter()
+            .find(|f| f.name == ref_column)
+            .ok_or_else(|| {
+                SchemaError::UserError(format!(
+                    "Table {:?} has no column named {ref_column:?}",
+                    self.name
+                ))
+            })?;
+        if self.unique_index_on(ref_column).is_none() {
+            return Err(SchemaError::UserError(format!(
+                "Column {ref_column:?} on table {:?} must be a PRIMARY KEY or UNIQUE column \
+                 to be a foreign key target",
+                self.name
+            )));
+        }
+        if field.datatype != column_datatype {
+            return Err(SchemaError::UserError(format!(
+                "Foreign key column type {column_datatype:?} does not match referenced column \
+                 {ref_column:?}'s type {:?}",
+                field.datatype
+            )));
+        }
+        Ok(())
+    }
+
+    // Does `self` have any foreign key whose LOCAL column is `name`?
+    // Used by alter_drop_column/alter_rename_column, same "drop the
+    // constraint first" restriction as an indexed column.
+    fn fk_referencing_local_column(&self, name: &str) -> Option<&SqlForeignKey> {
+        self.foreign_keys.iter().find(|fk| fk.column == name)
     }
 
     // The table's current column layout — the last entry in `versions`.
@@ -528,6 +743,12 @@ impl SqlTable {
                 idx.name.clone().unwrap_or_else(|| "<unnamed>".into())
             )));
         }
+        if let Some(fk) = self.fk_referencing_local_column(name) {
+            return Err(SchemaError::UserError(format!(
+                "Column {name:?} is used by foreign key {:?} — drop the foreign key first",
+                fk.name.clone().unwrap_or_else(|| "<unnamed>".into())
+            )));
+        }
         let fields: Vec<Arc<Field>> = self
             .fields()
             .iter()
@@ -571,6 +792,12 @@ impl SqlTable {
                 idx.name.clone().unwrap_or_else(|| "<unnamed>".into())
             )));
         }
+        if let Some(fk) = self.fk_referencing_local_column(old_name) {
+            return Err(SchemaError::UserError(format!(
+                "Column {old_name:?} is used by foreign key {:?} — drop the foreign key first",
+                fk.name.clone().unwrap_or_else(|| "<unnamed>".into())
+            )));
+        }
         let fields: Vec<Arc<Field>> = self
             .fields()
             .iter()
@@ -589,6 +816,45 @@ impl SqlTable {
             })
             .collect();
         self.versions.push(SchemaVersion { fields });
+        Ok(())
+    }
+
+    // Structural validation only (local column exists, no duplicate
+    // constraint name) — Schema::add_foreign_key is responsible for
+    // everything that needs to look outside this one table: does
+    // ref_table/ref_column exist and qualify as a target (see
+    // validate_foreign_key_target), and does every existing row's
+    // `fk.column` value already have a match there.
+    pub(crate) fn alter_add_foreign_key(&mut self, fk: SqlForeignKey) -> Result<(), SchemaError> {
+        if !self.fields().iter().any(|f| f.name == fk.column) {
+            return Err(SchemaError::UserError(format!(
+                "Table {:?} has no column named {:?}",
+                self.name, fk.column
+            )));
+        }
+        if let Some(name) = &fk.name
+            && self.foreign_keys.iter().any(|f| f.name.as_deref() == Some(name.as_str()))
+        {
+            return Err(SchemaError::UserError(format!(
+                "Duplicate foreign key constraint name: {name}"
+            )));
+        }
+        self.foreign_keys.push(fk);
+        Ok(())
+    }
+
+    pub(crate) fn alter_drop_foreign_key(&mut self, name: &str) -> Result<(), SchemaError> {
+        let pos = self
+            .foreign_keys
+            .iter()
+            .position(|fk| fk.name.as_deref() == Some(name))
+            .ok_or_else(|| {
+                SchemaError::UserError(format!(
+                    "Table {:?} has no foreign key constraint named {name:?}",
+                    self.name
+                ))
+            })?;
+        self.foreign_keys.remove(pos);
         Ok(())
     }
 

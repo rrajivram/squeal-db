@@ -669,3 +669,58 @@ fn test_new_rejects_alter_table_rename_table() {
     let err = c.create_statement("alter table t rename to u").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
+
+#[test]
+fn test_execute_alter_table_add_foreign_key_records_a_result_string() {
+    let c = conn();
+    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table orders (id integer not null, customer_id integer, primary key(id))")
+        .unwrap();
+    let mut stmt = c
+        .create_statement("alter table orders add foreign key (customer_id) references customers(id)")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 1);
+    assert_eq!(result_string(&stmt.results[0]), "Table \"orders\" altered");
+}
+
+#[test]
+fn test_execute_alter_table_drop_foreign_key_fails_for_an_unknown_table() {
+    let c = conn();
+    let mut stmt = c
+        .create_statement("alter table nope drop constraint fk_cust")
+        .unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_alter_table_add_constraint_not_valid() {
+    let c = conn();
+    let err = c
+        .create_statement(
+            "alter table t add constraint fk_x foreign key (x) references y(id) not valid",
+        )
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_alter_table_drop_constraint_if_exists() {
+    let c = conn();
+    let err = c
+        .create_statement("alter table t drop constraint if exists fk_x")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_a_composite_foreign_key() {
+    let c = conn();
+    let err = c
+        .create_statement(
+            "create table t (a integer, b integer, foreign key(a, b) references u(x, y))",
+        )
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
