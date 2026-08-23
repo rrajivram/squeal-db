@@ -70,8 +70,8 @@ fn test_tables_in_different_schemas_do_not_collide() {
 
     assert!(s1.table_exists("customers"));
     assert!(s2.table_exists("customers"));
-    assert_eq!(s1.get_table("customers").unwrap().fields.len(), 1);
-    assert_eq!(s2.get_table("customers").unwrap().fields.len(), 2);
+    assert_eq!(s1.get_table("customers").unwrap().fields().len(), 1);
+    assert_eq!(s2.get_table("customers").unwrap().fields().len(), 2);
     // s1's "customers" has a primary key index (a real store-level table
     // qualified as "schema1.customers0"); s2's same-named table has none
     // — proves the index name was qualified per-schema too, not just the

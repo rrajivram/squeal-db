@@ -12,7 +12,7 @@ fn test_create_table_extracts_basic_shape() {
         "users",
     );
     assert_eq!(t.name, "users");
-    let names: Vec<_> = t.fields.iter().map(|f| f.name.clone()).collect();
+    let names: Vec<_> = t.fields().iter().map(|f| f.name.clone()).collect();
     assert_eq!(
         names,
         vec!["c", "a", "b"],

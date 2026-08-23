@@ -610,6 +610,29 @@ where
         Ok(page_num)
     }
 
+    /// Like `alloc_page`, but for a Run page: always writes a fresh
+    /// `RunPage`, whether the slot is brand-new or popped from the free
+    /// list. Needed for the same reason `alloc_indexed_page` doesn't
+    /// trust the free list's prior content: a freed page always resets
+    /// to plain `AnyTuplePage` content (see `reset_freed_page`, which
+    /// only distinguishes indexed vs. non-indexed, not which kind of
+    /// non-indexed content a page held before) — reusing `alloc_page`
+    /// here would silently hand back id-sorted `AnyTuplePage` content
+    /// instead of the arrival-order `RunPage` a Run requires.
+    pub(crate) fn alloc_run_page(&self) -> Result<PageId, StoreError> {
+        let page_num = match self.free_pages.write().pop() {
+            Some(page) => page,
+            None => self
+                .page_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .into(),
+        };
+        let mut p = Page::new_run(self.header.page_size);
+        p.set_clock(self.clock.clone());
+        self.write_page(page_num, &p)?;
+        Ok(page_num)
+    }
+
     pub(crate) fn get_page(&self, page_num: PageId) -> Result<Arc<Page>, StoreError> {
         let valid = page_num
             < self
@@ -1749,7 +1772,7 @@ mod tests {
     }
 
     const TEST_BUCKET_KIND: crate::pages::content::PageContentKind =
-        crate::pages::content::PageContentKind(2);
+        crate::pages::content::PageContentKind(3);
 
     fn registry_with_test_bucket() -> crate::pages::content::PageContentRegistry {
         let mut registry = crate::pages::content::PageContentRegistry::builtin();
@@ -1863,7 +1886,7 @@ mod tests {
 
         let unregistered = crate::pages::content::PageContentRegistry::builtin();
         let err = Page::from_bytes(&raw_bytes, &unregistered).unwrap_err();
-        assert!(matches!(err, StoreError::UnknownPageContentKind(2)));
+        assert!(matches!(err, StoreError::UnknownPageContentKind(3)));
         let _ = buf.shutdown();
     }
 }

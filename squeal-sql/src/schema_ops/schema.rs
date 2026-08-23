@@ -12,7 +12,10 @@ use store::{
 };
 
 use crate::{
-    constant::MAX_TABLE_NAME_LEN, error::SchemaError, rslt::resultset::ResultSet, table::SqlTable,
+    constant::MAX_TABLE_NAME_LEN,
+    error::SchemaError,
+    rslt::resultset::ResultSet,
+    table::{Field, SqlTable, VersionedRow},
 };
 
 #[derive(Clone)]
@@ -318,7 +321,14 @@ where
         let mut count = 0usize;
         for row in rows {
             let row_key = self.row_key(table, row)?;
-            let row_data = IndexKey::new_from(row)?;
+            // Stamped with the table's CURRENT version — every new
+            // insert is always written in the table's latest shape;
+            // only rows written before an ALTER TABLE carry an older
+            // version (see VersionedRow, SqlTable::reproject).
+            let row_data = VersionedRow {
+                version: table.version(),
+                values: IndexKey::new_from(row)?,
+            };
             self.db.insert(
                 table.db_table_id,
                 Tuple::new_with(
@@ -374,16 +384,77 @@ where
         let table = self.get_table(table_name).ok_or_else(|| {
             SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
         })?;
-        let columns = table.fields.iter().map(|f| f.name.clone()).collect();
+        let columns = table.fields().iter().map(|f| f.name.clone()).collect();
         let mut rows = Vec::new();
         let mut cursor = match txn {
             Some(txn) => self.db.table_scan_in_txn(table.db_table_id, txn)?,
             None => self.db.table_scan(table.db_table_id)?,
         };
         while let Some(tuple) = cursor.next()? {
-            let row = from_bytes::<IndexKey>(tuple.data())?;
-            rows.push(row.values().to_vec());
+            let row = from_bytes::<VersionedRow>(tuple.data())?;
+            rows.push(table.reproject(&row)?);
         }
         Ok(ResultSet::new(columns, rows))
+    }
+
+    // Statement dispatch for ALTER TABLE lives in Statement::execute,
+    // same split as create_table/insert_rows/select_all — these three
+    // do the actual metadata mutation (see SqlTable::alter_add_column/
+    // alter_drop_column/alter_rename_column for the validation and
+    // version-history bookkeeping itself) plus persisting it. Mirrors
+    // create_table's own ordering: persist to disk and commit *before*
+    // updating the in-memory table, so a failure partway through never
+    // leaves the in-memory and on-disk shapes disagreeing.
+    pub(crate) fn add_column(
+        self: &Arc<Self>,
+        table_name: &str,
+        field: Field,
+    ) -> Result<(), SchemaError> {
+        self.alter_table(table_name, |t| t.alter_add_column(field))
+    }
+
+    pub(crate) fn drop_column(
+        self: &Arc<Self>,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), SchemaError> {
+        self.alter_table(table_name, |t| t.alter_drop_column(column_name))
+    }
+
+    pub(crate) fn rename_column(
+        self: &Arc<Self>,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), SchemaError> {
+        self.alter_table(table_name, |t| t.alter_rename_column(old_name, new_name))
+    }
+
+    fn alter_table(
+        self: &Arc<Self>,
+        table_name: &str,
+        apply: impl FnOnce(&mut SqlTable) -> Result<(), SchemaError>,
+    ) -> Result<(), SchemaError> {
+        let name = table_name.to_lowercase();
+        let mut table = self.get_table(&name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        apply(&mut table)?;
+
+        let txn = self.db.begin()?;
+        let ik = IndexKey::new_from(&[ValueItem::Str((name.clone(), MAX_TABLE_NAME_LEN as u32))])?;
+        self.db.update(
+            self.sys_table_id,
+            Tuple::new_with(
+                DBIdType::Rec(ik),
+                &to_allocvec(&table)?,
+                Some(txn.id()),
+                None,
+            ),
+            &txn,
+        )?;
+        self.db.commit(txn)?;
+        self.tables.write().insert(name, table);
+        Ok(())
     }
 }

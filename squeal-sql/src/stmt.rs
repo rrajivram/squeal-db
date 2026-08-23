@@ -84,6 +84,9 @@ where
                 sqlparser::ast::Statement::Query(query) => {
                     parse_select_star(query)?;
                 }
+                sqlparser::ast::Statement::AlterTable(alter) => {
+                    parse_alter_table(alter)?;
+                }
                 sqlparser::ast::Statement::StartTransaction { statements, .. }
                     if !statements.is_empty() =>
                 {
@@ -232,6 +235,22 @@ where
                         .conn
                         .with_current_txn(|txn| schema.select_all(&table_name, txn))?;
                     self.results.push(ResultType::Result(result_set));
+                }
+                sqlparser::ast::Statement::AlterTable(alter) => {
+                    let (table_name, op) = parse_alter_table(alter)?;
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    match op {
+                        AlterColumnOp::Add(field) => schema.add_column(&table_name, field)?,
+                        AlterColumnOp::Drop(name) => schema.drop_column(&table_name, &name)?,
+                        AlterColumnOp::Rename(old, new) => {
+                            schema.rename_column(&table_name, &old, &new)?
+                        }
+                    }
+                    self.results
+                        .push(ResultType::ResultString(format!("Table {table_name:?} altered")));
                 }
                 sqlparser::ast::Statement::AlterCollation(_) => {
                     todo!()
@@ -450,6 +469,96 @@ fn parse_select_star(query: &sqlparser::ast::Query) -> Result<String, SchemaErro
         [] => unsupported("SELECT without FROM"),
         _ => unsupported("JOINs / multiple FROM tables"),
     }
+}
+
+// What Statement::execute's AlterTable arm actually dispatches on —
+// parse_alter_table's own output, carrying just enough to call the
+// matching Schema::add_column/drop_column/rename_column. Column names
+// are already lowercased here, matching every other identifier in this
+// crate (see e.g. rows_from_insert's own column lookups).
+enum AlterColumnOp {
+    Add(crate::table::Field),
+    Drop(String),
+    Rename(String, String),
+}
+
+// Deliberately strict, same spirit as parse_select_star: accepts
+// exactly one ADD COLUMN / DROP COLUMN / RENAME COLUMN operation per
+// ALTER TABLE statement and rejects everything else sqlparser's
+// AlterTableOperation can represent (constraints, projections,
+// partitions, RENAME TABLE, IF EXISTS/IF NOT EXISTS, CASCADE/RESTRICT,
+// dropping more than one column at once, MySQL's FIRST/AFTER column
+// position, ...) with a specific message rather than silently doing
+// something other than what the SQL asked for.
+fn parse_alter_table(
+    alter: &sqlparser::ast::AlterTable,
+) -> Result<(String, AlterColumnOp), SchemaError> {
+    let unsupported = |what: &str| {
+        Err(SchemaError::UserError(format!(
+            "ALTER TABLE only supports a single ADD COLUMN / DROP COLUMN / RENAME COLUMN \
+             right now — {what} is not supported yet"
+        )))
+    };
+    if alter.if_exists {
+        return unsupported("IF EXISTS");
+    }
+    if alter.only {
+        return unsupported("ONLY");
+    }
+    if alter.location.is_some() {
+        return unsupported("SET LOCATION");
+    }
+    if alter.on_cluster.is_some() {
+        return unsupported("ON CLUSTER");
+    }
+    if alter.table_type.is_some() {
+        return unsupported("ICEBERG/DYNAMIC/EXTERNAL table types");
+    }
+    let table_name = alter.name.to_string().to_lowercase();
+    let op = match alter.operations.as_slice() {
+        [sqlparser::ast::AlterTableOperation::AddColumn {
+            if_not_exists,
+            column_def,
+            column_position,
+            ..
+        }] => {
+            if *if_not_exists {
+                return unsupported("ADD COLUMN IF NOT EXISTS");
+            }
+            if column_position.is_some() {
+                return unsupported("FIRST/AFTER column position");
+            }
+            AlterColumnOp::Add(crate::table::Field::try_from(column_def)?)
+        }
+        [sqlparser::ast::AlterTableOperation::DropColumn {
+            column_names,
+            if_exists,
+            drop_behavior,
+            ..
+        }] => {
+            if *if_exists {
+                return unsupported("DROP COLUMN IF EXISTS");
+            }
+            if drop_behavior.is_some() {
+                return unsupported("CASCADE/RESTRICT");
+            }
+            match column_names.as_slice() {
+                [name] => AlterColumnOp::Drop(name.value.to_lowercase()),
+                _ => return unsupported("dropping multiple columns in one statement"),
+            }
+        }
+        [sqlparser::ast::AlterTableOperation::RenameColumn {
+            old_column_name,
+            new_column_name,
+        }] => AlterColumnOp::Rename(
+            old_column_name.value.to_lowercase(),
+            new_column_name.value.to_lowercase(),
+        ),
+        [] => return unsupported("ALTER TABLE with no operations"),
+        [_] => return unsupported("this ALTER TABLE operation"),
+        _ => return unsupported("multiple operations in one ALTER TABLE statement"),
+    };
+    Ok((table_name, op))
 }
 
 impl<F> Display for Statement<F>

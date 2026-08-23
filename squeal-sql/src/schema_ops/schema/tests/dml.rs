@@ -4,11 +4,28 @@ use store::valueitem::{IndexKey, ValueItem};
 
 use super::*;
 
-// Reads a stored Tuple's raw bytes back as an IndexKey's own values —
-// works for both a row in a table's own row-storage backing table (the
-// full row) and an entry in an index's backing table (the row's
-// identity, per Schema::insert_rows' own encoding).
+// Reads a row back from a table's own row-storage backing table, raw —
+// decodes the VersionedRow wrapper Schema::insert_rows_in_txn actually
+// writes there (see table.rs) and hands back its values verbatim, NOT
+// reprojected onto the table's current schema (that's SqlTable::reproject's
+// job, exercised separately by the alter-table tests below) — exactly
+// what these plain-insert tests want to assert against.
 fn find_row(s: &Arc<Schema<MemFile>>, table_id: TableIdType, key: DBIdType) -> Option<Vec<ValueItem>> {
+    let txn = s.db.begin().unwrap();
+    let tuple = s.db.find(table_id, key, &txn).unwrap()?;
+    let row = postcard::from_bytes::<crate::table::VersionedRow>(tuple.data()).unwrap();
+    Some(row.values.values().to_vec())
+}
+
+// Reads an entry back from an INDEX's own backing table — unlike a row
+// table entry, this is still a bare IndexKey (see
+// Schema::insert_rows_in_txn's own `identity` encoding): an index entry
+// has no schema of its own to version.
+fn find_index_entry(
+    s: &Arc<Schema<MemFile>>,
+    table_id: TableIdType,
+    key: DBIdType,
+) -> Option<Vec<ValueItem>> {
     let txn = s.db.begin().unwrap();
     let tuple = s.db.find(table_id, key, &txn).unwrap()?;
     let ik = postcard::from_bytes::<IndexKey>(tuple.data()).unwrap();
@@ -75,7 +92,7 @@ fn test_insert_populates_secondary_unique_index() {
     let s = conn.current_schema().unwrap();
     let table = s.get_table("users").unwrap();
     let idx = table.indices.iter().find(|i| !i.is_primary).unwrap();
-    let identity = find_row(
+    let identity = find_index_entry(
         &s,
         idx.db_table_id,
         DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str(("a@example.com".into(), 50))]).unwrap()),

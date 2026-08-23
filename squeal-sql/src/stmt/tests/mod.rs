@@ -604,3 +604,68 @@ fn test_get_nextresult_before_get_results_starts_from_the_first_result() {
     let first = stmt.get_nextresult().unwrap().unwrap();
     assert_eq!(result_string(&first), "Table 't1' created");
 }
+
+#[test]
+fn test_execute_alter_table_add_column_records_a_result_string() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    let mut stmt = c
+        .create_statement("alter table t add column plan varchar(10) default 'free'")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 1);
+    assert_eq!(result_string(&stmt.results[0]), "Table \"t\" altered");
+}
+
+#[test]
+fn test_execute_alter_table_drop_column_fails_for_an_unknown_table() {
+    let c = conn();
+    let mut stmt = c.create_statement("alter table nope drop column x").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_alter_table_rename_column_fails_without_a_selected_schema() {
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let c = mgr.create_and_connect("test_db_no_schema_alter").unwrap();
+    let mut stmt = c
+        .create_statement("alter table t rename column a to b")
+        .unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::NoSchemaSelected));
+}
+
+#[test]
+fn test_new_rejects_alter_table_with_multiple_operations() {
+    let c = conn();
+    let err = c
+        .create_statement("alter table t add column x integer, add column y integer")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_alter_table_drop_column_if_exists() {
+    let c = conn();
+    let err = c
+        .create_statement("alter table t drop column if exists x")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_alter_table_dropping_multiple_columns() {
+    let c = conn();
+    let err = c
+        .create_statement("alter table t drop column x, y")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_alter_table_rename_table() {
+    let c = conn();
+    let err = c.create_statement("alter table t rename to u").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}

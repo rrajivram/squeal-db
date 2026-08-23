@@ -20,28 +20,6 @@ fn is_parse_error(e: &SchemaError) -> bool {
     matches!(e, SchemaError::ParseError(_))
 }
 
-// Only the two close/reopen persistence tests below need this: they
-// construct their own file-backed Schema directly (not through the
-// shared conn()/execute() helpers, which are MemFile-only) and are
-// testing Schema/Database's own persistence guarantees specifically —
-// independent of whichever higher-level dispatcher (Statement) calls
-// into create_table.
-fn try_create_table_directly(
-    s: &Arc<Schema<NamedMemFile>>,
-    sql: &str,
-) -> Result<(), SchemaError> {
-    let stmts =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect, sql).unwrap();
-    let sqlparser::ast::Statement::CreateTable(c) = &stmts[0] else {
-        panic!("expected a CREATE TABLE statement, got: {stmts:?}");
-    };
-    s.create_table(SqlTable::from_sql(s, c.clone())?)
-}
-
-fn create_table_directly(s: &Arc<Schema<NamedMemFile>>, sql: &str) {
-    try_create_table_directly(s, sql).unwrap();
-}
-
 #[test]
 fn test_execute_rejects_invalid_schema_definitions() {
     struct Case {
@@ -158,7 +136,7 @@ fn test_schema_state_survives_close_and_reopen() {
 
     // Table/field shape round-trips via the schema's own system table...
     assert_eq!(before.name, after.name);
-    assert_eq!(after.fields.len(), 2);
+    assert_eq!(after.fields().len(), 2);
     assert_eq!(field(&after, "id").datatype, DataType::Integer);
     assert_eq!(field(&after, "email").datatype, DataType::Str(50));
 

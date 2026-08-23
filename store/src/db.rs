@@ -18,6 +18,8 @@ use crate::logger::Record;
 use crate::memfile::MemFile;
 use crate::page::Page;
 use crate::table::Table;
+use crate::page::PageId;
+use crate::run::{Run, RunCursor};
 use crate::table::TableIdType;
 use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
@@ -843,6 +845,21 @@ where
         txn: &Transaction,
     ) -> Result<TableCursor<F>, StoreError> {
         TableCursor::new(Arc::clone(self), tid, Some(txn.id()))
+    }
+
+    /// Starts a new, empty Run — an append-only, unkeyed page chain for
+    /// query-execution scratch space (sort runs, hash-join/aggregation
+    /// spill partitions, ...). Unlike a table, a Run needs no MVCC/txn
+    /// machinery, so this only needs `&self`, not `&Arc<Self>`.
+    pub fn create_run(&self) -> Result<Run<F>, StoreError> {
+        Run::create(self.buffer.clone())
+    }
+
+    /// Reads back a Run written earlier (by this Db instance or another
+    /// owner) from its head page — e.g. a merge step reading several
+    /// already-written input runs.
+    pub fn open_run(&self, head: PageId) -> Result<RunCursor<F>, StoreError> {
+        RunCursor::new(self.buffer.clone(), head)
     }
 
     pub fn range_scan(
@@ -1743,6 +1760,95 @@ mod tests {
         // The name must still be free after reopen too — proves the
         // generator removal itself persisted, not just the table list.
         db2.create_table("rows".to_string()).unwrap();
+
+        FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    // ── runs ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_run_append_and_cursor_preserves_order_across_pages() {
+        // Small page size so a handful of records forces at least one
+        // page-chain extension, not just a single-page happy path.
+        let db: Arc<TestDB> = TestDB::create_with_page_size("run_order.db", 512).unwrap();
+        let mut run = db.create_run().unwrap();
+        let records: Vec<Vec<u8>> = (0..50).map(|i: u32| i.to_be_bytes().to_vec()).collect();
+        for r in &records {
+            run.append(r).unwrap();
+        }
+
+        let mut cursor = db.open_run(run.head()).unwrap();
+        let mut read_back = Vec::new();
+        while let Some(t) = cursor.next().unwrap() {
+            read_back.push(t.data().to_vec());
+        }
+        assert_eq!(&read_back, &records, "must read back in append order, not sorted");
+    }
+
+    #[test]
+    fn test_open_run_reads_a_run_by_head_page_id_alone() {
+        // A reader doesn't need the original Run handle — just the head
+        // page id, e.g. a later merge step reading runs an earlier phase
+        // wrote and has since dropped.
+        let db: Arc<TestDB> = TestDB::create_with_page_size("run_by_head.db", 512).unwrap();
+        let mut run = db.create_run().unwrap();
+        run.append(b"a").unwrap();
+        run.append(b"b").unwrap();
+        let head = run.head();
+        drop(run);
+
+        let mut cursor = db.open_run(head).unwrap();
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"a");
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"b");
+        assert!(cursor.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_run_free_releases_every_page_in_the_chain() {
+        let db: Arc<TestDB> = TestDB::create_with_page_size("run_free.db", 512).unwrap();
+        let mut run = db.create_run().unwrap();
+        for i in 0..50u32 {
+            run.append(&i.to_be_bytes()).unwrap();
+        }
+        let head = run.head();
+        assert_eq!(db.buffer.get_free_pages().len(), 0);
+
+        run.free().unwrap();
+
+        assert!(
+            db.buffer.get_free_pages().contains(&head),
+            "freeing a run must reclaim its own head page, not just later ones"
+        );
+        assert!(
+            db.buffer.get_free_pages().len() >= 2,
+            "a 50-record run at a 512-byte page size must span more than one page"
+        );
+    }
+
+    #[test]
+    fn test_run_survives_close_and_reopen() {
+        // Not a durability guarantee for a Run's own bookkeeping (see
+        // Run's own doc comment) — just confirms RunPage's registered
+        // PageContentKind round-trips through a real close/reopen like
+        // any other page content would.
+        let db_name = temp_db_path("run_close_reopen");
+        FileDB::delete(&db_name).unwrap_or_default();
+
+        let db = FileDB::create(&db_name).unwrap();
+        let mut run = db.create_run().unwrap();
+        run.append(b"hello").unwrap();
+        run.append(b"world").unwrap();
+        let head = run.head();
+        // Run holds its own Arc<PageBuffer<F>> clone (like BPlusTree) —
+        // Db::close needs unique ownership, same as with a live cursor.
+        drop(run);
+        let (f, u, r) = db.close().unwrap();
+
+        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        let mut cursor = db2.open_run(head).unwrap();
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"hello");
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"world");
+        assert!(cursor.next().unwrap().is_none());
 
         FileDB::delete(&db_name).unwrap_or_default();
     }

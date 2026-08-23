@@ -44,6 +44,7 @@ pub mod named_memfile;
 pub mod cursor;
 mod page;
 pub mod pages;
+pub mod run;
 pub mod table;
 pub mod tables;
 pub mod tuple;

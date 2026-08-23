@@ -230,6 +230,23 @@ impl Page {
         Self::new(size, INDEX_PAGE, Some(record_size))
     }
 
+    // A Run's pages (crate::run::Run) — like new_data, an ordinary
+    // variable-length data page with no record_size, but backed by
+    // RunPage (arrival-order, unkeyed) instead of AnyTuplePage
+    // (id-sorted, keyed) — see RunPage's own doc comment for why that
+    // distinction matters. Goes through new_with_content, not new's own
+    // record_size-driven branch, the same way any other registered
+    // custom content kind would.
+    pub(crate) fn new_run(size: DBSizeType) -> Self {
+        Self::new_with_content(
+            size,
+            NONE,
+            None,
+            Box::new(crate::pages::run::RunPage::new()),
+            PageContentKind::RUN_TUPLE,
+        )
+    }
+
     fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
         let (pt, content_kind): (Box<dyn PageTuple>, PageContentKind) =
             if let Some(record_size) = record_size {

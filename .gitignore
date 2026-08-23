@@ -3,3 +3,4 @@
 .DS_Store
 store/profile.json.gz
 squeal-cli/history.txt
+history.txt

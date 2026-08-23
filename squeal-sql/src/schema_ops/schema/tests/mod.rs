@@ -13,6 +13,12 @@
 //   and multi-row/multi-index atomicity on failure. Statement::execute's
 //   INSERT *dispatch* (parsing, result reporting) is tested in stmt.rs
 //   instead, same split as CREATE TABLE.
+// - `alter`: Schema::add_column/drop_column/rename_column and
+//   SqlTable::reproject — schema versioning, default backfill for rows
+//   written before a column existed, and the "column used by an index"
+//   guard. ALTER TABLE *dispatch* (parsing, result reporting) is tested
+//   in stmt.rs, same split as CREATE TABLE/INSERT.
+mod alter;
 mod contract;
 mod dml;
 mod mapping;
@@ -63,10 +69,32 @@ fn create_and_fetch(sql: &str, table_name: &str) -> SqlTable {
 }
 
 fn field<'a>(t: &'a SqlTable, name: &str) -> &'a crate::table::Field {
-    t.fields
+    t.fields()
         .iter()
         .find(|f| f.name == name)
         .unwrap_or_else(|| panic!("no field named {name:?} in {t:#?}"))
+}
+
+// Only the close/reopen persistence tests need this (contract's own
+// and alter's): they construct their own file-backed Schema directly
+// (not through the shared conn()/execute() helpers, which are
+// MemFile-only) and are testing Schema/Database's own persistence
+// guarantees specifically — independent of whichever higher-level
+// dispatcher (Statement) calls into create_table.
+fn try_create_table_directly(
+    s: &Arc<Schema<store::named_memfile::NamedMemFile>>,
+    sql: &str,
+) -> Result<(), SchemaError> {
+    let stmts =
+        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect, sql).unwrap();
+    let sqlparser::ast::Statement::CreateTable(c) = &stmts[0] else {
+        panic!("expected a CREATE TABLE statement, got: {stmts:?}");
+    };
+    s.create_table(SqlTable::from_sql(s, c.clone())?)
+}
+
+fn create_table_directly(s: &Arc<Schema<store::named_memfile::NamedMemFile>>, sql: &str) {
+    try_create_table_directly(s, sql).unwrap();
 }
 
 fn temp_schema_path(tag: &str) -> String {

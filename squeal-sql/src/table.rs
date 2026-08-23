@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable};
 use store::db::DBFile;
 use store::table::TableIdType;
-use store::valueitem::ValueItem;
+use store::valueitem::{IndexKey, ValueItem};
 
 use crate::constant::MAX_TABLE_NAME_LEN;
 use crate::datatype::DataType;
@@ -28,13 +28,47 @@ const ENTRY_OVERHEAD_BYTES: usize = 64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlTable {
     pub(crate) name: String,
-    pub(crate) fields: Vec<Arc<Field>>,
+    // Append-only history of this table's column layout — index 0 is the
+    // shape CREATE TABLE built, each ALTER TABLE (see alter_add_column/
+    // alter_drop_column/alter_rename_column) pushes one more, never
+    // mutating an earlier entry. This is what lets ALTER avoid rewriting
+    // every existing row: an old row stays encoded against whichever
+    // version was current when it was written (see VersionedRow), and
+    // gets reprojected onto the table's current version — the last
+    // entry here — only at read time (see Schema::select_all).
+    pub(crate) versions: Vec<SchemaVersion>,
     pub(crate) indices: Vec<SqlIndex>,
     // The table's own row-storage backing table — distinct from each
     // index's own db_table_id below. Set by Schema::create_table once
     // the backing table actually exists; TableIdType::none() until then
     // (mirrors SqlIndex::db_table_id's own convention).
     pub(crate) db_table_id: TableIdType,
+    // The next never-yet-used Field::id — starts at the initial column
+    // count (see TableBuilder::build) and only ever increases, one per
+    // alter_add_column, even across a column that's since been dropped:
+    // ids are never reused, so a dropped-then-re-added column of the
+    // same name still gets a fresh id and can't be confused with the
+    // original by reproject.
+    pub(crate) next_field_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaVersion {
+    pub(crate) fields: Vec<Arc<Field>>,
+}
+
+// What Schema::insert_rows_in_txn actually writes as a row's stored
+// payload, replacing the bare IndexKey it used before ALTER TABLE
+// existed: `values` alone is positional with no record of which
+// SchemaVersion that position order matches, so once a table can have
+// more than one version, decoding needs to know which one a given row
+// was encoded under. New inserts always stamp SqlTable::version()
+// (the current/latest version); older rows keep whatever version was
+// current when they were written.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct VersionedRow {
+    pub(crate) version: u32,
+    pub(crate) values: IndexKey,
 }
 
 /* #[derive(Debug, Clone)]
@@ -61,9 +95,27 @@ struct IndexHolder {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Field {
+    // A permanent identity, distinct from `name` and from this field's
+    // position in any particular SchemaVersion — assigned once (see
+    // SqlTable::next_field_id) and never reused or changed afterward,
+    // including across a RENAME COLUMN. This is what lets
+    // SqlTable::reproject bridge a renamed column between an old row's
+    // stored version and the table's current one: matching by `name`
+    // alone can't, since the whole point of a rename is that the name
+    // differs between those two versions.
+    pub(crate) id: u32,
     pub(crate) name: String,
     pub(crate) datatype: DataType,
     pub(crate) nullable: bool,
+    // A literal value, not a re-evaluated expression — captured once,
+    // at CREATE TABLE / ALTER TABLE ADD COLUMN time. Used two ways: (1)
+    // an ordinary INSERT that omits this column falls back to it (see
+    // rows_from_insert), same as any other database's DEFAULT; (2)
+    // reprojecting a row written under an older SchemaVersion that
+    // predates this column falls back to it too (see
+    // SqlTable::reproject) — the "backfill" ALTER TABLE ADD COLUMN
+    // needs without rewriting existing rows.
+    pub(crate) default: Option<ValueItem>,
 }
 
 pub struct TableBuilder {
@@ -73,18 +125,45 @@ pub struct TableBuilder {
 }
 
 impl Field {
-    pub fn new(name: String, datatype: DataType, nullable: bool) -> Result<Field, SchemaError> {
+    // `id` starts at 0, a placeholder — Field::new/TryFrom<&ColumnDef>
+    // build a field's *content* without knowing its permanent id yet,
+    // since that depends on which table it ends up in and (for ALTER
+    // TABLE ADD COLUMN) that table's current next_field_id, neither of
+    // which is available this early. Callers that actually place a
+    // field into a table (TableBuilder::build, SqlTable::alter_add_column)
+    // must call with_id afterward to assign the real one.
+    pub fn new(
+        name: String,
+        datatype: DataType,
+        nullable: bool,
+        default: Option<ValueItem>,
+    ) -> Result<Field, SchemaError> {
         match datatype {
             DataType::Blob(l) | DataType::Str(l) if l > 4 * 1024 * 1024 => {
                 return Err(SchemaError::UserError("Max field size is 4MB.".into()));
             }
             _ => {}
         }
+        if let Some(d) = &default
+            && *d == ValueItem::Null
+            && !nullable
+        {
+            return Err(SchemaError::UserError(format!(
+                "Column {name:?} is NOT NULL and cannot DEFAULT to NULL"
+            )));
+        }
         Ok(Self {
+            id: 0,
             name,
             nullable,
             datatype,
+            default,
         })
+    }
+
+    pub(crate) fn with_id(mut self, id: u32) -> Self {
+        self.id = id;
+        self
     }
 }
 
@@ -178,17 +257,24 @@ impl TableBuilder {
             }
         }
 
+        // Ids assigned by position here, 0..N — this is the one place a
+        // brand-new table's fields get their permanent identity (see
+        // Field::id); every later ADD COLUMN continues from
+        // next_field_id instead of restarting at 0.
         let fields = self
             .fields
             .iter()
-            .map(|f| Arc::new(f.clone()))
+            .enumerate()
+            .map(|(i, f)| Arc::new(f.clone().with_id(i as u32)))
             .collect::<Vec<_>>();
+        let next_field_id = fields.len() as u32;
 
         let mut table = SqlTable {
             name: self.name.as_ref().unwrap().clone(),
-            fields,
+            versions: vec![SchemaVersion { fields }],
             indices: vec![],
             db_table_id: TableIdType::none(),
+            next_field_id,
         };
         for i in &self.indices {
             let mut index = SqlIndex {
@@ -199,7 +285,7 @@ impl TableBuilder {
                 db_table_id: TableIdType::none(),
             };
             for index_f in &i.fields {
-                if let Some(f) = table.fields.iter().find(|f| f.name == *index_f) {
+                if let Some(f) = table.fields().iter().find(|f| f.name == *index_f) {
                     index.fields.push(f.clone());
                 }
             }
@@ -219,13 +305,20 @@ impl TryFrom<&ColumnDef> for Field {
             .options
             .iter()
             .any(|o| matches!(o.option, ColumnOption::NotNull));
+        let datatype: DataType = value.data_type.clone().into();
+        let default = value
+            .options
+            .iter()
+            .find_map(|o| match &o.option {
+                ColumnOption::Default(expr) => Some(expr),
+                _ => None,
+            })
+            .map(|expr| expr_to_value_item(expr, datatype))
+            .transpose()?;
         // Routed through Field::new (not a struct literal) so its size-cap
-        // validation actually runs for SQL-parsed columns.
-        Field::new(
-            value.name.value.clone(),
-            value.data_type.clone().into(),
-            nullable,
-        )
+        // and NOT-NULL-vs-DEFAULT-NULL validation actually run for
+        // SQL-parsed columns.
+        Field::new(value.name.value.clone(), datatype, nullable, default)
     }
 }
 
@@ -313,19 +406,211 @@ impl SqlTable {
         self.indices.iter().find(|i| i.is_primary)
     }
 
+    // The table's current column layout — the last entry in `versions`.
+    // Every place that used to read a flat `fields` list (row_size,
+    // field_position, rows_from_insert, SELECT's own column list, ...)
+    // goes through this now; it's always what "the table's columns"
+    // means outside of decoding an old row (see reproject, the one
+    // place that deliberately looks at an *older* version instead).
+    pub(crate) fn fields(&self) -> &[Arc<Field>] {
+        &self
+            .versions
+            .last()
+            .expect("a table always has at least one schema version")
+            .fields
+    }
+
+    // This table's current version number — 0 for a table that's never
+    // been ALTERed, incrementing by one per ALTER TABLE. Stamped onto
+    // every row written from here on (see VersionedRow) so a later
+    // reproject knows which version's field layout the row's positional
+    // values match.
+    pub(crate) fn version(&self) -> u32 {
+        (self.versions.len() - 1) as u32
+    }
+
+    fn fields_at(&self, version: u32) -> Option<&[Arc<Field>]> {
+        self.versions.get(version as usize).map(|v| v.fields.as_slice())
+    }
+
+    // Decodes a stored row back into ValueItems in the table's CURRENT
+    // field order, regardless of which (possibly older) version it was
+    // written under — the read side of ALTER TABLE's whole point: a row
+    // written before an ADD/DROP/RENAME COLUMN is never rewritten, so
+    // this has to bridge whatever version it actually has to whatever
+    // version the table is on now, every time it's read.
+    //   - a field present in both versions: carried over positionally
+    //     from the stored row.
+    //   - a field only in the current version (added after this row was
+    //     written): falls back to that field's own default, or NULL —
+    //     the same "backfill" a real ALTER TABLE ADD COLUMN gives you
+    //     without rewriting existing rows.
+    //   - a field only in the row's stored version (dropped since):
+    //     simply not carried over — the current version doesn't ask for
+    //     it.
+    pub(crate) fn reproject(&self, row: &VersionedRow) -> Result<Vec<ValueItem>, SchemaError> {
+        let stored_fields = self.fields_at(row.version).ok_or_else(|| {
+            SchemaError::UnknownError(format!(
+                "row was written under schema version {} but table {:?} has no such version",
+                row.version, self.name
+            ))
+        })?;
+        let stored_values = row.values.values();
+        if stored_values.len() != stored_fields.len() {
+            return Err(SchemaError::UnknownError(format!(
+                "row has {} value(s) but schema version {} of table {:?} declared {} field(s)",
+                stored_values.len(),
+                row.version,
+                self.name,
+                stored_fields.len()
+            )));
+        }
+        Ok(self
+            .fields()
+            .iter()
+            .map(|f| {
+                // Matched by Field::id, not name — a renamed column's
+                // stored (old) name and current name legitimately
+                // differ, but its id never changes across a rename, so
+                // this still finds it.
+                match stored_fields.iter().position(|sf| sf.id == f.id) {
+                    Some(pos) => stored_values[pos].clone(),
+                    None => f.default.clone().unwrap_or(ValueItem::Null),
+                }
+            })
+            .collect())
+    }
+
+    // Appends a new schema version with `field` added to the end of the
+    // current column order. A NOT NULL column needs a DEFAULT here even
+    // though CREATE TABLE doesn't require one for a NOT NULL column —
+    // CREATE TABLE has no pre-existing rows to backfill; ALTER TABLE
+    // might, and reproject needs *something* to hand back for every row
+    // written before this column existed.
+    pub(crate) fn alter_add_column(&mut self, field: Field) -> Result<(), SchemaError> {
+        if self.fields().iter().any(|f| f.name == field.name) {
+            return Err(SchemaError::UserError(format!(
+                "Duplicate field name: {}",
+                field.name
+            )));
+        }
+        if !field.nullable && field.default.is_none() {
+            return Err(SchemaError::UserError(format!(
+                "Column {:?} is NOT NULL — ADD COLUMN on a table that may already have rows \
+                 needs a DEFAULT to backfill existing rows with",
+                field.name
+            )));
+        }
+        let mut fields = self.fields().to_vec();
+        fields.push(Arc::new(field.with_id(self.next_field_id)));
+        self.next_field_id += 1;
+        self.versions.push(SchemaVersion { fields });
+        Ok(())
+    }
+
+    // Appends a new schema version with `name` removed. Refuses a
+    // column that's part of any index (including the PRIMARY KEY, which
+    // is just an index with is_primary set) — dropping it first, per
+    // the equivalent restriction on renaming below, keeps every index's
+    // own `fields` list (an Arc<Field> shared with the table's own
+    // version-0 field, not re-derived per version) trivially still
+    // correct without needing its own rewrite-on-ALTER logic.
+    pub(crate) fn alter_drop_column(&mut self, name: &str) -> Result<(), SchemaError> {
+        if !self.fields().iter().any(|f| f.name == name) {
+            return Err(SchemaError::UserError(format!(
+                "Table {:?} has no column named {name:?}",
+                self.name
+            )));
+        }
+        if let Some(idx) = self.index_referencing(name) {
+            return Err(SchemaError::UserError(format!(
+                "Column {name:?} is used by index {:?} — drop the index first",
+                idx.name.clone().unwrap_or_else(|| "<unnamed>".into())
+            )));
+        }
+        let fields: Vec<Arc<Field>> = self
+            .fields()
+            .iter()
+            .filter(|f| f.name != name)
+            .cloned()
+            .collect();
+        if fields.is_empty() {
+            return Err(SchemaError::UserError(
+                "Cannot drop the last remaining column".into(),
+            ));
+        }
+        self.versions.push(SchemaVersion { fields });
+        Ok(())
+    }
+
+    // Appends a new schema version with `old_name` renamed to
+    // `new_name` — same physical position and value, so unlike ADD/DROP
+    // this never needs reproject's default/omit handling; every version
+    // back to whichever one first introduced the column still decodes
+    // fine, just under its old name at write time. Refuses a column
+    // used by an index for the same reason alter_drop_column does.
+    pub(crate) fn alter_rename_column(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), SchemaError> {
+        if !self.fields().iter().any(|f| f.name == old_name) {
+            return Err(SchemaError::UserError(format!(
+                "Table {:?} has no column named {old_name:?}",
+                self.name
+            )));
+        }
+        if self.fields().iter().any(|f| f.name == new_name) {
+            return Err(SchemaError::UserError(format!(
+                "Duplicate field name: {new_name}"
+            )));
+        }
+        if let Some(idx) = self.index_referencing(old_name) {
+            return Err(SchemaError::UserError(format!(
+                "Column {old_name:?} is used by index {:?} — drop the index first",
+                idx.name.clone().unwrap_or_else(|| "<unnamed>".into())
+            )));
+        }
+        let fields: Vec<Arc<Field>> = self
+            .fields()
+            .iter()
+            .map(|f| {
+                if f.name == old_name {
+                    Arc::new(Field {
+                        id: f.id,
+                        name: new_name.to_string(),
+                        datatype: f.datatype,
+                        nullable: f.nullable,
+                        default: f.default.clone(),
+                    })
+                } else {
+                    f.clone()
+                }
+            })
+            .collect();
+        self.versions.push(SchemaVersion { fields });
+        Ok(())
+    }
+
+    fn index_referencing(&self, field_name: &str) -> Option<&SqlIndex> {
+        self.indices
+            .iter()
+            .find(|i| i.fields.iter().any(|f| f.name == field_name))
+    }
+
     // Every field's byte budget, summed (plus ENTRY_OVERHEAD_BYTES —
     // see its own comment) — the row-storage table's own
     // index_entry_size, mirroring SqlIndex::size() (indexed fields only)
     // but over the whole row, since the full row is what's stored there.
     pub(crate) fn row_size(&self) -> usize {
-        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
+        self.fields().iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
     }
 
     // The position of `field` within this table's own declared field
     // order — used to pull a PRIMARY KEY/index's values back out of a
     // full row (built in that same order by rows_from_insert).
     fn field_position(&self, field: &Field) -> Option<usize> {
-        self.fields.iter().position(|f| f.name == field.name)
+        self.fields().iter().position(|f| f.name == field.name)
     }
 
     // Extracts just the values for `fields` (e.g. a PRIMARY KEY or other
@@ -356,14 +641,14 @@ impl SqlTable {
         insert: &sqlparser::ast::Insert,
     ) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
         let target_fields: Vec<&Arc<Field>> = if insert.columns.is_empty() {
-            self.fields.iter().collect()
+            self.fields().iter().collect()
         } else {
             insert
                 .columns
                 .iter()
                 .map(|c| {
                     let name = c.to_string().to_lowercase();
-                    self.fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                    self.fields().iter().find(|f| f.name == name).ok_or_else(|| {
                         SchemaError::UserError(format!(
                             "Table {:?} has no column named {name:?}",
                             self.name
@@ -406,10 +691,19 @@ impl SqlTable {
                 }
                 by_name.insert(field.name.as_str(), item);
             }
-            let mut full_row = Vec::with_capacity(self.fields.len());
-            for f in &self.fields {
+            let fields = self.fields();
+            let mut full_row = Vec::with_capacity(fields.len());
+            for f in fields {
                 match by_name.remove(f.name.as_str()) {
                     Some(v) => full_row.push(v),
+                    // DEFAULT applies to any omitted column, not just a
+                    // backfilled pre-ALTER row (see Field::default) —
+                    // checked before the plain-NULL fallback so a NOT
+                    // NULL column with a DEFAULT still works via an
+                    // explicit column list that leaves it out.
+                    None if f.default.is_some() => {
+                        full_row.push(f.default.clone().expect("checked Some above"))
+                    }
                     None if f.nullable => full_row.push(ValueItem::Null),
                     None => {
                         return Err(SchemaError::UserError(format!(

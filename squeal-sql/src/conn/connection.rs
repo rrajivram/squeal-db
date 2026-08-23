@@ -191,6 +191,54 @@ where
         Statement::new(sql, self.clone())
     }
 
+    // Cleanly shuts down the database this connection is pointed at —
+    // flushes every loaded schema's metadata and truncates the WAL (see
+    // Database::close), and removes both this connection and the
+    // database from the owning ConnectionManager's registries so a
+    // later connect() to the same name reopens fresh rather than
+    // reusing one that's already shut down. Consumes `self`, matching
+    // Database::close's own "closing takes ownership" shape.
+    //
+    // Fails (via Database::close's own error) if any OTHER connection
+    // still references the same database: closing out from under a
+    // connection someone else is still using would be silently
+    // destructive, not a case this should paper over.
+    pub fn close(self: Arc<Self>) -> Result<(), SchemaError> {
+        let mgr = self.mgr.clone();
+        mgr.active_conns.write().remove(&self);
+        let db_name = self.database.read().name().to_string();
+        // Drop this connection's own Arc<Database> clone (held in its
+        // `database` field) before checking the reference count below —
+        // Database::close needs unique ownership, so every other
+        // reference has to be gone first.
+        drop(self);
+
+        // Held across the strong-count check and the possible reinsert
+        // below, not just the remove: without it, a concurrent connect()
+        // to the same name could interleave between them and either see
+        // the database briefly missing or race the reinsert.
+        let mut open_databases = mgr.open_databases.write();
+        let database = open_databases.remove(&db_name).ok_or_else(|| {
+            SchemaError::UnknownError(format!("database {db_name:?} is not open"))
+        })?;
+        // Database::close's own Arc::try_unwrap doesn't hand the Arc
+        // back on failure — it just drops the failed clone and reports
+        // an error, which would leave `database` gone from this map
+        // even though some other connection still legitimately has it
+        // open. Checked here instead, before ever calling close, so a
+        // failure is a clean no-op: the registry never disagrees with
+        // reality.
+        if Arc::strong_count(&database) > 1 {
+            open_databases.insert(db_name, database);
+            return Err(SchemaError::UnknownError(
+                "cannot close: another connection still has this database open".into(),
+            ));
+        }
+        drop(open_databases);
+        database.close()?;
+        Ok(())
+    }
+
     pub(crate) fn begin_transaction(self: &Arc<Self>) -> Result<(), SchemaError> {
         let mut slot = self.current_txn.write();
         if slot.is_some() {

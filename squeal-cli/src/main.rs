@@ -16,7 +16,9 @@ enum Backend {
 }
 
 fn main() -> Result<()> {
-    let db_path = std::env::args().nth(1).unwrap_or_else(|| "squeal.db".to_string());
+    let db_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "squeal.db".to_string());
     let mut rl = DefaultEditor::new()?;
 
     // Asked interactively rather than via a CLI flag — a flag has to be
@@ -97,6 +99,9 @@ where
                 if line.is_empty() {
                     continue;
                 }
+                if line == "exit" {
+                    break;
+                }
                 rl.add_history_entry(line)?;
                 run(&conn, line);
             }
@@ -115,6 +120,14 @@ where
         }
     }
     rl.save_history(HISTORY_FILE)?;
+    // Flushes every loaded schema's metadata and truncates the WAL (see
+    // Connection::close/Database::close) — without this, a table
+    // created (or a row inserted) in one squeal-cli run was never
+    // visible to the next one against the same file. A failure here is
+    // reported, not fatal: the process is exiting either way.
+    if let Err(e) = conn.close() {
+        eprintln!("warning: could not cleanly close the database: {e}");
+    }
     Ok(())
 }
 

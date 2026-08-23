@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::StoreError,
-    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage},
+    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage, run::RunPage},
 };
 
 // Discriminant persisted per-page (see PageHeader's own field) identifying
@@ -22,6 +22,11 @@ impl PageContentKind {
     // choice explicit and extensible going forward.
     pub const ANY_TUPLE: PageContentKind = PageContentKind(0);
     pub const FIXED_TUPLE: PageContentKind = PageContentKind(1);
+    // Not a legacy on-disk kind like the two above — added alongside
+    // crate::run::Run, but pre-registered in builtin() the same way
+    // since a Run's pages are first-class store content now, not a
+    // per-caller custom registration.
+    pub const RUN_TUPLE: PageContentKind = PageContentKind(2);
 }
 
 pub type PageContentFactory =
@@ -65,6 +70,12 @@ impl PageContentRegistry {
             .register(
                 PageContentKind::FIXED_TUPLE,
                 Arc::new(|bytes| Ok(Box::new(FixedTuplePage::from_bytes(bytes)?) as Box<dyn PageTuple>)),
+            )
+            .expect("built-in kinds register exactly once");
+        registry
+            .register(
+                PageContentKind::RUN_TUPLE,
+                Arc::new(|bytes| Ok(Box::new(RunPage::from_bytes(bytes)?) as Box<dyn PageTuple>)),
             )
             .expect("built-in kinds register exactly once");
         registry
@@ -142,7 +153,7 @@ mod tests {
         let mut registry = PageContentRegistry::builtin();
         registry
             .register(
-                PageContentKind(2),
+                PageContentKind(3),
                 Arc::new(|bytes| Ok(Box::new(AnyTuplePage::from_bytes(bytes)?) as Box<dyn PageTuple>)),
             )
             .unwrap();
@@ -150,7 +161,7 @@ mod tests {
         let mut page = AnyTuplePage::new();
         page.add(Tuple::new(7, b"world")).unwrap();
         let bytes = PageTuple::to_bytes(&page).unwrap();
-        let resolved = registry.resolve(PageContentKind(2), &bytes).unwrap();
+        let resolved = registry.resolve(PageContentKind(3), &bytes).unwrap();
         assert_eq!(resolved.to_bytes().unwrap(), bytes);
     }
 
