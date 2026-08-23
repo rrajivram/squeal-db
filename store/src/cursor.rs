@@ -7,7 +7,7 @@ use crate::{
     table::TableIdType,
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple},
-    txn::Transaction,
+    txn::{Transaction, TransactionId},
 };
 
 pub trait Cursor {
@@ -15,12 +15,38 @@ pub trait Cursor {
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError>;
 }
 
+// A scan needs a reader TransactionId for find_visible_to, but who keeps
+// that transaction registered as "active" (so a concurrent commit's
+// discard_or_defer_undo still retains what the scan might still need to
+// walk back to) differs by caller:
+//   - Owned: no transaction was supplied, so the cursor began one of its
+//     own and must hold onto the RAII guard itself for its whole
+//     lifetime — dropping it early would move it to `aborting`
+//     prematurely, before the scan is done needing its snapshot honored.
+//   - Borrowed: the caller supplied an already-open transaction (e.g. an
+//     explicit BEGIN) that they keep alive themselves for at least as
+//     long as the scan runs — the cursor only needs its id, not
+//     ownership, since the caller's own guard is what keeps it active.
+enum ScanTxn {
+    Owned(Transaction),
+    Borrowed(TransactionId),
+}
+
+impl ScanTxn {
+    fn id(&self) -> TransactionId {
+        match self {
+            ScanTxn::Owned(t) => t.id(),
+            ScanTxn::Borrowed(id) => id.clone(),
+        }
+    }
+}
+
 pub struct TableCursor<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     table: TableIdType,
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
-    transaction: Transaction,
+    transaction: ScanTxn,
 }
 
 pub struct RangeCursor<F: DBFile + 'static> {
@@ -48,9 +74,12 @@ where
     pub(crate) fn new(
         db: Arc<Db<F>>,
         table: TableIdType,
-        transaction: Option<Transaction>,
+        transaction: Option<TransactionId>,
     ) -> Result<Self, StoreError> {
-        let transaction = transaction.unwrap_or(db.begin()?);
+        let transaction = match transaction {
+            Some(id) => ScanTxn::Borrowed(id),
+            None => ScanTxn::Owned(db.begin()?),
+        };
         let current_page = db
             .table_by_id(table)?
             .next_data_page(None)?

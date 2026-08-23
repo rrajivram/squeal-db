@@ -6,7 +6,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
-use store::{db::DBFile, txn::TransactionId};
+use store::{db::DBFile, txn::Transaction};
 use uuid::Uuid;
 
 use crate::{error::SchemaError, schema_ops::database::Database, schema_ops::schema::Schema, stmt::Statement};
@@ -44,10 +44,15 @@ pub struct Connection<F: DBFile + 'static> {
     // was fixed at construction.
     database: RwLock<Arc<Database<F>>>,
     current_schema: RwLock<Option<Arc<Schema<F>>>>,
-    // Not yet wired to anything (no transaction support lands until
-    // row-level statement execution does) — carried forward from the
-    // old per-schema ConnectedSchema so it doesn't need re-adding later.
-    current_txn: RwLock<Option<TransactionId>>,
+    // Set by BEGIN/START TRANSACTION, cleared by COMMIT/ROLLBACK (see
+    // Statement::execute's handling of those). While set, statements
+    // that support it (currently just INSERT — see
+    // Schema::insert_rows' own `txn` parameter) run against this shared
+    // transaction instead of opening and auto-committing their own.
+    // DDL (CREATE TABLE/DATABASE/SCHEMA) and USE always still manage
+    // their own transaction regardless of this — deliberately out of
+    // scope for this first pass.
+    current_txn: RwLock<Option<Transaction>>,
 }
 
 impl<F> ConnectionManager<F>
@@ -55,7 +60,12 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn new() -> Self {
+    // Public (not just pub(crate)) so callers outside this crate can
+    // build a manager over a backend other than the File-pinned process
+    // singleton (see ConnectionManager::<File>::get_manager) — e.g.
+    // squeal-cli building a NamedMemFile-backed manager for an
+    // in-memory session.
+    pub fn new() -> Self {
         Self {
             active_conns: RwLock::new(HashSet::new()),
             open_databases: RwLock::new(HashMap::new()),
@@ -104,6 +114,16 @@ where
             .write()
             .insert(name.to_string(), db.clone());
         Ok(db)
+    }
+}
+
+impl<F> Default for ConnectionManager<F>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -169,6 +189,42 @@ where
 
     pub fn create_statement(self: Arc<Self>, sql: &str) -> Result<Statement<F>, SchemaError> {
         Statement::new(sql, self.clone())
+    }
+
+    pub(crate) fn begin_transaction(self: &Arc<Self>) -> Result<(), SchemaError> {
+        let mut slot = self.current_txn.write();
+        if slot.is_some() {
+            return Err(SchemaError::TransactionAlreadyActive);
+        }
+        *slot = Some(self.database.read().begin()?);
+        Ok(())
+    }
+
+    pub(crate) fn commit_transaction(self: &Arc<Self>) -> Result<(), SchemaError> {
+        let txn = self
+            .current_txn
+            .write()
+            .take()
+            .ok_or(SchemaError::NoActiveTransaction)?;
+        self.database.read().commit(txn)
+    }
+
+    pub(crate) fn rollback_transaction(self: &Arc<Self>) -> Result<(), SchemaError> {
+        let txn = self
+            .current_txn
+            .write()
+            .take()
+            .ok_or(SchemaError::NoActiveTransaction)?;
+        self.database.read().rollback(txn)
+    }
+
+    // Runs `f` with a reference to the currently-open explicit
+    // transaction, if any — None in autocommit mode (no BEGIN yet
+    // issued), in which case callers fall back to managing their own
+    // transaction, same as before explicit transactions existed.
+    pub(crate) fn with_current_txn<R>(&self, f: impl FnOnce(Option<&Transaction>) -> R) -> R {
+        let guard = self.current_txn.read();
+        f(guard.as_ref())
     }
 }
 

@@ -159,6 +159,53 @@ fn test_insert_rejects_an_unknown_column_in_explicit_list() {
 }
 
 #[test]
+fn test_select_all_returns_every_row_with_column_names() {
+    let conn = conn();
+    execute(
+        &conn,
+        "create table users (id integer not null, name varchar(50), primary key(id))",
+    )
+    .unwrap();
+    execute(&conn, "insert into users values (1, 'alice')").unwrap();
+    execute(&conn, "insert into users values (2, 'bob')").unwrap();
+
+    let s = conn.current_schema().unwrap();
+    let result = s.select_all("users", None).unwrap();
+    assert_eq!(result.columns(), &["id".to_string(), "name".to_string()]);
+    let mut rows = result.rows().to_vec();
+    rows.sort_by_key(|r| match &r[0] {
+        ValueItem::Integer(i) => *i,
+        _ => panic!("expected an integer id"),
+    });
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 50))],
+            vec![ValueItem::Integer(2), ValueItem::Str(("bob".into(), 50))],
+        ]
+    );
+}
+
+#[test]
+fn test_select_all_on_an_empty_table_returns_no_rows() {
+    let conn = conn();
+    execute(&conn, "create table users (id integer not null, primary key(id))").unwrap();
+
+    let s = conn.current_schema().unwrap();
+    let result = s.select_all("users", None).unwrap();
+    assert_eq!(result.columns(), &["id".to_string()]);
+    assert!(result.rows().is_empty());
+}
+
+#[test]
+fn test_select_all_rejects_an_unknown_table() {
+    let conn = conn();
+    let s = conn.current_schema().unwrap();
+    let err = s.select_all("nope", None).unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
 fn test_insert_explicit_columns_fill_omitted_nullable_columns_with_null() {
     let conn = conn();
     execute(

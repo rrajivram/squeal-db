@@ -21,7 +21,7 @@ pub struct Statement<F: DBFile> {
     sql: String,
     stmts: Vec<sqlparser::ast::Statement>,
     conn: Arc<Connection<F>>,
-    results: Vec<ResultType<F>>,
+    results: Vec<ResultType>,
     current_result: Option<usize>,
 }
 
@@ -81,6 +81,23 @@ where
                     validate_identifier("schema name", &schema_name_string(schema_name)?)?;
                 }
                 sqlparser::ast::Statement::Insert(insert) => validate_insert(insert)?,
+                sqlparser::ast::Statement::Query(query) => {
+                    parse_select_star(query)?;
+                }
+                sqlparser::ast::Statement::StartTransaction { statements, .. }
+                    if !statements.is_empty() =>
+                {
+                    return Err(SchemaError::UserError(
+                        "BEGIN ... END blocks are not supported".into(),
+                    ));
+                }
+                sqlparser::ast::Statement::Rollback {
+                    savepoint: Some(_), ..
+                } => {
+                    return Err(SchemaError::UserError(
+                        "ROLLBACK TO SAVEPOINT is not supported".into(),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -175,8 +192,46 @@ where
                         SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
                     })?;
                     let rows = table.rows_from_insert(insert)?;
-                    let count = schema.insert_rows(&table_name, rows)?;
+                    let count = self
+                        .conn
+                        .with_current_txn(|txn| schema.insert_rows(&table_name, rows, txn))?;
                     self.results.push(ResultType::Count(count));
+                }
+                sqlparser::ast::Statement::StartTransaction { statements, .. } => {
+                    if !statements.is_empty() {
+                        return Err(SchemaError::UserError(
+                            "BEGIN ... END blocks are not supported".into(),
+                        ));
+                    }
+                    self.conn.begin_transaction()?;
+                    self.results
+                        .push(ResultType::ResultString("Transaction started".into()));
+                }
+                sqlparser::ast::Statement::Commit { .. } => {
+                    self.conn.commit_transaction()?;
+                    self.results
+                        .push(ResultType::ResultString("Transaction committed".into()));
+                }
+                sqlparser::ast::Statement::Rollback { savepoint, .. } => {
+                    if savepoint.is_some() {
+                        return Err(SchemaError::UserError(
+                            "ROLLBACK TO SAVEPOINT is not supported".into(),
+                        ));
+                    }
+                    self.conn.rollback_transaction()?;
+                    self.results
+                        .push(ResultType::ResultString("Transaction rolled back".into()));
+                }
+                sqlparser::ast::Statement::Query(query) => {
+                    let table_name = parse_select_star(query)?;
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let result_set = self
+                        .conn
+                        .with_current_txn(|txn| schema.select_all(&table_name, txn))?;
+                    self.results.push(ResultType::Result(result_set));
                 }
                 sqlparser::ast::Statement::AlterCollation(_) => {
                     todo!()
@@ -191,7 +246,7 @@ where
     // one on first call — idempotent otherwise (repeated calls return the
     // same result until get_nextresult advances it). None if there are no
     // results at all, or the cursor has been advanced past the last one.
-    pub fn get_results(&mut self) -> Result<Option<ResultType<F>>, SchemaError> {
+    pub fn get_results(&mut self) -> Result<Option<ResultType>, SchemaError> {
         let i = *self.current_result.get_or_insert(0);
         Ok(self.results.get(i).cloned())
     }
@@ -200,7 +255,7 @@ where
     // there isn't one — the cursor is left unchanged in that case, so a
     // following get_results() still returns the last valid result rather
     // than nothing.
-    pub fn get_nextresult(&mut self) -> Result<Option<ResultType<F>>, SchemaError> {
+    pub fn get_nextresult(&mut self) -> Result<Option<ResultType>, SchemaError> {
         let next = self.current_result.map_or(0, |i| i + 1);
         match self.results.get(next) {
             Some(r) => {
@@ -334,6 +389,67 @@ fn validate_insert(insert: &sqlparser::ast::Insert) -> Result<(), SchemaError> {
         }
     }
     Ok(())
+}
+
+// Deliberately strict launchpad for real relational algebra support:
+// accepts exactly "SELECT * FROM <table>" and rejects (with a specific
+// message, not silent ignoring) anything else — WITH/CTEs, ORDER BY,
+// LIMIT, locking clauses, set operations, explicit column lists, WHERE,
+// DISTINCT, HAVING, GROUP BY, joins/multiple FROM tables, and
+// subqueries/table-functions/aliases in FROM.
+fn parse_select_star(query: &sqlparser::ast::Query) -> Result<String, SchemaError> {
+    let unsupported = |what: &str| {
+        Err(SchemaError::UserError(format!(
+            "SELECT only supports \"SELECT * FROM <table>\" right now — {what} is not supported yet"
+        )))
+    };
+    if query.with.is_some() {
+        return unsupported("CTEs (WITH)");
+    }
+    if query.order_by.is_some() {
+        return unsupported("ORDER BY");
+    }
+    if query.limit_clause.is_some() {
+        return unsupported("LIMIT");
+    }
+    if !query.locks.is_empty() {
+        return unsupported("locking clauses");
+    }
+    let select = match query.body.as_ref() {
+        sqlparser::ast::SetExpr::Select(select) => select,
+        _ => return unsupported("set operations (UNION/INTERSECT/EXCEPT) or non-SELECT queries"),
+    };
+    match select.projection.as_slice() {
+        [sqlparser::ast::SelectItem::Wildcard(_)] => {}
+        _ => return unsupported("explicit column lists (only SELECT *)"),
+    }
+    if select.selection.is_some() {
+        return unsupported("WHERE");
+    }
+    if select.distinct.is_some() {
+        return unsupported("DISTINCT");
+    }
+    if select.having.is_some() {
+        return unsupported("HAVING");
+    }
+    if !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(v, _) if v.is_empty())
+    {
+        return unsupported("GROUP BY");
+    }
+    match select.from.as_slice() {
+        [sqlparser::ast::TableWithJoins { relation, joins }] if joins.is_empty() => match relation
+        {
+            sqlparser::ast::TableFactor::Table {
+                name,
+                alias: None,
+                args: None,
+                ..
+            } => Ok(name.to_string().to_lowercase()),
+            _ => unsupported("subqueries/table functions/aliases in FROM"),
+        },
+        [] => unsupported("SELECT without FROM"),
+        _ => unsupported("JOINs / multiple FROM tables"),
+    }
 }
 
 impl<F> Display for Statement<F>

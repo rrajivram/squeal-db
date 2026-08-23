@@ -7,10 +7,13 @@ use store::{
     db::{DBFile, Db},
     table::TableIdType,
     tuple::{DBIdType, Tuple},
+    txn::Transaction,
     valueitem::{IndexKey, ValueItem},
 };
 
-use crate::{constant::MAX_TABLE_NAME_LEN, error::SchemaError, table::SqlTable};
+use crate::{
+    constant::MAX_TABLE_NAME_LEN, error::SchemaError, rslt::resultset::ResultSet, table::SqlTable,
+};
 
 #[derive(Clone)]
 pub struct Schema<F: DBFile> {
@@ -268,73 +271,119 @@ where
     // entry into every index's backing table (so PRIMARY KEY/UNIQUE
     // constraints are enforced immediately, by the same duplicate-key
     // rejection store already gives every BPlusTree table for free —
-    // not deferred to some later index-build step). All in one
-    // transaction per call: a violation on any row, or any index entry,
+    // not deferred to some later index-build step).
+    //
+    // `txn`: Some when a connection has an explicit BEGIN open (see
+    // Connection::with_current_txn) — rows go into that shared
+    // transaction, and committing/rolling it back is the caller's job
+    // (via COMMIT/ROLLBACK), not this call's. None (autocommit) opens
+    // and finishes its own transaction here, same as before explicit
+    // transactions existed: a violation on any row, or any index entry,
     // rolls the whole batch back — undo-logged row-level inserts, unlike
-    // create_table's own DDL, so a plain rollback(txn) is enough here.
+    // create_table's own DDL, so a plain rollback(txn) is enough.
     pub(crate) fn insert_rows(
         self: &Arc<Self>,
         table_name: &str,
         rows: Vec<Vec<ValueItem>>,
+        txn: Option<&Transaction>,
     ) -> Result<usize, SchemaError> {
         let table = self.get_table(table_name).ok_or_else(|| {
             SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
         })?;
 
-        let txn = self.db.begin()?;
-        let res: Result<usize, SchemaError> = (|| {
-            let mut count = 0usize;
-            for row in &rows {
-                let row_key = self.row_key(&table, row)?;
-                let row_data = IndexKey::new_from(row)?;
-                self.db.insert(
-                    table.db_table_id,
-                    Tuple::new_with(
-                        row_key.clone(),
-                        &to_allocvec(&row_data)?,
-                        Some(txn.id()),
-                        None,
-                    ),
-                    &txn,
-                )?;
-
-                // What every index's entry points back to: the row's own
-                // key, itself encoded as an IndexKey — the PRIMARY KEY's
-                // own IndexKey when there is one (so an index lookup can
-                // go straight to DBIdType::Rec of it), or a single-value
-                // IndexKey wrapping the auto-generated id otherwise.
-                let identity = match &row_key {
-                    DBIdType::Rec(ik) => ik.clone(),
-                    DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
-                };
-                for index in &table.indices {
-                    let values = table.extract_field_values(&index.fields, row);
-                    let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-                    self.db.insert(
-                        index.db_table_id,
-                        Tuple::new_with(
-                            index_key,
-                            &to_allocvec(&identity)?,
-                            Some(txn.id()),
-                            None,
-                        ),
-                        &txn,
-                    )?;
+        match txn {
+            Some(txn) => self.insert_rows_in_txn(&table, &rows, txn),
+            None => {
+                let txn = self.db.begin()?;
+                match self.insert_rows_in_txn(&table, &rows, &txn) {
+                    Ok(count) => {
+                        self.db.commit(txn)?;
+                        Ok(count)
+                    }
+                    Err(e) => {
+                        self.db.rollback(txn)?;
+                        Err(e)
+                    }
                 }
-                count += 1;
-            }
-            Ok(count)
-        })();
-
-        match res {
-            Ok(count) => {
-                self.db.commit(txn)?;
-                Ok(count)
-            }
-            Err(e) => {
-                self.db.rollback(txn)?;
-                Err(e)
             }
         }
+    }
+
+    fn insert_rows_in_txn(
+        self: &Arc<Self>,
+        table: &SqlTable,
+        rows: &[Vec<ValueItem>],
+        txn: &Transaction,
+    ) -> Result<usize, SchemaError> {
+        let mut count = 0usize;
+        for row in rows {
+            let row_key = self.row_key(table, row)?;
+            let row_data = IndexKey::new_from(row)?;
+            self.db.insert(
+                table.db_table_id,
+                Tuple::new_with(
+                    row_key.clone(),
+                    &to_allocvec(&row_data)?,
+                    Some(txn.id()),
+                    None,
+                ),
+                txn,
+            )?;
+
+            // What every index's entry points back to: the row's own
+            // key, itself encoded as an IndexKey — the PRIMARY KEY's own
+            // IndexKey when there is one (so an index lookup can go
+            // straight to DBIdType::Rec of it), or a single-value
+            // IndexKey wrapping the auto-generated id otherwise.
+            let identity = match &row_key {
+                DBIdType::Rec(ik) => ik.clone(),
+                DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+            };
+            for index in &table.indices {
+                let values = table.extract_field_values(&index.fields, row);
+                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+                self.db.insert(
+                    index.db_table_id,
+                    Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
+                    txn,
+                )?;
+            }
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    // Statement dispatch for SELECT lives in Statement::execute, same
+    // split as create_table/insert_rows — this is the "SELECT * FROM
+    // <table>" launchpad: every stored row in the table's own
+    // row-storage backing table (see create_table), decoded back out of
+    // the same IndexKey encoding insert_rows wrote them in, in whatever
+    // order table_scan yields (no ORDER BY support yet — see
+    // Statement::execute's own parsing). `txn` mirrors insert_rows' own
+    // parameter: Some(_) when the caller has an explicit transaction open
+    // (see Connection::current_txn) scans under that transaction — via
+    // Db::table_scan_in_txn — so the connection can see its own
+    // not-yet-committed inserts, same as a real DB's read-your-own-writes;
+    // None scans under a fresh transaction and so only ever sees committed
+    // state, same as every other autocommit statement.
+    pub(crate) fn select_all(
+        self: &Arc<Self>,
+        table_name: &str,
+        txn: Option<&Transaction>,
+    ) -> Result<ResultSet, SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let columns = table.fields.iter().map(|f| f.name.clone()).collect();
+        let mut rows = Vec::new();
+        let mut cursor = match txn {
+            Some(txn) => self.db.table_scan_in_txn(table.db_table_id, txn)?,
+            None => self.db.table_scan(table.db_table_id)?,
+        };
+        while let Some(tuple) = cursor.next()? {
+            let row = from_bytes::<IndexKey>(tuple.data())?;
+            rows.push(row.values().to_vec());
+        }
+        Ok(ResultSet::new(columns, rows))
     }
 }

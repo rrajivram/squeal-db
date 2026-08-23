@@ -9,7 +9,7 @@ pub enum SchemaError {
     InternalError(StoreError),
     #[error("Key not found : {0}")]
     KeyNotFound(DBIdType),
-    #[error("Key not found : {0}")]
+    #[error("Duplicate key : {0}")]
     DuplicateKey(DBIdType),
     #[error("Invalid table name: {0}")]
     BadTableName(String),
@@ -27,6 +27,10 @@ pub enum SchemaError {
     SchemaNotFound(String),
     #[error("No schema selected on this connection")]
     NoSchemaSelected,
+    #[error("A transaction is already active on this connection")]
+    TransactionAlreadyActive,
+    #[error("No active transaction on this connection")]
+    NoActiveTransaction,
 }
 
 impl From<StoreError> for SchemaError {
@@ -57,5 +61,29 @@ impl From<StoreError> for SchemaError {
 impl From<postcard::Error> for SchemaError {
     fn from(value: postcard::Error) -> Self {
         SchemaError::InternalError(value.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // KeyNotFound and DuplicateKey previously shared the exact same
+    // #[error(...)] message ("Key not found : {0}") — a copy-paste bug
+    // that `matches!(err, SchemaError::DuplicateKey(_))`-style variant
+    // checks elsewhere never caught, since they don't look at Display
+    // output at all. Only surfaced by a human actually reading a printed
+    // error message (in squeal-cli). Guards against the two silently
+    // drifting back together.
+    #[test]
+    fn test_duplicate_key_and_key_not_found_have_distinct_messages() {
+        let id = DBIdType::Int(1);
+        let not_found = SchemaError::KeyNotFound(id.clone()).to_string();
+        let duplicate = SchemaError::DuplicateKey(id).to_string();
+        assert_ne!(not_found, duplicate);
+        assert!(
+            duplicate.to_lowercase().contains("duplicate"),
+            "got {duplicate:?}"
+        );
     }
 }

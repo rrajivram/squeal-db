@@ -168,4 +168,20 @@ where
     pub(crate) fn schema_exists(self: &Arc<Self>, name: &str) -> bool {
         self.schemas.read().contains_key(name)
     }
+
+    // Exposed so Connection can hold an explicit transaction open across
+    // several statements (BEGIN ... COMMIT/ROLLBACK) — everything else
+    // in Database/Schema still opens and finishes its own, own-statement-
+    // scoped transaction directly against `db`.
+    pub(crate) fn begin(&self) -> Result<store::txn::Transaction, SchemaError> {
+        Ok(self.db.begin()?)
+    }
+
+    pub(crate) fn commit(&self, txn: store::txn::Transaction) -> Result<(), SchemaError> {
+        Ok(self.db.commit(txn)?)
+    }
+
+    pub(crate) fn rollback(&self, txn: store::txn::Transaction) -> Result<(), SchemaError> {
+        Ok(self.db.rollback(txn)?)
+    }
 }

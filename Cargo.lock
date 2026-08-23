@@ -1179,6 +1179,7 @@ dependencies = [
  "comfy-table",
  "rustyline",
  "squeal-sql",
+ "store",
 ]
 
 [[package]]

@@ -70,7 +70,7 @@ fn test_execute_propagates_create_table_errors() {
 #[test]
 fn test_execute_ignores_non_create_table_statements() {
     let c = conn();
-    let mut stmt = c.clone().create_statement("select 1").unwrap();
+    let mut stmt = c.clone().create_statement("drop table t").unwrap();
     stmt.execute().unwrap();
     assert!(stmt.results.is_empty());
     assert!(!c.current_schema().unwrap().table_exists("t"));
@@ -211,6 +211,238 @@ fn test_execute_insert_fails_for_an_unknown_table() {
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 }
 
+#[test]
+fn test_execute_select_star_returns_a_result_set() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, name varchar(50), primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 'alice')").unwrap();
+    let mut stmt = c.create_statement("select * from t").unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 1);
+    let ResultType::Result(rs) = &stmt.results[0] else {
+        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
+    };
+    assert_eq!(rs.columns(), &["id".to_string(), "name".to_string()]);
+    assert_eq!(
+        rs.rows(),
+        &[vec![
+            store::valueitem::ValueItem::Integer(1),
+            store::valueitem::ValueItem::Str(("alice".into(), 50))
+        ]]
+    );
+}
+
+#[test]
+fn test_execute_select_star_fails_without_a_selected_schema() {
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let c = mgr.create_and_connect("test_db_no_schema_select").unwrap();
+    let mut stmt = c.create_statement("select * from t").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::NoSchemaSelected));
+}
+
+#[test]
+fn test_execute_select_star_fails_for_an_unknown_table() {
+    let c = conn();
+    let mut stmt = c.create_statement("select * from nope").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_select_star_participates_in_a_multi_statement_batch() {
+    // parse_sql returns a Vec<Statement> for a single `;`-separated
+    // input, and both semantic_validate and execute already loop over
+    // every element — this confirms SELECT's new arm actually
+    // participates in that loop rather than only working as the sole
+    // statement in a batch.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    let mut stmt = c
+        .create_statement("select * from t; insert into t values (2); select * from t")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 3);
+
+    let ResultType::Result(first) = &stmt.results[0] else {
+        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
+    };
+    assert_eq!(first.rows().len(), 1);
+
+    assert!(matches!(stmt.results[1], ResultType::Count(1)));
+
+    let ResultType::Result(third) = &stmt.results[2] else {
+        panic!("expected a ResultType::Result, got {:?}", stmt.results[2]);
+    };
+    assert_eq!(third.rows().len(), 2);
+}
+
+#[test]
+fn test_new_rejects_select_with_an_explicit_column_list() {
+    let c = conn();
+    let err = c.create_statement("select id from t").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_select_with_a_where_clause() {
+    let c = conn();
+    let err = c.create_statement("select * from t where id = 1").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_select_with_a_join() {
+    let c = conn();
+    let err = c
+        .create_statement("select * from t join u on t.id = u.id")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_insert_without_a_transaction_still_autocommits() {
+    // No BEGIN issued — each INSERT manages (and commits) its own
+    // transaction, same as before explicit transactions existed.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    let err = run(&c, "insert into t values (1)").unwrap_err();
+    assert!(matches!(err, SchemaError::DuplicateKey(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_begin_commit_persists_inserts() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "begin").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    run(&c, "insert into t values (2)").unwrap();
+    run(&c, "commit").unwrap();
+
+    let s = c.current_schema().unwrap();
+    assert!(s.table_exists("t"));
+    assert_eq!(select_row_count(&c, "select * from t"), 2);
+}
+
+#[test]
+fn test_execute_select_star_sees_uncommitted_inserts_within_the_same_transaction() {
+    // The actual ask: a connection must be able to read its own writes
+    // before COMMIT, not just after — see Db::table_scan_in_txn and
+    // find_visible_to's self-write exception in store.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "begin").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    assert_eq!(select_row_count(&c, "select * from t"), 1);
+    run(&c, "insert into t values (2)").unwrap();
+    assert_eq!(select_row_count(&c, "select * from t"), 2);
+    run(&c, "commit").unwrap();
+    assert_eq!(select_row_count(&c, "select * from t"), 2);
+}
+
+#[test]
+fn test_execute_select_star_on_a_different_connection_does_not_see_uncommitted_inserts() {
+    // Read-your-own-writes must not leak into cross-connection isolation:
+    // a second, separate connection to the SAME database (autocommit, no
+    // BEGIN of its own) still can't see the first connection's
+    // uncommitted insert — only after commit does it become visible.
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let c1 = mgr.create_and_connect("shared_db").unwrap();
+    c1.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let c2 = mgr.connect("shared_db").unwrap();
+    c2.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+
+    run(&c1, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c1, "begin").unwrap();
+    run(&c1, "insert into t values (1)").unwrap();
+    assert_eq!(select_row_count(&c1, "select * from t"), 1);
+    assert_eq!(select_row_count(&c2, "select * from t"), 0);
+
+    run(&c1, "commit").unwrap();
+    assert_eq!(select_row_count(&c2, "select * from t"), 1);
+}
+
+// Materializes a SELECT's row count via a fresh Statement — the direct
+// way every SELECT-visibility test below checks what a connection can
+// currently see, mirroring test_execute_select_star_returns_a_result_set's
+// own ResultType::Result inspection.
+fn select_row_count(c: &Arc<Connection<MemFile>>, sql: &str) -> usize {
+    let mut stmt = c.clone().create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    let ResultType::Result(rs) = &stmt.results[0] else {
+        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
+    };
+    rs.rows().len()
+}
+
+#[test]
+fn test_execute_begin_rollback_discards_inserts() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "begin").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    run(&c, "rollback").unwrap();
+
+    // If the row had survived the rollback, this would fail with
+    // DuplicateKey instead of succeeding.
+    run(&c, "insert into t values (1)").unwrap();
+}
+
+#[test]
+fn test_execute_rollback_discards_every_insert_in_the_transaction_not_just_the_last() {
+    // No auto-abort-on-error: a failed statement inside an open
+    // transaction doesn't end it, and rows from *earlier*, individually
+    // successful statements in the same transaction stay uncommitted
+    // until an explicit COMMIT/ROLLBACK — so ROLLBACK here must discard
+    // row 1 too, not just row 2's failed attempt.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "begin").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    let err = run(&c, "insert into t values (1)").unwrap_err();
+    assert!(matches!(err, SchemaError::DuplicateKey(_)), "got {err:?}");
+    run(&c, "rollback").unwrap();
+
+    // Row 1 must be gone too — succeeds only if nothing from the aborted
+    // transaction survived.
+    run(&c, "insert into t values (1)").unwrap();
+}
+
+#[test]
+fn test_execute_begin_twice_errors() {
+    let c = conn();
+    run(&c, "begin").unwrap();
+    let err = run(&c, "begin").unwrap_err();
+    assert!(matches!(err, SchemaError::TransactionAlreadyActive));
+}
+
+#[test]
+fn test_execute_commit_without_begin_errors() {
+    let c = conn();
+    let err = run(&c, "commit").unwrap_err();
+    assert!(matches!(err, SchemaError::NoActiveTransaction));
+}
+
+#[test]
+fn test_execute_rollback_without_begin_errors() {
+    let c = conn();
+    let err = run(&c, "rollback").unwrap_err();
+    assert!(matches!(err, SchemaError::NoActiveTransaction));
+}
+
+#[test]
+fn test_execute_begin_again_after_commit_succeeds() {
+    let c = conn();
+    run(&c, "begin").unwrap();
+    run(&c, "commit").unwrap();
+    // The slot was cleared by commit, so a second BEGIN must not hit
+    // TransactionAlreadyActive.
+    run(&c, "begin").unwrap();
+    run(&c, "rollback").unwrap();
+}
+
 // semantic_validate: caught at Statement::new() (create_statement) time,
 // before execute() even runs — so these all fail there, not on execute().
 
@@ -288,7 +520,27 @@ fn test_new_accepts_a_values_row_matching_the_implicit_column_count() {
         .unwrap();
 }
 
-fn result_string(r: &ResultType<MemFile>) -> &str {
+#[test]
+fn test_new_rejects_a_begin_end_block() {
+    let c = conn();
+    let err = c
+        .clone()
+        .create_statement("begin select 1; end")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_rollback_to_savepoint() {
+    let c = conn();
+    let err = c
+        .clone()
+        .create_statement("rollback to savepoint sp1")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+fn result_string(r: &ResultType) -> &str {
     match r {
         ResultType::ResultString(s) => s,
         _ => panic!("expected a ResultString, got a different ResultType variant"),
@@ -312,7 +564,7 @@ fn test_get_results_returns_the_first_result_and_is_idempotent() {
 #[test]
 fn test_get_results_returns_none_when_there_are_no_results() {
     let c = conn();
-    let mut stmt = c.create_statement("select 1").unwrap();
+    let mut stmt = c.create_statement("drop table t").unwrap();
     stmt.execute().unwrap();
     assert!(stmt.get_results().unwrap().is_none());
 }

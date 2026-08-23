@@ -821,8 +821,28 @@ where
     // Arc<Db<F>> clone (it needs to call find_last_committed per row to
     // resolve MVCC visibility as it scans), which only a caller already
     // holding the Db as Arc<Db<F>> can provide.
+    //
+    // Scans under a fresh, cursor-owned transaction — reads only what was
+    // committed as of when the scan begins. A caller with its own
+    // already-open transaction (e.g. an explicit BEGIN) wants
+    // table_scan_in_txn instead, so the scan can also see that
+    // transaction's own not-yet-committed writes.
     pub fn table_scan(self: &Arc<Self>, tid: TableIdType) -> Result<TableCursor<F>, StoreError> {
         TableCursor::new(Arc::clone(self), tid, None)
+    }
+
+    // Like table_scan, but reads under `txn` instead of a fresh transaction
+    // of the scan's own — so the scan sees `txn`'s own uncommitted writes,
+    // not just what's already committed. `txn` must stay open (not
+    // committed/rolled back) for at least as long as the returned cursor is
+    // used; the cursor only borrows its id; the caller's own guard is what
+    // keeps it registered as active.
+    pub fn table_scan_in_txn(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        txn: &Transaction,
+    ) -> Result<TableCursor<F>, StoreError> {
+        TableCursor::new(Arc::clone(self), tid, Some(txn.id()))
     }
 
     pub fn range_scan(
@@ -895,11 +915,17 @@ where
     // Snapshot-isolated visibility for reads (Db::find, TableCursor,
     // RangeCursor): a version is visible to `reader` only if its writer
     // committed strictly *before* `reader` began — not just "is committed
-    // right now". A writer that was still active when `reader` began (in
-    // `reader`'s captured snapshot set) stays invisible for `reader`'s
-    // entire lifetime even once it commits, and a writer that didn't even
-    // exist yet when `reader` began is excluded the same way, since
-    // `reader`'s snapshot — captured once, at begin() — couldn't have
+    // right now" — OR the writer *is* `reader` itself (read-your-own-writes:
+    // a transaction must see its own not-yet-committed inserts/updates, the
+    // same way a fresh INSERT's Tuple carries no undo_id, so without this
+    // check `resolve_visible` has nothing to walk back to and reports the
+    // row as simply missing — confirmed the hard way: `Db::find` called
+    // with the very transaction that wrote the row returned `None` before
+    // this check existed). A writer that was still active when `reader`
+    // began (in `reader`'s captured snapshot set) stays invisible for
+    // `reader`'s entire lifetime even once it commits, and a writer that
+    // didn't even exist yet when `reader` began is excluded the same way,
+    // since `reader`'s snapshot — captured once, at begin() — couldn't have
     // recorded it either way. Together these two checks are what makes a
     // transaction's reads internally consistent (repeatable read):
     // re-reading the same row twice within one transaction can no longer
@@ -937,7 +963,10 @@ where
             .unwrap_or_default();
         let reader_ts = reader.ts();
         if let Some(t) = self.resolve_visible(tuple, |txn| {
-            self.tx_mgr.is_committed(txn) && txn.ts() < reader_ts && !reader_snapshot.contains(txn)
+            txn == reader
+                || (self.tx_mgr.is_committed(txn)
+                    && txn.ts() < reader_ts
+                    && !reader_snapshot.contains(txn))
         }) {
             return Some(t);
         }
@@ -1734,6 +1763,75 @@ mod tests {
             found.expect("row should be visible").data.to_vec(),
             b"hello"
         );
+    }
+
+    #[test]
+    fn test_txn_find_sees_its_own_uncommitted_insert() {
+        // Regression test for find_visible_to's self-write exception: a
+        // fresh INSERT's Tuple carries no undo_id, so before this check
+        // existed, resolve_visible had nothing to walk back to and
+        // Db::find incorrectly reported the row as missing to the very
+        // transaction that just wrote it.
+        let (db, tid) = make_db_with_table();
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &txn).unwrap();
+        let found = db.find(tid, id(1), &txn).unwrap();
+        assert_eq!(
+            found.expect("a transaction must see its own uncommitted insert").data.to_vec(),
+            b"hello"
+        );
+        db.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn test_txn_uncommitted_insert_is_invisible_to_a_different_transaction() {
+        // The self-write exception must not leak into cross-transaction
+        // visibility — an uncommitted row stays invisible to anyone else
+        // exactly as before.
+        let (db, tid) = make_db_with_table();
+        let writer = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &writer).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert!(db.find(tid, id(1), &reader).unwrap().is_none());
+        drop(reader);
+
+        db.commit(writer).unwrap();
+    }
+
+    #[test]
+    fn test_table_scan_in_txn_sees_its_own_uncommitted_insert() {
+        let (db, tid) = make_db_with_table();
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &txn).unwrap();
+
+        let mut cursor = db.table_scan_in_txn(tid, &txn).unwrap();
+        let found = cursor.next().unwrap();
+        assert_eq!(
+            found.expect("scan under the writer's own txn must see the row").data.to_vec(),
+            b"hello"
+        );
+        assert!(cursor.next().unwrap().is_none());
+        drop(cursor);
+
+        db.commit(txn).unwrap();
+    }
+
+    #[test]
+    fn test_table_scan_without_a_txn_does_not_see_a_concurrent_uncommitted_insert() {
+        // table_scan (no caller-supplied txn) still reads only committed
+        // state as of when the scan begins — read-your-own-writes only
+        // applies when the scan is explicitly run under the writer's own
+        // transaction via table_scan_in_txn.
+        let (db, tid) = make_db_with_table();
+        let txn = db.begin().unwrap();
+        db.insert(tid, row(1, b"hello"), &txn).unwrap();
+
+        let mut cursor = db.table_scan(tid).unwrap();
+        assert!(cursor.next().unwrap().is_none());
+        drop(cursor);
+
+        db.commit(txn).unwrap();
     }
 
     #[test]

@@ -109,13 +109,13 @@ fn test_execute_rejects_invalid_schema_definitions() {
 
 #[test]
 fn test_execute_silently_ignores_non_create_table_statements() {
-    // Documents current dispatch behavior: Statement::execute only
-    // handles Statement::CreateTable (and panics via todo!() on
-    // AlterCollation); anything else, including an ordinary SELECT,
-    // falls through its wildcard arm as a silent no-op rather than an
-    // error.
+    // Documents current dispatch behavior: Statement::execute handles
+    // CreateTable, CreateDatabase/Schema, Insert, Query (SELECT), and
+    // transaction control (and panics via todo!() on AlterCollation);
+    // anything else, like DROP TABLE, falls through its wildcard arm as
+    // a silent no-op rather than an error.
     let conn = conn();
-    execute(&conn, "select 1").unwrap();
+    execute(&conn, "drop table t").unwrap();
     let s = conn.current_schema().unwrap();
     assert!(!s.table_exists("t"));
 }
