@@ -1,249 +1,150 @@
-#![allow(dead_code, unused)]
-use proc_macro::TokenStream;
-use proc_macro2::Span;
-use quote::quote;
-use syn::{
-    DataEnum, DataStruct, DeriveInput, Field, GenericArgument, Ident, Type, TypePath, TypeTuple,
-    Variant, parse_macro_input,
-};
+//! `#[derive(SQLParser)]`: derive a token-level chumsky parser from the shape
+//! of an AST type.
+//!
+//! A struct parses as the sequence of its fields; an enum parses as an
+//! ordered choice of its variants (declaration order = priority, so put more
+//! specific variants first). All per-field behavior comes from the field
+//! type's own `SQLParser` impl — `Option<T>` is "maybe", `Vec<T>` is "zero or
+//! more", `Either<L, R>` is "L else R", tuples are sequences (those blanket
+//! impls live in `sql_parser::parser`). The derive itself only composes
+//! `<Field as SQLParser>::parser(())` calls with `.then()` and maps the
+//! nested tuples back into the type's constructor.
 
-#[derive(Debug, Clone)]
-enum SQLField {
-    Regular(Ident),
-    Either(Ident, Ident),
-    Option(Box<SQLField>),
-    Vec(Box<SQLField>),
-    Tuple(Vec<SQLField>),
-    Variant(Vec<(String, SQLField)>),
-}
+use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::{format_ident, quote};
+use syn::{Data, DeriveInput, Fields, Ident, Type, parse_macro_input, spanned::Spanned};
 
 extern crate proc_macro;
 
 #[proc_macro_derive(SQLParser)]
 pub fn derive_parser(inp: TokenStream) -> TokenStream {
     let inp = parse_macro_input!(inp as DeriveInput);
-    println!("ident {:?}", inp.ident);
-    match &inp.data {
-        syn::Data::Struct(data_struct) => {
-            //println!("{:?}", data_struct);
-            let fields = derive_struct(&inp.ident, data_struct);
-            println!("{:?}", fields);
-        }
-        syn::Data::Enum(data_enum) => {
-            let fields = derive_enum(&inp.ident, data_enum);
-            println!("{:?}", fields);
-        }
-        syn::Data::Union(data_union) => println!("{:?}", data_union),
-    }
-    let expanded = quote! {
-        impl<'src, I, E> SQLParser<'src, I, E> for #inp.ident
-        where
-            I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
-            E: ParserExtra<'src, I>,
-            E::Error: LabelError<'src, I, String>,
-        {
-            fn parse(_args: ()) -> impl Parser<'src, I, Self, E> {
-                custom(|stmt| {
+    let name = &inp.ident;
 
-                })
+    if !inp.generics.params.is_empty() {
+        return syn::Error::new(
+            inp.generics.span(),
+            "#[derive(SQLParser)] does not support generic types; write the impl by hand",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let (body, field_types) = match &inp.data {
+        Data::Struct(data) => match fields_parser(&data.fields, quote!(Self)) {
+            Ok(v) => v,
+            Err(e) => return e.to_compile_error().into(),
+        },
+        Data::Enum(data) => {
+            let mut variants = Vec::new();
+            let mut types = Vec::new();
+            for v in &data.variants {
+                let vname = &v.ident;
+                match fields_parser(&v.fields, quote!(Self::#vname)) {
+                    Ok((expr, mut tys)) => {
+                        variants.push(expr);
+                        types.append(&mut tys);
+                    }
+                    Err(e) => return e.to_compile_error().into(),
+                }
+            }
+            let Some(first) = variants.first().cloned() else {
+                return syn::Error::new(name.span(), "cannot derive SQLParser for an empty enum")
+                    .to_compile_error()
+                    .into();
+            };
+            let rest = &variants[1..];
+            (quote!( #first #( .or(#rest) )* ), types)
+        }
+        Data::Union(_) => {
+            return syn::Error::new(name.span(), "cannot derive SQLParser for a union")
+                .to_compile_error()
+                .into();
+        }
+    };
+
+    let bounds = field_types.iter().map(|ty| {
+        quote!( #ty: ::sql_parser::parser::SQLParser<'src, I, E>, )
+    });
+
+    let expanded = quote! {
+        impl<'src, I, E> ::sql_parser::parser::SQLParser<'src, I, E> for #name
+        where
+            I: ::sql_parser::parser::TokenInput<'src> + 'src,
+            E: ::chumsky::extra::ParserExtra<'src, I> + 'src,
+            E::Error: ::chumsky::label::LabelError<'src, I, ::std::string::String>,
+            #(#bounds)*
+        {
+            fn parser(_args: ()) -> impl ::chumsky::Parser<'src, I, Self, E> + Clone {
+                #[allow(unused_imports)]
+                use ::chumsky::Parser as _;
+                (#body).boxed()
             }
         }
     };
-    TokenStream::new()
+    expanded.into()
 }
 
-#[allow(clippy::single_match, clippy::collapsible_match)]
-fn generate_parser(field: &SQLField) -> String {
-    let mut s = "".to_string();
-    match field {
-        SQLField::Regular(f) => if f == "StringLiteral" {},
-        _ => {}
+/// Build the parser expression for one struct body or enum variant:
+/// sequence the field parsers with `.then()`, then map the nested tuple back
+/// into `#constructor { .. }` / `#constructor(..)`. Returns the expression
+/// and the field types (for where-clause bounds).
+fn fields_parser(
+    fields: &Fields,
+    constructor: TokenStream2,
+) -> syn::Result<(TokenStream2, Vec<Type>)> {
+    let (types, names): (Vec<Type>, Vec<Option<Ident>>) = match fields {
+        Fields::Named(named) => named
+            .named
+            .iter()
+            .map(|f| (f.ty.clone(), f.ident.clone()))
+            .unzip(),
+        Fields::Unnamed(unnamed) => unnamed
+            .unnamed
+            .iter()
+            .map(|f| (f.ty.clone(), None))
+            .unzip(),
+        Fields::Unit => {
+            return Err(syn::Error::new(
+                constructor.span(),
+                "SQLParser cannot be derived for unit types: there is nothing to parse",
+            ));
+        }
+    };
+
+    if types.is_empty() {
+        return Err(syn::Error::new(
+            constructor.span(),
+            "SQLParser cannot be derived for empty field lists: there is nothing to parse",
+        ));
     }
 
-    s
-}
+    let binders: Vec<Ident> = (0..types.len()).map(|i| format_ident!("f{i}")).collect();
 
-fn derive_enum(_id: &Ident, es: &DataEnum) -> Vec<(String, SQLField)> {
-    //   println!("Enum : {:?}", es);
-    let mut items = vec![];
-    for v in &es.variants {
-        items.push((v.ident.to_string(), handle_variant(v)));
+    // f0, (f0, f1), ((f0, f1), f2), ... — the tuple shape `.then()` chains
+    // produce.
+    let first_binder = &binders[0];
+    let mut pattern = quote!(#first_binder);
+    for b in &binders[1..] {
+        pattern = quote!((#pattern, #b));
     }
-    items
-}
 
-fn handle_variant(v: &Variant) -> SQLField {
-    let mut items = vec![];
-    match &v.fields {
-        syn::Fields::Named(n) => {
-            for f in &n.named {
-                items.push((f.ident.clone().unwrap().to_string(), handle_field(f)));
-                //println!("named: {:?},{}", items.last().unwrap(), items.len());
-            }
-        }
-        syn::Fields::Unnamed(u) => {
-            for (i, f) in u.unnamed.iter().enumerate() {
-                items.push((i.to_string(), handle_field(f)));
-                // println!("unnamed : {:?},{}", items.last().unwrap(), items.len());
-            }
-        }
-        syn::Fields::Unit => {
-            panic!("unit field:{:?} ", v.ident)
-        }
-    }
-    SQLField::Variant(items)
-}
+    let first_ty = &types[0];
+    let rest_ty = &types[1..];
+    let chain = quote! {
+        <#first_ty as ::sql_parser::parser::SQLParser<'src, I, E>>::parser(())
+        #( .then(<#rest_ty as ::sql_parser::parser::SQLParser<'src, I, E>>::parser(())) )*
+    };
 
-fn derive_struct(_id: &Ident, st: &DataStruct) -> Vec<(String, SQLField)> {
-    //we only handle named fields
-    let mut fields = vec![];
-    match &st.fields {
-        syn::Fields::Named(fields_named) => {
-            for f in &fields_named.named {
-                let ident = f.ident.clone().unwrap();
-                fields.push((ident.to_string(), handle_field(f)));
-            }
+    let build = match fields {
+        Fields::Named(_) => {
+            let names = names.into_iter().map(|n| n.unwrap());
+            quote!( #constructor { #( #names: #binders ),* } )
         }
-        syn::Fields::Unnamed(fields_unnamed) => {
-            for (i, f) in fields_unnamed.unnamed.iter().enumerate() {
-                fields.push((i.to_string(), handle_field(f)));
-            }
-        }
-        syn::Fields::Unit => {
-            panic!("Unit structs are not supported.")
-        }
-    }
-    fields
-}
+        Fields::Unnamed(_) => quote!( #constructor ( #( #binders ),* ) ),
+        Fields::Unit => unreachable!(),
+    };
 
-fn handle_field(f: &Field) -> SQLField {
-    match &f.ty {
-        syn::Type::Path(type_path) => {
-            // println!("here 4 : {:?}", type_path.path);
-            let ty = type_path.path.segments[0].ident.clone();
-            if ty == "Option" {
-                handle_option(type_path)
-            } else if ty == "Either" {
-                handle_either(type_path)
-            } else if ty == "Vec" {
-                handle_vec(type_path)
-            } else {
-                SQLField::Regular(ty.clone())
-            }
-        }
-        syn::Type::Tuple(tuple) => handle_tuple(tuple),
-        _ => {
-            panic!("Panic 2 : {:?}", f.ty);
-        }
-    }
-}
-
-fn handle_option(type_path: &TypePath) -> SQLField {
-    //println!("handle options");
-    let mut items = vec![];
-    for s in &type_path.path.segments {
-        match &s.arguments {
-            syn::PathArguments::AngleBracketed(angle_bracketed_generic_arguments) => {
-                for a in &angle_bracketed_generic_arguments.args {
-                    if let syn::GenericArgument::Type(p) = a
-                        && let syn::Type::Path(p) = p
-                    {
-                        let pi = p.path.get_ident().cloned();
-                        if pi.is_none() {
-                            for pi in &p.path.segments {
-                                if pi.ident == "Either"
-                                    && let syn::PathArguments::AngleBracketed(_ag) = &pi.arguments
-                                {
-                                    items.push(handle_either(p));
-                                }
-                            }
-                        } else {
-                            items.push(SQLField::Regular(pi.clone().unwrap()))
-                        }
-                        //println!("Option with {:?},{:?}", pi, p);
-                    } else if let syn::GenericArgument::Type(p) = a
-                        && let syn::Type::Tuple(t) = p
-                    {
-                        items.push(handle_tuple(t));
-                    } else {
-                        panic!("Found this: {:?}", a);
-                    }
-                }
-            }
-            _ => {
-                panic!("Panic 1");
-            }
-        }
-    }
-    assert!(items.len() == 1);
-    SQLField::Option(Box::new(items[0].clone()))
-}
-
-fn handle_tuple(t: &TypeTuple) -> SQLField {
-    let mut items = vec![];
-    for ti in &t.elems {
-        if let syn::Type::Path(p) = ti {
-            //println!("Here 2");
-            let it = p.path.get_ident().cloned().unwrap();
-            //println!("Option tuple: {}", it);
-            items.push(SQLField::Regular(it));
-        }
-    }
-    SQLField::Tuple(items)
-}
-
-fn handle_either(type_path: &TypePath) -> SQLField {
-    //println!("handle either: {:?}", type_path);
-    let mut items = vec![];
-    for args in &type_path.path.segments {
-        match &args.arguments {
-            syn::PathArguments::AngleBracketed(angle_bracketed_generic_arguments) => {
-                for ag in &angle_bracketed_generic_arguments.args {
-                    if let syn::GenericArgument::Type(p) = ag
-                        && let syn::Type::Path(p1) = p
-                    {
-                        let pi = p1.path.get_ident().cloned().unwrap();
-                        //println!("Either : {:?}", pi);
-                        items.push(pi);
-                    } else {
-                        panic!("Found this: {:?}", ag);
-                    }
-                }
-            }
-            syn::PathArguments::None => {
-                //println!("none: {:?}", args.ident);
-                items.push(args.ident.clone());
-            }
-            _ => {
-                panic!("Either arguments are bad : {:?}", args);
-            }
-        }
-    }
-    assert!(items.len() == 2, "len = {},{:?}", items.len(), type_path);
-    SQLField::Either(items[0].clone(), items[1].clone())
-}
-
-fn handle_vec(type_path: &TypePath) -> SQLField {
-    let mut items = vec![];
-    //println!("handling vec: {:?}", type_path);
-    for args in &type_path.path.segments {
-        if let syn::PathArguments::AngleBracketed(args) = &args.arguments {
-            for a in &args.args {
-                if let GenericArgument::Type(p) = &a
-                    && let Type::Path(p) = &p
-                {
-                    //println!("Vec ags: {:?}", p.path.get_ident());
-                    items.push(SQLField::Regular(p.path.get_ident().cloned().unwrap()));
-                } else if let GenericArgument::Type(p) = &a
-                    && let Type::Tuple(ty) = &p
-                {
-                    items.push(handle_tuple(ty));
-                }
-            }
-        } else if let syn::PathArguments::Parenthesized(args) = &args.arguments {
-            panic!("here : {:?}", args);
-        }
-    }
-    assert_eq!(items.len(), 1);
-    SQLField::Vec(Box::new(items[0].clone()))
+    Ok((quote!( #chain.map(|#pattern| #build) ), types))
 }

@@ -1,13 +1,12 @@
 use crate::{keyword::Keyword, span::TokenSpan};
-use chumsky::Parser;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Token<'src> {
-    Decimal {
-        is_neg: bool,
-        part1: u64,
-        period: bool,
-        part2: u64,
+    /// An unsigned numeric literal (`123`, `1.5`, `.5`). Sign is handled by
+    /// the expression parser as a unary operator; the raw text is kept so the
+    /// literal parser can decide between integer and float.
+    Number {
+        raw: &'src str,
     },
     Word {
         raw: &'src str,
@@ -18,6 +17,10 @@ pub enum Token<'src> {
         kind: StringStyle,
     },
     Space,
+    /// A multi-character operator (`<=`, `!=`, `||`, ...). Lexed as one token
+    /// so the parser never has to ask whether two punctuation marks were
+    /// adjacent in the source.
+    Operator(Operator),
     Punctuation(Punctuation),
 }
 
@@ -40,22 +43,22 @@ impl<'src> Token<'src> {
     }
 }
 
+impl<'src> std::fmt::Display for Token<'src> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from(self.clone()))
+    }
+}
+
+impl<'src> std::fmt::Display for TokenStruct<'src> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.token)
+    }
+}
+
 impl<'src> From<Token<'src>> for String {
     fn from(value: Token<'src>) -> Self {
         match value {
-            Token::Decimal {
-                is_neg,
-                part1,
-                period,
-                part2,
-            } => {
-                let neg = if is_neg { '-' } else { ' ' };
-                if period {
-                    format!("{neg}{part1}.{part2}")
-                } else {
-                    format!("{neg}{part1}")
-                }
-            }
+            Token::Number { raw } => String::from(raw),
             Token::Word { raw, keyword: _ } => String::from(raw),
             Token::String { raw, kind } => match kind {
                 StringStyle::SingleQuoted(c) | StringStyle::DoubleQuoted(c) if c.is_some() => {
@@ -65,61 +68,44 @@ impl<'src> From<Token<'src>> for String {
                 _ => String::from(raw),
             },
             Token::Space => String::from(" "),
+            Token::Operator(op) => String::from(op.as_str()),
             Token::Punctuation(punctuation) => String::from(punctuation.to_char()),
         }
     }
 }
 
-impl<'src> PartialEq<TokenStruct<'src>> for Token<'src> {
-    fn eq(&self, other: &TokenStruct<'src>) -> bool {
-        match (self, &other.token) {
-            (
-                Token::Decimal {
-                    is_neg: a_isneg,
-                    part1: a_part1,
-                    period: a_per,
-                    part2: a_part2,
-                },
-                Token::Decimal {
-                    is_neg: b_isneg,
-                    part1: b_part1,
-                    period: b_per,
-                    part2: b_part2,
-                },
-            ) => {
-                *a_isneg == *b_isneg
-                    && *a_per == *b_per
-                    && *a_part1 == *b_part1
-                    && *a_part2 == *b_part2
-            }
-            (
-                Token::Word {
-                    raw: a_raw,
-                    keyword: a_key,
-                },
-                Token::Word {
-                    raw: b_raw,
-                    keyword: b_key,
-                },
-            ) => *a_raw == *b_raw && *a_key == *b_key,
-            (
-                Token::String {
-                    raw: a_raw,
-                    kind: a_kind,
-                },
-                Token::String {
-                    raw: b_raw,
-                    kind: b_kind,
-                },
-            ) => *a_raw == *b_raw && *a_kind == *b_kind,
-            (Token::Space, Token::Space) => true,
-            (Token::Punctuation(punctuation_a), Token::Punctuation(punctuation_b)) => {
-                *punctuation_a == *punctuation_b
-            }
-            (_, _) => false,
+macro_rules! create_operators {
+    ($(($s:literal,$i:ident)),*$(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Operator {
+            $($i,)*
         }
-    }
+
+        impl Operator {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$i => $s,)*
+                }
+            }
+
+            /// All operators, longest spelling first, for greedy lexing.
+            pub const ALL: &'static [(&'static str, Operator)] = &[
+                $(($s, Operator::$i),)*
+            ];
+        }
+    };
 }
+
+// Order matters: the lexer tries these top to bottom, so longer operators
+// sharing a prefix with shorter ones must come first.
+create_operators!(
+    ("<>", NotEq),
+    ("!=", NotEqBang),
+    ("<=", LtEq),
+    (">=", GtEq),
+    ("||", Concat),
+    ("::", DoubleColon),
+);
 
 macro_rules! create_punctuation {
     ($(($x:expr,$c:literal,$i:ident)),*$(,)?) => {
@@ -142,47 +128,10 @@ macro_rules! create_punctuation {
                 }
             }
         }
-    };
-}
 
-create_punctuation!(
-    (0x21, '!', ExclamationMark),
-    (0x23, '#', NumberSign),
-    (0x24, '$', Dollar),
-    (0x25, '%', Percent),
-    (0x26, '&', Ampersand),
-    (0x28, '(', LeftParenthesis),
-    (0x29, ')', RightParenthesis),
-    (0x2A, '*', Asterisk),
-    (0x2B, '+', Plus),
-    (0x2C, ',', Comma),
-    (0x2D, '-', Minus),
-    (0x2E, '.', Period),
-    (0x2F, '/', Slash),
-    (0x3A, ':', Colon),
-    (0x3B, ';', Semicolon),
-    (0x3C, '<', LessThan),
-    (0x3D, '=', Equals),
-    (0x3E, '>', GreaterThan),
-    (0x3F, '?', QuestionMark),
-    (0x40, '@', At),
-    (0x5B, '[', LeftBracket),
-    (0x5C, '\\', Backslash),
-    (0x5D, ']', RightBracket),
-    (0x5E, '^', Caret),
-    (0x7B, '{', LeftBrace),
-    (0x7C, '|', VerticalBar),
-    (0x7D, '}', RightBrace),
-    (0x7E, '~', Tilde),
-);
-
-// Mirrors keyword.rs's create_keywords! — one span-carrying struct per
-// punctuation variant, for the same reason Create/Table exist alongside
-// the Keyword enum: a parser can match a specific punctuation character
-// and wrap the matched token's own span in a distinctly-typed value,
-// rather than carrying a bare Punctuation enum value with no span.
-macro_rules! define_punctuation {
-    ($(($x:expr,$c:literal,$i:ident)),*$(,)?) => {
+        // One span-carrying struct per punctuation variant, mirroring the
+        // keyword structs: a parser can match a specific punctuation mark and
+        // keep the matched token's span in a distinctly-typed value.
         $(
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
             pub struct $i {
@@ -197,21 +146,30 @@ macro_rules! define_punctuation {
 
             impl<'src, I, E> crate::parser::SQLParser<'src, I, E> for $i
             where
-                I: chumsky::input::Input<'src, Token = TokenStruct<'src>> + chumsky::input::ValueInput<'src> + chumsky::input::ExactSizeInput<'src>,
+                I: chumsky::input::Input<'src, Token = TokenStruct<'src>>
+                    + chumsky::input::ValueInput<'src>
+                    + chumsky::input::ExactSizeInput<'src>,
                 E: chumsky::extra::ParserExtra<'src, I>,
-                E::Error: chumsky::label::LabelError<'src, I, String>,
+                E::Error: chumsky::label::LabelError<'src, I, ::std::string::String>,
             {
                 fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+                    use chumsky::Parser;
                     chumsky::prelude::any()
-                        .filter(|t: &TokenStruct| matches!(t.token, Token::Punctuation(Punctuation::$i)))
-                        .map(|t| $i { span: t.span })
+                        .try_map(|t: TokenStruct<'src>, span| match t.token {
+                            Token::Punctuation(Punctuation::$i) => Ok($i { span: t.span }),
+                            _ => Err(chumsky::label::LabelError::<'src, I, ::std::string::String>::expected_found(
+                                [::std::string::String::from($c)],
+                                Some(chumsky::util::MaybeRef::Val(t)),
+                                span,
+                            )),
+                        })
                 }
             }
         )*
     };
 }
 
-define_punctuation!(
+create_punctuation!(
     (0x21, '!', ExclamationMark),
     (0x23, '#', NumberSign),
     (0x24, '$', Dollar),

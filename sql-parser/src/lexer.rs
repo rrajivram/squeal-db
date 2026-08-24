@@ -1,65 +1,68 @@
-use std::{collections::HashMap, ops::RangeFrom};
+//! The lexer: turns source text into a flat list of [`TokenStruct`]s.
+//!
+//! Keywords are recognized here (case-insensitively) so the token-level
+//! parsers can match on `Keyword` variants instead of comparing strings.
+//! Whitespace and comments are emitted as [`Token::Space`] and stripped by
+//! [`tokenize`], which is what the statement parsers consume.
 
 use chumsky::{
     IterParser, Parser,
     error::Rich,
-    extra::{self, SimpleState},
-    input::{Input, SliceInput, StrInput, ValueInput},
-    prelude::{any, choice, custom, end, just},
-    span::SimpleSpan,
+    extra,
+    prelude::{any, choice, end, just, one_of},
     text,
 };
 
 use crate::{
     keyword::Keyword,
     span::TokenSpan,
-    token::{Punctuation, StringStyle, Token, TokenStruct},
+    token::{Operator, Punctuation, StringStyle, Token, TokenStruct},
 };
 
-type LexExtra<'src, I> = extra::Full<Rich<'src, char>, SimpleState<HashMap<I, u64>>, ()>;
+type LexError<'src> = extra::Err<Rich<'src, char>>;
 
-pub fn word<'src, I>() -> impl Parser<'src, I, TokenStruct<'src>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>,
-{
-    any()
-        .filter(|c: &char| c.is_alphanumeric())
-        .repeated()
-        .at_least(1)
-        .map_with(|(), e| {
-            let keyword = Keyword::get(e.slice());
-            TokenStruct {
-                token: Token::Word {
-                    raw: e.slice(),
-                    keyword,
-                },
-                span: TokenSpan::from(e.span()),
-            }
-        })
+fn word<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    text::ident().map_with(|s: &str, e| TokenStruct {
+        token: Token::Word {
+            raw: s,
+            keyword: Keyword::get(s),
+        },
+        span: TokenSpan::from(e.span()),
+    })
 }
 
-pub fn string<'src, I>() -> impl Parser<'src, I, TokenStruct<'src>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>
-        + StrInput<'src>,
-{
-    let ident = text::ident().padded();
-    // text::ident() stops at the first whitespace, so quoted content (which
-    // should allow interior spaces) can't be built on top of it — instead,
-    // take any character up to the closing quote as-is and recover the
-    // matched &str via to_slice() (the same "grab the raw span" idiom word()
-    // uses via e.slice(), just expressed as a combinator here since the
-    // quotes need to be excluded from what's captured).
+fn number<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    let digits = any()
+        .filter(|c: &char| c.is_ascii_digit())
+        .repeated()
+        .at_least(1);
+    // `123`, `1.5`, `1.`, `.5` — no sign (unary minus belongs to the
+    // expression parser, otherwise `1-2` would lex as two numbers).
+    choice((
+        digits
+            .then(just('.').then(digits.or_not()).or_not())
+            .ignored(),
+        just('.').then(digits).ignored(),
+    ))
+    .to_slice()
+    .map_with(|s: &str, e| TokenStruct {
+        token: Token::Number { raw: s },
+        span: TokenSpan::from(e.span()),
+    })
+}
+
+fn string<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    // A doubled quote inside the string is the SQL escape for the quote
+    // character itself ('it''s'), so it must be consumed before the closing
+    // quote can end the literal. Unescaping happens at literal-parse time.
     let quoted = |quote: char| {
-        any()
-            .filter(move |c: &char| *c != quote)
-            .repeated()
-            .to_slice()
-            .delimited_by(just(quote), just(quote))
+        choice((
+            just([quote, quote]).ignored(),
+            any().filter(move |c: &char| *c != quote).ignored(),
+        ))
+        .repeated()
+        .to_slice()
+        .delimited_by(just(quote), just(quote))
     };
     choice((
         quoted('\'').map_with(|s: &str, e| TokenStruct {
@@ -72,142 +75,73 @@ where
         quoted('"').map_with(|s: &str, e| TokenStruct {
             token: Token::String {
                 raw: s,
-                kind: StringStyle::DoubleQuoted(Some('\"')),
-            },
-            span: TokenSpan::from(e.span()),
-        }),
-        ident.map_with(|s: &str, e| TokenStruct {
-            token: Token::Word {
-                raw: s,
-                keyword: Keyword::get(s),
+                kind: StringStyle::DoubleQuoted(Some('"')),
             },
             span: TokenSpan::from(e.span()),
         }),
     ))
 }
 
-#[allow(clippy::collapsible_match)]
-pub fn number<'src, I>() -> impl Parser<'src, I, TokenStruct<'src>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>,
-{
-    custom(|input| {
-        let mut neg: bool = false;
-        let begin = input.cursor();
-        let mut part1 = String::new();
-        let mut period = false;
-        let mut part2 = String::new();
-        let mut is_err = false;
-        let mut err_msg = String::new();
-        while let Some(c) = input.next() {
-            match c {
-                _ if c.is_ascii_digit() => {
-                    if period {
-                        part2.push(c);
-                    } else {
-                        part1.push(c);
-                    }
-                }
-                '.' => {
-                    if period {
-                        is_err = true;
-                        err_msg = "Unexpected '.' ".into();
-                        break;
-                    } else {
-                        period = true;
-                    }
-                }
-                '-' => {
-                    if !neg && !period && (part1.is_empty() && part2.is_empty()) {
-                        neg = true;
-                    } else {
-                        is_err = true;
-                        err_msg = "Unexpected '-'".into();
-                        break;
-                    }
-                }
-                ',' => {
-                    //ignore if before period
-                    if period {
-                        is_err = true;
-                        err_msg = "Ubexpected ',' ".into();
-                    }
-                }
-                _ => {
-                    break;
-                }
-            }
-        }
-
-        if !is_err && !neg && !period && part1.is_empty() && part2.is_empty() {
-            is_err = true;
-            err_msg = "expected a number".into();
-        }
-
-        if is_err {
-            Err(Rich::custom(
-                input.span_from(RangeFrom {
-                    start: &input.cursor(),
-                }),
-                err_msg,
-            ))
-        } else {
-            Ok(TokenStruct {
-                token: Token::Decimal {
-                    is_neg: neg,
-                    part1: part1.parse::<u64>().unwrap_or(0),
-                    period,
-                    part2: part2.parse().unwrap_or(0),
-                },
-                span: TokenSpan::from(input.span_from(RangeFrom { start: &begin })),
-            })
-        }
+fn operator<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    choice((
+        just("<>").to(Operator::NotEq),
+        just("!=").to(Operator::NotEqBang),
+        just("<=").to(Operator::LtEq),
+        just(">=").to(Operator::GtEq),
+        just("||").to(Operator::Concat),
+        just("::").to(Operator::DoubleColon),
+    ))
+    .map_with(|op, e| TokenStruct {
+        token: Token::Operator(op),
+        span: TokenSpan::from(e.span()),
     })
 }
 
-pub fn whitespace<'src, I>(c: char) -> impl Parser<'src, I, TokenStruct<'src>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>,
-{
-    just(c).repeated().at_least(1).map_with(|_, e| TokenStruct {
+fn punctuation<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    any().try_map(|c: char, span| match Punctuation::from_char(c) {
+        Some(p) => Ok(TokenStruct {
+            token: Token::Punctuation(p),
+            span: TokenSpan::from(span),
+        }),
+        None => Err(Rich::custom(span, format!("'{c}' is not punctuation"))),
+    })
+}
+
+fn whitespace<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    one_of(" \r\n\t")
+        .repeated()
+        .at_least(1)
+        .map_with(|(), e| TokenStruct {
+            token: Token::Space,
+            span: TokenSpan::from(e.span()),
+        })
+}
+
+fn comment<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    let line = just("--")
+        .then(any().filter(|c: &char| *c != '\n').repeated())
+        .ignored();
+    let block = any()
+        .and_is(just("*/").not())
+        .repeated()
+        .delimited_by(just("/*"), just("*/"))
+        .ignored();
+    line.or(block).map_with(|(), e| TokenStruct {
         token: Token::Space,
         span: TokenSpan::from(e.span()),
     })
 }
 
-pub fn punctuation<'src, I>() -> impl Parser<'src, I, TokenStruct<'src>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>,
-{
-    any().try_map_with(|c: char, e| match Punctuation::from_char(c) {
-        Some(p) => Ok(TokenStruct {
-            token: Token::Punctuation(p),
-            span: TokenSpan::from(e.span()),
-        }),
-        None => Err(Rich::custom(e.span(), format!("'{c}' is not punctuation"))),
-    })
-}
-
-pub fn lexer<'src, I>() -> impl Parser<'src, I, Vec<TokenStruct<'src>>, LexExtra<'src, I>>
-where
-    I: Input<'src, Token = char, Span = SimpleSpan>
-        + ValueInput<'src>
-        + SliceInput<'src, Slice = &'src str>
-        + StrInput<'src>,
-{
+pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<TokenStruct<'src>>, LexError<'src>> {
+    // Order matters: comments before punctuation (`--`, `/*`), operators
+    // before punctuation (`<=` vs `<`), numbers before punctuation (`.5`).
     choice((
+        comment(),
+        operator(),
         number(),
+        word(),
         string(),
-        whitespace(' '),
-        whitespace('\r'),
-        whitespace('\n'),
-        whitespace('\t'),
+        whitespace(),
         punctuation(),
     ))
     .repeated()
@@ -215,36 +149,83 @@ where
     .then_ignore(end())
 }
 
+/// Lex `src` into tokens with whitespace and comments removed — the input the
+/// statement parsers expect.
+pub fn tokenize(src: &str) -> Result<Vec<TokenStruct<'_>>, Vec<Rich<'_, char>>> {
+    lexer()
+        .parse(src)
+        .into_result()
+        .map(|tokens| {
+            tokens
+                .into_iter()
+                .filter(|t| t.token != Token::Space)
+                .collect()
+        })
+}
+
 #[cfg(test)]
 mod tests {
-
     use super::*;
 
     #[test]
-    fn test_lexer1() {
-        let l = lexer()
-            //.lazy()
-            .parse("create table table_name (id int, name varchar(128)) 128");
-        println!("{:?}", l);
+    fn test_lexer_create_table() {
+        let toks =
+            tokenize("create table table_name (id int, name varchar(128)) 128").unwrap();
+        assert!(toks.iter().all(|t| t.token != Token::Space));
+        assert!(matches!(
+            toks[0].token,
+            Token::Word {
+                keyword: Some(Keyword::Create),
+                ..
+            }
+        ));
+        assert_eq!(toks.last().unwrap().token, Token::Number { raw: "128" });
     }
 
     #[test]
     fn test_number() {
-        let n = number().parse("-123423.2234234");
-        println!("{:?}", n);
+        for (src, raw) in [("123", "123"), ("1.5", "1.5"), (".5", ".5"), ("1.", "1.")] {
+            let toks = tokenize(src).unwrap();
+            assert_eq!(toks.len(), 1, "{src}");
+            assert_eq!(toks[0].token, Token::Number { raw }, "{src}");
+        }
+        // no sign in the lexer: `1-2` is number, minus, number
+        let toks = tokenize("1-2").unwrap();
+        assert_eq!(toks.len(), 3);
+        assert_eq!(toks[1].token, Token::Punctuation(Punctuation::Minus));
     }
 
     #[test]
     fn test_string() {
-        let n = string().parse("\'abcd  ef\'");
-        println!("{:?}", n);
-        let n = string().parse("\"abcdef\"");
-        println!("{:?}", n);
-        let n = string().parse("\'abcdef");
-        println!("{:?}", n);
-        let n = string().parse("abcdef\"");
-        println!("{:?}", n);
-        let n = string().parse("create");
-        println!("{:?}", n);
+        let toks = tokenize("'abcd  ef'").unwrap();
+        assert_eq!(
+            toks[0].token,
+            Token::String {
+                raw: "abcd  ef",
+                kind: StringStyle::SingleQuoted(Some('\''))
+            }
+        );
+        let toks = tokenize("'it''s'").unwrap();
+        assert_eq!(toks.len(), 1);
+        assert_eq!(
+            toks[0].token,
+            Token::String {
+                raw: "it''s",
+                kind: StringStyle::SingleQuoted(Some('\''))
+            }
+        );
+        assert!(tokenize("'unterminated").is_err());
+    }
+
+    #[test]
+    fn test_operators_and_comments() {
+        let toks = tokenize("a <= b -- trailing\n/* block */ c <> 1").unwrap();
+        assert!(toks
+            .iter()
+            .any(|t| t.token == Token::Operator(Operator::LtEq)));
+        assert!(toks
+            .iter()
+            .any(|t| t.token == Token::Operator(Operator::NotEq)));
+        assert_eq!(toks.len(), 6);
     }
 }

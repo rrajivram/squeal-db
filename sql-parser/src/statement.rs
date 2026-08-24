@@ -1,30 +1,31 @@
-extern crate macros;
+//! The top-level [`Statement`] type: one parsed SQL statement.
+
 use macros::SQLParser;
 
 use crate::{
-    datatype::DataType,
-    keyword::{Create, Table},
-    literal::StringLiteral,
+    ddl::{AlterTable, CreateTable, DropTable},
+    dml::{Delete, Insert, Update},
+    keyword as kw,
+    query::SelectStatement,
 };
 
-#[derive(Debug, Clone, SQLParser)]
+#[derive(Debug, Clone, PartialEq, SQLParser)]
 pub enum Statement {
-    CreateTable {
-        create: Create,
-        table: Table,
-        name: Option<StringLiteral>,
-        columns: Option<ColumnDefList>,
-    },
+    Select(Box<SelectStatement>),
+    Insert(Insert),
+    Update(Update),
+    Delete(Delete),
+    CreateTable(CreateTable),
+    DropTable(DropTable),
+    AlterTable(AlterTable),
+    StartTransaction(StartTransaction),
+    Commit(kw::Commit),
+    Rollback(kw::Rollback),
 }
 
-#[derive(Debug, Clone)]
-pub struct ColumnDefList {
-    //    pub left: Punctuation
-    pub colums: Vec<ColumnDef>,
-}
-
-#[derive(Debug, Clone, SQLParser)]
-pub struct ColumnDef {
-    name: StringLiteral,
-    datatype: DataType,
+/// `BEGIN [TRANSACTION]` or `START TRANSACTION`.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum StartTransaction {
+    Begin(kw::Begin, Option<kw::Transaction>),
+    Start(kw::Start, kw::Transaction),
 }

@@ -1,18 +1,17 @@
 use chumsky::{
     IterParser, Parser,
     extra::ParserExtra,
-    input::{ExactSizeInput, Input, ValueInput},
     label::LabelError,
 };
 
-use crate::{token::TokenStruct, utils::Seq};
+use crate::{parser::TokenInput, utils::Seq};
 
 pub fn sequence<'src, I, E, T, S, PT, PS>(
     item: PT,
     sep: PS,
 ) -> impl Parser<'src, I, Seq<T, S>, E> + Clone
 where
-    I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
+    I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
     PT: Parser<'src, I, T, E> + Clone,

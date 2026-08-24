@@ -1,6 +1,19 @@
+//! SQL keywords.
+//!
+//! A single macro invocation generates three things from one list:
+//! - the `Keyword` enum (used by the lexer to classify words),
+//! - one span-carrying marker struct per keyword (used in AST nodes so a
+//!   parsed statement records where each keyword appeared), and
+//! - an `SQLParser` impl for each marker struct that matches a single
+//!   `Token::Word` holding that keyword.
+//!
+//! NOTE: some keyword structs shadow prelude names (`String`, `Option`,
+//! `Some`-adjacent ones like `All`) inside this module — generated code and
+//! anything added here must use fully-qualified `::std` / `::core` paths.
+
 macro_rules! define_keywords {
     ($($k:ident = $s:literal),* $(,)?) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq,Hash)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         pub enum Keyword {
             $($k,)*
         }
@@ -16,398 +29,79 @@ macro_rules! define_keywords {
             pub fn is_reserved(value: &str) -> bool {
                 Self::get(value).is_some()
             }
-        }
-    };
-}
 
-macro_rules! create_keywords {
-    ($($k:ident = $s:literal),* $(,)?) => {
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$k => $s,)*
+                }
+            }
+        }
+
+        impl Keyword {
+            /// Reserved keywords can never be used as bare identifiers
+            /// (column/table/alias names). Everything else in the keyword
+            /// list is recognized where the grammar asks for it but is
+            /// otherwise a valid name (`name`, `data`, `year`, ...).
+            pub fn reserved(self) -> bool {
+                use Keyword::*;
+                matches!(
+                    self,
+                    And | As | Asc | Between | By | Case | Cast | Check | Collate
+                        | Constraint | Create | Cross | Default | Delete | Desc
+                        | Distinct | Drop | Else | End | Except | Exists | False
+                        | Foreign | From | Full | Group | Having | Ilike | In
+                        | Inner | Insert | Intersect | Into | Is | Join | Left
+                        | Like | Limit | Natural | Not | Null | Offset | On | Or
+                        | Order | Outer | Primary | References | Right | Select
+                        | Set | Table | Then | True | Union | Unique | Update
+                        | Using | Values | When | Where
+                )
+            }
+        }
+
         $(
-            #[derive(Debug, Clone, Copy, PartialEq, Eq,Hash)]
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
             pub struct $k {
-                pub span: crate::span::TokenSpan
+                pub span: crate::span::TokenSpan,
             }
 
             impl $k {
                 pub fn new(span: crate::span::TokenSpan) -> Self {
-                    Self {span}
+                    Self { span }
                 }
             }
 
+            impl<'src, I, E> crate::parser::SQLParser<'src, I, E> for $k
+            where
+                I: chumsky::input::Input<'src, Token = crate::token::TokenStruct<'src>>
+                    + chumsky::input::ValueInput<'src>
+                    + chumsky::input::ExactSizeInput<'src>,
+                E: chumsky::extra::ParserExtra<'src, I>,
+                E::Error: chumsky::label::LabelError<'src, I, ::std::string::String>,
+            {
+                fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+                    use chumsky::Parser;
+                    chumsky::prelude::any()
+                        .try_map(|t: crate::token::TokenStruct<'src>, span| {
+                            match t.token {
+                                crate::token::Token::Word {
+                                    keyword: ::core::option::Option::Some(Keyword::$k),
+                                    ..
+                                } => ::core::result::Result::Ok($k { span: t.span }),
+                                _ => ::core::result::Result::Err(
+                                    chumsky::label::LabelError::<'src, I, ::std::string::String>::expected_found(
+                                        [::std::string::String::from($s)],
+                                        ::core::option::Option::Some(chumsky::util::MaybeRef::Val(t)),
+                                        span,
+                                    ),
+                                ),
+                            }
+                        })
+                }
+            }
         )*
     };
 }
-
-create_keywords!(
-    Add = "ADD",
-    After = "AFTER",
-    All = "ALL",
-    Alter = "ALTER",
-    Always = "ALWAYS",
-    Analyze = "ANALYZE",
-    And = "AND",
-    Anti = "ANTI",
-    Any = "ANY",
-    AnyValue = "ANY_VALUE",
-    Archive = "ARCHIVE",
-    Array = "ARRAY",
-    As = "AS",
-    Asc = "ASC",
-    At = "AT",
-    Authorization = "AUTHORIZATION",
-    Between = "BETWEEN",
-    Bigint = "BIGINT",
-    Binary = "BINARY",
-    Bool = "BOOL",
-    Boolean = "BOOLEAN",
-    Both = "BOTH",
-    Bucket = "BUCKET",
-    Buckets = "BUCKETS",
-    By = "BY",
-    Byte = "BYTE",
-    Bytea = "BYTEA",
-    Cache = "CACHE",
-    Cascade = "CASCADE",
-    Case = "CASE",
-    Cast = "CAST",
-    Catalog = "CATALOG",
-    Catalogs = "CATALOGS",
-    Change = "CHANGE",
-    Char = "CHAR",
-    Character = "CHARACTER",
-    Check = "CHECK",
-    Clear = "CLEAR",
-    Cluster = "CLUSTER",
-    Clustered = "CLUSTERED",
-    Codegen = "CODEGEN",
-    Collate = "COLLATE",
-    Collection = "COLLECTION",
-    Column = "COLUMN",
-    Columns = "COLUMNS",
-    Comment = "COMMENT",
-    Commit = "COMMIT",
-    Compact = "COMPACT",
-    Compactions = "COMPACTIONS",
-    Compute = "COMPUTE",
-    Concatenate = "CONCATENATE",
-    Connect = "CONNECT",
-    Constraint = "CONSTRAINT",
-    Cost = "COST",
-    Create = "CREATE",
-    Cross = "CROSS",
-    Cube = "CUBE",
-    Current = "CURRENT",
-    CurrentDate = "CURRENT_DATE",
-    CurrentTime = "CURRENT_TIME",
-    CurrentTimestamp = "CURRENT_TIMESTAMP",
-    CurrentUser = "CURRENT_USER",
-    Data = "DATA",
-    Database = "DATABASE",
-    Databases = "DATABASES",
-    Date = "DATE",
-    Date32 = "DATE32",
-    Date64 = "DATE64",
-    Dateadd = "DATEADD",
-    Datediff = "DATEDIFF",
-    DateAdd = "DATE_ADD",
-    DateDiff = "DATE_DIFF",
-    Day = "DAY",
-    Dayofyear = "DAYOFYEAR",
-    Days = "DAYS",
-    Dbproperties = "DBPROPERTIES",
-    Dec = "DEC",
-    Decimal = "DECIMAL",
-    Default = "DEFAULT",
-    Defined = "DEFINED",
-    Delete = "DELETE",
-    Delimited = "DELIMITED",
-    Desc = "DESC",
-    Describe = "DESCRIBE",
-    Dfs = "DFS",
-    Directories = "DIRECTORIES",
-    Directory = "DIRECTORY",
-    Distinct = "DISTINCT",
-    Distribute = "DISTRIBUTE",
-    Distributed = "DISTRIBUTED",
-    Div = "DIV",
-    Double = "DOUBLE",
-    Drop = "DROP",
-    Else = "ELSE",
-    End = "END",
-    Escape = "ESCAPE",
-    Escaped = "ESCAPED",
-    Evolution = "EVOLUTION",
-    Except = "EXCEPT",
-    Exchange = "EXCHANGE",
-    Exclude = "EXCLUDE",
-    Exists = "EXISTS",
-    Explain = "EXPLAIN",
-    Export = "EXPORT",
-    Extended = "EXTENDED",
-    External = "EXTERNAL",
-    Extract = "EXTRACT",
-    False = "FALSE",
-    Fetch = "FETCH",
-    Fields = "FIELDS",
-    Fileformat = "FILEFORMAT",
-    Filter = "FILTER",
-    First = "FIRST",
-    Float = "FLOAT",
-    Float32 = "FLOAT32",
-    Float64 = "FLOAT64",
-    Following = "FOLLOWING",
-    For = "FOR",
-    Foreign = "FOREIGN",
-    Format = "FORMAT",
-    Formatted = "FORMATTED",
-    From = "FROM",
-    Full = "FULL",
-    Function = "FUNCTION",
-    Functions = "FUNCTIONS",
-    Generated = "GENERATED",
-    Geography = "GEOGRAPHY",
-    Geometry = "GEOMETRY",
-    Global = "GLOBAL",
-    Grant = "GRANT",
-    Group = "GROUP",
-    Grouping = "GROUPING",
-    Having = "HAVING",
-    Hour = "HOUR",
-    Hours = "HOURS",
-    Identifier = "IDENTIFIER",
-    Identity = "IDENTITY",
-    If = "IF",
-    Ignore = "IGNORE",
-    Ilike = "ILIKE",
-    Import = "IMPORT",
-    In = "IN",
-    Include = "INCLUDE",
-    Increment = "INCREMENT",
-    Index = "INDEX",
-    Indexes = "INDEXES",
-    Inner = "INNER",
-    Inpath = "INPATH",
-    Inputformat = "INPUTFORMAT",
-    Insert = "INSERT",
-    Int = "INT",
-    Int16 = "INT16",
-    Int32 = "INT32",
-    Int64 = "INT64",
-    Int8 = "INT8",
-    Integer = "INTEGER",
-    Intersect = "INTERSECT",
-    Interval = "INTERVAL",
-    Into = "INTO",
-    Is = "IS",
-    Items = "ITEMS",
-    Join = "JOIN",
-    Keys = "KEYS",
-    Last = "LAST",
-    Lateral = "LATERAL",
-    Lazy = "LAZY",
-    Leading = "LEADING",
-    Left = "LEFT",
-    Like = "LIKE",
-    Limit = "LIMIT",
-    Lines = "LINES",
-    List = "LIST",
-    Load = "LOAD",
-    Local = "LOCAL",
-    Location = "LOCATION",
-    Lock = "LOCK",
-    Locks = "LOCKS",
-    Logical = "LOGICAL",
-    Long = "LONG",
-    Macro = "MACRO",
-    Map = "MAP",
-    Matched = "MATCHED",
-    MatchRecognize = "MATCH_RECOGNIZE",
-    Merge = "MERGE",
-    Microsecond = "MICROSECOND",
-    Microseconds = "MICROSECONDS",
-    Millisecond = "MILLISECOND",
-    Milliseconds = "MILLISECONDS",
-    Minus = "MINUS",
-    Minute = "MINUTE",
-    Minutes = "MINUTES",
-    Month = "MONTH",
-    Months = "MONTHS",
-    Msck = "MSCK",
-    Name = "NAME",
-    Namespace = "NAMESPACE",
-    Namespaces = "NAMESPACES",
-    Nanosecond = "NANOSECOND",
-    Nanoseconds = "NANOSECONDS",
-    Natural = "NATURAL",
-    No = "NO",
-    Noscan = "NOSCAN",
-    Not = "NOT",
-    Null = "NULL",
-    Nulls = "NULLS",
-    Numeric = "NUMERIC",
-    Of = "OF",
-    Offset = "OFFSET",
-    On = "ON",
-    Only = "ONLY",
-    Option = "OPTION",
-    Options = "OPTIONS",
-    Or = "OR",
-    Order = "ORDER",
-    Out = "OUT",
-    Outer = "OUTER",
-    Outputformat = "OUTPUTFORMAT",
-    Over = "OVER",
-    Overlaps = "OVERLAPS",
-    Overlay = "OVERLAY",
-    Overwrite = "OVERWRITE",
-    Partition = "PARTITION",
-    Partitioned = "PARTITIONED",
-    Partitions = "PARTITIONS",
-    Percent = "PERCENT",
-    PercentileCont = "PERCENTILE_CONT",
-    PercentileDisc = "PERCENTILE_DISC",
-    Pivot = "PIVOT",
-    Placing = "PLACING",
-    Position = "POSITION",
-    Preceding = "PRECEDING",
-    Prewhere = "PREWHERE",
-    Primary = "PRIMARY",
-    Principals = "PRINCIPALS",
-    Properties = "PROPERTIES",
-    Purge = "PURGE",
-    Qualify = "QUALIFY",
-    Quarter = "QUARTER",
-    Query = "QUERY",
-    Range = "RANGE",
-    Real = "REAL",
-    Recordreader = "RECORDREADER",
-    Recordwriter = "RECORDWRITER",
-    Recover = "RECOVER",
-    Recursive = "RECURSIVE",
-    Reduce = "REDUCE",
-    References = "REFERENCES",
-    Refresh = "REFRESH",
-    Regexp = "REGEXP",
-    Rename = "RENAME",
-    Repair = "REPAIR",
-    Repeatable = "REPEATABLE",
-    Replace = "REPLACE",
-    Reset = "RESET",
-    Respect = "RESPECT",
-    Restrict = "RESTRICT",
-    Revoke = "REVOKE",
-    Right = "RIGHT",
-    Rlike = "RLIKE",
-    Role = "ROLE",
-    Roles = "ROLES",
-    Rollback = "ROLLBACK",
-    Rollup = "ROLLUP",
-    Row = "ROW",
-    Rows = "ROWS",
-    Sample = "SAMPLE",
-    Schema = "SCHEMA",
-    Schemas = "SCHEMAS",
-    Second = "SECOND",
-    Seconds = "SECONDS",
-    Select = "SELECT",
-    Semi = "SEMI",
-    Separated = "SEPARATED",
-    Serde = "SERDE",
-    Serdeproperties = "SERDEPROPERTIES",
-    SessionUser = "SESSION_USER",
-    Set = "SET",
-    Sets = "SETS",
-    Settings = "SETTINGS",
-    Short = "SHORT",
-    Show = "SHOW",
-    Similar = "SIMILAR",
-    Skewed = "SKEWED",
-    Smallint = "SMALLINT",
-    Some = "SOME",
-    Sort = "SORT",
-    Sorted = "SORTED",
-    Source = "SOURCE",
-    Start = "START",
-    Statistics = "STATISTICS",
-    Stored = "STORED",
-    Stratify = "STRATIFY",
-    String = "STRING",
-    Struct = "STRUCT",
-    Substr = "SUBSTR",
-    Substring = "SUBSTRING",
-    Sync = "SYNC",
-    System = "SYSTEM",
-    SystemTime = "SYSTEM_TIME",
-    SystemVersion = "SYSTEM_VERSION",
-    Table = "TABLE",
-    Tables = "TABLES",
-    Tablesample = "TABLESAMPLE",
-    Target = "TARGET",
-    Tblproperties = "TBLPROPERTIES",
-    Temp = "TEMP",
-    Temporary = "TEMPORARY",
-    Terminated = "TERMINATED",
-    Text = "TEXT",
-    Then = "THEN",
-    Time = "TIME",
-    Timestamp = "TIMESTAMP",
-    Timestampadd = "TIMESTAMPADD",
-    Timestampdiff = "TIMESTAMPDIFF",
-    TimestampLtz = "TIMESTAMP_LTZ",
-    TimestampNtz = "TIMESTAMP_NTZ",
-    Tinyint = "TINYINT",
-    To = "TO",
-    Top = "TOP",
-    Touch = "TOUCH",
-    Trailing = "TRAILING",
-    Transaction = "TRANSACTION",
-    Transactions = "TRANSACTIONS",
-    Transform = "TRANSFORM",
-    Trim = "TRIM",
-    True = "TRUE",
-    Truncate = "TRUNCATE",
-    TryCast = "TRY_CAST",
-    Type = "TYPE",
-    Uescape = "UESCAPE",
-    Uint16 = "UINT16",
-    Uint32 = "UINT32",
-    Uint64 = "UINT64",
-    Uint8 = "UINT8",
-    Unarchive = "UNARCHIVE",
-    Unbounded = "UNBOUNDED",
-    Uncache = "UNCACHE",
-    Union = "UNION",
-    Unique = "UNIQUE",
-    Unknown = "UNKNOWN",
-    Unlock = "UNLOCK",
-    Unpivot = "UNPIVOT",
-    Unset = "UNSET",
-    Unsigned = "UNSIGNED",
-    Update = "UPDATE",
-    Use = "USE",
-    User = "USER",
-    Using = "USING",
-    Values = "VALUES",
-    Varchar = "VARCHAR",
-    Variant = "VARIANT",
-    Verbose = "VERBOSE",
-    Version = "VERSION",
-    View = "VIEW",
-    Views = "VIEWS",
-    Void = "VOID",
-    Week = "WEEK",
-    Weeks = "WEEKS",
-    When = "WHEN",
-    Where = "WHERE",
-    Window = "WINDOW",
-    With = "WITH",
-    Within = "WITHIN",
-    Without = "WITHOUT",
-    X = "X",
-    Year = "YEAR",
-    Years = "YEARS",
-    Zone = "ZONE"
-);
 
 define_keywords!(
     Add = "ADD",
@@ -426,6 +120,7 @@ define_keywords!(
     Asc = "ASC",
     At = "AT",
     Authorization = "AUTHORIZATION",
+    Begin = "BEGIN",
     Between = "BETWEEN",
     Bigint = "BIGINT",
     Binary = "BINARY",
@@ -482,6 +177,7 @@ define_keywords!(
     Datediff = "DATEDIFF",
     DateAdd = "DATE_ADD",
     DateDiff = "DATE_DIFF",
+    Datetime = "DATETIME",
     Day = "DAY",
     Dayofyear = "DAYOFYEAR",
     Days = "DAYS",
@@ -572,6 +268,7 @@ define_keywords!(
     Is = "IS",
     Items = "ITEMS",
     Join = "JOIN",
+    Key = "KEY",
     Keys = "KEYS",
     Last = "LAST",
     Lateral = "LATERAL",
@@ -641,6 +338,7 @@ define_keywords!(
     Placing = "PLACING",
     Position = "POSITION",
     Preceding = "PRECEDING",
+    Precision = "PRECISION",
     Prewhere = "PREWHERE",
     Primary = "PRIMARY",
     Principals = "PRINCIPALS",
@@ -774,8 +472,7 @@ define_keywords!(
     With = "WITH",
     Within = "WITHIN",
     Without = "WITHOUT",
-    X = "X",
     Year = "YEAR",
     Years = "YEARS",
-    Zone = "ZONE"
+    Zone = "ZONE",
 );

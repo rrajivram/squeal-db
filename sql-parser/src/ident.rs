@@ -1,135 +1,89 @@
-use chumsky::{
-    extra::ParserExtra,
-    input::{ExactSizeInput, Input, InputRef, ValueInput},
-    label::LabelError,
-    prelude::custom,
-    util::MaybeRef,
-};
+//! Identifiers: bare words that are not reserved keywords, or double-quoted
+//! strings (the SQL-standard way to use a reserved word or odd characters as
+//! a name).
+
+use chumsky::{Parser, extra::ParserExtra, label::LabelError};
 
 use crate::{
-    keyword::Keyword,
-    parser::SQLParser,
+    parser::{SQLParser, TokenInput, token},
     span::TokenSpan,
-    token::{Period, Token, TokenStruct},
+    token::{StringStyle, Token, Period},
     utils::Seq,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ident {
     pub span: TokenSpan,
-    pub val: String,
+    pub value: String,
+    /// True when written as a `"quoted identifier"` — such names bypass the
+    /// keyword check and are case-sensitive to consumers that care.
+    pub quoted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Variable {
-    pub span: TokenSpan,
-    pub val: String,
-}
-
+/// A possibly-qualified name: `t`, `schema.t`, `db.schema.t`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectName {
-    pub span: TokenSpan,
-    pub val: Seq<Ident, Period>,
+    pub parts: Seq<Ident, Period>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableIdent {
-    pub span: TokenSpan,
-    pub val: String,
+impl ObjectName {
+    pub fn span(&self) -> TokenSpan {
+        TokenSpan {
+            start: self.parts.head.span.start,
+            end: self.parts.last().span.end,
+        }
+    }
+
+    pub fn idents(&self) -> impl Iterator<Item = &Ident> {
+        self.parts.items()
+    }
+
+    /// The dotted textual form, e.g. `schema.table`.
+    pub fn to_dotted(&self) -> String {
+        self.idents()
+            .map(|i| i.value.as_str())
+            .collect::<Vec<_>>()
+            .join(".")
+    }
 }
 
 impl<'src, I, E> SQLParser<'src, I, E> for Ident
 where
-    I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
+    I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
-        custom(move |inp| parse_ident(inp, |_| true))
+    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+        token("identifier", |t| match &t.token {
+            // A bare word is an identifier unless it's a *reserved* keyword;
+            // non-reserved keywords (NAME, DATA, YEAR, ...) are fine names.
+            Token::Word { raw, keyword } if !keyword.is_some_and(|k| k.reserved()) => {
+                Some(Ident {
+                    span: t.span,
+                    value: (*raw).to_string(),
+                    quoted: false,
+                })
+            }
+            Token::String {
+                raw,
+                kind: StringStyle::DoubleQuoted(_),
+            } => Some(Ident {
+                span: t.span,
+                value: raw.replace("\"\"", "\""),
+                quoted: true,
+            }),
+            _ => None,
+        })
     }
 }
 
-impl<'src, I, E> SQLParser<'src, I, E> for TableIdent
+impl<'src, I, E> SQLParser<'src, I, E> for ObjectName
 where
-    I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
+    I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
-        fn matcher(k: &Option<Keyword>) -> bool {
-            k.is_none()
-        }
-        custom(move |inp| parse_ident(inp, matcher).map(TableIdent::from))
+    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+        Seq::<Ident, Period>::parser(()).map(|parts| ObjectName { parts })
     }
 }
-
-/* impl<'src, I, E> SQLParser<'src, I, E> for ObjectName
-where
-    I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
-    E: ParserExtra<'src, I>,
-    E::Error: LabelError<'src, I, String>,
-{
-    fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
-        fn matcher(k: &Option<Keyword>) -> bool {
-            k.is_none()
-        }
-        todo!()
-        //custom(move |inp| parse_ident(inp, matcher).map(ObjectName))
-    }
-} */
-
-fn parse_ident<'src, I, E, F>(
-    inp: &mut InputRef<'src, '_, I, E>,
-    matcher: F,
-) -> Result<Ident, E::Error>
-where
-    F: Fn(&Option<Keyword>) -> bool,
-    I: Input<'src, Token = TokenStruct<'src>> + ValueInput<'src> + ExactSizeInput<'src>,
-    E: ParserExtra<'src, I>,
-    E::Error: LabelError<'src, I, String>,
-{
-    let before = inp.cursor();
-    match inp.next() {
-        Some(tok) => match &tok.token {
-            Token::Word { keyword, .. } if matcher(keyword) => Ok(Ident::from(&tok)),
-            _ => Err(LabelError::expected_found(
-                [],
-                Some(MaybeRef::Val(tok)),
-                inp.span_since(&before),
-            )),
-        },
-        None => Err(LabelError::expected_found(
-            [],
-            None,
-            inp.span_since(&before),
-        )),
-    }
-}
-
-impl<'src> From<&TokenStruct<'src>> for Ident {
-    fn from(value: &TokenStruct<'src>) -> Self {
-        Self {
-            span: value.span,
-            val: value.token.clone().into(),
-        }
-    }
-}
-
-impl From<Ident> for TableIdent {
-    fn from(value: Ident) -> Self {
-        Self {
-            span: value.span,
-            val: value.val,
-        }
-    }
-}
-/*
-impl From<Ident> for ObjectName {
-    fn from(value: Ident) -> Self {
-        Self {
-            span: value.span,
-            val: value.val,
-        }
-    }
-}
- */
