@@ -18,7 +18,6 @@ use crate::{
     expr::Expr,
     ident::{Ident, ObjectName},
     keyword as kw,
-    literal::NumberLiteral,
     parser::{SQLParser, SqlCtx, TokenInput},
     token::{Asterisk, Comma, LeftParenthesis, Period, RightParenthesis},
     utils::Seq,
@@ -247,14 +246,37 @@ pub struct OrderByItem {
     pub nulls: Option<(kw::Nulls, Either<kw::First, kw::Last>)>,
 }
 
+/// `LIMIT <expr>` — an expression, not just a literal, so prepared
+/// statements can write `LIMIT ?`.
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct LimitClause {
     pub limit: kw::Limit,
-    pub count: NumberLiteral,
+    pub count: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct OffsetClause {
     pub offset: kw::Offset,
-    pub count: NumberLiteral,
+    pub count: Expr,
+}
+
+impl LimitClause {
+    /// The count when it is a plain integer literal.
+    pub fn count_i64(&self) -> Option<i64> {
+        literal_i64(&self.count)
+    }
+}
+
+impl OffsetClause {
+    /// The count when it is a plain integer literal.
+    pub fn count_i64(&self) -> Option<i64> {
+        literal_i64(&self.count)
+    }
+}
+
+fn literal_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Literal(crate::literal::Literal::Number(n)) => n.as_i64(),
+        _ => None,
+    }
 }

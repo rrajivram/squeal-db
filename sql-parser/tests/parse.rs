@@ -58,8 +58,8 @@ fn select_distinct_group_order_limit() {
     assert!(s.core().having.is_some());
     let order = s.order_by.unwrap();
     assert!(order.items.head.direction.unwrap().is_right()); // DESC
-    assert_eq!(s.limit.unwrap().count.as_i64(), Some(10));
-    assert_eq!(s.offset.unwrap().count.as_i64(), Some(5));
+    assert_eq!(s.limit.unwrap().count_i64(), Some(10));
+    assert_eq!(s.offset.unwrap().count_i64(), Some(5));
 }
 
 #[test]
@@ -493,7 +493,7 @@ fn union_and_set_ops() {
     assert!(matches!(q.compounds[1].op, SetOperator::Except(_)));
     // ORDER BY / LIMIT apply to the whole compound, at the Query level
     assert!(q.order_by.is_some());
-    assert_eq!(q.limit.unwrap().count.as_i64(), Some(3));
+    assert_eq!(q.limit.unwrap().count_i64(), Some(3));
 }
 
 #[test]
@@ -611,7 +611,7 @@ fn parenthesized_set_operands() {
     let SetOperand::Paren(_, inner, _) = &q.body else {
         unreachable!()
     };
-    assert_eq!(inner.limit.as_ref().unwrap().count.as_i64(), Some(5));
+    assert_eq!(inner.limit.as_ref().unwrap().count_i64(), Some(5));
     assert_eq!(q.compounds.len(), 1);
     assert!(matches!(q.compounds[0].operand, SetOperand::Paren(..)));
     assert!(q.order_by.is_some());
@@ -702,4 +702,69 @@ fn explain_statement() {
         panic!("expected EXPLAIN");
     };
     assert!(matches!(*inner, Statement::Explain(..)));
+}
+
+#[test]
+fn prepared_statement_placeholders() {
+    use sql_parser::Placeholder;
+    // parse once, inspect bind slots, reuse the AST across executions
+    let s = one("INSERT INTO t VALUES (?, ?)");
+    let ps = s.placeholders();
+    assert_eq!(ps.len(), 2);
+    assert!(ps.iter().all(|p| matches!(p, Placeholder::Anonymous(_))));
+    assert_eq!(s.parameter_count(), 2);
+
+    // source order across clauses and styles
+    let s = one("UPDATE t SET a = ?, b = :name WHERE id = $1");
+    let ps = s.placeholders();
+    assert_eq!(ps.len(), 3);
+    assert!(matches!(ps[0], Placeholder::Anonymous(_)));
+    assert!(matches!(ps[1], Placeholder::Named(_, n) if n == "name"));
+    assert!(matches!(ps[2], Placeholder::Positional(_, 1)));
+
+    // placeholders nested in subqueries, and LIMIT ? now parses
+    let s = one("SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE d = ?) LIMIT ?");
+    assert_eq!(s.parameter_count(), 2);
+
+    let s = one("DELETE FROM t WHERE id = ? AND ts < ?");
+    assert_eq!(s.parameter_count(), 2);
+}
+
+#[test]
+fn prepare_execute_deallocate() {
+    let Statement::Prepare(p) =
+        one("PREPARE ins (INT, VARCHAR(10)) AS INSERT INTO t VALUES ($1, $2)")
+    else {
+        panic!("expected PREPARE");
+    };
+    assert_eq!(p.name.value, "ins");
+    let (_, tys, _) = p.datatypes.as_ref().unwrap();
+    assert_eq!(tys.len(), 2);
+    assert!(matches!(*p.statement, Statement::Insert(_)));
+    assert_eq!(p.statement.parameter_count(), 2);
+
+    // without a type list
+    let Statement::Prepare(p) = one("PREPARE q1 AS SELECT a FROM t WHERE b = ?") else {
+        panic!("expected PREPARE");
+    };
+    assert!(p.datatypes.is_none());
+
+    let Statement::Execute(e) = one("EXECUTE ins (1, 'x')") else {
+        panic!("expected EXECUTE");
+    };
+    assert_eq!(e.name.value, "ins");
+    let (_, args, _) = e.params.as_ref().unwrap();
+    assert_eq!(args.len(), 2);
+    assert!(matches!(one("EXECUTE q1"), Statement::Execute(_)));
+
+    let Statement::Deallocate(d) = one("DEALLOCATE ins") else {
+        panic!("expected DEALLOCATE");
+    };
+    assert!(d.prepare.is_none());
+    assert!(d.name.is_right());
+    let Statement::Deallocate(d) = one("DEALLOCATE PREPARE ALL") else {
+        panic!("expected DEALLOCATE");
+    };
+    assert!(d.prepare.is_some());
+    assert!(d.name.is_left());
 }

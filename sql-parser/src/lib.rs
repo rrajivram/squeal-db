@@ -18,6 +18,7 @@ pub mod ident;
 pub mod keyword;
 pub mod lexer;
 pub mod literal;
+mod params;
 pub mod parser;
 pub mod query;
 pub mod span;
@@ -28,7 +29,7 @@ pub mod utils;
 use chumsky::{IterParser, Parser, error::Rich, extra, prelude::end};
 
 pub use crate::{
-    expr::Expr,
+    expr::{Expr, Placeholder},
     ident::{Ident, ObjectName},
     parser::{SQLParser, SqlCtx},
     query::Query,

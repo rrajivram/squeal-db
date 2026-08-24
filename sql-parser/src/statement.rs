@@ -7,17 +7,23 @@
 //! shared handle.
 
 use chumsky::{Parser, extra::ParserExtra, label::LabelError};
+use either::Either;
 use macros::SQLParser;
 
 use crate::{
+    datatype::DataType,
     ddl::{
-        AlterTable, CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex,
-        DropTable, Truncate, UseStatement,
+        AlterTable, CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex, DropTable,
+        Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
+    expr::Expr,
+    ident::Ident,
     keyword as kw,
     parser::{SQLParser, SqlCtx, TokenInput},
     query::Query,
+    token::{Comma, LeftParenthesis, RightParenthesis},
+    utils::Seq,
 };
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
@@ -36,6 +42,9 @@ pub enum Statement {
     AlterTable(AlterTable),
     Truncate(Truncate),
     Use(UseStatement),
+    Prepare(Prepare),
+    Execute(Execute),
+    Deallocate(Deallocate),
     Explain(kw::Explain, Box<Statement>),
     StartTransaction(StartTransaction),
     Commit(kw::Commit),
@@ -71,4 +80,32 @@ where
 pub enum StartTransaction {
     Begin(kw::Begin, Option<kw::Transaction>),
     Start(kw::Start, kw::Transaction),
+}
+
+/// `PREPARE name [(datatypes)] AS <statement>` — the statement body carries
+/// the placeholders (`?`, `$n`, `:name`); enumerate them with
+/// [`Statement::placeholders`].
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct Prepare {
+    pub prepare: kw::Prepare,
+    pub name: Ident,
+    pub datatypes: Option<(LeftParenthesis, Seq<DataType, Comma>, RightParenthesis)>,
+    pub as_token: kw::As,
+    pub statement: Box<Statement>,
+}
+
+/// `EXECUTE name [(args)]`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct Execute {
+    pub execute: kw::Execute,
+    pub name: Ident,
+    pub params: Option<(LeftParenthesis, Seq<Expr, Comma>, RightParenthesis)>,
+}
+
+/// `DEALLOCATE [PREPARE] name | ALL`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct Deallocate {
+    pub deallocate: kw::Deallocate,
+    pub prepare: Option<kw::Prepare>,
+    pub name: Either<kw::All, Ident>,
 }
