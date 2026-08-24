@@ -17,9 +17,9 @@ use crate::logger::Operation;
 use crate::logger::Record;
 use crate::memfile::MemFile;
 use crate::page::Page;
-use crate::table::Table;
 use crate::page::PageId;
 use crate::run::{Run, RunCursor};
+use crate::table::Table;
 use crate::table::TableIdType;
 use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
@@ -1782,7 +1782,10 @@ mod tests {
         while let Some(t) = cursor.next().unwrap() {
             read_back.push(t.data().to_vec());
         }
-        assert_eq!(&read_back, &records, "must read back in append order, not sorted");
+        assert_eq!(
+            &read_back, &records,
+            "must read back in append order, not sorted"
+        );
     }
 
     #[test]
@@ -1883,7 +1886,10 @@ mod tests {
         db.insert(tid, row(1, b"hello"), &txn).unwrap();
         let found = db.find(tid, id(1), &txn).unwrap();
         assert_eq!(
-            found.expect("a transaction must see its own uncommitted insert").data.to_vec(),
+            found
+                .expect("a transaction must see its own uncommitted insert")
+                .data
+                .to_vec(),
             b"hello"
         );
         db.commit(txn).unwrap();
@@ -1914,7 +1920,10 @@ mod tests {
         let mut cursor = db.table_scan_in_txn(tid, &txn).unwrap();
         let found = cursor.next().unwrap();
         assert_eq!(
-            found.expect("scan under the writer's own txn must see the row").data.to_vec(),
+            found
+                .expect("scan under the writer's own txn must see the row")
+                .data
+                .to_vec(),
             b"hello"
         );
         assert!(cursor.next().unwrap().is_none());

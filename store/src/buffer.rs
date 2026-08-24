@@ -163,6 +163,7 @@ where
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {
+        self.flush_dirty_cached_pages()?;
         self.write_tx.send(BufMsg::Shutdowm)?;
         if let Some(handle) = self.write_handle.take() {
             let res = handle.join();
@@ -191,31 +192,62 @@ where
         Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
     }
 
+    // Unlike write_locked_page, this one stays synchronous (eager) rather
+    // than deferring to eviction/checkpoint/shutdown. It's what
+    // init_page/alloc_indexed_page/alloc_run_page/reset_freed_page use to
+    // write a fresh page — and handle_large_page_size (called just below)
+    // can, within that SAME call, immediately reuse the very page_num just
+    // reset here as a new overflow-chain link and patch its on-disk header
+    // directly via write_page_header (a raw, synchronous, cache-bypassing
+    // write — see its own comment). Writing here synchronously, before
+    // handle_large_page_size can touch the same page_num again, keeps that
+    // reuse safe.
+    //
+    // Must clear dirty once the synchronous write below completes: this
+    // used to be a harmless no-op (the old eager design never consulted
+    // is_dirty() outside the writer thread's own send/receive cycle), but
+    // flush_dirty_cached_pages (checkpoint/shutdown) now does too — an
+    // Arc left dirty=true here would look like it still needs flushing
+    // even though it's already durable, and if this exact page_num then
+    // gets reused as an overflow-chain link (patched via the raw
+    // write_page_header above), that later flush would resurrect this
+    // stale content and clobber the patch — confirmed via
+    // test_freed_overflow_pages_persist_across_close_reopen.
     pub(crate) fn write_page(&self, page_num: PageId, page: &Page) -> Result<(), StoreError> {
         let page = Arc::new(page.clone());
         page.written();
         self.handle_large_page_size(page_num, &page)?;
         self.cache_strong(page_num, page.clone())?;
-        // Sending an Arc clone (not an owned copy) is what makes the Weak
-        // eviction scheme correct: as long as this message is in flight (or
-        // sitting in the writer thread's LSN-deferred queue), the strong
-        // count never drops to zero, so a concurrent get_page() for this
-        // page after eviction will see it via upgrade() instead of racing
-        // the writer thread to the backing file.
-        /*         Ok(self
-                   .write_tx
-                   .send(BufMsg::WritePage(WriteMsg { page_num, page }))?)
-
-        */
         write_page(
             page_num,
             &page,
             &*(self.self_file.read()),
             self.header.page_size,
             self.header.first_page_offset,
-        )
+        )?;
+        page.set_dirty(false)?;
+        Ok(())
     }
 
+    // Does NOT write `page` to disk itself, despite the name (kept for the
+    // caller-facing symmetry with write_page, and because that's still
+    // its net effect eventually) — it updates the cache (which is the
+    // only thing any reader ever consults; see get_page) and leaves the
+    // page marked dirty (already true by the time this runs: every
+    // mutator — add_tuple/replace_tuple/remove_tuple/set_next_page/etc.
+    // — calls set_dirty(true) itself). The actual disk write is deferred
+    // until this page leaves the cache: eviction (see evict_lru_locked/
+    // flush_evicted), or an explicit checkpoint/shutdown (see
+    // flush_dirty_cached_pages). This is what lets a page absorb many
+    // mutations — e.g. a table's own tail page during a bulk load —
+    // for the cost of one eventual write instead of one write per
+    // mutation; the previous eager-send-on-every-write behavior was
+    // confirmed (via temporary instrumentation, not kept) to rewrite
+    // some pages 200+ times for what a single flush would have covered.
+    // Deferring is safe because page writes were never this system's
+    // durability boundary to begin with — they're not fsynced except at
+    // checkpoint/shutdown; the redo log already is, on every commit, and
+    // is what a page write is recoverable *from* on an unclean reopen.
     pub(crate) fn write_locked_page(&self, handle: WritePageHandle) -> Result<(), StoreError> {
         // Use the handle's existing Arc directly rather than converting to &Page
         // and back. The Arc identity must be preserved: the same allocation goes
@@ -233,13 +265,8 @@ where
         } = handle;
         page.written();
         self.handle_large_page_size(page_num, &page)?;
-        self.cache_strong(page_num, page.clone())?;
+        self.cache_strong(page_num, page)
         // _lock drops here, releasing the per-page lock after cache is updated.
-        Ok(self.write_tx.send(BufMsg::WritePage(WriteMsg {
-            page_num,
-            page,
-            transient_retries: 0,
-        }))?)
     }
 
     fn handle_large_page_size(&self, page_id: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
@@ -442,7 +469,41 @@ where
         Ok(())
     }
 
+    // Scans the cache for every still-Strong, still-dirty resident and
+    // sends a flush for each. Needed because write_locked_page no longer
+    // flushes on every mutation (see its own doc comment) — a page that's
+    // mutated but never evicted would otherwise stay dirty in the cache
+    // forever, with flush_evicted (eviction-triggered) never once seeing
+    // it. checkpoint() and shutdown() both need every dirty page durable
+    // before they proceed, so both call this first.
+    fn flush_dirty_cached_pages(&self) -> Result<(), StoreError> {
+        let dirty: Vec<(PageId, Arc<Page>)> = {
+            let buffer = self.buffer.read();
+            buffer
+                .iter()
+                .filter_map(|(page_num, entry)| match entry {
+                    PageEntry::Strong(arc) if arc.is_dirty() => Some((*page_num, arc.clone())),
+                    _ => None,
+                })
+                .collect()
+            // `buffer`'s read lock drops here, before sending — same
+            // reasoning as flush_evicted: sending on the bounded channel
+            // while holding any lock on `buffer` risks stalling concurrent
+            // cache access for as long as the writer thread takes to make
+            // room.
+        };
+        for (page_num, page) in dirty {
+            self.write_tx.send(BufMsg::WritePage(WriteMsg {
+                page_num,
+                page,
+                transient_retries: 0,
+            }))?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
+        self.flush_dirty_cached_pages()?;
         let (tx, rx) = bounded(1);
         self.write_tx.send(BufMsg::Checkpoint(tx.clone()))?;
         rx.recv()
@@ -735,25 +796,36 @@ where
     //   2. The access_map update happens under the same lock, so evict_lru
     //      cannot pop a page that is in access_map but not yet in the buffer.
     fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
-        let mut buffer = self.buffer.write();
-        self.cache_strong_locked(&mut buffer, page_num, page);
-        Ok(())
+        let evicted = {
+            let mut buffer = self.buffer.write();
+            self.cache_strong_locked(&mut buffer, page_num, page)
+            // `buffer`'s write lock drops here, before the flush below —
+            // see flush_evicted's own doc comment on why that ordering
+            // matters.
+        };
+        self.flush_evicted(evicted)
     }
 
     // Install `page` as the Strong resident, evicting/counting/LRU-updating under
     // the caller's held buffer write lock. This UNCONDITIONALLY overwrites — it
     // is for WRITERS (write_page/write_locked_page), which hold the per-page lock
     // and are the authority on the page's latest contents.
+    //
+    // Returns whatever evict_lru_locked evicted (if it needed to evict at
+    // all, and if the victim was dirty) — the caller is responsible for
+    // flushing it, and must do so only after releasing `buffer`'s write
+    // lock (see cache_strong/get_or_install).
     fn cache_strong_locked(
         &self,
         buffer: &mut HashMap<PageId, PageEntry>,
         page_num: PageId,
         page: Arc<Page>,
-    ) {
+    ) -> Option<(PageId, Arc<Page>)> {
         let already_strong = matches!(buffer.get(&page_num), Some(PageEntry::Strong(_)));
+        let mut evicted = None;
         if !already_strong {
             if self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries {
-                self.evict_lru_locked(buffer);
+                evicted = self.evict_lru_locked(buffer);
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -765,6 +837,29 @@ where
             self.access_map.change_priority(&page_num, priority);
         }
         buffer.insert(page_num, PageEntry::Strong(page));
+        evicted
+    }
+
+    // Sends the flush a page eviction (see evict_lru_locked) uncovered —
+    // the same BufMsg::WritePage the writer thread already knows how to
+    // handle (LSN-gate, dedup-by-superseding an older still-pending write
+    // for the same page, keeping the page alive via its own Arc clone
+    // while in flight — see WriteMsg's own doc comments), just triggered
+    // by "this page is leaving the cache" instead of "this page was just
+    // mutated". MUST be called without the buffer's write lock held: the
+    // channel is bounded, so a full one blocks the sender — while holding
+    // that lock, this would stall every other reader/writer touching the
+    // cache for as long as the writer thread takes to make room, not just
+    // the caller of this specific eviction.
+    fn flush_evicted(&self, evicted: Option<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
+        if let Some((page_num, page)) = evicted {
+            self.write_tx.send(BufMsg::WritePage(WriteMsg {
+                page_num,
+                page,
+                transient_retries: 0,
+            }))?;
+        }
+        Ok(())
     }
 
     // Reader-side cache fill. If a Strong resident already exists (a writer's
@@ -773,18 +868,30 @@ where
     // clobber a concurrent writer's fresh version, silently losing that write.
     // Only when there is no Strong do we install our `page`.
     fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
-        let mut buffer = self.buffer.write();
-        if let Some(PageEntry::Strong(arc)) = buffer.get(&page_num) {
-            let arc = arc.clone();
-            let priority = u128::MAX - timestamp();
-            if !self.access_map.contains(&page_num) {
-                self.access_map.push(page_num, priority);
-            } else {
-                self.access_map.change_priority(&page_num, priority);
+        let evicted = {
+            let mut buffer = self.buffer.write();
+            if let Some(PageEntry::Strong(arc)) = buffer.get(&page_num) {
+                let arc = arc.clone();
+                let priority = u128::MAX - timestamp();
+                if !self.access_map.contains(&page_num) {
+                    self.access_map.push(page_num, priority);
+                } else {
+                    self.access_map.change_priority(&page_num, priority);
+                }
+                return arc;
             }
-            return arc;
+            self.cache_strong_locked(&mut buffer, page_num, page.clone())
+            // `buffer`'s write lock drops here, before the flush below.
+        };
+        // Best-effort: a reader installing a freshly-loaded page is not in
+        // a position to usefully propagate a flush failure (get_or_install
+        // has no Result to return it through, and every caller is itself a
+        // read path) — the evicted page stays dirty in that case and will
+        // be picked up by a later eviction, checkpoint, or shutdown
+        // instead. Logged so a persistent failure isn't silent.
+        if let Err(e) = self.flush_evicted(evicted) {
+            error!("failed to flush an evicted dirty page: {e}");
         }
-        self.cache_strong_locked(&mut buffer, page_num, page.clone());
         page
     }
 
@@ -793,7 +900,16 @@ where
     // past stale access_map entries (those whose victims are no longer Strong
     // in the buffer — can happen if update_page_access ran for a page that
     // was concurrently evicted by another thread's LRU-refresh call).
-    fn evict_lru_locked(&self, buffer: &mut HashMap<PageId, PageEntry>) {
+    // Returns the evicted victim's (page_num, Arc) if — and only if — it was
+    // dirty, so the caller can flush it once it's safe to do so (see this
+    // method's own callers: never while `buffer`'s write lock is still
+    // held, which would stall every other reader/writer in the whole cache
+    // for as long as the flush's channel send took to accept it). A clean
+    // victim needs no flush at all — its on-disk copy already matches.
+    fn evict_lru_locked(
+        &self,
+        buffer: &mut HashMap<PageId, PageEntry>,
+    ) -> Option<(PageId, Arc<Page>)> {
         loop {
             match self.access_map.pop() {
                 None => {
@@ -801,15 +917,27 @@ where
                     // shouldn't happen, but if strong_count drifted (e.g. due
                     // to a crash recovery path) don't panic — just allow the
                     // buffer to temporarily exceed max_entries.
-                    return;
+                    return None;
                 }
                 Some((victim, _)) => {
                     if let Some(PageEntry::Strong(arc)) = buffer.get(&victim) {
-                        let weak = Arc::downgrade(arc);
+                        // Cloned before downgrading: once `buffer.insert`
+                        // below replaces the map's own Strong entry, that
+                        // entry's Arc gets dropped — without a separate
+                        // owned clone here, a page that's dirty and held
+                        // nowhere else would be freed (and its unflushed
+                        // mutations lost) before this function ever gets a
+                        // chance to hand it back for flushing.
+                        let arc = arc.clone();
+                        let weak = Arc::downgrade(&arc);
                         buffer.insert(victim, PageEntry::Weak(weak));
                         self.strong_count
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        return;
+                        return if arc.is_dirty() {
+                            Some((victim, arc))
+                        } else {
+                            None
+                        };
                     }
                     // Stale entry: victim is already Weak or absent in the
                     // buffer (e.g. update_page_access ran after eviction).
@@ -1357,6 +1485,7 @@ mod tests {
 
     use postcard::from_bytes;
 
+    use super::{BufMsg, WriteMsg};
     use crate::db::DBSizeType;
     use crate::error::StoreError;
     use crate::page::Page;
@@ -1637,12 +1766,25 @@ mod tests {
         // `pending` at all.
         clock.mark_written(LsnId(100));
 
+        // Sends straight to the writer channel rather than through
+        // write_locked_page: that now only updates the cache and defers
+        // the actual send to eviction/checkpoint/shutdown (see its own
+        // doc comment), so it no longer feeds `pending` on every call the
+        // way this test needs to exercise the writer's own backpressure/
+        // deadlock-avoidance logic.
         fn dirty_and_send(buf: &PageBuffer<MemFile>, page_num: crate::page::PageId) {
             let mut handle = buf.get_page_mut(page_num).unwrap();
             std::sync::Arc::make_mut(&mut handle.page)
                 .set_dirty(true)
                 .unwrap();
-            buf.write_locked_page(handle).unwrap();
+            let page = handle.page.clone();
+            buf.write_tx
+                .send(BufMsg::WritePage(WriteMsg {
+                    page_num,
+                    page,
+                    transient_retries: 0,
+                }))
+                .unwrap();
         }
 
         // These fill `pending` exactly to capacity (both stamped at 100,
@@ -1684,6 +1826,112 @@ mod tests {
         sender.join().unwrap();
 
         let _ = Arc::try_unwrap(buf).unwrap().shutdown();
+    }
+
+    // write_locked_page no longer sends a write on every mutation — it only
+    // updates the cache and leaves the disk write to eviction, checkpoint,
+    // or shutdown (see its own doc comment). This exercises the eviction
+    // side: a dirty page pushed out of the cache under memory pressure
+    // must (a) still read back correctly in-process (the Weak-upgrade
+    // path, or the flush having already landed) and (b) actually be
+    // durable, not just cache-consistent — checked here by reopening a
+    // second, independent buffer over the same backing bytes with an
+    // empty cache, forcing a genuine disk read.
+    #[test]
+    fn test_evicting_a_dirty_page_flushes_it_before_a_fresh_buffer_can_see_it() {
+        // ShardedPQ::new(max_entries / 10) needs max_entries >= 10 to avoid
+        // a zero-shard-count divide, so eviction pressure here comes from
+        // page *count* (11 pages, max_entries 10) rather than a tiny cap.
+        const MAX_ENTRIES: usize = 10;
+        let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, MAX_ENTRIES as u64 + 1, MAX_ENTRIES);
+        let page0: crate::page::PageId = 0u64.into();
+
+        let handle = buf.get_page_mut(page0).unwrap();
+        handle.page.add_tuple(Tuple::new(1, b"hello")).unwrap();
+        buf.write_locked_page(handle).unwrap();
+
+        // Touching MAX_ENTRIES more pages fills the cache to capacity and
+        // past it, forcing page0 (now the LRU resident) out. It's still
+        // dirty at that point, so eviction must flush it (see
+        // evict_lru_locked/flush_evicted) instead of silently dropping the
+        // mutation.
+        for i in 1..=MAX_ENTRIES as u64 {
+            let _ = buf.get_page(i.into()).unwrap();
+        }
+
+        // Reading page0 again right away must still see the write — either
+        // via the Weak-upgrade path (the writer thread's own in-flight Arc
+        // clone keeps the evicted page alive) or, if the flush already
+        // landed, from disk. Never a stale pre-mutation copy.
+        let reread = buf.get_page(page0).unwrap();
+        assert_eq!(
+            reread.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"hello"
+        );
+
+        buf.checkpoint().unwrap();
+
+        // A brand-new buffer over the same bytes has no cache at all, so
+        // this read can only be satisfied from disk — proving the eviction
+        // actually made it durable, not just cache-visible.
+        let page_counter2 = Arc::new(AtomicU64::new(MAX_ENTRIES as u64 + 1));
+        let buf2 = PageBuffer::new(
+            PAGE_SIZE,
+            page_counter2,
+            file_clone,
+            make_header(),
+            MAX_ENTRIES,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
+        .unwrap();
+        let from_disk = buf2.get_page(page0).unwrap();
+        assert_eq!(
+            from_disk.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"hello"
+        );
+
+        let _ = buf.shutdown();
+        let _ = buf2.shutdown();
+    }
+
+    // The other half of the same deferral: a page that's mutated but never
+    // evicted (cache well under capacity) must still become durable once
+    // checkpoint() runs — flush_dirty_cached_pages exists specifically to
+    // catch this case, since flush_evicted only fires on the page actually
+    // leaving the cache.
+    #[test]
+    fn test_checkpoint_flushes_a_dirty_page_that_was_never_evicted() {
+        let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, 1, 10); // generous max_entries: no eviction
+        let page0: crate::page::PageId = 0u64.into();
+
+        let handle = buf.get_page_mut(page0).unwrap();
+        handle.page.add_tuple(Tuple::new(1, b"world")).unwrap();
+        buf.write_locked_page(handle).unwrap();
+
+        buf.checkpoint().unwrap();
+
+        let page_counter2 = Arc::new(AtomicU64::new(1));
+        let buf2 = PageBuffer::new(
+            PAGE_SIZE,
+            page_counter2,
+            file_clone,
+            make_header(),
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
+        .unwrap();
+        let from_disk = buf2.get_page(page0).unwrap();
+        assert_eq!(
+            from_disk.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            b"world"
+        );
+
+        let _ = buf.shutdown();
+        let _ = buf2.shutdown();
     }
 
     // A minimal third PageTuple kind, standing in for something like a
@@ -1780,7 +2028,8 @@ mod tests {
             .register(
                 TEST_BUCKET_KIND,
                 Arc::new(|bytes| {
-                    Ok(Box::new(TestBucketPage::from_bytes(bytes)?) as Box<dyn crate::pages::PageTuple>)
+                    Ok(Box::new(TestBucketPage::from_bytes(bytes)?)
+                        as Box<dyn crate::pages::PageTuple>)
                 }),
             )
             .unwrap();
@@ -1794,8 +2043,7 @@ mod tests {
         let file_clone = mem.clone();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
 
         let buf = PageBuffer::new(
             page_size,
@@ -1859,8 +2107,7 @@ mod tests {
         let mut mem = MemFile::new();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
         let buf = PageBuffer::new(
             page_size,
             page_counter.clone(),

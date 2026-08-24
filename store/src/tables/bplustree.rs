@@ -815,7 +815,13 @@ where
             for row in handle.page.iter() {
                 if id < row.id {
                     if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
-                        return self.update_index_entry(id, new_page_id, txn, page_num, Some(handle));
+                        return self.update_index_entry(
+                            id,
+                            new_page_id,
+                            txn,
+                            page_num,
+                            Some(handle),
+                        );
                     } else {
                         panic!("Expected Inner. Found leaf! {:?}", row.id);
                     }
@@ -1029,11 +1035,7 @@ where
         }
     }
 
-    fn split_if_needed(
-        &self,
-        page_id: PageId,
-        tuple: &Tuple,
-    ) -> Result<SplitOutcome, StoreError> {
+    fn split_if_needed(&self, page_id: PageId, tuple: &Tuple) -> Result<SplitOutcome, StoreError> {
         let handle = self.buffer.get_page_mut(page_id)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
@@ -1893,7 +1895,11 @@ mod tests {
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         let entries: Vec<_> = ip.iter().collect();
-        assert_eq!(entries.len(), 2, "root must have split into 2 routing entries");
+        assert_eq!(
+            entries.len(),
+            2,
+            "root must have split into 2 routing entries"
+        );
         for entry in &entries {
             let node: Node = from_bytes(&entry.data).unwrap();
             if let Node::Inner(child_page_id) = node {
@@ -1928,9 +1934,8 @@ mod tests {
             tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
         }
 
-        let big_key = DBIdType::Rec(
-            IndexKey::new_from(&[ValueItem::Str(("z".repeat(90), 90))]).unwrap(),
-        );
+        let big_key =
+            DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str(("z".repeat(90), 90))]).unwrap());
         match tree.insert(Tuple::new_with(big_key, b"v", None, None), txn()) {
             Err(StoreError::TupleTooLarge(actual, budget)) => {
                 assert_eq!(budget, index_entry_size as usize);
@@ -2479,9 +2484,9 @@ mod tests {
             index_entry_size,
         );
         let err = match result {
-            Ok(_) => panic!(
-                "an index_entry_size that can't fit at least 2 entries per page must fail"
-            ),
+            Ok(_) => {
+                panic!("an index_entry_size that can't fit at least 2 entries per page must fail")
+            }
             Err(e) => e,
         };
         let StoreError::UnknownError(msg) = err else {
@@ -2506,8 +2511,14 @@ mod tests {
         let page_size = 1024u64;
         let small_entries = make_tree_with_entry_size(page_size, 32);
         let large_entries = make_tree_with_entry_size(page_size, 128);
-        assert_eq!(small_entries.table.nodes_per_page, (page_size / 32) as usize);
-        assert_eq!(large_entries.table.nodes_per_page, (page_size / 128) as usize);
+        assert_eq!(
+            small_entries.table.nodes_per_page,
+            (page_size / 32) as usize
+        );
+        assert_eq!(
+            large_entries.table.nodes_per_page,
+            (page_size / 128) as usize
+        );
         assert!(
             small_entries.table.nodes_per_page > large_entries.table.nodes_per_page,
             "a smaller per-entry budget must pack strictly more entries per page"
@@ -2527,7 +2538,9 @@ mod tests {
         }
         for i in 0u64..50 {
             assert_eq!(
-                tree.find(DBIdType::Int(i)).unwrap().map(|t| t.data.to_vec()),
+                tree.find(DBIdType::Int(i))
+                    .unwrap()
+                    .map(|t| t.data.to_vec()),
                 Some(format!("v{i}").into_bytes())
             );
         }
@@ -2625,8 +2638,7 @@ mod tests {
                 .unwrap();
             let page = Arc::make_mut(&mut handle.page);
             let mut i = 0u64;
-            let filler =
-                |i: u64| Tuple::new_with(DBIdType::Int(i), b"pay", Some(txn()), None);
+            let filler = |i: u64| Tuple::new_with(DBIdType::Int(i), b"pay", Some(txn()), None);
             while page.can_store(&filler(i)) {
                 page.add_tuple(filler(i)).unwrap();
                 i += 1;
@@ -2640,9 +2652,8 @@ mod tests {
             );
             tree.buffer.write_locked_page(handle).unwrap();
         }
-        let big_key = DBIdType::Rec(
-            IndexKey::new_from(&[ValueItem::Str(("z".repeat(60), 60))]).unwrap(),
-        );
+        let big_key =
+            DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str(("z".repeat(60), 60))]).unwrap());
         match tree.insert(Tuple::new_with(big_key, b"v", None, None), txn()) {
             Err(StoreError::TupleTooLarge(actual, budget)) => {
                 assert_eq!(budget, index_entry_size as usize);
