@@ -221,9 +221,10 @@ where
         let mut created_names: Vec<String> = Vec::with_capacity(table.indices.len() + 1);
         let mut created_generator = false;
         let res: Result<(), SchemaError> = (|| {
-            let row_table_id = self
-                .db
-                .create_table_with_index_entry_size(row_table_name.clone(), table.row_size() as u64)?;
+            let row_table_id = self.db.create_table_with_index_entry_size(
+                row_table_name.clone(),
+                table.row_size() as u64,
+            )?;
             created_names.push(row_table_name.clone());
             table.db_table_id = row_table_id;
 
@@ -604,6 +605,53 @@ where
         self.alter_table(table_name, |t| t.alter_drop_foreign_key(constraint_name))
     }
 
+    // Statement dispatch for COPY INTO lives in Statement::execute, same
+    // split as everything else — this does the actual load. `path` is
+    // read as a CSV file (always assumed — see stmt.rs's
+    // parse_copy_into, which rejects FILE_FORMAT overrides), first row
+    // skipped as a header, every row after that mapped POSITIONALLY
+    // onto the table's current column order (like an implicit-column-
+    // list INSERT). Permissive, not atomic, on purpose: a row that
+    // fails to parse or violates a constraint is skipped and counted,
+    // not fatal to the whole load — matches real COPY INTO's own
+    // per-row reporting, unlike this engine's own multi-row INSERT
+    // (which rolls the whole batch back on any single failure). Each
+    // row is its own independent insert_rows call (autocommit), so an
+    // earlier row's success survives a later row's failure.
+    pub(crate) fn copy_csv_into(
+        self: &Arc<Self>,
+        table_name: &str,
+        path: &str,
+    ) -> Result<(usize, usize), SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let file = std::fs::File::open(path)
+            .map_err(|e| SchemaError::UserError(format!("could not open {path:?}: {e}")))?;
+        let mut reader = csv::ReaderBuilder::new().has_headers(true).from_reader(file);
+        let fields = table.fields();
+
+        let mut loaded = 0usize;
+        let mut failed = 0usize;
+        for record in reader.records() {
+            let row = record
+                .map_err(|e| SchemaError::UserError(e.to_string()))
+                .and_then(|record| csv_record_to_row(&record, fields));
+            let row = match row {
+                Ok(row) => row,
+                Err(_) => {
+                    failed += 1;
+                    continue;
+                }
+            };
+            match self.insert_rows(table_name, vec![row], None) {
+                Ok(_) => loaded += 1,
+                Err(_) => failed += 1,
+            }
+        }
+        Ok((loaded, failed))
+    }
+
     fn alter_table(
         self: &Arc<Self>,
         table_name: &str,
@@ -630,5 +678,72 @@ where
         self.db.commit(txn)?;
         self.tables.write().insert(name, table);
         Ok(())
+    }
+}
+
+// One CSV row -> one full row's worth of ValueItems, in `fields`' own
+// (i.e. the table's current) order — positional, so the CSV's own
+// column count must match exactly; there's no header-name-based
+// mapping (see Schema::copy_csv_into's own doc comment).
+fn csv_record_to_row(
+    record: &csv::StringRecord,
+    fields: &[Arc<Field>],
+) -> Result<Vec<ValueItem>, SchemaError> {
+    if record.len() != fields.len() {
+        return Err(SchemaError::UserError(format!(
+            "expected {} field(s), got {}",
+            fields.len(),
+            record.len()
+        )));
+    }
+    fields
+        .iter()
+        .zip(record.iter())
+        .map(|(f, cell)| csv_field_to_value_item(cell, f.datatype, f.nullable))
+        .collect()
+}
+
+// An empty CSV field means NULL (matching Snowflake's own default CSV
+// NULL handling) — an error for a NOT NULL column, same as any other
+// NULL-into-NOT-NULL rejection. Blob has no CSV representation this
+// engine knows how to parse (no literal Blob syntax anywhere else in
+// this crate either — see expr_to_value_item's own gap).
+fn csv_field_to_value_item(
+    cell: &str,
+    datatype: crate::datatype::DataType,
+    nullable: bool,
+) -> Result<ValueItem, SchemaError> {
+    use crate::datatype::DataType;
+    if cell.is_empty() {
+        return if nullable {
+            Ok(ValueItem::Null)
+        } else {
+            Err(SchemaError::UserError(
+                "empty CSV field for a NOT NULL column".into(),
+            ))
+        };
+    }
+    match datatype {
+        DataType::Integer => cell
+            .parse()
+            .map(ValueItem::Integer)
+            .map_err(|_| SchemaError::UserError(format!("invalid integer: {cell:?}"))),
+        DataType::Double => cell
+            .parse()
+            .map(ValueItem::Double)
+            .map_err(|_| SchemaError::UserError(format!("invalid double: {cell:?}"))),
+        // A bare number is accepted as-is (an already-computed literal
+        // value); anything else is tried as "YYYY-MM-DD"/"HH:MM:SS"/
+        // the two combined — see crate::datetime's own doc comment.
+        DataType::Datetime => cell
+            .parse()
+            .ok()
+            .or_else(|| crate::datetime::parse_datetime(cell))
+            .map(ValueItem::Datetime)
+            .ok_or_else(|| SchemaError::UserError(format!("invalid datetime: {cell:?}"))),
+        DataType::Str(cap) => Ok(ValueItem::Str((cell.to_string(), cap))),
+        DataType::Blob(_) | DataType::Unsupported => Err(SchemaError::UserError(format!(
+            "CSV loading into a {datatype:?} column is not supported yet"
+        ))),
     }
 }

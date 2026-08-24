@@ -1016,6 +1016,18 @@ fn expr_to_value_item(
             .parse()
             .map(ValueItem::Datetime)
             .map_err(|_| SchemaError::UserError(format!("invalid datetime literal: {s}"))),
+        // A quoted literal against a DATETIME column — "2020-04-13",
+        // "12:53:24", or the two combined (space or "T" separated) —
+        // see crate::datetime's own doc comment for the exact forms
+        // and how they're encoded. A bare number (the arm above) is
+        // still accepted too, as a literal, already-computed value.
+        (
+            sqlparser::ast::Value::SingleQuotedString(s)
+            | sqlparser::ast::Value::DoubleQuotedString(s),
+            DataType::Datetime,
+        ) => crate::datetime::parse_datetime(s)
+            .map(ValueItem::Datetime)
+            .ok_or_else(|| SchemaError::UserError(format!("invalid datetime literal: {s:?}"))),
         (
             sqlparser::ast::Value::SingleQuotedString(s)
             | sqlparser::ast::Value::DoubleQuotedString(s),

@@ -8,12 +8,11 @@ use std::{fmt::Display, sync::Arc};
 // existing CREATE TABLE SQL in this crate parses (same ColumnDef/
 // TableConstraint shapes come out either way).
 use sqlparser::dialect::SnowflakeDialect;
-use store::db::DBFile;
+use store::{db::DBFile, valueitem::ValueItem};
 use uuid::Uuid;
 
 use crate::{
-    conn::connection::Connection, error::SchemaError, rslt::resultset::ResultType,
-    table::SqlTable,
+    conn::connection::Connection, error::SchemaError, rslt::resultset::ResultType, table::SqlTable,
 };
 
 pub struct Statement<F: DBFile> {
@@ -23,6 +22,27 @@ pub struct Statement<F: DBFile> {
     conn: Arc<Connection<F>>,
     results: Vec<ResultType>,
     current_result: Option<usize>,
+}
+
+pub struct PreparedStatement<F: DBFile> {
+    stmt: Statement<F>,
+    // The original, still placeholder-bearing statement — kept
+    // separate from (a clone of) `stmt.stmts[0]` specifically because
+    // execute() overwrites `stmt.stmts` with a *substituted* (no longer
+    // placeholder-bearing) copy each time it runs. Substituting always
+    // starts from this template, never from `stmt.stmts[0]` itself —
+    // otherwise a second execute() call would find no placeholders left
+    // to replace (they were already replaced by the first call) and
+    // silently reuse the first call's bound values instead of the
+    // newly-set ones.
+    template: sqlparser::ast::Statement,
+    // Bound values, indexed by the "?" placeholder's position (0-based,
+    // in the order it appears across the statement's own AST — see
+    // count_placeholders) — None until set_field is called for that
+    // index. Deliberately persists across execute() calls rather than
+    // being cleared: a caller can either rebind every field before each
+    // execute() or leave values as-is to repeat the same execution.
+    params: Vec<Option<ValueItem>>,
 }
 
 #[cfg(test)]
@@ -39,6 +59,261 @@ impl<F: DBFile> std::fmt::Debug for Statement<F> {
             .field("sql", &self.sql)
             .finish_non_exhaustive()
     }
+}
+
+impl<F: DBFile> std::fmt::Debug for PreparedStatement<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedStatement")
+            .field("stmt", &self.stmt)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F> PreparedStatement<F>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    pub(crate) fn new(sql: &str, conn: Arc<Connection<F>>) -> Result<Self, SchemaError> {
+        let stmt = Statement::new(sql, conn)?;
+        if stmt.stmts.len() != 1 {
+            return Err(SchemaError::TooManyPreparedStatement);
+        }
+        let st = &stmt.stmts[0];
+        match st {
+            sqlparser::ast::Statement::Insert(_)
+            | sqlparser::ast::Statement::Delete(_)
+            | sqlparser::ast::Statement::Update(_)
+            | sqlparser::ast::Statement::Query(_) => {}
+            _ => return Err(SchemaError::BadPreparedStatement(st.to_string())),
+        }
+        let param_count = count_placeholders(st);
+        let template = st.clone();
+        Ok(Self {
+            stmt,
+            template,
+            params: vec![None; param_count],
+        })
+    }
+
+    /// The number of "?" placeholders this statement has — set_field
+    /// accepts any index in `0..parameter_count()`.
+    pub fn parameter_count(&self) -> usize {
+        self.params.len()
+    }
+
+    pub fn set_field(&mut self, index: usize, value: ValueItem) -> Result<(), SchemaError> {
+        let count = self.params.len();
+        let slot = self.params.get_mut(index).ok_or_else(|| {
+            SchemaError::UserError(format!(
+                "parameter index {index} out of range — this statement has {count} placeholder(s)"
+            ))
+        })?;
+        *slot = Some(value);
+        Ok(())
+    }
+
+    // Only INSERT is actually executable right now: DELETE/UPDATE
+    // aren't dispatched by Statement::execute at all yet (there's no
+    // row-mutation support in this engine yet, prepared or otherwise),
+    // and Query is permanently limited to "SELECT * FROM <table>" with
+    // no WHERE clause (rejected outright by parse_select_star) — the
+    // only place a "?" could ever legally appear in a Query is a WHERE
+    // clause, so a prepared SELECT can never actually have anything to
+    // bind. Both are accepted at `new()` (matching the parse-time
+    // validation already written) so a caller can construct and bind
+    // one ahead of when those become real, but execute() has to be
+    // honest about not being able to run them yet.
+    pub fn execute(&mut self) -> Result<ResultType, SchemaError> {
+        let insert = match &self.template {
+            sqlparser::ast::Statement::Insert(insert) => insert.clone(),
+            sqlparser::ast::Statement::Update(_) => {
+                return Err(SchemaError::UserError(
+                    "prepared UPDATE is not executable yet — UPDATE isn't supported by this \
+                     engine at all yet"
+                        .into(),
+                ));
+            }
+            sqlparser::ast::Statement::Delete(_) => {
+                return Err(SchemaError::UserError(
+                    "prepared DELETE is not executable yet — DELETE isn't supported by this \
+                     engine at all yet"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(SchemaError::UserError(
+                    "prepared SELECT is not executable yet — SELECT has no WHERE clause support \
+                     yet for a placeholder to bind into"
+                        .into(),
+                ));
+            }
+        };
+        let substituted = substitute_insert_placeholders(insert, &self.params)?;
+        // Swapped into the underlying Statement and run through its own
+        // ordinary execute() — reuses every bit of INSERT's existing
+        // validation/dispatch (rows_from_insert's type/NOT NULL checks,
+        // FK enforcement, transaction handling, ...) unchanged, since a
+        // fully-substituted Insert is indistinguishable from one a
+        // caller typed as a literal statement.
+        self.stmt.stmts = vec![sqlparser::ast::Statement::Insert(substituted)];
+        self.stmt.results.clear();
+        self.stmt.current_result = None;
+        self.stmt.execute()?;
+        Ok(self
+            .stmt
+            .results
+            .first()
+            .cloned()
+            .expect("Insert's own execute() arm always pushes exactly one result"))
+    }
+}
+
+// How many "?" placeholders `stmt` has, in the order they'll be
+// substituted (see substitute_insert_placeholders) — set_field's own
+// index range is 0..this. Best-effort for Update/Delete/Query (their
+// WHERE/SET expressions aren't restricted the way INSERT's VALUES are,
+// so count_placeholders_in_expr's fallback of 0 for an expr shape it
+// doesn't specifically walk is possible) — harmless since neither is
+// actually executable yet (see PreparedStatement::execute); INSERT's
+// count, the one that matters for real use, is exact.
+fn count_placeholders(stmt: &sqlparser::ast::Statement) -> usize {
+    match stmt {
+        sqlparser::ast::Statement::Insert(insert) => insert
+            .source
+            .as_ref()
+            .map(|q| match q.body.as_ref() {
+                sqlparser::ast::SetExpr::Values(values) => values
+                    .rows
+                    .iter()
+                    .flat_map(|r| r.content.iter())
+                    .map(count_placeholders_in_expr)
+                    .sum(),
+                _ => 0,
+            })
+            .unwrap_or(0),
+        sqlparser::ast::Statement::Update(update) => {
+            update
+                .assignments
+                .iter()
+                .map(|a| count_placeholders_in_expr(&a.value))
+                .sum::<usize>()
+                + update
+                    .selection
+                    .as_ref()
+                    .map(count_placeholders_in_expr)
+                    .unwrap_or(0)
+        }
+        sqlparser::ast::Statement::Delete(delete) => delete
+            .selection
+            .as_ref()
+            .map(count_placeholders_in_expr)
+            .unwrap_or(0),
+        sqlparser::ast::Statement::Query(query) => match query.body.as_ref() {
+            sqlparser::ast::SetExpr::Select(select) => select
+                .selection
+                .as_ref()
+                .map(count_placeholders_in_expr)
+                .unwrap_or(0),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+// Recursive placeholder count for one expression — handles the
+// composite Expr shapes common enough to plausibly show up in a WHERE/
+// SET clause; anything else falls back to 0 rather than trying to be
+// exhaustive over sqlparser's full Expr enum (see count_placeholders'
+// own doc comment on why that's an acceptable, honest limitation here).
+fn count_placeholders_in_expr(expr: &sqlparser::ast::Expr) -> usize {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Value(v) => usize::from(matches!(v.value, sqlparser::ast::Value::Placeholder(_))),
+        Expr::BinaryOp { left, right, .. } => {
+            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
+        }
+        Expr::UnaryOp { expr, .. } => count_placeholders_in_expr(expr),
+        Expr::Nested(expr) => count_placeholders_in_expr(expr),
+        Expr::IsNull(expr) => count_placeholders_in_expr(expr),
+        Expr::IsNotNull(expr) => count_placeholders_in_expr(expr),
+        Expr::Cast { expr, .. } => count_placeholders_in_expr(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            count_placeholders_in_expr(expr)
+                + count_placeholders_in_expr(low)
+                + count_placeholders_in_expr(high)
+        }
+        Expr::InList { expr, list, .. } => {
+            count_placeholders_in_expr(expr)
+                + list.iter().map(count_placeholders_in_expr).sum::<usize>()
+        }
+        _ => 0,
+    }
+}
+
+// Clones `insert`'s VALUES rows, replacing each "?" placeholder — in
+// the same left-to-right, row-major order count_placeholders counted
+// them in — with a literal Expr built from the correspondingly-bound
+// param. Errors if a placeholder's slot was never bound (set_field
+// never called for that index); can't error the other way (more bound
+// params than placeholders) since params.len() is fixed at
+// PreparedStatement::new time to exactly the placeholder count.
+fn substitute_insert_placeholders(
+    mut insert: sqlparser::ast::Insert,
+    params: &[Option<ValueItem>],
+) -> Result<sqlparser::ast::Insert, SchemaError> {
+    let mut next = 0usize;
+    if let Some(query) = &mut insert.source
+        && let sqlparser::ast::SetExpr::Values(values) = query.body.as_mut()
+    {
+        for row in &mut values.rows {
+            for expr in &mut row.content {
+                substitute_placeholder_expr(expr, params, &mut next)?;
+            }
+        }
+    }
+    Ok(insert)
+}
+
+fn substitute_placeholder_expr(
+    expr: &mut sqlparser::ast::Expr,
+    params: &[Option<ValueItem>],
+    next: &mut usize,
+) -> Result<(), SchemaError> {
+    if let sqlparser::ast::Expr::Value(v) = expr
+        && matches!(v.value, sqlparser::ast::Value::Placeholder(_))
+    {
+        let value = params
+            .get(*next)
+            .and_then(|o| o.clone())
+            .ok_or_else(|| SchemaError::UserError(format!("parameter {} was not bound", *next + 1)))?;
+        *next += 1;
+        *expr = value_item_to_expr(&value)?;
+    }
+    Ok(())
+}
+
+// The inverse of expr_to_value_item — builds a literal Expr node from a
+// bound ValueItem so a substituted Insert round-trips through the same
+// validation (rows_from_insert -> expr_to_value_item) an ordinary,
+// literally-typed INSERT already goes through.
+fn value_item_to_expr(v: &ValueItem) -> Result<sqlparser::ast::Expr, SchemaError> {
+    use sqlparser::ast::Value;
+    let value = match v {
+        ValueItem::Null => Value::Null,
+        ValueItem::Integer(i) => Value::Number(i.to_string(), false),
+        ValueItem::Double(d) => Value::Number(d.to_string(), false),
+        ValueItem::Datetime(d) => Value::Number(d.to_string(), false),
+        ValueItem::Str((s, _)) => Value::SingleQuotedString(s.clone()),
+        ValueItem::Blob(_) => {
+            return Err(SchemaError::UserError(
+                "binding a Blob value into a prepared statement is not supported yet".into(),
+            ));
+        }
+    };
+    Ok(sqlparser::ast::Expr::Value(value.into()))
 }
 
 impl<F> Statement<F>
@@ -87,6 +362,9 @@ where
                 sqlparser::ast::Statement::AlterTable(alter) => {
                     parse_alter_table(alter)?;
                 }
+                sqlparser::ast::Statement::CopyIntoSnowflake { .. } => {
+                    parse_copy_into(stmt)?;
+                }
                 sqlparser::ast::Statement::StartTransaction { statements, .. }
                     if !statements.is_empty() =>
                 {
@@ -117,8 +395,9 @@ where
                         .ok_or(SchemaError::NoSchemaSelected)?;
                     let table_name = c.name.to_string();
                     schema.create_table(SqlTable::from_sql(&schema, c.clone())?)?;
-                    self.results
-                        .push(ResultType::ResultString(format!("Table '{table_name}' created")));
+                    self.results.push(ResultType::ResultString(format!(
+                        "Table '{table_name}' created"
+                    )));
                 }
                 sqlparser::ast::Statement::CreateDatabase {
                     db_name,
@@ -255,8 +534,20 @@ where
                             schema.drop_foreign_key(&table_name, &name)?
                         }
                     }
-                    self.results
-                        .push(ResultType::ResultString(format!("Table {table_name:?} altered")));
+                    self.results.push(ResultType::ResultString(format!(
+                        "Table {table_name:?} altered"
+                    )));
+                }
+                sqlparser::ast::Statement::CopyIntoSnowflake { .. } => {
+                    let (table_name, path) = parse_copy_into(stmt)?;
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let (loaded, failed) = schema.copy_csv_into(&table_name, &path)?;
+                    self.results.push(ResultType::ResultString(format!(
+                        "{loaded} row(s) loaded, {failed} row(s) failed"
+                    )));
                 }
                 sqlparser::ast::Statement::AlterCollation(_) => {
                     todo!()
@@ -327,7 +618,9 @@ fn validate_identifier(what: &str, name: &str) -> Result<(), SchemaError> {
 // first, e.g. any future caller that skips it).
 fn validate_table_name(name: &str) -> Result<(), SchemaError> {
     if name.is_empty() {
-        return Err(SchemaError::BadTableName("table name cannot be empty".into()));
+        return Err(SchemaError::BadTableName(
+            "table name cannot be empty".into(),
+        ));
     }
     if name.len() > crate::constant::MAX_TABLE_NAME_LEN {
         return Err(SchemaError::BadTableName(format!(
@@ -465,21 +758,21 @@ fn parse_select_star(query: &sqlparser::ast::Query) -> Result<String, SchemaErro
     if select.having.is_some() {
         return unsupported("HAVING");
     }
-    if !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(v, _) if v.is_empty())
-    {
+    if !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(v, _) if v.is_empty()) {
         return unsupported("GROUP BY");
     }
     match select.from.as_slice() {
-        [sqlparser::ast::TableWithJoins { relation, joins }] if joins.is_empty() => match relation
-        {
-            sqlparser::ast::TableFactor::Table {
-                name,
-                alias: None,
-                args: None,
-                ..
-            } => Ok(name.to_string().to_lowercase()),
-            _ => unsupported("subqueries/table functions/aliases in FROM"),
-        },
+        [sqlparser::ast::TableWithJoins { relation, joins }] if joins.is_empty() => {
+            match relation {
+                sqlparser::ast::TableFactor::Table {
+                    name,
+                    alias: None,
+                    args: None,
+                    ..
+                } => Ok(name.to_string().to_lowercase()),
+                _ => unsupported("subqueries/table functions/aliases in FROM"),
+            }
+        }
         [] => unsupported("SELECT without FROM"),
         _ => unsupported("JOINs / multiple FROM tables"),
     }
@@ -534,12 +827,14 @@ fn parse_alter_table(
     }
     let table_name = alter.name.to_string().to_lowercase();
     let op = match alter.operations.as_slice() {
-        [sqlparser::ast::AlterTableOperation::AddColumn {
-            if_not_exists,
-            column_def,
-            column_position,
-            ..
-        }] => {
+        [
+            sqlparser::ast::AlterTableOperation::AddColumn {
+                if_not_exists,
+                column_def,
+                column_position,
+                ..
+            },
+        ] => {
             if *if_not_exists {
                 return unsupported("ADD COLUMN IF NOT EXISTS");
             }
@@ -548,12 +843,14 @@ fn parse_alter_table(
             }
             AlterColumnOp::Add(crate::table::Field::try_from(column_def)?)
         }
-        [sqlparser::ast::AlterTableOperation::DropColumn {
-            column_names,
-            if_exists,
-            drop_behavior,
-            ..
-        }] => {
+        [
+            sqlparser::ast::AlterTableOperation::DropColumn {
+                column_names,
+                if_exists,
+                drop_behavior,
+                ..
+            },
+        ] => {
             if *if_exists {
                 return unsupported("DROP COLUMN IF EXISTS");
             }
@@ -565,27 +862,33 @@ fn parse_alter_table(
                 _ => return unsupported("dropping multiple columns in one statement"),
             }
         }
-        [sqlparser::ast::AlterTableOperation::RenameColumn {
-            old_column_name,
-            new_column_name,
-        }] => AlterColumnOp::Rename(
+        [
+            sqlparser::ast::AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            },
+        ] => AlterColumnOp::Rename(
             old_column_name.value.to_lowercase(),
             new_column_name.value.to_lowercase(),
         ),
-        [sqlparser::ast::AlterTableOperation::AddConstraint {
-            constraint: sqlparser::ast::TableConstraint::ForeignKey(fk),
-            not_valid,
-        }] => {
+        [
+            sqlparser::ast::AlterTableOperation::AddConstraint {
+                constraint: sqlparser::ast::TableConstraint::ForeignKey(fk),
+                not_valid,
+            },
+        ] => {
             if *not_valid {
                 return unsupported("ADD CONSTRAINT ... NOT VALID");
             }
             AlterColumnOp::AddForeignKey(crate::table::foreign_key_from_constraint(fk, None)?)
         }
-        [sqlparser::ast::AlterTableOperation::DropConstraint {
-            if_exists,
-            name,
-            drop_behavior,
-        }] => {
+        [
+            sqlparser::ast::AlterTableOperation::DropConstraint {
+                if_exists,
+                name,
+                drop_behavior,
+            },
+        ] => {
             if *if_exists {
                 return unsupported("DROP CONSTRAINT IF EXISTS");
             }
@@ -599,6 +902,90 @@ fn parse_alter_table(
         _ => return unsupported("multiple operations in one ALTER TABLE statement"),
     };
     Ok((table_name, op))
+}
+
+// Deliberately strict, same spirit as parse_select_star/parse_alter_table:
+// accepts exactly "COPY INTO <table> FROM @<path>" — a literal local
+// filesystem path, `@` stripped, not a real Snowflake stage (no
+// credentials/URL/storage-integration resolution) — and rejects every
+// other CopyIntoSnowflake option (COPY INTO <location> unload direction,
+// target column list, source alias, FILES/PATTERN, FILE_FORMAT/COPY
+// options, VALIDATION_MODE, PARTITION BY, loading from a query instead
+// of a stage) with a specific message.
+fn parse_copy_into(stmt: &sqlparser::ast::Statement) -> Result<(String, String), SchemaError> {
+    let sqlparser::ast::Statement::CopyIntoSnowflake {
+        kind,
+        into,
+        into_columns,
+        from_obj,
+        from_obj_alias,
+        stage_params,
+        from_transformations,
+        from_query,
+        files,
+        pattern,
+        file_format,
+        copy_options,
+        validation_mode,
+        partition,
+    } = stmt
+    else {
+        unreachable!("caller already matched Statement::CopyIntoSnowflake");
+    };
+    let unsupported = |what: &str| {
+        Err(SchemaError::UserError(format!(
+            "COPY INTO only supports \"COPY INTO <table> FROM @<path>\" right now — {what} is \
+             not supported yet"
+        )))
+    };
+    if !matches!(kind, sqlparser::ast::CopyIntoSnowflakeKind::Table) {
+        return unsupported("COPY INTO <location> (unloading)");
+    }
+    if into_columns.is_some() {
+        return unsupported("an explicit target column list");
+    }
+    if from_obj_alias.is_some() {
+        return unsupported("a source alias");
+    }
+    if stage_params.url.is_some()
+        || !stage_params.encryption.options.is_empty()
+        || stage_params.endpoint.is_some()
+        || stage_params.storage_integration.is_some()
+        || !stage_params.credentials.options.is_empty()
+    {
+        return unsupported("stage credentials/URL/endpoint/storage integration");
+    }
+    if from_transformations.is_some() {
+        return unsupported("column transformations");
+    }
+    if from_query.is_some() {
+        return unsupported("loading from a query instead of a stage");
+    }
+    if files.is_some() {
+        return unsupported("an explicit FILES list");
+    }
+    if pattern.is_some() {
+        return unsupported("PATTERN");
+    }
+    if !file_format.options.is_empty() {
+        return unsupported("FILE_FORMAT options — CSV is always assumed");
+    }
+    if !copy_options.options.is_empty() {
+        return unsupported("COPY options");
+    }
+    if validation_mode.is_some() {
+        return unsupported("VALIDATION_MODE");
+    }
+    if partition.is_some() {
+        return unsupported("PARTITION BY");
+    }
+    let table_name = into.to_string().to_lowercase();
+    let path = from_obj
+        .as_ref()
+        .ok_or_else(|| SchemaError::UserError("COPY INTO needs a FROM @<path>".into()))?
+        .to_string();
+    let path = path.strip_prefix('@').unwrap_or(&path).to_string();
+    Ok((table_name, path))
 }
 
 impl<F> Display for Statement<F>

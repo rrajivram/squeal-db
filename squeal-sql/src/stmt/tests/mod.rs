@@ -724,3 +724,226 @@ fn test_new_rejects_a_composite_foreign_key() {
         .unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
+
+#[test]
+fn test_new_tolerates_a_placeholder_in_ordinary_sql() {
+    // The actual ask: semantic_validate must not reject "?" outright —
+    // Statement::new (which PreparedStatement::new itself calls) has to
+    // succeed for SQL containing a placeholder, the same way it would
+    // for any other well-formed INSERT.
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    c.create_statement("insert into t values (?)").unwrap();
+}
+
+#[test]
+fn test_prepared_insert_executes_with_bound_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, name varchar(10), primary key(id))").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?, ?)")
+        .unwrap();
+    assert_eq!(stmt.parameter_count(), 2);
+    stmt.set_field(0, ValueItem::Integer(1)).unwrap();
+    stmt.set_field(1, ValueItem::Str(("alice".into(), 10)))
+        .unwrap();
+    let result = stmt.execute().unwrap();
+    assert!(matches!(result, ResultType::Count(1)), "got {result:?}");
+
+    let mut check = c.create_statement("select * from t").unwrap();
+    check.execute().unwrap();
+    let ResultType::Result(rs) = &check.results[0] else {
+        panic!("expected a ResultType::Result");
+    };
+    assert_eq!(
+        rs.rows(),
+        &[vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("alice".into(), 10))
+        ]]
+    );
+}
+
+#[test]
+fn test_prepared_insert_can_be_reused_with_different_bound_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?)")
+        .unwrap();
+
+    stmt.set_field(0, ValueItem::Integer(1)).unwrap();
+    stmt.execute().unwrap();
+    stmt.set_field(0, ValueItem::Integer(2)).unwrap();
+    stmt.execute().unwrap();
+
+    let mut check = c.create_statement("select * from t").unwrap();
+    check.execute().unwrap();
+    let ResultType::Result(rs) = &check.results[0] else {
+        panic!("expected a ResultType::Result");
+    };
+    let mut rows = rs.rows().to_vec();
+    rows.sort_by_key(|r| match &r[0] {
+        ValueItem::Integer(i) => *i,
+        _ => panic!("expected an integer id"),
+    });
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(2)]]
+    );
+}
+
+#[test]
+fn test_prepared_insert_type_checks_bound_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?)")
+        .unwrap();
+    stmt.set_field(0, ValueItem::Str(("nope".into(), 10)))
+        .unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_insert_enforces_not_null() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?)")
+        .unwrap();
+    stmt.set_field(0, ValueItem::Null).unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_statement_execute_fails_when_a_parameter_is_unbound() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?)")
+        .unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_statement_set_field_rejects_an_out_of_range_index() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("insert into t values (?)")
+        .unwrap();
+    let err = stmt.set_field(1, ValueItem::Integer(1)).unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_statement_rejects_multiple_sql_statements() {
+    let c = conn();
+    let err = c
+        .create_prepared_statement("insert into t values (?); insert into u values (?)")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::TooManyPreparedStatement));
+}
+
+#[test]
+fn test_prepared_statement_rejects_ddl() {
+    let c = conn();
+    let err = c
+        .create_prepared_statement("create table t (id integer)")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::BadPreparedStatement(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_update_execute_errors_not_implemented() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("update t set id = ? where id = ?")
+        .unwrap();
+    assert_eq!(stmt.parameter_count(), 2);
+    stmt.set_field(0, ValueItem::Integer(1)).unwrap();
+    stmt.set_field(1, ValueItem::Integer(2)).unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_delete_execute_errors_not_implemented() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("delete from t where id = ?")
+        .unwrap();
+    stmt.set_field(0, ValueItem::Integer(1)).unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_prepared_select_execute_errors_not_implemented() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("select * from t")
+        .unwrap();
+    assert_eq!(stmt.parameter_count(), 0);
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_copy_into_records_load_counts() {
+    let path = std::env::temp_dir().join(format!("squeal_sql_stmt_copy_test_{}.csv", std::process::id()));
+    std::fs::write(&path, "id\n1\n2\n").unwrap();
+
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    let mut stmt = c
+        .create_statement(&format!("copy into t from @{}", path.to_str().unwrap()))
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 1);
+    assert_eq!(result_string(&stmt.results[0]), "2 row(s) loaded, 0 row(s) failed");
+
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn test_execute_copy_into_fails_for_an_unknown_table() {
+    let c = conn();
+    let mut stmt = c.create_statement("copy into nope from @/tmp/x.csv").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_copy_into_with_a_file_format_clause() {
+    let c = conn();
+    let err = c
+        .create_statement("copy into t from @stage file_format = (type = csv)")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_new_rejects_copy_into_with_a_pattern_clause() {
+    let c = conn();
+    let err = c
+        .create_statement("copy into t from @stage pattern = '.*.csv'")
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}

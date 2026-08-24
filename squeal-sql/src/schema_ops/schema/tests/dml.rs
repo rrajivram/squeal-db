@@ -153,6 +153,55 @@ fn test_insert_rejects_value_type_mismatch() {
 }
 
 #[test]
+fn test_insert_accepts_date_and_time_string_literals_into_a_datetime_column() {
+    let conn = conn();
+    execute(
+        &conn,
+        "create table events (id integer not null, happened_on datetime, primary key(id))",
+    )
+    .unwrap();
+    execute(&conn, "insert into events values (1, '2020-04-13')").unwrap();
+    execute(&conn, "insert into events values (2, '12:53:24')").unwrap();
+    execute(&conn, "insert into events values (3, '2020-04-13 12:53:24')").unwrap();
+
+    let s = conn.current_schema().unwrap();
+    let table = s.get_table("events").unwrap();
+    assert_eq!(
+        find_row(&s, table.db_table_id, pk_key(1)).unwrap()[1],
+        ValueItem::Datetime(18365 * 86400)
+    );
+    assert_eq!(
+        find_row(&s, table.db_table_id, pk_key(2)).unwrap()[1],
+        ValueItem::Datetime(12 * 3600 + 53 * 60 + 24)
+    );
+    assert_eq!(
+        find_row(&s, table.db_table_id, pk_key(3)).unwrap()[1],
+        ValueItem::Datetime(18365 * 86400 + 12 * 3600 + 53 * 60 + 24)
+    );
+}
+
+#[test]
+fn test_insert_rejects_an_unparseable_datetime_literal() {
+    let conn = conn();
+    execute(&conn, "create table events (happened_on datetime)").unwrap();
+    let err = execute(&conn, "insert into events values ('not a date')").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_insert_rejects_a_string_longer_than_its_column_reports_a_user_error() {
+    // Regression test: a too-long VARCHAR value used to surface as
+    // SchemaError::InternalError("Internal Store Error") — StoreError::
+    // TupleTooLarge was bucketed with genuinely internal errors even
+    // though this specific case is caused by, and actionable by, the
+    // caller's own input.
+    let conn = conn();
+    execute(&conn, "create table users (name varchar(3))").unwrap();
+    let err = execute(&conn, "insert into users values ('toolong')").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
 fn test_insert_rejects_null_into_not_null_column() {
     let conn = conn();
     execute(&conn, "create table users (id integer not null, primary key(id))").unwrap();

@@ -22,8 +22,14 @@
 //   TABLE ADD/DROP time, and enforcement at INSERT time. Statement
 //   dispatch for the ALTER TABLE ADD/DROP FOREIGN KEY forms is tested
 //   in stmt.rs, same split as everything else ALTER-shaped.
+// - `copy_into`: Schema::copy_csv_into's own loading mechanics —
+//   positional mapping, header-row skipping, NULL-on-empty-field, and
+//   permissive (continue-on-error, not atomic) row handling. COPY INTO
+//   *dispatch* (parsing, result reporting) is tested in stmt.rs, same
+//   split as everything else.
 mod alter;
 mod contract;
+mod copy_into;
 mod dml;
 mod foreign_key;
 mod mapping;

@@ -31,6 +31,10 @@ pub enum SchemaError {
     TransactionAlreadyActive,
     #[error("No active transaction on this connection")]
     NoActiveTransaction,
+    #[error("Prepared statements can only have one execution statement")]
+    TooManyPreparedStatement,
+    #[error("Only INSERT, UPDATE, DELETE , SELECT are allowed in prepared statements, found {0}")]
+    BadPreparedStatement(String),
 }
 
 impl From<StoreError> for SchemaError {
@@ -44,11 +48,19 @@ impl From<StoreError> for SchemaError {
             | StoreError::UnknownError(_)
             | StoreError::UndoLogError(_)
             | StoreError::MissingKey(_)
-            | StoreError::TupleTooLarge(_, _)
             | StoreError::PageTransientlyInconsistent(_)
             | StoreError::UnknownPageContentKind(_)
             | StoreError::DuplicatePageContentKind(_)
             | StoreError::LockContentionError => Self::InternalError(value),
+            // Not internal — "this value is too big to fit in its
+            // declared size" (a VARCHAR/BLOB literal longer than the
+            // column's declared capacity, most commonly) is something
+            // the caller's own input caused and can fix, the same way
+            // a NOT NULL violation or a type mismatch is. Previously
+            // bucketed with the genuinely internal errors above, so it
+            // surfaced as an opaque "Internal Store Error" instead of
+            // a message naming the actual sizes involved.
+            StoreError::TupleTooLarge(_, _) => Self::UserError(value.to_string()),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),
             StoreError::TableNameInvalid(_, _)

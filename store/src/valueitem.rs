@@ -126,16 +126,22 @@ impl ValueItem {
             ValueItem::Integer(_) => Ok(()),
             ValueItem::Double(_) => Ok(()),
             ValueItem::Datetime(_) => Ok(()),
+            // TupleTooLarge(actual, max) — every other call site in this
+            // crate (page.rs, fixedtuple.rs, bplustree.rs) passes this
+            // same (actual, max) order, matching the variant's own
+            // Display format; this one had it backwards (reserved cap
+            // first, actual length second), so the printed message
+            // reported the two numbers swapped.
             ValueItem::Str(s) => {
                 if s.0.len() as u32 > s.1 {
-                    Err(StoreError::TupleTooLarge(s.1 as DBSizeType, s.0.len()))
+                    Err(StoreError::TupleTooLarge(s.0.len() as DBSizeType, s.1 as usize))
                 } else {
                     Ok(())
                 }
             }
             ValueItem::Blob(s) => {
                 if s.0.len() as u32 > s.1 {
-                    Err(StoreError::TupleTooLarge(s.1 as DBSizeType, s.0.len()))
+                    Err(StoreError::TupleTooLarge(s.0.len() as DBSizeType, s.1 as usize))
                 } else {
                     Ok(())
                 }

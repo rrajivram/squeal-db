@@ -36,7 +36,7 @@ pub enum StoreError {
     DuplicateName(String),
     #[error("Missing key {0}")]
     MissingKey(String),
-    #[error("Tuple too large. {0}: Max : {1}")]
+    #[error("value too large: {0} byte(s), maximum allowed is {1} byte(s)")]
     TupleTooLarge(DBSizeType, usize),
     #[error("Undo log error : {0}")]
     UndoLogError(String),

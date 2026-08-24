@@ -9,7 +9,12 @@ use parking_lot::RwLock;
 use store::{db::DBFile, txn::Transaction};
 use uuid::Uuid;
 
-use crate::{error::SchemaError, schema_ops::database::Database, schema_ops::schema::Schema, stmt::Statement};
+use crate::{
+    error::SchemaError,
+    schema_ops::database::Database,
+    schema_ops::schema::Schema,
+    stmt::{PreparedStatement, Statement},
+};
 
 #[cfg(test)]
 mod tests;
@@ -189,6 +194,18 @@ where
 
     pub fn create_statement(self: Arc<Self>, sql: &str) -> Result<Statement<F>, SchemaError> {
         Statement::new(sql, self.clone())
+    }
+
+    // A single INSERT/UPDATE/DELETE/SELECT statement, "?"-parameterized
+    // and re-executable with different bound values (see
+    // PreparedStatement::set_field/execute) instead of being re-parsed
+    // from scratch every time — only INSERT is actually runnable right
+    // now (see PreparedStatement::execute's own doc comment).
+    pub fn create_prepared_statement(
+        self: Arc<Self>,
+        sql: &str,
+    ) -> Result<PreparedStatement<F>, SchemaError> {
+        PreparedStatement::new(sql, self.clone())
     }
 
     // Cleanly shuts down the database this connection is pointed at —
