@@ -31,15 +31,18 @@ use chumsky::{
 };
 use either::Either;
 
+use macros::SQLParser;
+
 use crate::{
     datatype::DataType,
     ident::{Ident, ObjectName},
     keyword as kw,
     literal::{Literal, NumberLiteral, NumberValue},
     parser::{SQLParser, SqlCtx, TokenInput, oper, punct},
-    query::Query,
+    query::{OrderByClause, Query},
     span::TokenSpan,
-    token::{Operator, Punctuation},
+    token::{Comma, LeftParenthesis, Operator, Punctuation, RightParenthesis},
+    utils::Seq,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +90,15 @@ pub enum Expr {
         name: Ident,
         distinct: bool,
         args: Vec<FunctionArg>,
+        /// `OVER (...)` — present when used as a window function.
+        over: Option<Box<OverClause>>,
+    },
+    /// `x op ANY|ALL|SOME (SELECT ...)`
+    QuantifiedComparison {
+        left: Box<Expr>,
+        op: BinaryOp,
+        quantifier: Quantifier,
+        query: Box<Query>,
     },
     Cast {
         expr: Box<Expr>,
@@ -104,6 +116,51 @@ pub enum Expr {
         query: Box<Query>,
     },
     Nested(Box<Expr>),
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum Quantifier {
+    Any(kw::Any),
+    All(kw::All),
+    Some(kw::Some),
+}
+
+/// `OVER ( [PARTITION BY ...] [ORDER BY ...] [frame] )`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct OverClause {
+    pub over: kw::Over,
+    pub lparen: LeftParenthesis,
+    pub spec: WindowSpec,
+    pub rparen: RightParenthesis,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct WindowSpec {
+    pub partition_by: Option<(kw::Partition, kw::By, Seq<Expr, Comma>)>,
+    pub order_by: Option<OrderByClause>,
+    pub frame: Option<WindowFrame>,
+}
+
+/// `ROWS|RANGE <extent>`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct WindowFrame {
+    pub units: Either<kw::Rows, kw::Range>,
+    pub extent: WindowFrameExtent,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum WindowFrameExtent {
+    Between(kw::Between, WindowFrameBound, kw::And, WindowFrameBound),
+    Single(WindowFrameBound),
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum WindowFrameBound {
+    UnboundedPreceding(kw::Unbounded, kw::Preceding),
+    UnboundedFollowing(kw::Unbounded, kw::Following),
+    CurrentRow(kw::Current, kw::Row),
+    Preceding(NumberLiteral, kw::Preceding),
+    Following(NumberLiteral, kw::Following),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +215,7 @@ fn binary(left: Expr, op: BinaryOp, right: Expr) -> Expr {
 
 enum Suffix {
     Cmp(BinaryOp, Expr),
+    CmpQuantified(BinaryOp, Quantifier, Box<Query>),
     IsNull(bool),
     In(bool, Vec<Expr>),
     InQuery(bool, Box<Query>),
@@ -173,6 +231,12 @@ impl Suffix {
                 left: expr,
                 op,
                 right: Box::new(right),
+            },
+            Suffix::CmpQuantified(op, quantifier, query) => Expr::QuantifiedComparison {
+                left: expr,
+                op,
+                quantifier,
+                query,
             },
             Suffix::IsNull(negated) => Expr::IsNull { expr, negated },
             Suffix::In(negated, list) => Expr::InList {
@@ -282,10 +346,12 @@ where
         .then(kw::Distinct::parser(()).or_not())
         .then(function_arg.separated_by(comma.clone()).collect::<Vec<_>>())
         .then_ignore(rparen.clone())
-        .map(|((name, distinct), args)| Expr::Function {
+        .then(OverClause::parser(ctx.clone()).or_not())
+        .map(|(((name, distinct), args), over)| Expr::Function {
             name,
             distinct: distinct.is_some(),
             args,
+            over: over.map(Box::new),
         });
 
     let cast = kw::Cast::parser(())
@@ -418,6 +484,20 @@ where
 
     let negation = kw::Not::parser(()).or_not().map(|n| n.is_some());
     let suffix = choice((
+        // `op ANY|ALL|SOME (query)` before plain `op expr`: the quantifier
+        // branch backtracks unless a real subquery follows (so `a = any(1)`
+        // still parses as a call to a function named `any`).
+        cmp_op
+            .clone()
+            .then(Quantifier::parser(ctx.clone()))
+            .then(
+                query
+                    .clone()
+                    .delimited_by(lparen.clone(), rparen.clone()),
+            )
+            .map(|((op, quantifier), q)| {
+                Suffix::CmpQuantified(op, quantifier, Box::new(q))
+            }),
         cmp_op.then(sum.clone()).map(|(op, r)| Suffix::Cmp(op, r)),
         kw::Is::parser(())
             .ignore_then(negation.clone())

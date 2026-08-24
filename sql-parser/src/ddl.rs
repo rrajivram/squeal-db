@@ -1,5 +1,7 @@
-//! DDL statements: `CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`.
+//! DDL statements: `CREATE`/`DROP`/`ALTER TABLE`, `CREATE`/`DROP`
+//! `DATABASE`/`SCHEMA`, `CREATE`/`DROP INDEX`, `USE`, `TRUNCATE`.
 
+use either::Either;
 use macros::SQLParser;
 
 use crate::{
@@ -7,6 +9,7 @@ use crate::{
     expr::Expr,
     ident::{Ident, ObjectName},
     keyword as kw,
+    query::OrderByItem,
     token::{Comma, LeftParenthesis, RightParenthesis},
     utils::Seq,
 };
@@ -125,4 +128,62 @@ pub enum AlterTableOp {
     DropColumn(kw::Drop, Option<kw::Column>, Ident),
     RenameTo(kw::Rename, kw::To, ObjectName),
     RenameColumn(kw::Rename, Option<kw::Column>, Ident, kw::To, Ident),
+}
+
+/// `CREATE DATABASE|SCHEMA [IF NOT EXISTS] name`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct CreateDatabase {
+    pub create: kw::Create,
+    pub kind: Either<kw::Database, kw::Schema>,
+    pub if_not_exists: Option<(kw::If, kw::Not, kw::Exists)>,
+    pub name: Ident,
+}
+
+/// `DROP DATABASE|SCHEMA [IF EXISTS] name [CASCADE | RESTRICT]`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct DropDatabase {
+    pub drop: kw::Drop,
+    pub kind: Either<kw::Database, kw::Schema>,
+    pub if_exists: Option<(kw::If, kw::Exists)>,
+    pub name: Ident,
+    pub behavior: Option<Either<kw::Cascade, kw::Restrict>>,
+}
+
+/// `USE name` / `USE db.schema`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct UseStatement {
+    pub use_token: kw::Use,
+    pub name: ObjectName,
+}
+
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (col [ASC|DESC], ...)`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct CreateIndex {
+    pub create: kw::Create,
+    pub unique: Option<kw::Unique>,
+    pub index: kw::Index,
+    pub if_not_exists: Option<(kw::If, kw::Not, kw::Exists)>,
+    pub name: Ident,
+    pub on: kw::On,
+    pub table: ObjectName,
+    pub lparen: LeftParenthesis,
+    pub columns: Seq<OrderByItem, Comma>,
+    pub rparen: RightParenthesis,
+}
+
+/// `DROP INDEX [IF EXISTS] name`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct DropIndex {
+    pub drop: kw::Drop,
+    pub index: kw::Index,
+    pub if_exists: Option<(kw::If, kw::Exists)>,
+    pub name: ObjectName,
+}
+
+/// `TRUNCATE [TABLE] name`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct Truncate {
+    pub truncate: kw::Truncate,
+    pub table: Option<kw::Table>,
+    pub name: ObjectName,
 }

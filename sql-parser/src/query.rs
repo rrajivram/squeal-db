@@ -28,11 +28,19 @@ use crate::{
 #[sql_parser(body_only)]
 pub struct Query {
     pub with: Option<With>,
-    pub body: SelectCore,
+    pub body: SetOperand,
     pub compounds: Vec<CompoundSelect>,
     pub order_by: Option<OrderByClause>,
     pub limit: Option<LimitClause>,
     pub offset: Option<OffsetClause>,
+}
+
+impl Query {
+    /// The leading `SELECT` block, looking through parenthesized operands —
+    /// the common case for consumers of simple, non-compound queries.
+    pub fn core(&self) -> &SelectCore {
+        self.body.core()
+    }
 }
 
 impl<'src, I, E> SQLParser<'src, I, E, SqlCtx<'src, I, E>> for Query
@@ -75,11 +83,28 @@ pub struct Cte {
     pub rparen: RightParenthesis,
 }
 
+/// One operand of a set operation: either a bare `SELECT` block or a
+/// parenthesized query (`(SELECT ...) UNION (SELECT ...)`).
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum SetOperand {
+    Paren(LeftParenthesis, Box<Query>, RightParenthesis),
+    Select(Box<SelectCore>),
+}
+
+impl SetOperand {
+    pub fn core(&self) -> &SelectCore {
+        match self {
+            SetOperand::Select(core) => core,
+            SetOperand::Paren(_, query, _) => query.core(),
+        }
+    }
+}
+
 /// One `UNION [ALL | DISTINCT] / INTERSECT / EXCEPT` arm.
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct CompoundSelect {
     pub op: SetOperator,
-    pub select: SelectCore,
+    pub operand: SetOperand,
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
@@ -218,6 +243,8 @@ pub struct OrderByClause {
 pub struct OrderByItem {
     pub expr: Expr,
     pub direction: Option<Either<kw::Asc, kw::Desc>>,
+    /// `NULLS FIRST` / `NULLS LAST`
+    pub nulls: Option<(kw::Nulls, Either<kw::First, kw::Last>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]

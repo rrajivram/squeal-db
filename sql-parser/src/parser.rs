@@ -109,6 +109,8 @@ where
 {
     pub expr: Recursive<Indirect<'src, 'src, I, crate::expr::Expr, E>>,
     pub query: Recursive<Indirect<'src, 'src, I, crate::query::Query, E>>,
+    /// Statements recurse too: `EXPLAIN <statement>`.
+    pub stmt: Recursive<Indirect<'src, 'src, I, crate::statement::Statement, E>>,
 }
 
 // Derived Clone would demand I: Clone + E: Clone; the handles themselves are
@@ -122,6 +124,7 @@ where
         Self {
             expr: self.expr.clone(),
             query: self.query.clone(),
+            stmt: self.stmt.clone(),
         }
     }
 }
@@ -135,12 +138,15 @@ where
     pub fn build() -> Self {
         let mut expr = Recursive::declare();
         let mut query = Recursive::declare();
+        let mut stmt = Recursive::declare();
         let ctx = Self {
             expr: expr.clone(),
             query: query.clone(),
+            stmt: stmt.clone(),
         };
         expr.define(crate::expr::expr_body(ctx.clone()));
         query.define(crate::query::Query::body_parser(ctx.clone()));
+        stmt.define(crate::statement::Statement::body_parser(ctx.clone()));
         ctx
     }
 }
