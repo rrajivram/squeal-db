@@ -7,8 +7,19 @@
 //! type's own `SQLParser` impl — `Option<T>` is "maybe", `Vec<T>` is "zero or
 //! more", `Either<L, R>` is "L else R", tuples are sequences (those blanket
 //! impls live in `sql_parser::parser`). The derive itself only composes
-//! `<Field as SQLParser>::parser(())` calls with `.then()` and maps the
-//! nested tuples back into the type's constructor.
+//! `<Field as SQLParser>::parser(args.clone())` calls with `.then()` and maps
+//! the nested tuples back into the type's constructor.
+//!
+//! Derived parsers take a `SqlCtx` as their args: the shared recursion
+//! context holding the `Recursive` handles for `Expr` and `Query`, so that
+//! mutually recursive grammar (subqueries inside expressions inside queries)
+//! is built exactly once per knot instead of recursing at construction time.
+//!
+//! `#[sql_parser(body_only)]` generates the same parser as an inherent
+//! `fn body_parser(args)` and skips the trait impl — used by the recursion
+//! handle types themselves (`Query`), whose trait impl instead returns the
+//! handle out of the context, while the knot-tier feeds `body_parser` into
+//! `Recursive::define`.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -17,7 +28,7 @@ use syn::{Data, DeriveInput, Fields, Ident, Type, parse_macro_input, spanned::Sp
 
 extern crate proc_macro;
 
-#[proc_macro_derive(SQLParser)]
+#[proc_macro_derive(SQLParser, attributes(sql_parser))]
 pub fn derive_parser(inp: TokenStream) -> TokenStream {
     let inp = parse_macro_input!(inp as DeriveInput);
     let name = &inp.ident;
@@ -30,6 +41,13 @@ pub fn derive_parser(inp: TokenStream) -> TokenStream {
         .to_compile_error()
         .into();
     }
+
+    let body_only = inp.attrs.iter().any(|a| {
+        a.path().is_ident("sql_parser")
+            && a.parse_args::<Ident>()
+                .map(|id| id == "body_only")
+                .unwrap_or(false)
+    });
 
     let (body, field_types) = match &inp.data {
         Data::Struct(data) => match fields_parser(&data.fields, quote!(Self)) {
@@ -65,21 +83,46 @@ pub fn derive_parser(inp: TokenStream) -> TokenStream {
     };
 
     let bounds = field_types.iter().map(|ty| {
-        quote!( #ty: ::sql_parser::parser::SQLParser<'src, I, E>, )
+        quote!( #ty: ::sql_parser::parser::SQLParser<'src, I, E, ::sql_parser::parser::SqlCtx<'src, I, E>>, )
     });
-
-    let expanded = quote! {
-        impl<'src, I, E> ::sql_parser::parser::SQLParser<'src, I, E> for #name
+    let where_clause = quote! {
         where
             I: ::sql_parser::parser::TokenInput<'src> + 'src,
             E: ::chumsky::extra::ParserExtra<'src, I> + 'src,
             E::Error: ::chumsky::label::LabelError<'src, I, ::std::string::String>,
             #(#bounds)*
+    };
+
+    let fn_body = quote! {
         {
-            fn parser(_args: ()) -> impl ::chumsky::Parser<'src, I, Self, E> + Clone {
-                #[allow(unused_imports)]
-                use ::chumsky::Parser as _;
-                (#body).boxed()
+            #[allow(unused_imports)]
+            use ::chumsky::Parser as _;
+            (#body).boxed()
+        }
+    };
+
+    let expanded = if body_only {
+        quote! {
+            impl #name {
+                /// The derived field-sequence parser, used by the recursion
+                /// knot-tier (`SqlCtx::build`) to `define` this type's
+                /// `Recursive` handle.
+                pub fn body_parser<'src, I, E>(
+                    args: ::sql_parser::parser::SqlCtx<'src, I, E>,
+                ) -> impl ::chumsky::Parser<'src, I, Self, E> + Clone
+                #where_clause
+                #fn_body
+            }
+        }
+    } else {
+        quote! {
+            impl<'src, I, E> ::sql_parser::parser::SQLParser<'src, I, E, ::sql_parser::parser::SqlCtx<'src, I, E>> for #name
+            #where_clause
+            {
+                fn parser(
+                    args: ::sql_parser::parser::SqlCtx<'src, I, E>,
+                ) -> impl ::chumsky::Parser<'src, I, Self, E> + Clone
+                #fn_body
             }
         }
     };
@@ -133,8 +176,8 @@ fn fields_parser(
     let first_ty = &types[0];
     let rest_ty = &types[1..];
     let chain = quote! {
-        <#first_ty as ::sql_parser::parser::SQLParser<'src, I, E>>::parser(())
-        #( .then(<#rest_ty as ::sql_parser::parser::SQLParser<'src, I, E>>::parser(())) )*
+        <#first_ty as ::sql_parser::parser::SQLParser<'src, I, E, ::sql_parser::parser::SqlCtx<'src, I, E>>>::parser(args.clone())
+        #( .then(<#rest_ty as ::sql_parser::parser::SQLParser<'src, I, E, ::sql_parser::parser::SqlCtx<'src, I, E>>>::parser(args.clone())) )*
     };
 
     let build = match fields {

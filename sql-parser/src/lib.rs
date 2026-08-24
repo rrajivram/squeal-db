@@ -30,7 +30,8 @@ use chumsky::{IterParser, Parser, error::Rich, extra, prelude::end};
 pub use crate::{
     expr::Expr,
     ident::{Ident, ObjectName},
-    parser::SQLParser,
+    parser::{SQLParser, SqlCtx},
+    query::Query,
     span::TokenSpan,
     statement::Statement,
 };

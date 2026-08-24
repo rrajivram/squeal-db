@@ -13,6 +13,7 @@ use chumsky::{
     input::{ExactSizeInput, Input, ValueInput},
     label::LabelError,
     prelude::any,
+    recursive::{Indirect, Recursive},
     util::MaybeRef,
 };
 use either::Either;
@@ -91,6 +92,57 @@ where
     E::Error: LabelError<'a, I, String>,
 {
     fn parser(args: A) -> impl Parser<'a, I, Self, E> + Clone;
+}
+
+/// The shared recursion context threaded through every derived parser as its
+/// args. It holds the `Recursive` handles for the two mutually recursive
+/// grammar roots — expressions and queries — so that `Expr -> Query -> Expr`
+/// cycles (subqueries) reference one shared definition instead of recursing
+/// at parser-construction time.
+///
+/// [`SqlCtx::build`] declares both handles, then defines each body with the
+/// context (so the bodies see the handles), and returns the tied knot.
+pub struct SqlCtx<'src, I, E>
+where
+    I: Input<'src>,
+    E: ParserExtra<'src, I>,
+{
+    pub expr: Recursive<Indirect<'src, 'src, I, crate::expr::Expr, E>>,
+    pub query: Recursive<Indirect<'src, 'src, I, crate::query::Query, E>>,
+}
+
+// Derived Clone would demand I: Clone + E: Clone; the handles themselves are
+// unconditionally cheap to clone (shared Rc).
+impl<'src, I, E> Clone for SqlCtx<'src, I, E>
+where
+    I: Input<'src>,
+    E: ParserExtra<'src, I>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            expr: self.expr.clone(),
+            query: self.query.clone(),
+        }
+    }
+}
+
+impl<'src, I, E> SqlCtx<'src, I, E>
+where
+    I: TokenInput<'src> + 'src,
+    E: ParserExtra<'src, I> + 'src,
+    E::Error: LabelError<'src, I, String>,
+{
+    pub fn build() -> Self {
+        let mut expr = Recursive::declare();
+        let mut query = Recursive::declare();
+        let ctx = Self {
+            expr: expr.clone(),
+            query: query.clone(),
+        };
+        expr.define(crate::expr::expr_body(ctx.clone()));
+        query.define(crate::query::Query::body_parser(ctx.clone()));
+        ctx
+    }
 }
 
 impl<'a, I, E, A, T> SQLParser<'a, I, E, A> for Option<T>

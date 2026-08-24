@@ -11,7 +11,7 @@ fn one(src: &str) -> Statement {
     parse_one(src).unwrap_or_else(|e| panic!("failed to parse {src:?}: {e:?}"))
 }
 
-fn select(src: &str) -> sql_parser::query::SelectStatement {
+fn select(src: &str) -> sql_parser::Query {
     match one(src) {
         Statement::Select(s) => *s,
         other => panic!("expected SELECT, got {other:?}"),
@@ -19,22 +19,25 @@ fn select(src: &str) -> sql_parser::query::SelectStatement {
 }
 
 fn where_expr(src: &str) -> Expr {
-    select(src).where_clause.expect("expected WHERE").expr
+    select(src).body.where_clause.expect("expected WHERE").expr
 }
 
 #[test]
 fn select_basic() {
     let s = select("SELECT a, b FROM t");
-    assert_eq!(s.projection.len(), 2);
-    let from = s.from.unwrap();
-    assert_eq!(from.tables.head.relation.name.to_dotted(), "t");
-    assert!(s.where_clause.is_none());
+    assert_eq!(s.body.projection.len(), 2);
+    let from = s.body.from.unwrap();
+    match &from.tables.head.relation {
+        sql_parser::query::TableFactor::Table { name, .. } => assert_eq!(name.to_dotted(), "t"),
+        other => panic!("expected plain table, got {other:?}"),
+    }
+    assert!(s.body.where_clause.is_none());
 }
 
 #[test]
 fn select_star_and_qualified_star() {
     let s = select("SELECT *, t.*, a AS x FROM t");
-    let items: Vec<_> = s.projection.items().collect();
+    let items: Vec<_> = s.body.projection.items().collect();
     assert!(matches!(items[0], SelectItem::Wildcard(_)));
     assert!(matches!(items[1], SelectItem::QualifiedWildcard(..)));
     match items[2] {
@@ -50,9 +53,9 @@ fn select_distinct_group_order_limit() {
          WHERE age >= 21 GROUP BY city HAVING count(*) > 1 \
          ORDER BY city DESC LIMIT 10 OFFSET 5",
     );
-    assert!(s.distinct.is_some());
-    assert!(s.group_by.is_some());
-    assert!(s.having.is_some());
+    assert!(s.body.distinct.is_some());
+    assert!(s.body.group_by.is_some());
+    assert!(s.body.having.is_some());
     let order = s.order_by.unwrap();
     assert!(order.items.head.direction.unwrap().is_right()); // DESC
     assert_eq!(s.limit.unwrap().count.as_i64(), Some(10));
@@ -66,7 +69,7 @@ fn select_joins() {
          LEFT OUTER JOIN c ON b.id = c.b_id \
          CROSS JOIN d",
     );
-    let t = &s.from.unwrap().tables.head;
+    let t = &s.body.from.unwrap().tables.head;
     assert_eq!(t.joins.len(), 3);
     assert!(matches!(t.joins[0].operator, JoinOperator::Inner(..)));
     assert!(matches!(t.joins[1].operator, JoinOperator::LeftOuter(..)));
@@ -77,7 +80,7 @@ fn select_joins() {
 #[test]
 fn join_using() {
     let s = select("SELECT * FROM a JOIN b USING (id, org_id)");
-    let t = &s.from.unwrap().tables.head;
+    let t = &s.body.from.unwrap().tables.head;
     match t.joins[0].constraint.as_ref().unwrap() {
         sql_parser::query::JoinConstraint::Using(_, _, cols, _) => assert_eq!(cols.len(), 2),
         other => panic!("expected USING, got {other:?}"),
@@ -363,7 +366,7 @@ fn comments_and_case_insensitivity() {
 #[test]
 fn quoted_identifiers() {
     let s = select("SELECT \"select\", \"weird \"\"name\"\"\" FROM \"table\"");
-    let items: Vec<_> = s.projection.items().collect();
+    let items: Vec<_> = s.body.projection.items().collect();
     match items[1] {
         SelectItem::Expr { expr: Expr::Column(c), .. } => {
             assert_eq!(c.parts.head.value, "weird \"name\"");
@@ -414,4 +417,127 @@ fn table_element_debris_rejected() {
     // trailing garbage must not be silently ignored
     assert!(parse_sql("SELECT a FROM t extra_token !").is_err());
     assert!(parse_sql("CREATE TABLE t (a INT,)").is_err());
+}
+
+#[test]
+fn scalar_subquery() {
+    let e = where_expr("SELECT a FROM t WHERE b = (SELECT max(x) FROM u)");
+    let Expr::Binary { right, .. } = e else {
+        panic!("expected =");
+    };
+    assert!(matches!(*right, Expr::Subquery(_)));
+}
+
+#[test]
+fn in_subquery() {
+    match where_expr("SELECT a FROM t WHERE id NOT IN (SELECT t_id FROM u WHERE ok = TRUE)") {
+        Expr::InSubquery { negated, query, .. } => {
+            assert!(negated);
+            assert!(query.body.where_clause.is_some());
+        }
+        other => panic!("expected IN subquery, got {other:?}"),
+    }
+    // plain lists still work
+    assert!(matches!(
+        where_expr("SELECT a FROM t WHERE id IN (1, 2)"),
+        Expr::InList { .. }
+    ));
+}
+
+#[test]
+fn exists_subquery() {
+    assert!(matches!(
+        where_expr("SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.t_id = t.id)"),
+        Expr::Exists { .. }
+    ));
+    // NOT EXISTS = Unary(Not, Exists)
+    match where_expr("SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM u)") {
+        Expr::Unary { op: UnaryOp::Not, expr } => assert!(matches!(*expr, Expr::Exists { .. })),
+        other => panic!("expected NOT EXISTS, got {other:?}"),
+    }
+}
+
+#[test]
+fn nested_subqueries() {
+    // three levels deep
+    let e = where_expr(
+        "SELECT a FROM t WHERE b IN (SELECT c FROM u WHERE d = (SELECT max(e) FROM v WHERE f IN (SELECT g FROM w)))",
+    );
+    assert!(matches!(e, Expr::InSubquery { .. }));
+}
+
+#[test]
+fn derived_table() {
+    let s = select("SELECT x FROM (SELECT a AS x FROM t WHERE a > 0) AS sub JOIN u ON sub.x = u.id");
+    let table = &s.body.from.unwrap().tables.head;
+    match &table.relation {
+        sql_parser::query::TableFactor::Derived { query, alias, .. } => {
+            assert!(query.body.where_clause.is_some());
+            assert_eq!(alias.as_ref().unwrap().name.value, "sub");
+        }
+        other => panic!("expected derived table, got {other:?}"),
+    }
+    assert_eq!(table.joins.len(), 1);
+}
+
+#[test]
+fn union_and_set_ops() {
+    use sql_parser::query::SetOperator;
+    let q = select("SELECT a FROM t UNION ALL SELECT b FROM u EXCEPT SELECT c FROM v ORDER BY 1 LIMIT 3");
+    assert_eq!(q.compounds.len(), 2);
+    match &q.compounds[0].op {
+        SetOperator::Union(_, all) => assert!(all.as_ref().unwrap().is_left()),
+        other => panic!("expected UNION ALL, got {other:?}"),
+    }
+    assert!(matches!(q.compounds[1].op, SetOperator::Except(_)));
+    // ORDER BY / LIMIT apply to the whole compound, at the Query level
+    assert!(q.order_by.is_some());
+    assert_eq!(q.limit.unwrap().count.as_i64(), Some(3));
+}
+
+#[test]
+fn with_cte() {
+    let q = select(
+        "WITH regional AS (SELECT region, sum(amount) AS total FROM orders GROUP BY region), \
+              top AS (SELECT region FROM regional WHERE total > 100) \
+         SELECT r.region FROM regional r JOIN top USING (region)",
+    );
+    let with = q.with.unwrap();
+    assert!(with.recursive.is_none());
+    assert_eq!(with.ctes.len(), 2);
+    assert_eq!(with.ctes.head.name.value, "regional");
+
+    let q = select("WITH RECURSIVE cnt (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 10) SELECT n FROM cnt");
+    let with = q.with.unwrap();
+    assert!(with.recursive.is_some());
+    let (_, cols, _) = with.ctes.head.columns.as_ref().unwrap();
+    assert_eq!(cols.len(), 1);
+    // the CTE body itself is a compound query
+    assert_eq!(with.ctes.head.query.compounds.len(), 1);
+}
+
+#[test]
+fn cte_in_insert() {
+    let Statement::Insert(i) = one(
+        "INSERT INTO summary WITH s AS (SELECT a FROM t) SELECT a FROM s",
+    ) else {
+        panic!("expected INSERT");
+    };
+    let InsertSource::Select(q) = i.source else {
+        panic!("expected SELECT source");
+    };
+    assert!(q.with.is_some());
+}
+
+#[test]
+fn check_constraints() {
+    let Statement::CreateTable(c) = one(
+        "CREATE TABLE t (a INT CHECK (a > 0), b INT, CHECK (b > a))",
+    ) else {
+        panic!("expected CREATE TABLE");
+    };
+    let cols: Vec<_> = c.columns().collect();
+    assert!(matches!(cols[0].options[0], ColumnOption::Check(..)));
+    let cons: Vec<_> = c.constraints().collect();
+    assert!(matches!(cons[0].kind, TableConstraintKind::Check(..)));
 }

@@ -64,13 +64,13 @@ pub enum Literal {
     Null(kw::Null),
 }
 
-impl<'src, I, E> SQLParser<'src, I, E> for StringLiteral
+impl<'src, I, E, A> SQLParser<'src, I, E, A> for StringLiteral
 where
     I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+    fn parser(_args: A) -> impl Parser<'src, I, Self, E> + Clone {
         token("string literal", |t| match &t.token {
             Token::String {
                 raw,
@@ -84,13 +84,13 @@ where
     }
 }
 
-impl<'src, I, E> SQLParser<'src, I, E> for NumberLiteral
+impl<'src, I, E, A> SQLParser<'src, I, E, A> for NumberLiteral
 where
     I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+    fn parser(_args: A) -> impl Parser<'src, I, Self, E> + Clone {
         token("number", |t| match &t.token {
             Token::Number { raw } => {
                 let value = match raw.parse::<i64>() {

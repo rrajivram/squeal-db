@@ -59,6 +59,7 @@ pub enum ColumnOption {
     Unique(kw::Unique),
     Default(kw::Default, Expr),
     References(ForeignKeyReference),
+    Check(kw::Check, LeftParenthesis, Expr, RightParenthesis),
 }
 
 /// `REFERENCES table [(column)]`
@@ -99,6 +100,7 @@ pub enum TableConstraintKind {
         RightParenthesis,
         ForeignKeyReference,
     ),
+    Check(kw::Check, LeftParenthesis, Expr, RightParenthesis),
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]

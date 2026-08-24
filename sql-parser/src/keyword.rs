@@ -71,7 +71,9 @@ macro_rules! define_keywords {
                 }
             }
 
-            impl<'src, I, E> crate::parser::SQLParser<'src, I, E> for $k
+            // Generic over the args type `A`: keywords need no context, so
+            // they parse the same whether handed `()` or a `SqlCtx`.
+            impl<'src, I, E, A> crate::parser::SQLParser<'src, I, E, A> for $k
             where
                 I: chumsky::input::Input<'src, Token = crate::token::TokenStruct<'src>>
                     + chumsky::input::ValueInput<'src>
@@ -79,7 +81,7 @@ macro_rules! define_keywords {
                 E: chumsky::extra::ParserExtra<'src, I>,
                 E::Error: chumsky::label::LabelError<'src, I, ::std::string::String>,
             {
-                fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+                fn parser(_args: A) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
                     use chumsky::Parser;
                     chumsky::prelude::any()
                         .try_map(|t: crate::token::TokenStruct<'src>, span| {

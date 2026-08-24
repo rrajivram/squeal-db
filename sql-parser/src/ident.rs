@@ -47,13 +47,13 @@ impl ObjectName {
     }
 }
 
-impl<'src, I, E> SQLParser<'src, I, E> for Ident
+impl<'src, I, E, A> SQLParser<'src, I, E, A> for Ident
 where
     I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
 {
-    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+    fn parser(_args: A) -> impl Parser<'src, I, Self, E> + Clone {
         token("identifier", |t| match &t.token {
             // A bare word is an identifier unless it's a *reserved* keyword;
             // non-reserved keywords (NAME, DATA, YEAR, ...) are fine names.
@@ -77,13 +77,14 @@ where
     }
 }
 
-impl<'src, I, E> SQLParser<'src, I, E> for ObjectName
+impl<'src, I, E, A> SQLParser<'src, I, E, A> for ObjectName
 where
     I: TokenInput<'src>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
+    A: Clone,
 {
-    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
-        Seq::<Ident, Period>::parser(()).map(|parts| ObjectName { parts })
+    fn parser(args: A) -> impl Parser<'src, I, Self, E> + Clone {
+        Seq::<Ident, Period>::parser(args).map(|parts| ObjectName { parts })
     }
 }

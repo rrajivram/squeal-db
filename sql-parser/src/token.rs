@@ -144,7 +144,8 @@ macro_rules! create_punctuation {
                 }
             }
 
-            impl<'src, I, E> crate::parser::SQLParser<'src, I, E> for $i
+            // Generic over the args type `A`, like the keyword impls.
+            impl<'src, I, E, A> crate::parser::SQLParser<'src, I, E, A> for $i
             where
                 I: chumsky::input::Input<'src, Token = TokenStruct<'src>>
                     + chumsky::input::ValueInput<'src>
@@ -152,7 +153,7 @@ macro_rules! create_punctuation {
                 E: chumsky::extra::ParserExtra<'src, I>,
                 E::Error: chumsky::label::LabelError<'src, I, ::std::string::String>,
             {
-                fn parser(_args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+                fn parser(_args: A) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
                     use chumsky::Parser;
                     chumsky::prelude::any()
                         .try_map(|t: TokenStruct<'src>, span| match t.token {

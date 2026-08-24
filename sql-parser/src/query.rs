@@ -1,7 +1,16 @@
-//! `SELECT` and its clauses. Almost everything here is a `#[derive(SQLParser)]`
-//! type: a struct parses as its fields in order, an enum as its variants in
-//! order, `Option` means the clause may be absent.
+//! Queries. [`Query`] is the full form — optional `WITH` CTEs, a
+//! [`SelectCore`], any number of `UNION`/`INTERSECT`/`EXCEPT` compounds, and
+//! trailing `ORDER BY`/`LIMIT`/`OFFSET`. Almost everything here is a
+//! `#[derive(SQLParser)]` type: a struct parses as its fields in order, an
+//! enum as its variants in order, `Option` means the clause may be absent.
+//!
+//! `Query` is one of the two recursion roots (with `Expr`): subqueries,
+//! derived tables, and CTE bodies all refer back to it. Its derived parser is
+//! therefore emitted as `Query::body_parser` (`#[sql_parser(body_only)]`) and
+//! fed into the `Recursive` handle by [`SqlCtx::build`]; the `SQLParser`
+//! trait impl below just hands out that shared handle.
 
+use chumsky::{Parser, extra::ParserExtra, label::LabelError};
 use either::Either;
 use macros::SQLParser;
 
@@ -10,12 +19,81 @@ use crate::{
     ident::{Ident, ObjectName},
     keyword as kw,
     literal::NumberLiteral,
+    parser::{SQLParser, SqlCtx, TokenInput},
     token::{Asterisk, Comma, LeftParenthesis, Period, RightParenthesis},
     utils::Seq,
 };
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
-pub struct SelectStatement {
+#[sql_parser(body_only)]
+pub struct Query {
+    pub with: Option<With>,
+    pub body: SelectCore,
+    pub compounds: Vec<CompoundSelect>,
+    pub order_by: Option<OrderByClause>,
+    pub limit: Option<LimitClause>,
+    pub offset: Option<OffsetClause>,
+}
+
+impl<'src, I, E> SQLParser<'src, I, E, SqlCtx<'src, I, E>> for Query
+where
+    I: TokenInput<'src> + 'src,
+    E: ParserExtra<'src, I> + 'src,
+    E::Error: LabelError<'src, I, String>,
+{
+    fn parser(args: SqlCtx<'src, I, E>) -> impl Parser<'src, I, Self, E> + Clone {
+        args.query
+    }
+}
+
+impl<'src, I, E> SQLParser<'src, I, E> for Query
+where
+    I: TokenInput<'src> + 'src,
+    E: ParserExtra<'src, I> + 'src,
+    E::Error: LabelError<'src, I, String>,
+{
+    fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
+        SqlCtx::build().query
+    }
+}
+
+/// `WITH [RECURSIVE] name [(cols)] AS (query), ...`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct With {
+    pub with: kw::With,
+    pub recursive: Option<kw::Recursive>,
+    pub ctes: Seq<Cte, Comma>,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct Cte {
+    pub name: Ident,
+    pub columns: Option<(LeftParenthesis, Seq<Ident, Comma>, RightParenthesis)>,
+    pub as_token: kw::As,
+    pub lparen: LeftParenthesis,
+    pub query: Box<Query>,
+    pub rparen: RightParenthesis,
+}
+
+/// One `UNION [ALL | DISTINCT] / INTERSECT / EXCEPT` arm.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct CompoundSelect {
+    pub op: SetOperator,
+    pub select: SelectCore,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum SetOperator {
+    Union(kw::Union, Option<Either<kw::All, kw::Distinct>>),
+    Intersect(kw::Intersect),
+    Except(kw::Except),
+}
+
+/// One `SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...` block —
+/// everything a set operation combines. `ORDER BY`/`LIMIT`/`OFFSET` live on
+/// [`Query`], applying to the compound result.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct SelectCore {
     pub select: kw::Select,
     pub distinct: Option<kw::Distinct>,
     pub projection: Seq<SelectItem, Comma>,
@@ -23,9 +101,6 @@ pub struct SelectStatement {
     pub where_clause: Option<WhereClause>,
     pub group_by: Option<GroupByClause>,
     pub having: Option<HavingClause>,
-    pub order_by: Option<OrderByClause>,
-    pub limit: Option<LimitClause>,
-    pub offset: Option<OffsetClause>,
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
@@ -61,9 +136,28 @@ pub struct TableWithJoins {
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
-pub struct TableFactor {
-    pub name: ObjectName,
-    pub alias: Option<Alias>,
+pub enum TableFactor {
+    /// `(SELECT ...) [AS] alias` — a derived table.
+    Derived {
+        lparen: LeftParenthesis,
+        query: Box<Query>,
+        rparen: RightParenthesis,
+        alias: Option<Alias>,
+    },
+    Table {
+        name: ObjectName,
+        alias: Option<Alias>,
+    },
+}
+
+impl TableFactor {
+    pub fn alias(&self) -> Option<&Alias> {
+        match self {
+            TableFactor::Derived { alias, .. } | TableFactor::Table { alias, .. } => {
+                alias.as_ref()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]

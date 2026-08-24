@@ -6,7 +6,7 @@ use crate::{
     expr::Expr,
     ident::{Ident, ObjectName},
     keyword as kw,
-    query::{SelectStatement, WhereClause},
+    query::{Query, WhereClause},
     token::{Comma, Equals, LeftParenthesis, RightParenthesis},
     utils::Seq,
 };
@@ -25,7 +25,7 @@ pub enum InsertSource {
     /// `VALUES (1, 'a'), (2, 'b')`
     Values(kw::Values, Seq<ValuesRow, Comma>),
     /// `INSERT INTO t SELECT ...`
-    Select(Box<SelectStatement>),
+    Select(Box<Query>),
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]

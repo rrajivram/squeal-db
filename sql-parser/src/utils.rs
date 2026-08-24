@@ -31,15 +31,16 @@ impl<T, S> Seq<T, S> {
     }
 }
 
-impl<'src, I, E, T, S> SQLParser<'src, I, E> for Seq<T, S>
+impl<'src, I, E, T, S, A> SQLParser<'src, I, E, A> for Seq<T, S>
 where
     I: TokenInput<'src>,
-    T: SQLParser<'src, I, E>,
-    S: SQLParser<'src, I, E>,
+    T: SQLParser<'src, I, E, A>,
+    S: SQLParser<'src, I, E, A>,
     E: ParserExtra<'src, I>,
     E::Error: LabelError<'src, I, String>,
+    A: Clone,
 {
-    fn parser(args: ()) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
-        sequence(T::parser(args), S::parser(args))
+    fn parser(args: A) -> impl chumsky::Parser<'src, I, Self, E> + Clone {
+        sequence(T::parser(args.clone()), S::parser(args))
     }
 }
