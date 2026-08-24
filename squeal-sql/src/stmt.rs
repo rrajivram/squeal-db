@@ -285,10 +285,9 @@ fn substitute_placeholder_expr(
     if let sqlparser::ast::Expr::Value(v) = expr
         && matches!(v.value, sqlparser::ast::Value::Placeholder(_))
     {
-        let value = params
-            .get(*next)
-            .and_then(|o| o.clone())
-            .ok_or_else(|| SchemaError::UserError(format!("parameter {} was not bound", *next + 1)))?;
+        let value = params.get(*next).and_then(|o| o.clone()).ok_or_else(|| {
+            SchemaError::UserError(format!("parameter {} was not bound", *next + 1))
+        })?;
         *next += 1;
         *expr = value_item_to_expr(&value)?;
     }
@@ -1001,13 +1000,142 @@ where
 #[cfg(test)]
 mod dummy_tests {
 
+    use std::ops::ControlFlow;
+
+    use sqlparser::ast::{Visit, VisitMut, Visitor};
+
     use super::*;
+
+    #[derive(Default)]
+    struct V {}
+
+    impl Visitor for V {
+        type Break = ();
+
+        fn post_visit_expr(
+            &mut self,
+            _expr: &sqlparser::ast::Expr,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            println!("post visit expr: {:?}", _expr);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+            println!("post visit query: {:?}", _query);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_relation(
+            &mut self,
+            _relation: &sqlparser::ast::ObjectName,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit rela: {:?}", _relation);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_select(
+            &mut self,
+            _select: &sqlparser::ast::Select,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit select: {:?}", _select);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_statement(
+            &mut self,
+            _statement: &sqlparser::ast::Statement,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit stmt: {:?}", _statement);
+            println!("");
+            ControlFlow::Continue(())
+        }
+        fn post_visit_table_factor(
+            &mut self,
+            _table_factor: &sqlparser::ast::TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit table_factor: {:?}", _table_factor);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_value(
+            &mut self,
+            _value: &sqlparser::ast::ValueWithSpan,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit value: {:?}", _value);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, _expr: &sqlparser::ast::Expr) -> ControlFlow<Self::Break> {
+            println!("pre visit expr: {:?}", _expr);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
+            println!("pre visit query: {:?}", _query);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_relation(
+            &mut self,
+            _relation: &sqlparser::ast::ObjectName,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit rela: {:?}", _relation);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(
+            &mut self,
+            _select: &sqlparser::ast::Select,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit select: {:?}", _select);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_statement(
+            &mut self,
+            _statement: &sqlparser::ast::Statement,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit statement: {:?}", _statement);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(
+            &mut self,
+            _table_factor: &sqlparser::ast::TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit t_factor: {:?}", _table_factor);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_value(
+            &mut self,
+            _value: &sqlparser::ast::ValueWithSpan,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit valye: {:?}", _value);
+            println!("");
+            ControlFlow::Continue(())
+        }
+    }
 
     fn exec(sql: &str) {
         let stmt = sqlparser::parser::Parser::parse_sql(&SnowflakeDialect, sql).unwrap();
-        for s in stmt {
-            println!("{:?}", s);
-        }
+        let mut v = V::default();
+        let _ = stmt[0].visit(&mut v);
+        //        for s in stmt {
+        //            println!("{:?}", s);
+        //       }
     }
 
     #[test]
@@ -1018,5 +1146,10 @@ mod dummy_tests {
     #[test]
     fn test_ct() {
         exec("create table if not exists test (a int)");
+    }
+
+    #[test]
+    fn test_sel() {
+        exec("select 1+3 ,TT.a from t1  as TT");
     }
 }
