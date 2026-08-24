@@ -17,8 +17,8 @@ pub enum SchemaError {
     UserError(String),
     #[error("Unknown error: {0}")]
     UnknownError(String),
-    #[error("Parse error")]
-    ParseError(#[from] sqlparser::parser::ParserError),
+    #[error("Parse error: {0}")]
+    ParseError(String),
     #[error("Database already in use : {0}")]
     DatabaseInUseError(String),
     #[error("Schema already exists : {0}")]
@@ -73,6 +73,22 @@ impl From<StoreError> for SchemaError {
 impl From<postcard::Error> for SchemaError {
     fn from(value: postcard::Error) -> Self {
         SchemaError::InternalError(value.into())
+    }
+}
+
+// sql_parser::parse_sql reports every syntax error it found, not just the
+// first — joined into one message here since SchemaError::ParseError (like
+// every other error variant in this crate) carries a single string, not a
+// list. A caller that wants each individually still can, by calling
+// sql_parser::parse_sql directly instead of going through Statement::new.
+impl From<Vec<sql_parser::ParseError>> for SchemaError {
+    fn from(value: Vec<sql_parser::ParseError>) -> Self {
+        let joined = value
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        SchemaError::ParseError(joined)
     }
 }
 

@@ -47,7 +47,7 @@ macro_rules! define_keywords {
                 matches!(
                     self,
                     And | As | Asc | Between | By | Case | Cast | Check | Collate
-                        | Constraint | Create | Cross | Default | Delete | Desc
+                        | Constraint | Create | Cross | Delete | Desc
                         | Distinct | Drop | Else | End | Except | Exists | False
                         | Foreign | From | Full | Group | Having | Ilike | In
                         | Inner | Insert | Intersect | Into | Is | Join | Left
@@ -160,6 +160,7 @@ define_keywords!(
     Concatenate = "CONCATENATE",
     Connect = "CONNECT",
     Constraint = "CONSTRAINT",
+    Copy = "COPY",
     Cost = "COST",
     Create = "CREATE",
     Cross = "CROSS",

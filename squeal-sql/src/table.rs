@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::{ColumnDef, ColumnOption, CreateTable};
+use sql_parser::ddl::{
+    ColumnDef, ColumnOption, CreateTable, ForeignKeyReference, TableConstraint,
+    TableConstraintKind,
+};
+use sql_parser::ident::Ident;
 use store::db::DBFile;
 use store::table::TableIdType;
 use store::valueitem::{IndexKey, ValueItem};
@@ -374,13 +378,13 @@ impl TryFrom<&ColumnDef> for Field {
         let nullable = !value
             .options
             .iter()
-            .any(|o| matches!(o.option, ColumnOption::NotNull));
+            .any(|o| matches!(o, ColumnOption::NotNull(_, _)));
         let datatype: DataType = value.data_type.clone().into();
         let default = value
             .options
             .iter()
-            .find_map(|o| match &o.option {
-                ColumnOption::Default(expr) => Some(expr),
+            .find_map(|o| match o {
+                ColumnOption::Default(_, expr) => Some(expr),
                 _ => None,
             })
             .map(|expr| expr_to_value_item(expr, datatype))
@@ -394,25 +398,22 @@ impl TryFrom<&ColumnDef> for Field {
 
 // A column's own inline PRIMARY KEY / UNIQUE option (e.g. `id INTEGER
 // PRIMARY KEY`), as opposed to a table-level constraint clause (`PRIMARY
-// KEY(id)`). sqlparser represents both with the same PrimaryKeyConstraint/
-// UniqueConstraint types, but the inline form's own `columns` field is
-// always empty — the column is implicit ("this one"), not named — so it
-// has to be supplied here from the ColumnDef itself rather than reused via
-// the same `From<&PrimaryKeyConstraint>`/`From<&UniqueConstraint>` impls
-// the table-level constraints go through.
+// KEY(id)`). The inline form's grammar has no CONSTRAINT-name capture at
+// all (see ddl::ColumnOption) — unlike a table-level constraint, whose
+// name comes from index_from_constraint — so `name` here is always None.
 fn inline_indices(column: &ColumnDef) -> Vec<IndexHolder> {
     column
         .options
         .iter()
-        .filter_map(|o| match &o.option {
-            ColumnOption::PrimaryKey(c) => Some(IndexHolder {
-                name: c.name.clone().map(|n| n.to_string()),
+        .filter_map(|o| match o {
+            ColumnOption::PrimaryKey(_, _) => Some(IndexHolder {
+                name: None,
                 is_primary: true,
                 is_unique: true,
                 fields: vec![column.name.value.clone()],
             }),
-            ColumnOption::Unique(c) => Some(IndexHolder {
-                name: c.name.clone().map(|n| n.to_string()),
+            ColumnOption::Unique(_) => Some(IndexHolder {
+                name: None,
                 is_primary: false,
                 is_unique: true,
                 fields: vec![column.name.value.clone()],
@@ -422,18 +423,20 @@ fn inline_indices(column: &ColumnDef) -> Vec<IndexHolder> {
         .collect()
 }
 
-// Converts a parsed FOREIGN KEY constraint (table-level or, via
-// `implicit_column`, the inline column form — see inline_foreign_key)
-// into a SqlForeignKey, rejecting every form this crate doesn't support
-// yet: composite (multi-column) keys, ON DELETE/ON UPDATE (moot
-// anyway — this engine has no UPDATE/DELETE to cascade/restrict
-// against), MATCH, characteristics (e.g. DEFERRABLE), and MySQL's
-// separate index_name. Shared with Statement::execute's ALTER TABLE ADD
-// CONSTRAINT/ADD FOREIGN KEY parsing (see stmt.rs's parse_alter_table),
-// so both entry points reject exactly the same unsupported forms.
+// Converts a parsed FOREIGN KEY reference (table-level or, via
+// inline_foreign_key, the inline column form) into a SqlForeignKey,
+// rejecting every form this crate doesn't support yet: composite
+// (multi-column) keys, and REFERENCES without an explicit target column.
+// Everything sqlparser's ForeignKeyConstraint used to carry beyond that
+// (ON DELETE/ON UPDATE, MATCH, characteristics, a MySQL-style index name)
+// has no equivalent in sql-parser's grammar at all — that SQL simply
+// fails to parse now instead of parsing and then being rejected here.
+// Shared with Statement::execute's ALTER TABLE ADD CONSTRAINT parsing
+// (see stmt.rs's parse_alter_table), so both entry points agree.
 pub(crate) fn foreign_key_from_constraint(
-    fk: &sqlparser::ast::ForeignKeyConstraint,
-    implicit_column: Option<&str>,
+    reference: &ForeignKeyReference,
+    local_columns: &[Ident],
+    name: Option<&Ident>,
 ) -> Result<SqlForeignKey, SchemaError> {
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
@@ -441,48 +444,38 @@ pub(crate) fn foreign_key_from_constraint(
              supported yet"
         )))
     };
-    if fk.index_name.is_some() {
-        return unsupported("a MySQL-style index name");
-    }
-    if fk.on_delete.is_some() || fk.on_update.is_some() {
-        return unsupported("ON DELETE/ON UPDATE");
-    }
-    if fk.match_kind.is_some() {
-        return unsupported("MATCH FULL/PARTIAL/SIMPLE");
-    }
-    if fk.characteristics.is_some() {
-        return unsupported("constraint characteristics (e.g. DEFERRABLE)");
-    }
-    let column = match (implicit_column, fk.columns.as_slice()) {
-        (Some(c), []) => c.to_string(),
-        (None, [c]) => c.value.clone(),
+    let column = match local_columns {
+        [c] => c.value.clone(),
         _ => return unsupported("multiple columns"),
     };
-    let ref_column = match fk.referred_columns.as_slice() {
-        [c] => c.value.clone(),
-        _ => return unsupported("multiple referenced columns"),
+    let ref_column = match &reference.column {
+        Some((_, cols, _)) if cols.len() == 1 => cols.items().next().unwrap().value.clone(),
+        Some(_) => return unsupported("multiple referenced columns"),
+        None => return unsupported("REFERENCES without an explicit target column"),
     };
     Ok(SqlForeignKey {
         // Lowercased, matching every other identifier in this crate
         // (table/column names) — DROP CONSTRAINT's own name lookup
         // lowercases too (see stmt.rs's parse_alter_table), so this has
         // to agree or a mixed-case constraint name would never match.
-        name: fk.name.clone().map(|n| n.to_string().to_lowercase()),
+        name: name.map(|n| n.value.to_lowercase()),
         column,
-        ref_table: fk.foreign_table.to_string().to_lowercase(),
+        ref_table: reference.table.to_dotted().to_lowercase(),
         ref_column,
     })
 }
 
 // Mirrors inline_indices: a column's own inline REFERENCES (e.g.
-// `customer_id INTEGER REFERENCES customers(id)`) parses to the same
-// ForeignKeyConstraint as a table-level FOREIGN KEY(...) clause, but
-// with an empty `columns` — the column is implicit ("this one").
+// `customer_id INTEGER REFERENCES customers(id)`) — the column is
+// implicit ("this one"), and never named (no CONSTRAINT-name capture in
+// the inline grammar, same as inline_indices).
 fn inline_foreign_key(column: &ColumnDef) -> Option<Result<SqlForeignKey, SchemaError>> {
-    column.options.iter().find_map(|o| match &o.option {
-        ColumnOption::ForeignKey(fk) => {
-            Some(foreign_key_from_constraint(fk, Some(&column.name.value)))
-        }
+    column.options.iter().find_map(|o| match o {
+        ColumnOption::References(reference) => Some(foreign_key_from_constraint(
+            reference,
+            std::slice::from_ref(&column.name),
+            None,
+        )),
         _ => None,
     })
 }
@@ -493,7 +486,7 @@ impl SqlTable {
         F: DBFile + 'static,
         F: DBFile<Item = F>,
     {
-        let name = value.name.to_string().to_lowercase();
+        let name = value.name.to_dotted().to_lowercase();
         if db.table_exists(&name) {
             return Err(SchemaError::BadTableName(format!("Table {name} exists.")));
         }
@@ -502,40 +495,31 @@ impl SqlTable {
         // is what rejects a duplicate name now, instead of a HashMap
         // silently keeping whichever column happened to collect last.
         let fields: Vec<Field> = value
-            .columns
-            .iter()
+            .columns()
             .map(Field::try_from)
             .collect::<Result<_, _>>()?;
         let mut indices = value
-            .constraints
-            .iter()
-            .filter_map(|t| {
-                let index: Option<IndexHolder> = match t {
-                    sqlparser::ast::TableConstraint::Unique(unique_constraint) => {
-                        Some(unique_constraint.into())
-                    }
-                    sqlparser::ast::TableConstraint::PrimaryKey(primary_key_constraint) => {
-                        Some(primary_key_constraint.into())
-                    }
-                    _ => None,
-                };
-                index
-            })
+            .constraints()
+            .filter_map(index_from_constraint)
             .collect::<Vec<_>>();
-        for c in &value.columns {
+        for c in value.columns() {
             indices.extend(inline_indices(c));
         }
         let mut foreign_keys = value
-            .constraints
-            .iter()
-            .filter_map(|t| match t {
-                sqlparser::ast::TableConstraint::ForeignKey(fk) => {
-                    Some(foreign_key_from_constraint(fk, None))
+            .constraints()
+            .filter_map(|t| match &t.kind {
+                TableConstraintKind::ForeignKey(_, _, _, columns, _, reference) => {
+                    let cols: Vec<Ident> = columns.items().cloned().collect();
+                    Some(foreign_key_from_constraint(
+                        reference,
+                        &cols,
+                        t.name.as_ref().map(|(_, n)| n),
+                    ))
                 }
                 _ => None,
             })
             .collect::<Result<Vec<_>, _>>()?;
-        for c in &value.columns {
+        for c in value.columns() {
             if let Some(fk) = inline_foreign_key(c) {
                 foreign_keys.push(fk?);
             }
@@ -904,16 +888,14 @@ impl SqlTable {
     // nullable).
     pub(crate) fn rows_from_insert(
         &self,
-        insert: &sqlparser::ast::Insert,
+        insert: &sql_parser::dml::Insert,
     ) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
-        let target_fields: Vec<&Arc<Field>> = if insert.columns.is_empty() {
-            self.fields().iter().collect()
-        } else {
-            insert
-                .columns
-                .iter()
+        let target_fields: Vec<&Arc<Field>> = match &insert.columns {
+            None => self.fields().iter().collect(),
+            Some((_, cols, _)) => cols
+                .items()
                 .map(|c| {
-                    let name = c.to_string().to_lowercase();
+                    let name = c.value.to_lowercase();
                     self.fields().iter().find(|f| f.name == name).ok_or_else(|| {
                         SchemaError::UserError(format!(
                             "Table {:?} has no column named {name:?}",
@@ -921,24 +903,21 @@ impl SqlTable {
                         ))
                     })
                 })
-                .collect::<Result<_, _>>()?
+                .collect::<Result<_, _>>()?,
         };
 
-        let query = insert.source.as_ref().ok_or_else(|| {
-            SchemaError::UserError("INSERT without a VALUES clause is not supported".into())
-        })?;
-        let values = match query.body.as_ref() {
-            sqlparser::ast::SetExpr::Values(v) => v,
-            _ => {
+        let value_rows = match &insert.source {
+            sql_parser::dml::InsertSource::Values(_, rows) => rows,
+            sql_parser::dml::InsertSource::Select(_) => {
                 return Err(SchemaError::UserError(
                     "Only INSERT ... VALUES (...) is supported".into(),
                 ));
             }
         };
 
-        let mut rows = Vec::with_capacity(values.rows.len());
-        for row in &values.rows {
-            let exprs = &row.content;
+        let mut rows = Vec::with_capacity(value_rows.len());
+        for row in value_rows.items() {
+            let exprs: Vec<&sql_parser::Expr> = row.exprs().collect();
             if exprs.len() != target_fields.len() {
                 return Err(SchemaError::UserError(format!(
                     "Expected {} value(s), got {}",
@@ -991,50 +970,48 @@ impl SqlTable {
 // validation for Str/Blob (does the literal actually fit within the
 // column's declared length) happens later, in IndexKey::new_from.
 fn expr_to_value_item(
-    expr: &sqlparser::ast::Expr,
+    expr: &sql_parser::Expr,
     datatype: DataType,
 ) -> Result<ValueItem, SchemaError> {
-    let value = match expr {
-        sqlparser::ast::Expr::Value(v) => &v.value,
+    use sql_parser::{expr::Expr, literal::Literal};
+    let literal = match expr {
+        Expr::Literal(l) => l,
         _ => {
             return Err(SchemaError::UserError(format!(
-                "unsupported expression in VALUES: {expr}"
+                "unsupported expression in VALUES: {expr:?}"
             )));
         }
     };
-    match (value, datatype) {
-        (sqlparser::ast::Value::Null, _) => Ok(ValueItem::Null),
-        (sqlparser::ast::Value::Number(s, _), DataType::Integer) => s
-            .parse()
-            .map(ValueItem::Integer)
-            .map_err(|_| SchemaError::UserError(format!("invalid integer literal: {s}"))),
-        (sqlparser::ast::Value::Number(s, _), DataType::Double) => s
-            .parse()
-            .map(ValueItem::Double)
-            .map_err(|_| SchemaError::UserError(format!("invalid double literal: {s}"))),
-        (sqlparser::ast::Value::Number(s, _), DataType::Datetime) => s
-            .parse()
-            .map(ValueItem::Datetime)
-            .map_err(|_| SchemaError::UserError(format!("invalid datetime literal: {s}"))),
+    match (literal, datatype) {
+        (Literal::Null(_), _) => Ok(ValueItem::Null),
+        (Literal::Number(n), DataType::Integer) => n.as_i64().map(ValueItem::Integer).ok_or_else(
+            || SchemaError::UserError(format!("invalid integer literal: {}", n.raw)),
+        ),
+        (Literal::Number(n), DataType::Double) => Ok(ValueItem::Double(n.as_f64())),
+        (Literal::Number(n), DataType::Datetime) => n
+            .as_i64()
+            .map(|i| ValueItem::Datetime(i as u64))
+            .ok_or_else(|| SchemaError::UserError(format!("invalid datetime literal: {}", n.raw))),
         // A quoted literal against a DATETIME column — "2020-04-13",
         // "12:53:24", or the two combined (space or "T" separated) —
         // see crate::datetime's own doc comment for the exact forms
         // and how they're encoded. A bare number (the arm above) is
         // still accepted too, as a literal, already-computed value.
-        (
-            sqlparser::ast::Value::SingleQuotedString(s)
-            | sqlparser::ast::Value::DoubleQuotedString(s),
-            DataType::Datetime,
-        ) => crate::datetime::parse_datetime(s)
+        // Only single-quoted strings are literals here (unlike the old
+        // sqlparser-based grammar, which also accepted double-quoted
+        // strings as values) — sql-parser's grammar treats a
+        // double-quoted token exclusively as a quoted identifier, the
+        // standard SQL reading, so `VALUES ("x")` now parses as a column
+        // reference and correctly falls through to the "unsupported
+        // expression" error above instead of being silently accepted.
+        (Literal::String(s), DataType::Datetime) => crate::datetime::parse_datetime(&s.value)
             .map(ValueItem::Datetime)
-            .ok_or_else(|| SchemaError::UserError(format!("invalid datetime literal: {s:?}"))),
-        (
-            sqlparser::ast::Value::SingleQuotedString(s)
-            | sqlparser::ast::Value::DoubleQuotedString(s),
-            DataType::Str(cap),
-        ) => Ok(ValueItem::Str((s.clone(), cap))),
+            .ok_or_else(|| {
+                SchemaError::UserError(format!("invalid datetime literal: {:?}", s.value))
+            }),
+        (Literal::String(s), DataType::Str(cap)) => Ok(ValueItem::Str((s.value.clone(), cap))),
         _ => Err(SchemaError::UserError(format!(
-            "value {value} does not match column type {datatype:?}"
+            "value {literal:?} does not match column type {datatype:?}"
         ))),
     }
 }
@@ -1046,24 +1023,27 @@ impl SqlIndex {
     }
 }
 
-impl From<&sqlparser::ast::UniqueConstraint> for IndexHolder {
-    fn from(value: &sqlparser::ast::UniqueConstraint) -> Self {
-        Self {
-            fields: value.columns.iter().map(|c| c.column.to_string()).collect(),
+// A table-level UNIQUE/PRIMARY KEY constraint (e.g. `CONSTRAINT uq
+// UNIQUE (a, b)`) as an IndexHolder — None for every other constraint kind
+// (FOREIGN KEY is handled separately, by from_sql's own foreign_key loop;
+// CHECK has no index representation at all). Unlike the inline
+// (column-level) form (see inline_indices), a table-level constraint's own
+// optional `CONSTRAINT name` clause carries through as `name`.
+fn index_from_constraint(constraint: &TableConstraint) -> Option<IndexHolder> {
+    let name = constraint.name.as_ref().map(|(_, n)| n.value.clone());
+    match &constraint.kind {
+        TableConstraintKind::Unique(_, _, cols, _) => Some(IndexHolder {
+            fields: cols.items().map(|c| c.value.clone()).collect(),
             is_primary: false,
             is_unique: true,
-            name: value.name.clone().map(|n| n.to_string()),
-        }
-    }
-}
-
-impl From<&sqlparser::ast::PrimaryKeyConstraint> for IndexHolder {
-    fn from(value: &sqlparser::ast::PrimaryKeyConstraint) -> Self {
-        Self {
-            fields: value.columns.iter().map(|c| c.column.to_string()).collect(),
+            name,
+        }),
+        TableConstraintKind::PrimaryKey(_, _, _, cols, _) => Some(IndexHolder {
+            fields: cols.items().map(|c| c.value.clone()).collect(),
             is_primary: true,
             is_unique: true,
-            name: value.name.clone().map(|n| n.to_string()),
-        }
+            name,
+        }),
+        _ => None,
     }
 }

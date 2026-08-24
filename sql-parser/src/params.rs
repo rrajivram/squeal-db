@@ -94,6 +94,7 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
         | Statement::DropTable(_)
         | Statement::DropIndex(_)
         | Statement::Truncate(_)
+        | Statement::CopyInto(_)
         | Statement::Use(_)
         | Statement::Deallocate(_)
         | Statement::StartTransaction(_)

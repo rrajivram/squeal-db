@@ -16,10 +16,9 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    let stmts =
-        sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect, sql).unwrap();
-    let sqlparser::ast::Statement::CreateTable(c) = &stmts[0] else {
-        panic!("expected a CREATE TABLE statement, got: {stmts:?}");
+    let stmt = sql_parser::parse_one(sql).unwrap();
+    let sql_parser::Statement::CreateTable(c) = &stmt else {
+        panic!("expected a CREATE TABLE statement, got: {stmt:?}");
     };
     s.create_table(SqlTable::from_sql(s, c.clone()).unwrap())
         .unwrap();

@@ -9,7 +9,7 @@ log = "0.4.33"
 parking_lot = "0.12.5"
 postcard = "1.1.3"
 serde = "1.0.228"
-sqlparser = {version="0.62.0", features=["visitor"]}
+sql-parser = {path="../sql-parser"}
 store= {path="../store"}
 thiserror = "2.0.18"
 macros ={path="../macros"}

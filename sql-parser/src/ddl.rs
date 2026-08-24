@@ -1,6 +1,8 @@
 //! DDL statements: `CREATE`/`DROP`/`ALTER TABLE`, `CREATE`/`DROP`
-//! `DATABASE`/`SCHEMA`, `CREATE`/`DROP INDEX`, `USE`, `TRUNCATE`.
+//! `DATABASE`/`SCHEMA`, `CREATE`/`DROP INDEX`, `USE`, `TRUNCATE`,
+//! `COPY INTO`.
 
+use chumsky::{Parser, extra::ParserExtra, label::LabelError};
 use either::Either;
 use macros::SQLParser;
 
@@ -9,8 +11,10 @@ use crate::{
     expr::Expr,
     ident::{Ident, ObjectName},
     keyword as kw,
+    parser::{SQLParser, TokenInput, token},
     query::OrderByItem,
-    token::{Comma, LeftParenthesis, RightParenthesis},
+    span::TokenSpan,
+    token::{Comma, LeftParenthesis, RightParenthesis, StringStyle, Token},
     utils::Seq,
 };
 
@@ -65,12 +69,17 @@ pub enum ColumnOption {
     Check(kw::Check, LeftParenthesis, Expr, RightParenthesis),
 }
 
-/// `REFERENCES table [(column)]`
+/// `REFERENCES table [(column, ...)]` — a column list, not a single
+/// column, symmetric with FOREIGN KEY's own local column list
+/// (TableConstraintKind::ForeignKey); a consumer that only supports
+/// single-column references (as of this writing, the only kind) rejects
+/// a multi-column one itself, the same way it already rejects a
+/// multi-column local list.
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct ForeignKeyReference {
     pub references: kw::References,
     pub table: ObjectName,
-    pub column: Option<(LeftParenthesis, Ident, RightParenthesis)>,
+    pub column: Option<(LeftParenthesis, Seq<Ident, Comma>, RightParenthesis)>,
 }
 
 /// `[CONSTRAINT name] <kind>`
@@ -128,6 +137,15 @@ pub enum AlterTableOp {
     DropColumn(kw::Drop, Option<kw::Column>, Ident),
     RenameTo(kw::Rename, kw::To, ObjectName),
     RenameColumn(kw::Rename, Option<kw::Column>, Ident, kw::To, Ident),
+    /// `ADD [CONSTRAINT name] <kind>` — reuses TableConstraint/
+    /// TableConstraintKind from CREATE TABLE unchanged; a caller only
+    /// meaning to support foreign keys (as of this writing, the only kind
+    /// ALTER TABLE ADD CONSTRAINT is used for) matches
+    /// TableConstraintKind::ForeignKey and rejects the rest itself, the
+    /// same way it already has to reject every other AlterTableOp variant
+    /// it doesn't handle.
+    AddConstraint(kw::Add, TableConstraint),
+    DropConstraint(kw::Drop, kw::Constraint, Ident),
 }
 
 /// `CREATE DATABASE|SCHEMA [IF NOT EXISTS] name`
@@ -149,10 +167,15 @@ pub struct DropDatabase {
     pub behavior: Option<Either<kw::Cascade, kw::Restrict>>,
 }
 
-/// `USE name` / `USE db.schema`
+/// `USE [DATABASE | SCHEMA] name` / `USE db.schema`. `kind` is `None` for
+/// the bare form (no equivalent concept in this engine — a caller that only
+/// understands DATABASE/SCHEMA is expected to treat `None` as a no-op, the
+/// same way sqlparser's other USE targets like CATALOG/WAREHOUSE/ROLE were
+/// always silently ignored).
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct UseStatement {
     pub use_token: kw::Use,
+    pub kind: Option<Either<kw::Database, kw::Schema>>,
     pub name: ObjectName,
 }
 
@@ -178,6 +201,50 @@ pub struct DropIndex {
     pub index: kw::Index,
     pub if_exists: Option<(kw::If, kw::Exists)>,
     pub name: ObjectName,
+}
+
+/// `COPY INTO <table> FROM @<path>` — loads a CSV file at a literal local
+/// filesystem path into `table`. Deliberately minimal, not a real Snowflake
+/// `COPY INTO`: no stage credentials/URL/storage-integration resolution, no
+/// target column list, no FILES/PATTERN/FILE_FORMAT/COPY options, no
+/// unloading (`COPY INTO <location>`), no loading from a query. A consumer
+/// wanting the full Snowflake grammar would need to extend this — this
+/// shape is only as wide as squeal-sql's own `copy_csv_into` needs.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct CopyInto {
+    pub copy: kw::Copy,
+    pub into: kw::Into,
+    pub table: ObjectName,
+    pub from: kw::From,
+    pub path: StagePath,
+}
+
+/// The `@<path>` half of `COPY INTO ... FROM @<path>` — a literal local
+/// filesystem path, `@` already stripped by the lexer (see lexer::stage_path).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StagePath {
+    pub span: TokenSpan,
+    pub path: String,
+}
+
+impl<'src, I, E, A> SQLParser<'src, I, E, A> for StagePath
+where
+    I: TokenInput<'src>,
+    E: ParserExtra<'src, I>,
+    E::Error: LabelError<'src, I, String>,
+{
+    fn parser(_args: A) -> impl Parser<'src, I, Self, E> + Clone {
+        token("a stage path (@<path>)", |t| match &t.token {
+            Token::String {
+                raw,
+                kind: StringStyle::Unquoted,
+            } => Some(StagePath {
+                span: t.span,
+                path: (*raw).to_string(),
+            }),
+            _ => None,
+        })
+    }
 }
 
 /// `TRUNCATE [TABLE] name`

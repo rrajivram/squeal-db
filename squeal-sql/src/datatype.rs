@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use log::warn;
 use serde::{Deserialize, Serialize};
-use sqlparser::ast::CharacterLength;
 use store::valueitem::ValueItem;
 
 use crate::constant::DEFAULT_VAR_SIZE;
@@ -63,37 +62,52 @@ impl DataType {
     }
 }
 
-impl From<sqlparser::ast::DataType> for DataType {
-    fn from(value: sqlparser::ast::DataType) -> Self {
+// The length argument out of a parenthesized `(n)` / `(n, m)` type suffix
+// (VARCHAR(n), CHAR(n), ...) — None for the bare, unparenthesized form.
+fn args1_len(args: &sql_parser::datatype::Args1) -> Option<u32> {
+    args.as_ref().and_then(|(_, n, _)| n.as_i64()).map(|n| n as u32)
+}
+
+impl From<sql_parser::datatype::DataType> for DataType {
+    fn from(value: sql_parser::datatype::DataType) -> Self {
+        use sql_parser::datatype::DataType as SqlDataType;
         match value {
-            sqlparser::ast::DataType::Int(_) | sqlparser::ast::DataType::Integer(_) => {
-                DataType::Integer
+            SqlDataType::TinyInt(_)
+            | SqlDataType::SmallInt(_)
+            | SqlDataType::BigInt(_)
+            | SqlDataType::Integer(_)
+            | SqlDataType::Int8(_)
+            | SqlDataType::Int16(_)
+            | SqlDataType::Int32(_)
+            | SqlDataType::Int64(_)
+            | SqlDataType::Int(_)
+            | SqlDataType::Uint8(_)
+            | SqlDataType::Uint16(_)
+            | SqlDataType::Uint32(_)
+            | SqlDataType::Uint64(_) => DataType::Integer,
+            SqlDataType::Float32(_)
+            | SqlDataType::Float64(_)
+            | SqlDataType::Float(_)
+            | SqlDataType::Double(_)
+            | SqlDataType::Real(_)
+            | SqlDataType::DoublePrecision(_, _) => DataType::Double,
+            SqlDataType::Datetime(_)
+            | SqlDataType::Timestamp(_)
+            | SqlDataType::Date(_)
+            | SqlDataType::Time(_) => DataType::Datetime,
+            SqlDataType::Text(_) | SqlDataType::String(_) => {
+                DataType::Str(DEFAULT_VAR_SIZE as u32)
             }
-            sqlparser::ast::DataType::Double(_) => DataType::Double,
-            sqlparser::ast::DataType::Datetime(_) | sqlparser::ast::DataType::Date => {
-                DataType::Datetime
+            SqlDataType::Varchar(_, args) | SqlDataType::Char(_, args) | SqlDataType::Character(_, args) => {
+                DataType::Str(args1_len(&args).unwrap_or(32))
             }
-            sqlparser::ast::DataType::String(l) => {
-                DataType::Str(l.unwrap_or(DEFAULT_VAR_SIZE as u64) as u32)
+            SqlDataType::Bytea(_) | SqlDataType::Binary(_) => {
+                DataType::Blob(DEFAULT_VAR_SIZE as u32)
             }
-            sqlparser::ast::DataType::Text => DataType::Str(DEFAULT_VAR_SIZE as u32),
-            sqlparser::ast::DataType::Varchar(l) => {
-                let l = l.unwrap_or(CharacterLength::IntegerLength {
-                    length: 32,
-                    unit: None,
-                });
-                match l {
-                    CharacterLength::IntegerLength { length, unit: _ } => {
-                        DataType::Str(length as u32)
-                    }
-                    _ => DataType::Str(32),
-                }
-            }
-            sqlparser::ast::DataType::Blob(l) => {
-                DataType::Blob(l.unwrap_or(DEFAULT_VAR_SIZE as u64) as u32)
-            }
-            _ => {
-                warn!("unsupported datatype: {:?}", value);
+            other @ (SqlDataType::Decimal(_, _)
+            | SqlDataType::Numeric(_, _)
+            | SqlDataType::Boolean(_)) => {
+                warn!("unsupported datatype: {:?}", other);
                 DataType::Unsupported
             }
         }

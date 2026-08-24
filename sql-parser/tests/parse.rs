@@ -768,3 +768,82 @@ fn prepare_execute_deallocate() {
     assert!(d.prepare.is_some());
     assert!(d.name.is_left());
 }
+
+#[test]
+fn use_database_and_schema() {
+    let Statement::Use(u) = one("USE DATABASE app") else {
+        panic!("expected USE");
+    };
+    assert!(u.kind.unwrap().is_left());
+    assert_eq!(u.name.to_dotted(), "app");
+
+    let Statement::Use(u) = one("USE SCHEMA analytics") else {
+        panic!("expected USE");
+    };
+    assert!(u.kind.unwrap().is_right());
+    assert_eq!(u.name.to_dotted(), "analytics");
+
+    // bare form still parses, with no kind
+    let Statement::Use(u) = one("USE app.analytics") else {
+        panic!("expected USE");
+    };
+    assert!(u.kind.is_none());
+    assert_eq!(u.name.to_dotted(), "app.analytics");
+}
+
+#[test]
+fn copy_into() {
+    let Statement::CopyInto(c) =
+        one("COPY INTO users FROM @/data/imports/users.csv")
+    else {
+        panic!("expected COPY INTO");
+    };
+    assert_eq!(c.table.to_dotted(), "users");
+    assert_eq!(c.path.path, "/data/imports/users.csv");
+
+    // a relative, extension-bearing, hyphenated path — exactly the shape
+    // that would fragment into ambiguous punctuation/word tokens if `@`
+    // weren't lexed as a single stage-path token (see lexer::stage_path).
+    let Statement::CopyInto(c) = one("COPY INTO t FROM @./my-data_2024/f.csv") else {
+        panic!("expected COPY INTO");
+    };
+    assert_eq!(c.path.path, "./my-data_2024/f.csv");
+
+    assert!(parse_one("COPY INTO t FROM users").is_err());
+}
+
+#[test]
+fn alter_table_add_and_drop_foreign_key() {
+    let Statement::AlterTable(a) = one(
+        "ALTER TABLE orders ADD CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users (id)",
+    ) else {
+        panic!("expected ALTER TABLE");
+    };
+    let AlterTableOp::AddConstraint(_, c) = &a.operation else {
+        panic!("expected ADD CONSTRAINT, got {:?}", a.operation);
+    };
+    assert_eq!(c.name.as_ref().unwrap().1.value, "fk_user");
+    assert!(matches!(c.kind, TableConstraintKind::ForeignKey(..)));
+
+    // unnamed form
+    let Statement::AlterTable(a) =
+        one("ALTER TABLE orders ADD FOREIGN KEY (user_id) REFERENCES users (id)")
+    else {
+        panic!("expected ALTER TABLE");
+    };
+    assert!(matches!(a.operation, AlterTableOp::AddConstraint(..)));
+
+    let Statement::AlterTable(a) = one("ALTER TABLE orders DROP CONSTRAINT fk_user") else {
+        panic!("expected ALTER TABLE");
+    };
+    let AlterTableOp::DropConstraint(_, _, name) = &a.operation else {
+        panic!("expected DROP CONSTRAINT, got {:?}", a.operation);
+    };
+    assert_eq!(name.value, "fk_user");
+
+    // ADD COLUMN must still win over ADD CONSTRAINT's own leading ADD
+    let Statement::AlterTable(a) = one("ALTER TABLE t ADD COLUMN c INT") else {
+        panic!("expected ALTER TABLE");
+    };
+    assert!(matches!(a.operation, AlterTableOp::AddColumn(..)));
+}

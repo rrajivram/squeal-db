@@ -82,6 +82,37 @@ fn string<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'s
     ))
 }
 
+// `@<path>` — a COPY INTO stage reference. Lexed as one token (not `@`
+// punctuation followed by a run of Word/Slash/Period/Minus tokens) because a
+// real filesystem path can contain characters (`-`, `_`, multiple `.`) that
+// would otherwise fragment into ambiguous punctuation/word tokens with no
+// reliable way to losslessly reassemble the original path from them —
+// notably `-` lexes as Punctuation::Minus, indistinguishable at the token
+// level from a subtraction operator. Reuses Token::String's Unquoted style
+// (see StringStyle's own doc comment) rather than a bespoke token variant,
+// since it's exactly that: a bare, unescaped run of text, just introduced by
+// `@` instead of a quote character. The `@` itself is not part of the
+// captured span's text (only used to trigger the rule) — sql-parser's own
+// `StagePath` type re-adds it to `span` bookkeeping but stores the path
+// with it already stripped, matching what a filesystem path actually needs.
+fn stage_path<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
+    just('@')
+        .ignore_then(
+            any()
+                .filter(|c: &char| !Token::is_whitespace(*c) && *c != ';')
+                .repeated()
+                .at_least(1)
+                .to_slice(),
+        )
+        .map_with(|s: &str, e| TokenStruct {
+            token: Token::String {
+                raw: s,
+                kind: StringStyle::Unquoted,
+            },
+            span: TokenSpan::from(e.span()),
+        })
+}
+
 fn operator<'src>() -> impl Parser<'src, &'src str, TokenStruct<'src>, LexError<'src>> + Clone {
     choice((
         just("<>").to(Operator::NotEq),
@@ -141,6 +172,7 @@ pub fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<TokenStruct<'src>>, Lex
         number(),
         word(),
         string(),
+        stage_path(),
         whitespace(),
         punctuation(),
     ))

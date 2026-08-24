@@ -522,22 +522,28 @@ fn test_new_accepts_a_values_row_matching_the_implicit_column_count() {
 
 #[test]
 fn test_new_rejects_a_begin_end_block() {
+    // sql-parser's StartTransaction::Begin grammar has no body at all
+    // (just the bare BEGIN [TRANSACTION] keyword(s)) — a BEGIN...END
+    // block fails to parse rather than parsing and being rejected
+    // semantically, but either way the SQL is refused.
     let c = conn();
     let err = c
         .clone()
         .create_statement("begin select 1; end")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
 fn test_new_rejects_rollback_to_savepoint() {
+    // sql-parser's Rollback grammar is just the bare ROLLBACK keyword —
+    // TO SAVEPOINT has no equivalent, so this fails to parse.
     let c = conn();
     let err = c
         .clone()
         .create_statement("rollback to savepoint sp1")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 fn result_string(r: &ResultType) -> &str {
@@ -638,29 +644,34 @@ fn test_execute_alter_table_rename_column_fails_without_a_selected_schema() {
 
 #[test]
 fn test_new_rejects_alter_table_with_multiple_operations() {
+    // sql-parser's AlterTable grammar has exactly one `operation`, not a
+    // list — a second operation fails to parse rather than parsing and
+    // being rejected semantically.
     let c = conn();
     let err = c
         .create_statement("alter table t add column x integer, add column y integer")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
 fn test_new_rejects_alter_table_drop_column_if_exists() {
+    // sql-parser's DropColumn grammar has no IF EXISTS.
     let c = conn();
     let err = c
         .create_statement("alter table t drop column if exists x")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
 fn test_new_rejects_alter_table_dropping_multiple_columns() {
+    // sql-parser's DropColumn grammar takes exactly one Ident, not a list.
     let c = conn();
     let err = c
         .create_statement("alter table t drop column x, y")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
@@ -696,22 +707,24 @@ fn test_execute_alter_table_drop_foreign_key_fails_for_an_unknown_table() {
 
 #[test]
 fn test_new_rejects_alter_table_add_constraint_not_valid() {
+    // sql-parser's AddConstraint grammar has no NOT VALID.
     let c = conn();
     let err = c
         .create_statement(
             "alter table t add constraint fk_x foreign key (x) references y(id) not valid",
         )
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
 fn test_new_rejects_alter_table_drop_constraint_if_exists() {
+    // sql-parser's DropConstraint grammar has no IF EXISTS.
     let c = conn();
     let err = c
         .create_statement("alter table t drop constraint if exists fk_x")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
@@ -932,11 +945,15 @@ fn test_execute_copy_into_fails_for_an_unknown_table() {
 
 #[test]
 fn test_new_rejects_copy_into_with_a_file_format_clause() {
+    // sql-parser's CopyInto grammar is exactly "COPY INTO <table> FROM
+    // @<path>" — a trailing FILE_FORMAT clause is leftover, unparsed
+    // input after a complete statement, so this fails to parse rather
+    // than parsing and being rejected semantically.
     let c = conn();
     let err = c
         .create_statement("copy into t from @stage file_format = (type = csv)")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }
 
 #[test]
@@ -945,5 +962,5 @@ fn test_new_rejects_copy_into_with_a_pattern_clause() {
     let err = c
         .create_statement("copy into t from @stage pattern = '.*.csv'")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
 }

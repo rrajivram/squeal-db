@@ -13,8 +13,8 @@ use macros::SQLParser;
 use crate::{
     datatype::DataType,
     ddl::{
-        AlterTable, CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex, DropTable,
-        Truncate, UseStatement,
+        AlterTable, CopyInto, CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex,
+        DropTable, Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -41,6 +41,7 @@ pub enum Statement {
     DropDatabase(DropDatabase),
     AlterTable(AlterTable),
     Truncate(Truncate),
+    CopyInto(CopyInto),
     Use(UseStatement),
     Prepare(Prepare),
     Execute(Execute),
