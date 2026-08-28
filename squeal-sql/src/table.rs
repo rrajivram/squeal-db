@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use serde::de::{self, Visitor};
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sql_parser::ddl::{
-    ColumnDef, ColumnOption, CreateTable, ForeignKeyReference, TableConstraint,
-    TableConstraintKind,
+    ColumnDef, ColumnOption, CreateTable, ForeignKeyReference, TableConstraint, TableConstraintKind,
 };
 use sql_parser::ident::Ident;
 use store::db::DBFile;
@@ -59,7 +60,17 @@ pub struct SqlTable {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaVersion {
-    pub(crate) fields: Vec<Arc<Field>>,
+    // An Arc-wrapped slice, not a Vec: this list is built once (see
+    // TableBuilder::build/alter_add_column/alter_drop_column/
+    // alter_rename_column, the only places that ever construct a new
+    // SchemaVersion) and read many times after — most rows insert/
+    // reproject against the table's current version, and SqlTable
+    // itself is now cloned via Arc (see Schema::get_table), so cloning
+    // *this* is on the same hot path. Cloning an Arc<[_]> is a refcount
+    // bump; cloning a Vec<_> reallocates and copies its whole spine
+    // every time, even though each element (Arc<Field>) was already
+    // cheap to clone on its own.
+    pub(crate) fields: Arc<[Arc<Field>]>,
 }
 
 // What Schema::insert_rows_in_txn actually writes as a row's stored
@@ -70,7 +81,7 @@ pub struct SchemaVersion {
 // was encoded under. New inserts always stamp SqlTable::version()
 // (the current/latest version); older rows keep whatever version was
 // current when they were written.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct VersionedRow {
     pub(crate) version: u32,
     pub(crate) values: IndexKey,
@@ -82,7 +93,9 @@ pub struct SqlIndex {
     pub(crate) db_table_id: TableIdType,
     pub(crate) is_primary: bool,
     pub(crate) is_unique: bool,
-    pub(crate) fields: Vec<Arc<Field>>,
+    // Same reasoning as SchemaVersion::fields — built once, cloned
+    // whenever the containing SqlTable is.
+    pub(crate) fields: Arc<[Arc<Field>]>,
 }
 
 // A single-column foreign key — this table's `column` must, for every
@@ -109,7 +122,7 @@ struct IndexHolder {
     fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Field {
     // A permanent identity, distinct from `name` and from this field's
     // position in any particular SchemaVersion — assigned once (see
@@ -139,6 +152,60 @@ pub struct TableBuilder {
     fields: Vec<Field>,
     indices: Vec<IndexHolder>,
     foreign_keys: Vec<SqlForeignKey>,
+}
+
+impl Serialize for VersionedRow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_struct("VersionedRow", 2)?;
+        s.serialize_field("ver", &self.version)?;
+        s.serialize_field("data", &self.values.to_bytes())?;
+        s.end()
+    }
+}
+
+struct VersionedRowVisitor;
+
+// Field names given to deserialize_struct below only matter to
+// self-describing formats (JSON, ...) that key on them; postcard (the
+// only format this crate actually feeds VersionedRow through) ignores
+// them entirely and always drives visit_seq, reading fields in
+// declaration order — same as the Serialize side's serialize_struct.
+const VERSIONED_ROW_FIELDS: &[&str] = &["ver", "data"];
+
+impl<'de> Visitor<'de> for VersionedRowVisitor {
+    type Value = VersionedRow;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("struct VersionedRow")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: de::SeqAccess<'de>,
+    {
+        let version = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let bytes: Vec<u8> = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        Ok(VersionedRow {
+            version,
+            values: IndexKey::from_bytes(&bytes),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for VersionedRow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("VersionedRow", VERSIONED_ROW_FIELDS, VersionedRowVisitor)
+    }
 }
 
 impl Field {
@@ -328,26 +395,32 @@ impl TableBuilder {
 
         let mut table = SqlTable {
             name: self.name.as_ref().unwrap().clone(),
-            versions: vec![SchemaVersion { fields }],
+            versions: vec![SchemaVersion {
+                fields: fields.into(),
+            }],
             indices: vec![],
             foreign_keys: vec![],
             db_table_id: TableIdType::none(),
             next_field_id,
         };
         for i in &self.indices {
-            let mut index = SqlIndex {
+            // Built as a Vec (needs .push() while resolving each name
+            // below), converted to the stored Arc<[_]> only once it's
+            // complete — same pattern as alter_add_column/
+            // alter_drop_column/alter_rename_column.
+            let mut fields: Vec<Arc<Field>> = vec![];
+            for index_f in &i.fields {
+                if let Some(f) = table.fields().iter().find(|f| f.name == *index_f) {
+                    fields.push(f.clone());
+                }
+            }
+            table.indices.push(SqlIndex {
                 name: i.name.clone(),
                 is_primary: i.is_primary,
                 is_unique: i.is_unique,
-                fields: vec![],
+                fields: fields.into(),
                 db_table_id: TableIdType::none(),
-            };
-            for index_f in &i.fields {
-                if let Some(f) = table.fields().iter().find(|f| f.name == *index_f) {
-                    index.fields.push(f.clone());
-                }
-            }
-            table.indices.push(index);
+            });
         }
         for fk in &self.foreign_keys {
             // Case-insensitive: table names are lowercased everywhere
@@ -552,9 +625,9 @@ impl SqlTable {
     // only, so the reference has to be resolvable from that one column
     // alone.
     pub(crate) fn unique_index_on(&self, column: &str) -> Option<&SqlIndex> {
-        self.indices
-            .iter()
-            .find(|i| (i.is_primary || i.is_unique) && i.fields.len() == 1 && i.fields[0].name == column)
+        self.indices.iter().find(|i| {
+            (i.is_primary || i.is_unique) && i.fields.len() == 1 && i.fields[0].name == column
+        })
     }
 
     // Validates `ref_column` as a foreign key target on THIS table
@@ -619,6 +692,19 @@ impl SqlTable {
             .fields
     }
 
+    // Same fields as fields(), but a cheap Arc clone (refcount bump) of
+    // the current version's own backing slice, for a caller (e.g.
+    // Source::fields) that needs an owned, shareable handle rather than
+    // a borrow tied to &self — not a fresh Arc<[_]> built by re-collecting
+    // the slice, which would allocate every call for no reason.
+    pub(crate) fn fields_arc(&self) -> Arc<[Arc<Field>]> {
+        self.versions
+            .last()
+            .expect("a table always has at least one schema version")
+            .fields
+            .clone()
+    }
+
     // This table's current version number — 0 for a table that's never
     // been ALTERed, incrementing by one per ALTER TABLE. Stamped onto
     // every row written from here on (see VersionedRow) so a later
@@ -629,7 +715,7 @@ impl SqlTable {
     }
 
     fn fields_at(&self, version: u32) -> Option<&[Arc<Field>]> {
-        self.versions.get(version as usize).map(|v| v.fields.as_slice())
+        self.versions.get(version as usize).map(|v| &v.fields[..])
     }
 
     // Decodes a stored row back into ValueItems in the table's CURRENT
@@ -647,7 +733,7 @@ impl SqlTable {
     //   - a field only in the row's stored version (dropped since):
     //     simply not carried over — the current version doesn't ask for
     //     it.
-    pub(crate) fn reproject(&self, row: &VersionedRow) -> Result<Vec<ValueItem>, SchemaError> {
+    pub(crate) fn reproject(&self, row: &VersionedRow) -> Result<IndexKey, SchemaError> {
         let stored_fields = self.fields_at(row.version).ok_or_else(|| {
             SchemaError::UnknownError(format!(
                 "row was written under schema version {} but table {:?} has no such version",
@@ -664,7 +750,19 @@ impl SqlTable {
                 stored_fields.len()
             )));
         }
-        Ok(self
+        // The common case: a row written under the table's current
+        // version (every row not predating the table's last ALTER
+        // TABLE) already has its values in exactly the shape the loop
+        // below would reconstruct one field at a time — stored_fields
+        // and self.fields() are the literal same SchemaVersion here.
+        // Cloning row.values is an Arc refcount bump (IndexKey wraps
+        // Arc<[ValueItem]>), not a real allocation, and skips both the
+        // O(fields^2) id lookup below and new_from's redundant
+        // re-validation of data that's already known valid.
+        if row.version == self.version() {
+            return Ok(row.values.clone());
+        }
+        let values: Vec<ValueItem> = self
             .fields()
             .iter()
             .map(|f| {
@@ -677,7 +775,14 @@ impl SqlTable {
                     None => f.default.clone().unwrap_or(ValueItem::Null),
                 }
             })
-            .collect())
+            .collect();
+        // Every value here is either a clone of an already-validated
+        // stored value or an already-validated Field::default (see
+        // Field::new's own size-cap check) — new_from's validation can't
+        // meaningfully fail on either, but going through it anyway (not
+        // a raw IndexKey construction) keeps this the one place that
+        // decides what "a valid IndexKey" means.
+        Ok(IndexKey::new_from(&values)?)
     }
 
     // Appends a new schema version with `field` added to the end of the
@@ -703,7 +808,9 @@ impl SqlTable {
         let mut fields = self.fields().to_vec();
         fields.push(Arc::new(field.with_id(self.next_field_id)));
         self.next_field_id += 1;
-        self.versions.push(SchemaVersion { fields });
+        self.versions.push(SchemaVersion {
+            fields: fields.into(),
+        });
         Ok(())
     }
 
@@ -744,7 +851,9 @@ impl SqlTable {
                 "Cannot drop the last remaining column".into(),
             ));
         }
-        self.versions.push(SchemaVersion { fields });
+        self.versions.push(SchemaVersion {
+            fields: fields.into(),
+        });
         Ok(())
     }
 
@@ -799,7 +908,9 @@ impl SqlTable {
                 }
             })
             .collect();
-        self.versions.push(SchemaVersion { fields });
+        self.versions.push(SchemaVersion {
+            fields: fields.into(),
+        });
         Ok(())
     }
 
@@ -817,7 +928,10 @@ impl SqlTable {
             )));
         }
         if let Some(name) = &fk.name
-            && self.foreign_keys.iter().any(|f| f.name.as_deref() == Some(name.as_str()))
+            && self
+                .foreign_keys
+                .iter()
+                .any(|f| f.name.as_deref() == Some(name.as_str()))
         {
             return Err(SchemaError::UserError(format!(
                 "Duplicate foreign key constraint name: {name}"
@@ -853,7 +967,11 @@ impl SqlTable {
     // index_entry_size, mirroring SqlIndex::size() (indexed fields only)
     // but over the whole row, since the full row is what's stored there.
     pub(crate) fn row_size(&self) -> usize {
-        self.fields().iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
+        self.fields()
+            .iter()
+            .map(|f| f.datatype.size())
+            .sum::<usize>()
+            + ENTRY_OVERHEAD_BYTES
     }
 
     // The position of `field` within this table's own declared field
@@ -873,9 +991,9 @@ impl SqlTable {
         fields
             .iter()
             .map(|f| {
-                let pos = self
-                    .field_position(f)
-                    .expect("index/primary-key fields are always a subset of the table's own fields");
+                let pos = self.field_position(f).expect(
+                    "index/primary-key fields are always a subset of the table's own fields",
+                );
                 row[pos].clone()
             })
             .collect()
@@ -890,78 +1008,92 @@ impl SqlTable {
         &self,
         insert: &sql_parser::dml::Insert,
     ) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
-        let target_fields: Vec<&Arc<Field>> = match &insert.columns {
-            None => self.fields().iter().collect(),
-            Some((_, cols, _)) => cols
-                .items()
-                .map(|c| {
-                    let name = c.value.to_lowercase();
-                    self.fields().iter().find(|f| f.name == name).ok_or_else(|| {
-                        SchemaError::UserError(format!(
-                            "Table {:?} has no column named {name:?}",
-                            self.name
-                        ))
-                    })
+        build_insert_rows(&self.name, self.fields(), insert)
+    }
+}
+
+// The actual logic behind SqlTable::rows_from_insert, extracted to a
+// free function taking just a name (for error messages) and a field
+// list rather than a whole SqlTable — so a temp table (crate::temp::
+// TempTable, which has fields but no SqlTable at all: no versions,
+// indices, or store-backed db_table_id) can validate/build its own
+// INSERT rows through the exact same rules (column-list resolution,
+// NOT NULL, DEFAULT, arity checking) instead of a second, parallel
+// implementation that could silently drift from this one.
+pub(crate) fn build_insert_rows(
+    table_name: &str,
+    fields: &[Arc<Field>],
+    insert: &sql_parser::dml::Insert,
+) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
+    let target_fields: Vec<&Arc<Field>> = match &insert.columns {
+        None => fields.iter().collect(),
+        Some((_, cols, _)) => cols
+            .items()
+            .map(|c| {
+                let name = c.value.to_lowercase();
+                fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                    SchemaError::UserError(format!(
+                        "Table {table_name:?} has no column named {name:?}"
+                    ))
                 })
-                .collect::<Result<_, _>>()?,
-        };
+            })
+            .collect::<Result<_, _>>()?,
+    };
 
-        let value_rows = match &insert.source {
-            sql_parser::dml::InsertSource::Values(_, rows) => rows,
-            sql_parser::dml::InsertSource::Select(_) => {
-                return Err(SchemaError::UserError(
-                    "Only INSERT ... VALUES (...) is supported".into(),
-                ));
-            }
-        };
+    let value_rows = match &insert.source {
+        sql_parser::dml::InsertSource::Values(_, rows) => rows,
+        sql_parser::dml::InsertSource::Select(_) => {
+            return Err(SchemaError::UserError(
+                "Only INSERT ... VALUES (...) is supported".into(),
+            ));
+        }
+    };
 
-        let mut rows = Vec::with_capacity(value_rows.len());
-        for row in value_rows.items() {
-            let exprs: Vec<&sql_parser::Expr> = row.exprs().collect();
-            if exprs.len() != target_fields.len() {
+    let mut rows = Vec::with_capacity(value_rows.len());
+    for row in value_rows.items() {
+        let exprs: Vec<&sql_parser::Expr> = row.exprs().collect();
+        if exprs.len() != target_fields.len() {
+            return Err(SchemaError::UserError(format!(
+                "Expected {} value(s), got {}",
+                target_fields.len(),
+                exprs.len()
+            )));
+        }
+        let mut by_name: HashMap<&str, ValueItem> = HashMap::with_capacity(exprs.len());
+        for (field, expr) in target_fields.iter().zip(exprs) {
+            let item = expr_to_value_item(expr, field.datatype)?;
+            if item == ValueItem::Null && !field.nullable {
                 return Err(SchemaError::UserError(format!(
-                    "Expected {} value(s), got {}",
-                    target_fields.len(),
-                    exprs.len()
+                    "Column {:?} cannot be null",
+                    field.name
                 )));
             }
-            let mut by_name: HashMap<&str, ValueItem> = HashMap::with_capacity(exprs.len());
-            for (field, expr) in target_fields.iter().zip(exprs) {
-                let item = expr_to_value_item(expr, field.datatype)?;
-                if item == ValueItem::Null && !field.nullable {
+            by_name.insert(field.name.as_str(), item);
+        }
+        let mut full_row = Vec::with_capacity(fields.len());
+        for f in fields {
+            match by_name.remove(f.name.as_str()) {
+                Some(v) => full_row.push(v),
+                // DEFAULT applies to any omitted column, not just a
+                // backfilled pre-ALTER row (see Field::default) —
+                // checked before the plain-NULL fallback so a NOT
+                // NULL column with a DEFAULT still works via an
+                // explicit column list that leaves it out.
+                None if f.default.is_some() => {
+                    full_row.push(f.default.clone().expect("checked Some above"))
+                }
+                None if f.nullable => full_row.push(ValueItem::Null),
+                None => {
                     return Err(SchemaError::UserError(format!(
-                        "Column {:?} cannot be null",
-                        field.name
+                        "Column {:?} has no value and is not nullable",
+                        f.name
                     )));
                 }
-                by_name.insert(field.name.as_str(), item);
             }
-            let fields = self.fields();
-            let mut full_row = Vec::with_capacity(fields.len());
-            for f in fields {
-                match by_name.remove(f.name.as_str()) {
-                    Some(v) => full_row.push(v),
-                    // DEFAULT applies to any omitted column, not just a
-                    // backfilled pre-ALTER row (see Field::default) —
-                    // checked before the plain-NULL fallback so a NOT
-                    // NULL column with a DEFAULT still works via an
-                    // explicit column list that leaves it out.
-                    None if f.default.is_some() => {
-                        full_row.push(f.default.clone().expect("checked Some above"))
-                    }
-                    None if f.nullable => full_row.push(ValueItem::Null),
-                    None => {
-                        return Err(SchemaError::UserError(format!(
-                            "Column {:?} has no value and is not nullable",
-                            f.name
-                        )));
-                    }
-                }
-            }
-            rows.push(full_row);
         }
-        Ok(rows)
+        rows.push(full_row);
     }
+    Ok(rows)
 }
 
 // Converts a single VALUES-clause literal into a ValueItem matching
@@ -984,9 +1116,10 @@ fn expr_to_value_item(
     };
     match (literal, datatype) {
         (Literal::Null(_), _) => Ok(ValueItem::Null),
-        (Literal::Number(n), DataType::Integer) => n.as_i64().map(ValueItem::Integer).ok_or_else(
-            || SchemaError::UserError(format!("invalid integer literal: {}", n.raw)),
-        ),
+        (Literal::Number(n), DataType::Integer) => n
+            .as_i64()
+            .map(ValueItem::Integer)
+            .ok_or_else(|| SchemaError::UserError(format!("invalid integer literal: {}", n.raw))),
         (Literal::Number(n), DataType::Double) => Ok(ValueItem::Double(n.as_f64())),
         (Literal::Number(n), DataType::Datetime) => n
             .as_i64()

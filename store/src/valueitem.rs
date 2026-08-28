@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, fmt::Display, sync::Arc};
+use std::{cmp::Ordering, fmt::Display, hash::Hash, sync::Arc};
 
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ pub enum ValueItem {
     Blob((Arc<[u8]>, u32)) = 25,
 }
 
-#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, Hash)]
 pub struct IndexKey {
     data: Arc<[ValueItem]>,
 }
@@ -134,14 +134,20 @@ impl ValueItem {
             // reported the two numbers swapped.
             ValueItem::Str(s) => {
                 if s.0.len() as u32 > s.1 {
-                    Err(StoreError::TupleTooLarge(s.0.len() as DBSizeType, s.1 as usize))
+                    Err(StoreError::TupleTooLarge(
+                        s.0.len() as DBSizeType,
+                        s.1 as usize,
+                    ))
                 } else {
                     Ok(())
                 }
             }
             ValueItem::Blob(s) => {
                 if s.0.len() as u32 > s.1 {
-                    Err(StoreError::TupleTooLarge(s.0.len() as DBSizeType, s.1 as usize))
+                    Err(StoreError::TupleTooLarge(
+                        s.0.len() as DBSizeType,
+                        s.1 as usize,
+                    ))
                 } else {
                     Ok(())
                 }
@@ -295,6 +301,21 @@ impl ValueItem {
     }
 }
 
+impl Hash for ValueItem {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            ValueItem::Double(f) => {
+                f.to_bits().hash(state);
+            }
+            ValueItem::Blob(b) => b.hash(state),
+            ValueItem::Datetime(d) => d.hash(state),
+            ValueItem::Integer(i) => i.hash(state),
+            ValueItem::Str(s) => s.hash(state),
+            ValueItem::Null => {}
+        }
+    }
+}
+
 impl Display for ValueItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -328,6 +349,23 @@ impl PartialOrd for ValueItem {
 
             (ValueItem::Null, _) => Some(std::cmp::Ordering::Less),
         }
+    }
+}
+
+impl TryFrom<String> for ValueItem {
+    type Error = StoreError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let len = value.len() as u32;
+        Ok(ValueItem::Str((value, len)))
+    }
+}
+impl TryFrom<&String> for ValueItem {
+    type Error = StoreError;
+
+    fn try_from(value: &String) -> Result<Self, Self::Error> {
+        let len = value.len() as u32;
+        Ok(ValueItem::Str((value.clone(), len)))
     }
 }
 

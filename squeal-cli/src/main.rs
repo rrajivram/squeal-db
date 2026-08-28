@@ -18,7 +18,7 @@ enum Backend {
 fn main() -> Result<()> {
     let db_path = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "squeal.db".to_string());
+        .unwrap_or_else(|| "/Users/rajiv/dev/rust/squeal_db/test_data/squeal.db".to_string());
     let mut rl = DefaultEditor::new()?;
 
     // Asked interactively rather than via a CLI flag — a flag has to be
@@ -156,8 +156,8 @@ where
     let mut next = stmt.get_results();
     loop {
         match next {
-            Ok(Some(r)) => {
-                print_result(&r);
+            Ok(Some(mut r)) => {
+                print_result(&mut r);
                 next = stmt.get_nextresult();
             }
             Ok(None) => break,
@@ -169,7 +169,7 @@ where
     }
 }
 
-fn print_result(r: &ResultType) {
+fn print_result(r: &mut ResultType) {
     match r {
         ResultType::ResultString(s) => println!("{s}"),
         ResultType::Count(n) => println!("{n} row(s) affected"),
@@ -178,6 +178,21 @@ fn print_result(r: &ResultType) {
             table.set_header(rs.columns().to_vec());
             for row in rs.rows_as_strings() {
                 table.add_row(row);
+            }
+            println!("{table}");
+        }
+        ResultType::StreamingResult(stream) => {
+            let mut table = comfy_table::Table::new();
+            table.set_header(stream.columns());
+            loop {
+                match stream.next_result_as_strings() {
+                    Ok(Some(row)) => table.add_row(row),
+                    Ok(None) => break,
+                    Err(e) => {
+                        println!("error: {e}");
+                        break;
+                    }
+                };
             }
             println!("{table}");
         }

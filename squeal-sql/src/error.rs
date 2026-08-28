@@ -35,6 +35,22 @@ pub enum SchemaError {
     TooManyPreparedStatement,
     #[error("Only INSERT, UPDATE, DELETE , SELECT are allowed in prepared statements, found {0}")]
     BadPreparedStatement(String),
+    #[error("Internal Error {0}")]
+    InternalSchemaError(String),
+    // A blocking operator (hash join build side, sort, GROUP BY hash
+    // table, ...) tried to buffer more than this query's own memory
+    // budget allows — see plan::memory::QueryMemory. Distinct from
+    // InternalError/UnknownError: this is an expected, user-actionable
+    // outcome (the query is too memory-hungry for its configured
+    // limit), not a bug.
+    #[error(
+        "query exceeded its memory limit: requested {requested} byte(s), already using {used} of {limit} byte(s)"
+    )]
+    QueryMemoryExceeded {
+        requested: usize,
+        used: usize,
+        limit: usize,
+    },
 }
 
 impl From<StoreError> for SchemaError {
@@ -51,6 +67,8 @@ impl From<StoreError> for SchemaError {
             | StoreError::PageTransientlyInconsistent(_)
             | StoreError::UnknownPageContentKind(_)
             | StoreError::DuplicatePageContentKind(_)
+            | StoreError::InvalidPageMagic(_)
+            | StoreError::PageChecksumMismatch(_)
             | StoreError::LockContentionError => Self::InternalError(value),
             // Not internal — "this value is too big to fit in its
             // declared size" (a VARCHAR/BLOB literal longer than the

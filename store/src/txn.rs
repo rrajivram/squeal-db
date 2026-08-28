@@ -28,7 +28,7 @@ pub struct TransactionInner {
     ts: u128,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TransactionData {
     id: TransactionId,
     snapshot: HashSet<TransactionId>,
@@ -56,6 +56,7 @@ pub(crate) struct TransactionManager {
 ///
 /// Rolls back automatically when dropped if `commit()` was never called. Use
 /// `id()` to get the raw `TransactionId` for passing to lower-level operations.
+#[derive(Clone)]
 pub struct Transaction {
     id: Option<TransactionId>,
     mgr: Arc<TransactionManager>,

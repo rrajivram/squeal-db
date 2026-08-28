@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
-use postcard::to_allocvec;
+use postcard::{from_bytes, to_allocvec};
 use store::{
+    cursor::Cursor,
     db::{DBFile, Db},
     generator::Generator,
     table::TableIdType,
@@ -24,7 +25,7 @@ use crate::{
 // schemas' same-named tables colliding in the shared, flat namespace.
 pub struct Database<F: DBFile> {
     name: String,
-    db: Arc<Db<F>>,
+    pub(crate) db: Arc<Db<F>>,
     generator: Arc<Generator>,
     schemas_table: TableIdType,
     schemas: RwLock<HashMap<String, Arc<Schema<F>>>>,
@@ -71,9 +72,9 @@ where
 
     pub fn open(name: String) -> Result<Arc<Self>, SchemaError> {
         let db = Db::open(&name)?;
-        let schemas_table = db.table_id_by_name(SYSTEM_SCHEMAS_TABLE)?.ok_or_else(|| {
-            SchemaError::UnknownError("Unable to load system schemas!".into())
-        })?;
+        let schemas_table = db
+            .table_id_by_name(SYSTEM_SCHEMAS_TABLE)?
+            .ok_or_else(|| SchemaError::UnknownError("Unable to load system schemas!".into()))?;
         let database = Arc::new(Self {
             name,
             generator: db.get_generator(),
@@ -152,7 +153,9 @@ where
             }
         };
         self.db.commit(txn)?;
-        self.schemas.write().insert(name.to_string(), schema.clone());
+        self.schemas
+            .write()
+            .insert(name.to_string(), schema.clone());
         Ok(schema)
     }
 
@@ -161,12 +164,30 @@ where
             return Ok(schema.clone());
         }
         let schema = Schema::<F>::load(name.to_string(), self.db.clone())?;
-        self.schemas.write().insert(name.to_string(), schema.clone());
+        self.schemas
+            .write()
+            .insert(name.to_string(), schema.clone());
         Ok(schema)
     }
 
     pub(crate) fn schema_exists(self: &Arc<Self>, name: &str) -> bool {
-        self.schemas.read().contains_key(name)
+        self.get_schema(name).is_ok()
+    }
+
+    // Scans schemas_table (the durable record every create_schema call
+    // writes to, before it ever touches the in-memory map) rather than
+    // reading self.schemas directly — that map is only lazily populated
+    // (see get_schema), and Database::open only eagerly loads "default"
+    // into it, not every schema that actually exists on disk. Reading
+    // the map directly here would silently hide any schema this
+    // connection hasn't explicitly USE'd or CREATE'd yet.
+    pub(crate) fn list_schemas(self: &Arc<Self>) -> Result<Vec<String>, SchemaError> {
+        let mut cursor = self.db.table_scan(self.schemas_table)?;
+        let mut names = Vec::new();
+        while let Some(tuple) = cursor.next()? {
+            names.push(from_bytes::<String>(tuple.data())?);
+        }
+        Ok(names)
     }
 
     // Exposed so Connection can hold an explicit transaction open across

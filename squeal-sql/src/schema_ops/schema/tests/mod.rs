@@ -71,7 +71,7 @@ fn execute(c: &Arc<Connection<MemFile>>, sql: &str) -> Result<(), SchemaError> {
 // commits, and only then updates the in-memory map) and returns just
 // `()`, tests have to go back through the schema to see what actually
 // landed.
-fn create_and_fetch(sql: &str, table_name: &str) -> SqlTable {
+fn create_and_fetch(sql: &str, table_name: &str) -> Arc<SqlTable> {
     let c = conn();
     execute(&c, sql).unwrap();
     let s = c.current_schema().unwrap();

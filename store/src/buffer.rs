@@ -17,7 +17,7 @@ use crate::{
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::LsnClock,
-    page::{PAGE_OVERHEAD, Page, PageHeader, PageId},
+    page::{PAGE_MAGIC, PAGE_OVERHEAD, Page, PageHeader, PageId, fnv1a_32},
     pages::content::PageContentRegistry,
     utils::shardedpq::ShardedPQ,
 };
@@ -334,6 +334,20 @@ where
             // Use alloc_overflow_page (no init_page write) so the IS_OVERFLOW headers we writeim
             // synchronously below are not overwritten by an async init_page from alloc_page.
             let first_page = self.alloc_overflow_page()?;
+            // alloc_overflow_page never writes data, so every continuation
+            // page's own bytes are genuinely all-zero at this point (a
+            // brand-new page from extending page_count is zero-filled; a
+            // reused free-list one was zeroed by reset_freed_page before
+            // being freed) — a checksum matching that, not the 0
+            // placeholder header_from_inner defaults to, so a read landing
+            // in the window before write_page's later real data flush (see
+            // its own comment: continuation pages are never cached, so
+            // get_page always reads them raw off disk) sees a checksum
+            // that actually matches what's on disk right now. write_page
+            // overwrites this again with the true data checksum once it
+            // runs — this is only about the header being honest about
+            // disk contents in the meantime.
+            let zero_checksum = fnv1a_32(&vec![0u8; header.page_data_size as usize]);
             header.set_has_overflow();
             header.set_next_page(first_page);
             self.write_page_header(page_id, &header)?;
@@ -344,12 +358,14 @@ where
                 let new_page_id = self.alloc_overflow_page()?;
                 header.next_page = new_page_id.into();
                 header.set_is_overflow();
+                header.checksum = zero_checksum;
                 self.write_page_header(write_page_id, &header)?;
                 write_page_id = new_page_id;
             }
             // Terminator: restore original next_page and clear IS_OVERFLOW so the read loop stops.
             header.next_page = orig_next_page.into();
             header.clear_is_overflow();
+            header.checksum = zero_checksum;
             self.write_page_header(write_page_id, &header)?;
             // Reflect the overflow state on the in-memory Arc so the writer thread's write_page
             // call uses the overflow path and distributes data across the chain.
@@ -1331,12 +1347,8 @@ fn write_page(
     // has_overflow read as false (from a newer write that had already
     // cleared it) alongside leftover oversized content an older write's
     // to_bytes() call captured moments later. One snapshot closes the gap.
-    let (header, data) = page.to_bytes_snapshot();
+    let (mut header, data) = page.to_bytes_snapshot();
     let start_offset = page_offset(page_id, page_size, first_offset);
-    let mut header_bytes = to_allocvec(&header).unwrap_or_default();
-    if header_bytes.len() < PAGE_OVERHEAD {
-        header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
-    }
     if header.has_overflow() {
         // Re-write the HAS_OVERFLOW header at the primary page slot. An async
         // init_page write (queued by alloc_page before handle_large_page_size
@@ -1344,30 +1356,64 @@ fn write_page(
         // the header that handle_large_page_size already wrote synchronously.
         // Writing it here — inside the writer thread with the data —
         // eliminates the race window.
+        //
+        // Each physical page's checksum is computed over exactly the
+        // page_data_size-sized, zero-padded chunk written to its own slot —
+        // not to_bytes_snapshot's whole, not-yet-split `data` — so it
+        // matches what read_page reads back for that one slot (a fixed-size
+        // pread, zero-padding included). Overwriting the header here, right
+        // before writing that chunk, costs no extra I/O: this slot's header
+        // is already being (re)written in this same pass regardless.
+        let first_len = (header.page_data_size as usize).min(data.len());
+        let mut first_chunk = vec![0u8; header.page_data_size as usize];
+        first_chunk[..first_len].copy_from_slice(&data[..first_len]);
+        header.checksum = fnv1a_32(&first_chunk);
+        let mut header_bytes = to_allocvec(&header).unwrap_or_default();
+        if header_bytes.len() < PAGE_OVERHEAD {
+            header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
+        }
         pwrite_all(file, &header_bytes, start_offset)?; // header with HAS_OVERFLOW
-        let first_end = (header.page_data_size as usize).min(data.len());
-        pwrite_all(
-            file,
-            &data[..first_end],
-            start_offset + PAGE_OVERHEAD as u64,
-        )?;
-        let mut start = first_end;
-        if start < data.len() {
-            let mut cur_page_id = header.next_page();
-            loop {
-                let cur_offset = page_offset(cur_page_id, page_size, first_offset);
-                let cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
-                let end = (start + cur_header.page_data_size as usize).min(data.len());
-                pwrite_all(file, &data[start..end], cur_offset + PAGE_OVERHEAD as u64)?;
-                start = end;
-                // Stop when all data is written or when we've written to the terminator page.
-                if !cur_header.is_overflow() || start >= data.len() {
-                    break;
-                }
-                cur_page_id = cur_header.next_page();
+        pwrite_all(file, &first_chunk, start_offset + PAGE_OVERHEAD as u64)?;
+        let mut start = first_len;
+        let mut cur_page_id = header.next_page();
+        loop {
+            let cur_offset = page_offset(cur_page_id, page_size, first_offset);
+            let mut cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
+            let chunk_len = (cur_header.page_data_size as usize).min(data.len().saturating_sub(start));
+            let mut chunk = vec![0u8; cur_header.page_data_size as usize];
+            if chunk_len > 0 {
+                chunk[..chunk_len].copy_from_slice(&data[start..start + chunk_len]);
             }
+            cur_header.checksum = fnv1a_32(&chunk);
+            let mut cur_header_bytes = to_allocvec(&cur_header)?;
+            if cur_header_bytes.len() < PAGE_OVERHEAD {
+                cur_header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - cur_header_bytes.len()]);
+            }
+            pwrite_all(file, &cur_header_bytes, cur_offset)?;
+            pwrite_all(file, &chunk, cur_offset + PAGE_OVERHEAD as u64)?;
+            start += chunk_len;
+            // Walk all the way to the physical terminator, not just until
+            // the real data runs out: handle_large_page_size sizes the
+            // chain conservatively (via usable_data_size's margin) while
+            // this loop writes at the full page_data_size rate, so it can
+            // finish consuming `data` a page or two before the chain's
+            // actual last page. Any such trailing, logically-unused page
+            // is still a real physical link a later reader (e.g.
+            // drop_table's free_page_chain) will walk to and checksum —
+            // it needs its own correct (all-zero-data) checksum written
+            // here too, not the checksum:0 placeholder
+            // handle_large_page_size left it with at chain-construction
+            // time.
+            if !cur_header.is_overflow() {
+                break;
+            }
+            cur_page_id = cur_header.next_page();
         }
     } else {
+        let mut header_bytes = to_allocvec(&header).unwrap_or_default();
+        if header_bytes.len() < PAGE_OVERHEAD {
+            header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
+        }
         let mut bytes = header_bytes;
         bytes.extend_from_slice(&data);
         // This page isn't flagged has_overflow, so its slot is exactly
@@ -1419,6 +1465,9 @@ fn read_page(
             &mut all_data,
             page_offset(page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
         )?;
+        if header.checksum != fnv1a_32(&all_data) {
+            return Err(StoreError::PageChecksumMismatch(page_id));
+        }
         let primary_header = header;
         let mut cur_header;
         let mut cur_page_id = primary_header.next_page();
@@ -1445,6 +1494,12 @@ fn read_page(
                 &mut chunk,
                 page_offset(cur_page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
             )?;
+            // Verified per physical page, against its own header — not
+            // against some checksum over the whole reassembled object — the
+            // same granularity write_page computed it at.
+            if cur_header.checksum != fnv1a_32(&chunk) {
+                return Err(StoreError::PageChecksumMismatch(cur_page_id));
+            }
             all_data.extend_from_slice(&chunk);
             if !cur_header.is_overflow() {
                 break;
@@ -1463,6 +1518,9 @@ fn read_page(
         // zero-initialized buffer acts as padding.
         let mut bytes = vec![0u8; page_size as usize];
         file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
+        if header.checksum != fnv1a_32(&bytes[PAGE_OVERHEAD..]) {
+            return Err(StoreError::PageChecksumMismatch(page_id));
+        }
         Ok(Page::from_bytes(&bytes, content_registry)?)
     }
 }
@@ -1475,7 +1533,15 @@ fn read_page_header(
 ) -> Result<PageHeader, StoreError> {
     let mut bytes = vec![0u8; PageHeader::header_size()];
     pread_exact(file, &mut bytes, page_offset(page, page_size, first_offset))?;
-    Ok(from_bytes(&bytes)?)
+    let header: PageHeader = from_bytes(&bytes)?;
+    // Cheap, header-only sanity check — catches a garbage/zeroed/wrong-offset
+    // slot before any data byte is even read. A checksum failure (see
+    // read_page) means the header itself decoded fine but the data attached
+    // to it didn't; this catches the case where the header didn't either.
+    if header.magic != PAGE_MAGIC {
+        return Err(StoreError::InvalidPageMagic(page));
+    }
+    Ok(header)
 }
 
 #[cfg(test)]
@@ -1486,9 +1552,9 @@ mod tests {
     use postcard::from_bytes;
 
     use super::{BufMsg, WriteMsg};
-    use crate::db::DBSizeType;
+    use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
-    use crate::page::Page;
+    use crate::page::{PAGE_OVERHEAD, Page, PageId};
     use crate::tuple::{DBIdType, Tuple};
     use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
 
@@ -2135,5 +2201,136 @@ mod tests {
         let err = Page::from_bytes(&raw_bytes, &unregistered).unwrap_err();
         assert!(matches!(err, StoreError::UnknownPageContentKind(3)));
         let _ = buf.shutdown();
+    }
+
+    // ── page reliability: magic number + checksum ──────────────────────────
+
+    #[test]
+    fn test_get_page_detects_a_bitflipped_data_byte_via_checksum() {
+        let (buf, page_counter, file_clone) = make_buffer_ps(PAGE_SIZE, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+        let page = Page::new_data(PAGE_SIZE);
+        page.add_tuple(Tuple::new(1, b"hello")).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+        // shutdown flushes the write to the shared MemFile before we corrupt it.
+        buf.shutdown().unwrap();
+
+        // Flip a byte inside the page's data region, well past the header, directly on disk.
+        let corrupt_offset = crate::page::PageHeader::header_size() as u64 + 5;
+        let mut byte = [0u8; 1];
+        file_clone.pread(&mut byte, corrupt_offset).unwrap();
+        byte[0] ^= 0xFF;
+        file_clone.pwrite(&byte, corrupt_offset).unwrap();
+
+        // Fresh buffer over the same (now-corrupted) backing storage: page_id
+        // was never evicted from the first buffer's cache, so re-reading
+        // through it would just return the cached (uncorrupted) copy without
+        // ever touching disk.
+        let page_count = page_counter.load(Ordering::Relaxed);
+        let page_counter2 = Arc::new(AtomicU64::new(page_count));
+        let header2 =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE)).unwrap());
+        let buf2 = PageBuffer::new(
+            PAGE_SIZE,
+            page_counter2,
+            file_clone,
+            header2,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
+        .unwrap();
+
+        let err = buf2.get_page(page_id).unwrap_err();
+        assert!(matches!(err, StoreError::PageChecksumMismatch(id) if id == page_id));
+        let _ = buf2.shutdown();
+    }
+
+    #[test]
+    fn test_get_page_detects_a_missing_magic_number_on_a_garbage_page() {
+        let (buf, page_counter, file_clone) = make_buffer_ps(PAGE_SIZE, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+        buf.shutdown().unwrap();
+
+        // Zero out the whole slot, as if it were never actually written
+        // (a garbage/corrupt page id, or a read racing an allocation).
+        let zeros = vec![0u8; PAGE_SIZE as usize];
+        file_clone
+            .pwrite(&zeros, super::page_offset(page_id, PAGE_SIZE, 0))
+            .unwrap();
+
+        let page_count = page_counter.load(Ordering::Relaxed);
+        let page_counter2 = Arc::new(AtomicU64::new(page_count));
+        let header2 =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE)).unwrap());
+        let buf2 = PageBuffer::new(
+            PAGE_SIZE,
+            page_counter2,
+            file_clone,
+            header2,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
+        .unwrap();
+
+        let err = buf2.get_page(page_id).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidPageMagic(id) if id == page_id));
+        let _ = buf2.shutdown();
+    }
+
+    #[test]
+    fn test_get_page_detects_corruption_in_an_overflow_continuation_page() {
+        let page_size = 300u64;
+        let (buf, page_counter, file_clone) = make_buffer_ps(page_size, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+        let count_before = page_counter.load(Ordering::Relaxed);
+
+        // Large enough to need several overflow continuation pages, not just one.
+        let big_data = vec![9u8; page_size as usize * 3];
+        let page = Page::new_data(page_size);
+        page.add_tuple(Tuple::new(1, &big_data)).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+        buf.shutdown().unwrap();
+
+        let count_after = page_counter.load(Ordering::Relaxed);
+        assert!(
+            count_after > count_before + 1,
+            "expected more than one overflow continuation page for this test to be meaningful"
+        );
+        // alloc_overflow_page hands out ids sequentially starting right after
+        // the primary — this is the first continuation page in the chain.
+        let continuation_id: PageId = count_before.into();
+
+        // Flip a byte inside that continuation page's own data region — not
+        // the primary's — to specifically exercise per-physical-page
+        // verification of an overflow chain, not just the primary.
+        let corrupt_offset =
+            super::page_offset(continuation_id, page_size, 0) + PAGE_OVERHEAD as u64 + 2;
+        let mut byte = [0u8; 1];
+        file_clone.pread(&mut byte, corrupt_offset).unwrap();
+        byte[0] ^= 0xFF;
+        file_clone.pwrite(&byte, corrupt_offset).unwrap();
+
+        let page_counter2 = Arc::new(AtomicU64::new(count_after));
+        let header2 =
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, count_after, page_size)).unwrap());
+        let buf2 = PageBuffer::new(
+            page_size,
+            page_counter2,
+            file_clone,
+            header2,
+            10,
+            Arc::new(crate::logger::LsnClock::default()),
+            1024,
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
+        .unwrap();
+
+        let err = buf2.get_page(page_id).unwrap_err();
+        assert!(matches!(err, StoreError::PageChecksumMismatch(id) if id == continuation_id));
+        let _ = buf2.shutdown();
     }
 }

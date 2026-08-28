@@ -52,6 +52,25 @@ pub(crate) struct PageHeader {
     // pages written before this field existed still decode the same way
     // `record_size.is_some()` used to pick between them.
     pub(crate) content_kind: PageContentKind,
+    // A fixed sentinel (see PAGE_MAGIC), written on every page and checked
+    // on every read (Page::from_bytes) — catches "this slot was never
+    // actually written" or "the header is corrupted past recognition"
+    // *before* anything else in the header is trusted, distinctly from a
+    // checksum mismatch (see `checksum`, below), which means the header
+    // decoded fine but the data attached to it didn't.
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) magic: u32,
+    // FNV-1a (see fnv1a_32) over exactly this page's own on-disk data
+    // slice — not, for an overflow chain, the whole reassembled logical
+    // object. Set once the data bytes for *this* physical page are known
+    // (see Page::to_bytes_snapshot for the ordinary case, and
+    // buffer.rs's write_page for why an overflow continuation page's
+    // checksum has to be computed and its header rewritten at data-flush
+    // time, not when the chain is first built) and checked against a
+    // fresh hash of the bytes actually read, per physical page, before
+    // they're trusted (see buffer.rs's read_page).
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) checksum: u32,
 }
 
 impl PageHeader {
@@ -80,7 +99,31 @@ struct PageDto {
     flags: u16,
     high_key: Option<DBIdType>,
     content_kind: PageContentKind,
+    #[serde(with = "postcard::fixint::le")]
+    magic: u32,
+    #[serde(with = "postcard::fixint::le")]
+    checksum: u32,
     data: Vec<u8>,
+}
+
+// Written into every page's header and checked on every read (see
+// Page::from_bytes) — an arbitrary but fixed, recognizable value ("SQDB"
+// as ASCII bytes, read as one little-endian u32) distinguishing an
+// actually-initialized page from a zeroed/garbage/wrong-offset read.
+pub(crate) const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"SQDB");
+
+// The standard FNV-1a 32-bit hash (basis 0x811c9dc5, prime 0x01000193 —
+// the same constants IndexKey::hash/ValueItem::hash already use, applied
+// here to raw bytes instead of structured values) — not cryptographic,
+// but cheap and good enough to catch accidental corruption (truncation,
+// torn writes, bit rot), which is all a page checksum needs to do.
+pub(crate) fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -213,6 +256,7 @@ pub(crate) struct Page {
     written: AtomicU128,
 }
 
+#[derive(Clone)]
 pub(crate) struct PageTupleIterator {
     data: std::vec::IntoIter<Tuple>,
 }
@@ -320,6 +364,13 @@ impl Page {
             flags,
             high_key: inner.high_key.clone(),
             content_kind: self.content_kind,
+            magic: PAGE_MAGIC,
+            // Real value filled in once the data bytes this header actually
+            // travels with are known — see to_bytes_snapshot (the whole-blob
+            // case) and buffer.rs's write_page (which overwrites this again,
+            // per physical page, for an overflow chain). 0 here is never
+            // itself written to disk.
+            checksum: 0,
         }
     }
 
@@ -508,13 +559,16 @@ impl Page {
             // a giant overflow chain (observed: 21 GB file / OOM). Surface it
             // as an error instead.
             inner.page_used_size =
-                inner.page_used_size.checked_sub(old.size()).ok_or_else(|| {
-                    StoreError::UnknownError(format!(
-                        "remove_tuple used_size underflow: used={} old={}",
-                        inner.page_used_size,
-                        old.size()
-                    ))
-                })?;
+                inner
+                    .page_used_size
+                    .checked_sub(old.size())
+                    .ok_or_else(|| {
+                        StoreError::UnknownError(format!(
+                            "remove_tuple used_size underflow: used={} old={}",
+                            inner.page_used_size,
+                            old.size()
+                        ))
+                    })?;
             old
         };
         self.set_dirty(true)?;
@@ -527,16 +581,12 @@ impl Page {
             let mut inner = self.inner.write()?;
             let old = inner.data.replace(id, tuple)?;
             let old_size = old.size();
-            inner.page_used_size =
-                inner
-                    .page_used_size
-                    .checked_sub(old_size)
-                    .ok_or_else(|| {
-                        StoreError::UnknownError(format!(
-                            "replace_tuple used_size underflow: used={} old={}",
-                            inner.page_used_size, old_size
-                        ))
-                    })?;
+            inner.page_used_size = inner.page_used_size.checked_sub(old_size).ok_or_else(|| {
+                StoreError::UnknownError(format!(
+                    "replace_tuple used_size underflow: used={} old={}",
+                    inner.page_used_size, old_size
+                ))
+            })?;
             inner.page_used_size += new_size;
             old
         };
@@ -580,11 +630,18 @@ impl Page {
     // One lock acquisition here closes that the rest of the way.
     pub(crate) fn to_bytes_snapshot(&self) -> (PageHeader, Vec<u8>) {
         let inner = self.inner.read().unwrap();
-        let header = self.header_from_inner(&inner);
+        let mut header = self.header_from_inner(&inner);
         let mut data = inner.data.to_bytes().unwrap_or_default();
         if data.len() < self.page_data_size as usize {
             data.append(&mut vec![0u8; self.page_data_size as usize - data.len()]);
         }
+        // Correct as-is for a page that fits in one physical slot (`data` IS
+        // that slot's own on-disk bytes). For an overflow chain, `data` here
+        // is the whole, not-yet-split logical payload — buffer.rs's
+        // write_page recomputes and overwrites this per physical page (its
+        // own on-disk slice only) once it knows how the split lands; see its
+        // own comment.
+        header.checksum = fnv1a_32(&data);
         (header, data)
     }
 
@@ -750,7 +807,9 @@ impl From<PageDto> for Page {
         // style, rather than threading a registry through a trait that
         // structurally can't carry one.
         let pt: Box<dyn PageTuple> = match value.content_kind {
-            PageContentKind::FIXED_TUPLE => Box::new(FixedTuplePage::from_bytes(&value.data).unwrap()),
+            PageContentKind::FIXED_TUPLE => {
+                Box::new(FixedTuplePage::from_bytes(&value.data).unwrap())
+            }
             PageContentKind::ANY_TUPLE => Box::new(AnyTuplePage::from_bytes(&value.data).unwrap()),
             other => panic!(
                 "From<PageDto> for Page only supports the built-in content kinds, got {other:?} — \
@@ -798,6 +857,7 @@ impl From<Page> for PageDto {
         } else {
             flags &= !HAS_OVERFLOW;
         }
+        let data = inner.data.to_bytes().unwrap();
         Self {
             next_page: inner.next_page,
             page_data_size: value.page_data_size,
@@ -807,7 +867,9 @@ impl From<Page> for PageDto {
             flags,
             high_key: inner.high_key,
             content_kind: value.content_kind,
-            data: inner.data.to_bytes().unwrap(),
+            magic: PAGE_MAGIC,
+            checksum: fnv1a_32(&data),
+            data,
         }
     }
 }

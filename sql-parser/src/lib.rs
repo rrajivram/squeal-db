@@ -25,6 +25,7 @@ pub mod span;
 pub mod statement;
 pub mod token;
 pub mod utils;
+pub mod visitor;
 
 use chumsky::{IterParser, Parser, error::Rich, extra, prelude::end};
 

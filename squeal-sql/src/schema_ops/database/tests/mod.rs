@@ -107,6 +107,31 @@ fn test_database_state_survives_close_and_reopen() {
     NamedMemFile::delete(&path);
 }
 
+#[test]
+fn test_list_schemas_finds_a_schema_not_yet_loaded_into_memory() {
+    use store::named_memfile::NamedMemFile;
+
+    let path = temp_db_path("list_schemas_after_reopen");
+    NamedMemFile::delete(&path);
+
+    let db = super::Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s1 = db.create_schema("schema1").unwrap();
+    drop(s1);
+    db.close().unwrap();
+
+    // A fresh open only eagerly loads "default" into the in-memory
+    // schemas map (see Database::open) — list_schemas() must still find
+    // "schema1" by reading the durable schemas_table record create_schema
+    // wrote, not by relying on something having already called
+    // get_schema("schema1") to populate the cache first.
+    let db2 = super::Database::<NamedMemFile>::open(path.clone()).unwrap();
+    let mut names = db2.list_schemas().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["default".to_string(), "schema1".to_string()]);
+
+    NamedMemFile::delete(&path);
+}
+
 fn count_schema_registry_rows(db: &Database<MemFile>, name: &str) -> usize {
     use store::cursor::Cursor;
     let mut cursor = db.db.table_scan(db.schemas_table).unwrap();

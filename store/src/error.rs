@@ -54,6 +54,18 @@ pub enum StoreError {
     UnknownPageContentKind(u16),
     #[error("PageContent kind {0} is already registered")]
     DuplicatePageContentKind(u16),
+    // The bytes read at this page's slot don't start with PAGE_MAGIC —
+    // either this slot was never actually written (a corrupt/garbage
+    // page id, a read racing an allocation) or its header has been
+    // corrupted badly enough that trusting any other field in it would
+    // be worse than refusing outright.
+    #[error("Page {0:?} has an invalid magic number — not a valid page, or badly corrupted")]
+    InvalidPageMagic(crate::page::PageId),
+    // The header parsed fine (magic matched) but the data bytes don't
+    // hash to the checksum stored alongside them — the header survived,
+    // but the data didn't: truncation, a torn write, or on-disk bit rot.
+    #[error("Page {0:?} failed its checksum — data is corrupted")]
+    PageChecksumMismatch(crate::page::PageId),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

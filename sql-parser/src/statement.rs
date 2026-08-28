@@ -14,7 +14,7 @@ use crate::{
     datatype::DataType,
     ddl::{
         AlterTable, CopyInto, CreateDatabase, CreateIndex, CreateTable, DropDatabase, DropIndex,
-        DropTable, Truncate, UseStatement,
+        DropTable, ShowSchemas, ShowTables, Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -50,6 +50,8 @@ pub enum Statement {
     StartTransaction(StartTransaction),
     Commit(kw::Commit),
     Rollback(kw::Rollback),
+    ShowTables(ShowTables),
+    ShowSchemas(ShowSchemas),
 }
 
 impl<'src, I, E> SQLParser<'src, I, E, SqlCtx<'src, I, E>> for Statement

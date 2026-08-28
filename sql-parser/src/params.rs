@@ -33,18 +33,16 @@ impl Statement {
 fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
     match s {
         Statement::Select(q) => query(q, out),
-        Statement::Insert(i) => {
-            match &i.source {
-                InsertSource::Values(_, rows) => {
-                    for row in rows.items() {
-                        for e in row.exprs() {
-                            expr(e, out);
-                        }
+        Statement::Insert(i) => match &i.source {
+            InsertSource::Values(_, rows) => {
+                for row in rows.items() {
+                    for e in row.exprs() {
+                        expr(e, out);
                     }
                 }
-                InsertSource::Select(q) => query(q, out),
             }
-        }
+            InsertSource::Select(q) => query(q, out),
+        },
         Statement::Update(u) => {
             for a in u.assignments.items() {
                 expr(&a.value, out);
@@ -99,7 +97,9 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
         | Statement::Deallocate(_)
         | Statement::StartTransaction(_)
         | Statement::Commit(_)
-        | Statement::Rollback(_) => {}
+        | Statement::Rollback(_)
+        | Statement::ShowTables(_)
+        | Statement::ShowSchemas(_) => {}
     }
 }
 

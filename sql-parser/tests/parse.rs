@@ -1,9 +1,10 @@
 use sql_parser::{
-    Expr, Statement, parse_one, parse_sql,
-    ddl::{AlterTableOp, ColumnOption, TableConstraintKind, TableElement},
+    Expr, Statement,
+    ddl::{AlterTableOp, ColumnOption, TableConstraintKind},
     dml::InsertSource,
     expr::{BinaryOp, FunctionArg, Placeholder, UnaryOp},
     literal::{Literal, NumberValue},
+    parse_one, parse_sql,
     query::{JoinOperator, SelectItem},
 };
 
@@ -19,7 +20,12 @@ fn select(src: &str) -> sql_parser::Query {
 }
 
 fn where_expr(src: &str) -> Expr {
-    select(src).core().where_clause.clone().expect("expected WHERE").expr
+    select(src)
+        .core()
+        .where_clause
+        .clone()
+        .expect("expected WHERE")
+        .expr
 }
 
 #[test]
@@ -91,33 +97,70 @@ fn join_using() {
 fn expr_precedence() {
     // 1 + 2 * 3 => 1 + (2 * 3)
     let e = where_expr("SELECT a FROM t WHERE x = 1 + 2 * 3");
-    let Expr::Binary { op: BinaryOp::Eq, right, .. } = e else {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        right,
+        ..
+    } = e
+    else {
         panic!("expected =, got another shape");
     };
-    let Expr::Binary { op: BinaryOp::Plus, right: mul, .. } = *right else {
+    let Expr::Binary {
+        op: BinaryOp::Plus,
+        right: mul,
+        ..
+    } = *right
+    else {
         panic!("expected +");
     };
-    assert!(matches!(*mul, Expr::Binary { op: BinaryOp::Multiply, .. }));
+    assert!(matches!(
+        *mul,
+        Expr::Binary {
+            op: BinaryOp::Multiply,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn expr_and_or_not() {
     // NOT a = 1 AND b = 2 OR c = 3  =>  ((NOT (a=1)) AND (b=2)) OR (c=3)
     let e = where_expr("SELECT x FROM t WHERE NOT a = 1 AND b = 2 OR c = 3");
-    let Expr::Binary { op: BinaryOp::Or, left, .. } = e else {
+    let Expr::Binary {
+        op: BinaryOp::Or,
+        left,
+        ..
+    } = e
+    else {
         panic!("expected OR at top");
     };
-    let Expr::Binary { op: BinaryOp::And, left: not_side, .. } = *left else {
+    let Expr::Binary {
+        op: BinaryOp::And,
+        left: not_side,
+        ..
+    } = *left
+    else {
         panic!("expected AND under OR");
     };
-    assert!(matches!(*not_side, Expr::Unary { op: UnaryOp::Not, .. }));
+    assert!(matches!(
+        *not_side,
+        Expr::Unary {
+            op: UnaryOp::Not,
+            ..
+        }
+    ));
 }
 
 #[test]
 fn expr_between_and() {
     // BETWEEN binds its own AND: (a BETWEEN 1 AND 10) AND b
     let e = where_expr("SELECT x FROM t WHERE a BETWEEN 1 AND 10 AND b = 2");
-    let Expr::Binary { op: BinaryOp::And, left, .. } = e else {
+    let Expr::Binary {
+        op: BinaryOp::And,
+        left,
+        ..
+    } = e
+    else {
         panic!("expected top-level AND");
     };
     assert!(matches!(*left, Expr::Between { negated: false, .. }));
@@ -138,11 +181,19 @@ fn expr_predicates() {
     }
     assert!(matches!(
         where_expr("SELECT x FROM t WHERE name LIKE 'a%'"),
-        Expr::Like { negated: false, case_insensitive: false, .. }
+        Expr::Like {
+            negated: false,
+            case_insensitive: false,
+            ..
+        }
     ));
     assert!(matches!(
         where_expr("SELECT x FROM t WHERE name NOT ILIKE '%b'"),
-        Expr::Like { negated: true, case_insensitive: true, .. }
+        Expr::Like {
+            negated: true,
+            case_insensitive: true,
+            ..
+        }
     ));
 }
 
@@ -154,7 +205,10 @@ fn expr_neq_spellings() {
     ] {
         assert!(matches!(
             where_expr(src),
-            Expr::Binary { op: BinaryOp::NotEq, .. }
+            Expr::Binary {
+                op: BinaryOp::NotEq,
+                ..
+            }
         ));
     }
 }
@@ -163,7 +217,12 @@ fn expr_neq_spellings() {
 fn expr_functions_case_cast() {
     match where_expr("SELECT x FROM t WHERE f(DISTINCT a, *, 1 + 2) = 1") {
         Expr::Binary { left, .. } => match *left {
-            Expr::Function { name, distinct, args, over } => {
+            Expr::Function {
+                name,
+                distinct,
+                args,
+                over,
+            } => {
                 assert_eq!(name.value, "f");
                 assert!(distinct);
                 assert_eq!(args.len(), 3);
@@ -186,7 +245,11 @@ fn expr_functions_case_cast() {
 
     match where_expr("SELECT x FROM t WHERE CASE WHEN a = 1 THEN 2 ELSE 3 END = 2") {
         Expr::Binary { left, .. } => match *left {
-            Expr::Case { operand, when_then, else_expr } => {
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
                 assert!(operand.is_none());
                 assert_eq!(when_then.len(), 1);
                 assert!(else_expr.is_some());
@@ -271,16 +334,15 @@ fn update_and_delete() {
 
 #[test]
 fn create_table() {
-    let Statement::CreateTable(c) = one(
-        "CREATE TABLE IF NOT EXISTS orders (\
+    let Statement::CreateTable(c) = one("CREATE TABLE IF NOT EXISTS orders (\
             id INT PRIMARY KEY, \
             user_id BIGINT NOT NULL REFERENCES users (id), \
             amount DECIMAL(10, 2) DEFAULT 0, \
             note VARCHAR(255) NULL, \
             CONSTRAINT uq UNIQUE (user_id, note), \
             FOREIGN KEY (user_id) REFERENCES users (id)\
-         )",
-    ) else {
+         )")
+    else {
         panic!("expected CREATE TABLE");
     };
     assert!(c.if_not_exists.is_some());
@@ -294,8 +356,14 @@ fn create_table() {
     let constraints: Vec<_> = c.constraints().collect();
     assert_eq!(constraints.len(), 2);
     assert!(constraints[0].name.is_some());
-    assert!(matches!(constraints[0].kind, TableConstraintKind::Unique(..)));
-    assert!(matches!(constraints[1].kind, TableConstraintKind::ForeignKey(..)));
+    assert!(matches!(
+        constraints[0].kind,
+        TableConstraintKind::Unique(..)
+    ));
+    assert!(matches!(
+        constraints[1].kind,
+        TableConstraintKind::ForeignKey(..)
+    ));
 }
 
 #[test]
@@ -345,10 +413,9 @@ fn transactions() {
 
 #[test]
 fn multiple_statements() {
-    let stmts = parse_sql(
-        "BEGIN; INSERT INTO t VALUES (1); UPDATE t SET a = 2 WHERE id = 1; COMMIT;",
-    )
-    .unwrap();
+    let stmts =
+        parse_sql("BEGIN; INSERT INTO t VALUES (1); UPDATE t SET a = 2 WHERE id = 1; COMMIT;")
+            .unwrap();
     assert_eq!(stmts.len(), 4);
     assert!(matches!(stmts[0], Statement::StartTransaction(_)));
     assert!(matches!(stmts[3], Statement::Commit(_)));
@@ -369,7 +436,10 @@ fn quoted_identifiers() {
     let s = select("SELECT \"select\", \"weird \"\"name\"\"\" FROM \"table\"");
     let items: Vec<_> = s.core().projection.items().collect();
     match items[1] {
-        SelectItem::Expr { expr: Expr::Column(c), .. } => {
+        SelectItem::Expr {
+            expr: Expr::Column(c),
+            ..
+        } => {
             assert_eq!(c.parts.head.value, "weird \"name\"");
             assert!(c.parts.head.quoted);
         }
@@ -398,7 +468,13 @@ fn number_literals() {
         exprs[2],
         Expr::Literal(Literal::Number(n)) if n.value == NumberValue::Float(0.5)
     ));
-    assert!(matches!(exprs[3], Expr::Unary { op: UnaryOp::Minus, .. }));
+    assert!(matches!(
+        exprs[3],
+        Expr::Unary {
+            op: UnaryOp::Minus,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -453,7 +529,10 @@ fn exists_subquery() {
     ));
     // NOT EXISTS = Unary(Not, Exists)
     match where_expr("SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM u)") {
-        Expr::Unary { op: UnaryOp::Not, expr } => assert!(matches!(*expr, Expr::Exists { .. })),
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } => assert!(matches!(*expr, Expr::Exists { .. })),
         other => panic!("expected NOT EXISTS, got {other:?}"),
     }
 }
@@ -469,7 +548,8 @@ fn nested_subqueries() {
 
 #[test]
 fn derived_table() {
-    let s = select("SELECT x FROM (SELECT a AS x FROM t WHERE a > 0) AS sub JOIN u ON sub.x = u.id");
+    let s =
+        select("SELECT x FROM (SELECT a AS x FROM t WHERE a > 0) AS sub JOIN u ON sub.x = u.id");
     let table = &s.core().from.clone().unwrap().tables.head;
     match &table.relation {
         sql_parser::query::TableFactor::Derived { query, alias, .. } => {
@@ -484,7 +564,9 @@ fn derived_table() {
 #[test]
 fn union_and_set_ops() {
     use sql_parser::query::SetOperator;
-    let q = select("SELECT a FROM t UNION ALL SELECT b FROM u EXCEPT SELECT c FROM v ORDER BY 1 LIMIT 3");
+    let q = select(
+        "SELECT a FROM t UNION ALL SELECT b FROM u EXCEPT SELECT c FROM v ORDER BY 1 LIMIT 3",
+    );
     assert_eq!(q.compounds.len(), 2);
     match &q.compounds[0].op {
         SetOperator::Union(_, all) => assert!(all.as_ref().unwrap().is_left()),
@@ -508,7 +590,9 @@ fn with_cte() {
     assert_eq!(with.ctes.len(), 2);
     assert_eq!(with.ctes.head.name.value, "regional");
 
-    let q = select("WITH RECURSIVE cnt (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 10) SELECT n FROM cnt");
+    let q = select(
+        "WITH RECURSIVE cnt (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM cnt WHERE n < 10) SELECT n FROM cnt",
+    );
     let with = q.with.unwrap();
     assert!(with.recursive.is_some());
     let (_, cols, _) = with.ctes.head.columns.as_ref().unwrap();
@@ -519,9 +603,9 @@ fn with_cte() {
 
 #[test]
 fn cte_in_insert() {
-    let Statement::Insert(i) = one(
-        "INSERT INTO summary WITH s AS (SELECT a FROM t) SELECT a FROM s",
-    ) else {
+    let Statement::Insert(i) =
+        one("INSERT INTO summary WITH s AS (SELECT a FROM t) SELECT a FROM s")
+    else {
         panic!("expected INSERT");
     };
     let InsertSource::Select(q) = i.source else {
@@ -532,9 +616,9 @@ fn cte_in_insert() {
 
 #[test]
 fn check_constraints() {
-    let Statement::CreateTable(c) = one(
-        "CREATE TABLE t (a INT CHECK (a > 0), b INT, CHECK (b > a))",
-    ) else {
+    let Statement::CreateTable(c) =
+        one("CREATE TABLE t (a INT CHECK (a > 0), b INT, CHECK (b > a))")
+    else {
         panic!("expected CREATE TABLE");
     };
     let cols: Vec<_> = c.columns().collect();
@@ -793,9 +877,7 @@ fn use_database_and_schema() {
 
 #[test]
 fn copy_into() {
-    let Statement::CopyInto(c) =
-        one("COPY INTO users FROM @/data/imports/users.csv")
-    else {
+    let Statement::CopyInto(c) = one("COPY INTO users FROM @/data/imports/users.csv") else {
         panic!("expected COPY INTO");
     };
     assert_eq!(c.table.to_dotted(), "users");

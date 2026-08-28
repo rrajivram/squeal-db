@@ -20,13 +20,13 @@ use crate::{
 
 #[derive(Clone)]
 pub struct Schema<F: DBFile> {
-    name: String,
+    pub(crate) name: String,
     // Shared with the owning Database and every sibling Schema — the
     // underlying store has one flat table namespace, so every store-level
     // table/index this schema creates must go through `qualify()` first
     // to avoid colliding with another schema's tables of the same name.
-    db: Arc<Db<F>>,
-    tables: Arc<RwLock<HashMap<String, SqlTable>>>,
+    pub(crate) db: Arc<Db<F>>,
+    tables: Arc<RwLock<HashMap<String, Arc<SqlTable>>>>,
     sys_table_id: TableIdType,
 }
 
@@ -91,7 +91,9 @@ where
         let mut cursor = self.db.table_scan(self.sys_table_id)?;
         while let Some(tuple) = cursor.next()? {
             let table = from_bytes::<SqlTable>(tuple.data())?;
-            self.tables.write().insert(table.name.clone(), table);
+            self.tables
+                .write()
+                .insert(table.name.clone(), Arc::new(table));
         }
         Ok(())
     }
@@ -260,7 +262,9 @@ where
             return res;
         }
         self.db.commit(txn)?;
-        self.tables.write().insert(table.name.clone(), table);
+        self.tables
+            .write()
+            .insert(table.name.clone(), Arc::new(table));
         Ok(())
     }
 
@@ -269,8 +273,20 @@ where
         self.tables.read().contains_key(&name)
     }
 
-    pub(crate) fn get_table(self: &Arc<Self>, name: &str) -> Option<SqlTable> {
+    // Returns the shared Arc, not a deep clone — get_table used to
+    // return an owned SqlTable, so every lookup (at least once per
+    // statement — INSERT/SELECT/ALTER/COPY INTO all call this) deep-
+    // cloned every SchemaVersion's and SqlIndex's own fields list, even
+    // though the vast majority of callers only ever read from it.
+    // Arc::clone here is O(1) regardless of how many versions/indices/
+    // fields the table has; a caller that genuinely needs to mutate its
+    // own copy still can via Arc::make_mut (see alter_table).
+    pub(crate) fn get_table(self: &Arc<Self>, name: &str) -> Option<Arc<SqlTable>> {
         self.tables.read().get(&name.to_lowercase()).cloned()
+    }
+
+    pub(crate) fn list_tables(self: &Arc<Self>) -> Vec<String> {
+        self.tables.read().keys().cloned().collect()
     }
 
     // The DBIdType a full row (in table-field order) should be keyed by
@@ -468,7 +484,7 @@ where
         };
         while let Some(tuple) = cursor.next()? {
             let row = from_bytes::<VersionedRow>(tuple.data())?;
-            rows.push(table.reproject(&row)?);
+            rows.push(table.reproject(&row)?.values().to_vec());
         }
         Ok(ResultSet::new(columns, rows))
     }
@@ -581,7 +597,7 @@ where
                 .iter()
                 .position(|f| f.name == fk.column)
                 .expect("checked present above");
-            let value = &row[pos];
+            let value = &row.values()[pos];
             if *value != ValueItem::Null {
                 let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
                 if self.db.find(index.db_table_id, key, &txn)?.is_none() {
@@ -628,7 +644,9 @@ where
         })?;
         let file = std::fs::File::open(path)
             .map_err(|e| SchemaError::UserError(format!("could not open {path:?}: {e}")))?;
-        let mut reader = csv::ReaderBuilder::new().has_headers(true).from_reader(file);
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(file);
         let fields = table.fields();
 
         let mut loaded = 0usize;
@@ -661,7 +679,16 @@ where
         let mut table = self.get_table(&name).ok_or_else(|| {
             SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
         })?;
-        apply(&mut table)?;
+        // Arc::make_mut: get_table's Arc is shared with the map's own
+        // entry (and possibly other readers), so mutating through it
+        // directly isn't an option — this clones the underlying SqlTable
+        // only if some other reference is still alive (copy-on-write),
+        // giving `apply` a private copy to mutate. Same net effect as
+        // the old always-owned `table`: the map's own entry is
+        // untouched until the write below explicitly replaces it, so a
+        // failure partway through (e.g. self.db.update erroring) still
+        // never leaves it half-mutated.
+        apply(Arc::make_mut(&mut table))?;
 
         let txn = self.db.begin()?;
         let ik = IndexKey::new_from(&[ValueItem::Str((name.clone(), MAX_TABLE_NAME_LEN as u32))])?;

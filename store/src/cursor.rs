@@ -27,6 +27,7 @@ pub trait Cursor {
 //     explicit BEGIN) that they keep alive themselves for at least as
 //     long as the scan runs — the cursor only needs its id, not
 //     ownership, since the caller's own guard is what keeps it active.
+#[derive(Clone)]
 enum ScanTxn {
     Owned(Transaction),
     Borrowed(TransactionId),
@@ -41,6 +42,7 @@ impl ScanTxn {
     }
 }
 
+#[derive(Clone)]
 pub struct TableCursor<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     table: TableIdType,
@@ -49,6 +51,7 @@ pub struct TableCursor<F: DBFile + 'static> {
     transaction: ScanTxn,
 }
 
+#[derive(Clone)]
 pub struct RangeCursor<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     table: TableIdType,

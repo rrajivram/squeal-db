@@ -5,7 +5,13 @@ use store::{db::DBFile, valueitem::ValueItem};
 use uuid::Uuid;
 
 use crate::{
-    conn::connection::Connection, error::SchemaError, rslt::resultset::ResultType, table::SqlTable,
+    conn::connection::Connection,
+    error::SchemaError,
+    plan::logical::LogicalPlan,
+    rslt::resultset::{ResultSet, ResultType},
+    schema_ops::schema::Schema,
+    table::SqlTable,
+    temp,
 };
 
 pub struct Statement<F: DBFile> {
@@ -13,7 +19,13 @@ pub struct Statement<F: DBFile> {
     sql: String,
     stmts: Vec<sql_parser::Statement>,
     conn: Arc<Connection<F>>,
-    results: Vec<ResultType>,
+    // Option<_>, not a bare ResultType: a result — streaming ones
+    // especially, see ResultType::StreamingResult — can't be cheaply
+    // cloned to hand out while keeping an intact copy behind for a
+    // later re-read, so get_results/get_nextresult *take* the slot
+    // instead (see their own doc comments); None here means "already
+    // retrieved", not "never had a result".
+    results: Vec<Option<ResultType>>,
     current_result: Option<usize>,
 }
 
@@ -157,8 +169,8 @@ where
         Ok(self
             .stmt
             .results
-            .first()
-            .cloned()
+            .first_mut()
+            .and_then(Option::take)
             .expect("Insert's own execute() arm always pushes exactly one result"))
     }
 }
@@ -308,16 +320,52 @@ where
     pub fn execute(&mut self) -> Result<(), SchemaError> {
         for stmt in &self.stmts {
             match stmt {
-                sql_parser::Statement::CreateTable(c) => {
-                    let schema = self
+                sql_parser::Statement::ShowSchemas(_) => {
+                    let schemas = self
+                        .conn
+                        .list_schemas()?
+                        .iter()
+                        .map(|n| vec![ValueItem::try_from(n).unwrap()])
+                        .collect::<Vec<_>>();
+                    self.results.push(Some(ResultType::Result(ResultSet::new(
+                        vec!["Schema name".into()],
+                        schemas,
+                    ))));
+                }
+                sql_parser::Statement::ShowTables(_) => {
+                    let tables = self
                         .conn
                         .current_schema()
-                        .ok_or(SchemaError::NoSchemaSelected)?;
-                    let table_name = c.name.to_dotted();
-                    schema.create_table(SqlTable::from_sql(&schema, c.clone())?)?;
-                    self.results.push(ResultType::ResultString(format!(
-                        "Table '{table_name}' created"
-                    )));
+                        .ok_or(SchemaError::NoSchemaSelected)?
+                        .list_tables()
+                        .iter()
+                        .map(|n| vec![ValueItem::try_from(n).unwrap()])
+                        .collect();
+                    self.results.push(Some(ResultType::Result(ResultSet::new(
+                        vec!["Table name".into()],
+                        tables,
+                    ))));
+                }
+                sql_parser::Statement::CreateTable(c) => {
+                    let parts: Vec<&str> = c.name.idents().map(|i| i.value.as_str()).collect();
+                    if let Some(temp_name) = temp::temp_table_name(&parts) {
+                        let fields = temp::fields_from_create_table(c)?;
+                        let db = self.conn.database.read().db.clone();
+                        self.conn.temp_tables().create(&db, temp_name.clone(), fields)?;
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Table 'temp.{temp_name}' created"
+                        ))));
+                    } else {
+                        let schema = self
+                            .conn
+                            .current_schema()
+                            .ok_or(SchemaError::NoSchemaSelected)?;
+                        let table_name = c.name.to_dotted();
+                        schema.create_table(SqlTable::from_sql(&schema, c.clone())?)?;
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Table '{table_name}' created"
+                        ))));
+                    }
                 }
                 sql_parser::Statement::CreateDatabase(c) => {
                     let name = c.name.value.to_lowercase();
@@ -340,29 +388,29 @@ where
                     } else {
                         match self.conn.create_schema(&name) {
                             Ok(()) => format!("Schema '{name}' created"),
-                            Err(SchemaError::SchemaInUseError(_))
-                                if c.if_not_exists.is_some() =>
-                            {
+                            Err(SchemaError::SchemaInUseError(_)) if c.if_not_exists.is_some() => {
                                 self.conn.use_schema(&name)?;
                                 format!("Schema '{name}' already exists")
                             }
                             Err(e) => return Err(e),
                         }
                     };
-                    self.results.push(ResultType::ResultString(message));
+                    self.results.push(Some(ResultType::ResultString(message)));
                 }
                 sql_parser::Statement::Use(u) => match &u.kind {
                     Some(Either::Left(_)) => {
                         let name = u.name.to_dotted().to_lowercase();
                         self.conn.use_database(&name)?;
-                        self.results
-                            .push(ResultType::ResultString(format!("Using database '{name}'")));
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Using database '{name}'"
+                        ))));
                     }
                     Some(Either::Right(_)) => {
                         let name = u.name.to_dotted().to_lowercase();
                         self.conn.use_schema(&name)?;
-                        self.results
-                            .push(ResultType::ResultString(format!("Using schema '{name}'")));
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Using schema '{name}'"
+                        ))));
                     }
                     // Bare `USE name` (no DATABASE/SCHEMA keyword) has no
                     // equivalent concept here yet — silently ignored, same
@@ -371,52 +419,70 @@ where
                     None => {}
                 },
                 sql_parser::Statement::Insert(insert) => {
-                    let schema = self
-                        .conn
-                        .current_schema()
-                        .ok_or(SchemaError::NoSchemaSelected)?;
-                    let table_name = insert.table.to_dotted().to_lowercase();
-                    let table = schema.get_table(&table_name).ok_or_else(|| {
-                        SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
-                    })?;
-                    let rows = table.rows_from_insert(insert)?;
-                    let count = self
-                        .conn
-                        .with_current_txn(|txn| schema.insert_rows(&table_name, rows, txn))?;
-                    self.results.push(ResultType::Count(count));
+                    let parts: Vec<&str> = insert.table.idents().map(|i| i.value.as_str()).collect();
+                    if let Some(temp_name) = temp::temp_table_name(&parts) {
+                        let handle = self.conn.temp_tables().get(&temp_name).ok_or_else(|| {
+                            SchemaError::BadTableName(format!(
+                                "Table \"temp.{temp_name}\" does not exist"
+                            ))
+                        })?;
+                        let fields = handle.read().fields();
+                        let rows = crate::table::build_insert_rows(&temp_name, &fields, insert)?;
+                        let count = handle.write().insert_rows(rows)?;
+                        self.results.push(Some(ResultType::Count(count)));
+                    } else {
+                        let (schema, table_name) = resolve_table(&self.conn, &insert.table)?;
+                        let table = schema.get_table(&table_name).ok_or_else(|| {
+                            SchemaError::BadTableName(format!(
+                                "Table {table_name:?} does not exist"
+                            ))
+                        })?;
+                        let rows = table.rows_from_insert(insert)?;
+                        let count = self
+                            .conn
+                            .with_current_txn(|txn| schema.insert_rows(&table_name, rows, txn))?;
+                        self.results.push(Some(ResultType::Count(count)));
+                    }
                 }
                 sql_parser::Statement::StartTransaction(_) => {
                     self.conn.begin_transaction()?;
                     self.results
-                        .push(ResultType::ResultString("Transaction started".into()));
+                        .push(Some(ResultType::ResultString("Transaction started".into())));
                 }
                 sql_parser::Statement::Commit(_) => {
                     self.conn.commit_transaction()?;
-                    self.results
-                        .push(ResultType::ResultString("Transaction committed".into()));
+                    self.results.push(Some(ResultType::ResultString(
+                        "Transaction committed".into(),
+                    )));
                 }
                 sql_parser::Statement::Rollback(_) => {
                     self.conn.rollback_transaction()?;
-                    self.results
-                        .push(ResultType::ResultString("Transaction rolled back".into()));
+                    self.results.push(Some(ResultType::ResultString(
+                        "Transaction rolled back".into(),
+                    )));
                 }
                 sql_parser::Statement::Select(query) => {
-                    let table_name = parse_select_star(query)?;
-                    let schema = self
-                        .conn
-                        .current_schema()
-                        .ok_or(SchemaError::NoSchemaSelected)?;
-                    let result_set = self
-                        .conn
-                        .with_current_txn(|txn| schema.select_all(&table_name, txn))?;
-                    self.results.push(ResultType::Result(result_set));
+                    /*                     let table_name_obj = parse_select_star(query)?;
+                    let (schema, table_name) = resolve_table(&self.conn, &table_name_obj)?;
+                    let table = schema.get_table(&table_name).ok_or_else(|| {
+                        SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+                    })?;
+                    let mut plan = LogicalPlan::new(self.conn.clone());
+                    self.conn
+                        .with_current_txn::<Result<(), SchemaError>>(|txn| {
+                            let ts =
+                                TableSource::new(self.conn.database.read().db.clone(), table, txn)?;
+                            plan.add_step(Box::new(ts));
+                            Ok(())
+                        })?;
+                     */
+                    let mut plan = LogicalPlan::build(self.conn.clone(), query)?;
+                    let result = plan.execute()?;
+                    self.results.push(Some(ResultType::StreamingResult(result)));
                 }
                 sql_parser::Statement::AlterTable(alter) => {
-                    let (table_name, op) = parse_alter_table(alter)?;
-                    let schema = self
-                        .conn
-                        .current_schema()
-                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let (table_name_obj, op) = parse_alter_table(alter)?;
+                    let (schema, table_name) = resolve_table(&self.conn, &table_name_obj)?;
                     match op {
                         AlterColumnOp::Add(field) => schema.add_column(&table_name, field)?,
                         AlterColumnOp::Drop(name) => schema.drop_column(&table_name, &name)?,
@@ -430,20 +496,17 @@ where
                             schema.drop_foreign_key(&table_name, &name)?
                         }
                     }
-                    self.results.push(ResultType::ResultString(format!(
+                    self.results.push(Some(ResultType::ResultString(format!(
                         "Table {table_name:?} altered"
-                    )));
+                    ))));
                 }
                 sql_parser::Statement::CopyInto(c) => {
-                    let (table_name, path) = parse_copy_into(c);
-                    let schema = self
-                        .conn
-                        .current_schema()
-                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let (table_name_obj, path) = parse_copy_into(c);
+                    let (schema, table_name) = resolve_table(&self.conn, &table_name_obj)?;
                     let (loaded, failed) = schema.copy_csv_into(&table_name, &path)?;
-                    self.results.push(ResultType::ResultString(format!(
+                    self.results.push(Some(ResultType::ResultString(format!(
                         "{loaded} row(s) loaded, {failed} row(s) failed"
-                    )));
+                    ))));
                 }
                 _ => {}
             }
@@ -452,24 +515,33 @@ where
     }
 
     // Returns the "current" result, initializing the cursor to the first
-    // one on first call — idempotent otherwise (repeated calls return the
-    // same result until get_nextresult advances it). None if there are no
-    // results at all, or the cursor has been advanced past the last one.
+    // one on first call. Each result can only be retrieved once — this
+    // *takes* the slot rather than cloning it, because a StreamingResult
+    // holds a live cursor that fundamentally can't be cloned (see
+    // ResultType's own doc comment), and every other variant follows the
+    // same rule for consistency rather than letting some results be
+    // re-readable and others not. Concretely: calling this again at the
+    // same position (without an intervening get_nextresult) finds the
+    // slot already emptied and returns None — this is no longer
+    // idempotent the way it used to be when results were cheap to clone.
+    // None also covers the ordinary "no results at all" and "advanced
+    // past the last one" cases.
     pub fn get_results(&mut self) -> Result<Option<ResultType>, SchemaError> {
         let i = *self.current_result.get_or_insert(0);
-        Ok(self.results.get(i).cloned())
+        Ok(self.results.get_mut(i).and_then(Option::take))
     }
 
-    // Advances the cursor to the next result and returns it, or None if
-    // there isn't one — the cursor is left unchanged in that case, so a
-    // following get_results() still returns the last valid result rather
-    // than nothing.
+    // Advances the cursor to the next result and takes it (see
+    // get_results on why take, not clone), or returns None if there
+    // isn't one — the cursor position is left unchanged in that case,
+    // but the result it points at may already have been taken by an
+    // earlier get_results/get_nextresult call.
     pub fn get_nextresult(&mut self) -> Result<Option<ResultType>, SchemaError> {
         let next = self.current_result.map_or(0, |i| i + 1);
-        match self.results.get(next) {
-            Some(r) => {
+        match self.results.get_mut(next) {
+            Some(slot) => {
                 self.current_result = Some(next);
-                Ok(Some(r.clone()))
+                Ok(slot.take())
             }
             None => Ok(None),
         }
@@ -512,6 +584,15 @@ fn validate_table_name(name: &str) -> Result<(), SchemaError> {
 
 fn validate_create_table(c: &sql_parser::ddl::CreateTable) -> Result<(), SchemaError> {
     validate_table_name(&c.name.to_dotted())?;
+
+    let parts: Vec<&str> = c.name.idents().map(|i| i.value.as_str()).collect();
+    if temp::temp_table_name(&parts).is_some() && c.constraints().next().is_some() {
+        return Err(SchemaError::UserError(
+            "CREATE TABLE temp.<table> doesn't support constraints (PRIMARY KEY/UNIQUE/FOREIGN \
+             KEY/CHECK) yet"
+                .into(),
+        ));
+    }
 
     let mut seen = std::collections::HashSet::new();
     for col in c.columns() {
@@ -594,7 +675,37 @@ fn validate_insert(insert: &sql_parser::dml::Insert) -> Result<(), SchemaError> 
 // LIMIT/OFFSET, set operations, explicit column lists, WHERE, DISTINCT,
 // HAVING, GROUP BY, joins/multiple FROM tables, and subqueries/aliases
 // in FROM.
-fn parse_select_star(query: &sql_parser::Query) -> Result<String, SchemaError> {
+// Resolves a possibly schema-qualified table reference (`table` or
+// `schema.table`) to the Schema it lives in and its own (unqualified,
+// lowercased) name. The bare form resolves against `conn`'s current
+// schema, same as always; the qualified form looks up that schema by
+// name (via Connection::schema — not necessarily the current one, and
+// doesn't change it, unlike USE SCHEMA). More than two parts
+// (db.schema.table) isn't supported yet — nothing in this engine lets a
+// single statement reach across databases.
+fn resolve_table<F>(
+    conn: &Arc<Connection<F>>,
+    name: &sql_parser::ObjectName,
+) -> Result<(Arc<Schema<F>>, String), SchemaError>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    let parts: Vec<&str> = name.idents().map(|i| i.value.as_str()).collect();
+    match parts.as_slice() {
+        [table] => Ok((
+            conn.current_schema().ok_or(SchemaError::NoSchemaSelected)?,
+            table.to_lowercase(),
+        )),
+        [schema, table] => Ok((conn.schema(schema)?, table.to_lowercase())),
+        _ => Err(SchemaError::UserError(format!(
+            "{:?} has too many parts — only <table> or <schema>.<table> is supported",
+            name.to_dotted()
+        ))),
+    }
+}
+
+fn parse_select_star(query: &sql_parser::Query) -> Result<sql_parser::ObjectName, SchemaError> {
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
             "SELECT only supports \"SELECT * FROM <table>\" right now — {what} is not supported yet"
@@ -652,9 +763,7 @@ fn parse_select_star(query: &sql_parser::Query) -> Result<String, SchemaError> {
         return unsupported("JOINs / multiple FROM tables");
     }
     match &t.relation {
-        sql_parser::query::TableFactor::Table { name, alias: None } => {
-            Ok(name.to_dotted().to_lowercase())
-        }
+        sql_parser::query::TableFactor::Table { name, alias: None } => Ok(name.clone()),
         sql_parser::query::TableFactor::Table { alias: Some(_), .. } => {
             unsupported("aliases in FROM")
         }
@@ -687,7 +796,7 @@ enum AlterColumnOp {
 // being rejected here.
 fn parse_alter_table(
     alter: &sql_parser::ddl::AlterTable,
-) -> Result<(String, AlterColumnOp), SchemaError> {
+) -> Result<(sql_parser::ObjectName, AlterColumnOp), SchemaError> {
     use sql_parser::ddl::{AlterTableOp, TableConstraintKind};
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
@@ -695,7 +804,7 @@ fn parse_alter_table(
              ADD FOREIGN KEY / DROP CONSTRAINT right now — {what} is not supported yet"
         )))
     };
-    let table_name = alter.name.to_dotted().to_lowercase();
+    let table_name = alter.name.clone();
     let op = match &alter.operation {
         AlterTableOp::AddColumn(_, _, column_def) => {
             AlterColumnOp::Add(crate::table::Field::try_from(column_def)?)
@@ -728,8 +837,8 @@ fn parse_alter_table(
 // nothing else parses at all — so unlike parse_select_star/
 // parse_alter_table there's no further validation to do here; this just
 // extracts the two pieces schema::copy_csv_into needs.
-fn parse_copy_into(c: &sql_parser::ddl::CopyInto) -> (String, String) {
-    (c.table.to_dotted().to_lowercase(), c.path.path.clone())
+fn parse_copy_into(c: &sql_parser::ddl::CopyInto) -> (sql_parser::ObjectName, String) {
+    (c.table.clone(), c.path.path.clone())
 }
 
 impl<F> Display for Statement<F>
@@ -739,5 +848,159 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Statement: id: {}, sql: {}", self.id, self.sql)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dummy_tests {
+
+    use std::{ops::ControlFlow, sync::Arc};
+
+    use sql_parser::{
+        Expr, ObjectName, Statement,
+        literal::Literal,
+        query::{Query, SelectCore, TableFactor},
+        visitor::{Visit, Visitor},
+    };
+    use store::named_memfile::NamedMemFile;
+
+    use crate::conn::connection::{Connection, ConnectionManager};
+
+    struct V;
+    impl Visitor for V {
+        type Break = ();
+
+        fn post_visit_expr(&mut self, _expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
+            println!("post visit expr: {:?}", _expr);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            println!("post visit query: {:?}", _query);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_relation(&mut self, _relation: &ObjectName) -> ControlFlow<Self::Break> {
+            println!("post visit rela: {:?}", _relation);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_select(&mut self, _select: &SelectCore) -> ControlFlow<Self::Break> {
+            println!("post visit select: {:?}", _select);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
+            println!("post visit stmt: {:?}", _statement);
+            println!("");
+            ControlFlow::Continue(())
+        }
+        fn post_visit_table_factor(
+            &mut self,
+            _table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit table_factor: {:?}", _table_factor);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_literal(
+            &mut self,
+            _lit: &sql_parser::literal::Literal,
+        ) -> ControlFlow<Self::Break> {
+            println!("post visit value: {:?}", _lit);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
+            println!("pre visit expr: {:?}", _expr);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            println!("pre visit query: {:?}", _query);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_relation(&mut self, _relation: &ObjectName) -> ControlFlow<Self::Break> {
+            println!("pre visit rela: {:?}", _relation);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_select(&mut self, _select: &SelectCore) -> ControlFlow<Self::Break> {
+            println!("pre visit select: {:?}", _select);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
+            println!("pre visit statement: {:?}", _statement);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_table_factor(
+            &mut self,
+            _table_factor: &TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            println!("pre visit t_factor: {:?}", _table_factor);
+            println!("");
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_literal(&mut self, _lit: &Literal) -> ControlFlow<Self::Break> {
+            println!("pre visit valye: {:?}", _lit);
+            println!("");
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn exec(sql: &str) {
+        let stmt = sql_parser::parse_sql(sql).unwrap();
+        let mut v = V;
+        stmt[0].visit(&mut v);
+        println!("\n");
+        println!("{:?}", stmt[0]);
+    }
+
+    fn get_conn() -> Arc<Connection<NamedMemFile>> {
+        let mgr = Arc::new(ConnectionManager::<NamedMemFile>::new());
+        let conn = mgr.create_and_connect("test").unwrap();
+        conn.use_schema(crate::constant::DEFAULT_SCHEMA_NAME)
+            .unwrap();
+        conn
+    }
+
+    fn exec_sql(conn: Arc<Connection<NamedMemFile>>, sql: &str) {
+        let mut stmt = conn.create_statement(sql).unwrap();
+        stmt.execute().unwrap();
+        let mut next = stmt.get_results().unwrap();
+        while let Some(res) = next {
+            println!("{:?}", res);
+            next = stmt.get_nextresult().unwrap();
+        }
+    }
+
+    #[test]
+    fn test1() {
+        exec("select * from a.b ");
+    }
+
+    #[test]
+    fn test2() {
+        let conn = get_conn();
+        exec_sql(conn.clone(), "create table t1 (id int, name varchar(10))");
+        // SELECT only supports "SELECT * FROM <table>" right now (see
+        // parse_select_star) — no column lists or aggregates like
+        // COUNT(*) yet.
+        exec_sql(conn, "select * from t1");
     }
 }

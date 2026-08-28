@@ -28,6 +28,17 @@ pub struct CreateTable {
     pub elements: Seq<TableElement, Comma>,
     pub rparen: RightParenthesis,
 }
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct ShowTables {
+    pub create: kw::Show,
+    pub table: kw::Tables,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct ShowSchemas {
+    pub create: kw::Show,
+    pub schema: kw::Schemas,
+}
 
 impl CreateTable {
     pub fn columns(&self) -> impl Iterator<Item = &ColumnDef> {

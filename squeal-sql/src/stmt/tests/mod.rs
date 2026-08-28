@@ -5,7 +5,7 @@ use store::memfile::MemFile;
 use super::*;
 use crate::conn::connection::{ConMgr, ConnectionManager};
 use crate::constant::DEFAULT_SCHEMA_NAME;
-use crate::rslt::resultset::ResultType;
+use crate::rslt::resultset::{ResultType, StreamingResultSet};
 
 fn conn() -> Arc<Connection<MemFile>> {
     let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
@@ -16,6 +16,55 @@ fn conn() -> Arc<Connection<MemFile>> {
 
 fn run(c: &Arc<Connection<MemFile>>, sql: &str) -> Result<(), SchemaError> {
     c.clone().create_statement(sql)?.execute()
+}
+
+// Test-only accessor: get_results/get_nextresult now *take* a result
+// out of Statement::results (see get_results' own doc comment — a
+// StreamingResult can't be cloned, so every result is retrievable at
+// most once), but plenty of tests want to just peek at
+// Statement::results by index, without going through that consuming
+// path. Panics with a clearer message than a raw index would if the
+// slot is empty (out of range, or already taken by a real
+// get_results/get_nextresult call elsewhere in the same test).
+fn nth_result(stmt: &Statement<MemFile>, i: usize) -> &ResultType {
+    stmt.results
+        .get(i)
+        .and_then(|r| r.as_ref())
+        .unwrap_or_else(|| panic!("no result at index {i} (out of range, or already taken)"))
+}
+
+// Drains a StreamingResultSet into plain (columns, rows) — the
+// streaming equivalent of ResultSet::columns()/rows(), for tests that
+// just want to assert on fully-materialized data rather than exercise
+// incremental streaming itself.
+fn drain_streaming(mut stream: StreamingResultSet) -> (Vec<String>, Vec<Vec<ValueItem>>) {
+    let columns = stream.columns();
+    let mut rows = Vec::new();
+    while let Some(key) = stream.next_result().unwrap() {
+        rows.push(key.values().to_vec());
+    }
+    (columns, rows)
+}
+
+// SELECT always produces a ResultType::StreamingResult (see
+// Statement::execute's Select arm) — since a StreamingResult can't be
+// cloned/peeked (see nth_result's own doc comment), reading one
+// requires *taking* the slot, not borrowing it the way nth_result does.
+// Panics if the slot is empty/already taken, or holds a different
+// ResultType variant.
+fn take_streaming_result(
+    stmt: &mut Statement<MemFile>,
+    i: usize,
+) -> (Vec<String>, Vec<Vec<ValueItem>>) {
+    let result = stmt
+        .results
+        .get_mut(i)
+        .and_then(Option::take)
+        .unwrap_or_else(|| panic!("no result at index {i} (out of range, or already taken)"));
+    match result {
+        ResultType::StreamingResult(stream) => drain_streaming(stream),
+        other => panic!("expected a StreamingResult at index {i}, got {other:?}"),
+    }
 }
 
 #[test]
@@ -38,7 +87,7 @@ fn test_execute_records_a_result_string_for_create_table() {
     let mut stmt = c.create_statement("create table t (id integer)").unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    let ResultType::ResultString(s) = &stmt.results[0] else {
+    let ResultType::ResultString(s) = nth_result(&stmt, 0) else {
         panic!("expected a ResultString, got a different ResultType variant");
     };
     assert_eq!(s, "Table 't' created");
@@ -176,10 +225,13 @@ fn test_execute_use_schema_fails_for_an_unknown_name() {
 fn test_execute_insert_stores_a_row_and_records_a_count_result() {
     let c = conn();
     run(&c, "create table t (id integer not null, primary key(id))").unwrap();
-    let mut stmt = c.clone().create_statement("insert into t values (1)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("insert into t values (1)")
+        .unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    assert!(matches!(stmt.results[0], ResultType::Count(1)));
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(1)));
 }
 
 #[test]
@@ -191,7 +243,7 @@ fn test_execute_insert_multi_row_records_the_right_count() {
         .unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    assert!(matches!(stmt.results[0], ResultType::Count(3)));
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(3)));
 }
 
 #[test]
@@ -214,22 +266,141 @@ fn test_execute_insert_fails_for_an_unknown_table() {
 #[test]
 fn test_execute_select_star_returns_a_result_set() {
     let c = conn();
-    run(&c, "create table t (id integer not null, name varchar(50), primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, name varchar(50), primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 'alice')").unwrap();
     let mut stmt = c.create_statement("select * from t").unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    let ResultType::Result(rs) = &stmt.results[0] else {
-        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
-    };
-    assert_eq!(rs.columns(), &["id".to_string(), "name".to_string()]);
+    let (columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
     assert_eq!(
-        rs.rows(),
-        &[vec![
+        rows,
+        vec![vec![
             store::valueitem::ValueItem::Integer(1),
             store::valueitem::ValueItem::Str(("alice".into(), 50))
         ]]
     );
+}
+
+#[test]
+fn test_execute_insert_and_select_support_schema_qualified_table_names() {
+    let c = conn();
+    // "default" is the schema `conn()` already selected — create a
+    // second schema and a table in it, then switch back to "default" so
+    // `other.t` can only resolve by explicitly qualifying it, not by
+    // accidentally falling back to whatever's current.
+    run(&c, "create schema other").unwrap();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+
+    run(&c, "insert into other.t values (1)").unwrap();
+
+    let mut stmt = c.clone().create_statement("select * from other.t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![store::valueitem::ValueItem::Integer(1)]]);
+
+    // "default" never got the table — proves the qualified INSERT above
+    // actually landed in "other", not silently in whatever's current.
+    assert!(!c.current_schema().unwrap().table_exists("t"));
+}
+
+#[test]
+fn test_execute_rejects_a_table_reference_with_too_many_parts() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c.create_statement("select * from db.default.t").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_qualified_table_reference_fails_for_an_unknown_schema() {
+    let c = conn();
+    let mut stmt = c.create_statement("select * from nope.t").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::SchemaNotFound(_)), "got {err:?}");
+}
+
+#[test]
+fn test_temp_table_create_insert_select_roundtrip() {
+    let c = conn();
+    run(
+        &c,
+        "create table temp.t (id integer not null, name varchar(50))",
+    )
+    .unwrap();
+    run(&c, "insert into temp.t values (1, 'alice')").unwrap();
+    run(&c, "insert into temp.t values (2, 'bob')").unwrap();
+
+    let mut stmt = c.clone().create_statement("select * from temp.t").unwrap();
+    stmt.execute().unwrap();
+    let (columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 50))],
+            vec![ValueItem::Integer(2), ValueItem::Str(("bob".into(), 50))],
+        ]
+    );
+
+    // A temp table never touches the real schema system at all.
+    assert!(!c.current_schema().unwrap().table_exists("t"));
+}
+
+#[test]
+fn test_temp_table_is_private_to_its_own_connection() {
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let c1 = mgr.create_and_connect("temp_isolation_db").unwrap();
+    c1.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let c2 = mgr.connect("temp_isolation_db").unwrap();
+    c2.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+
+    run(&c1, "create table temp.t (id integer not null)").unwrap();
+    run(&c1, "insert into temp.t values (1)").unwrap();
+
+    // c2 is a different connection to the SAME database — its own
+    // temp.t must not exist at all, let alone see c1's row.
+    let mut stmt = c2.create_statement("select * from temp.t").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_temp_table_create_rejects_constraints() {
+    let c = conn();
+    let err = run(
+        &c,
+        "create table temp.t (id integer not null, primary key(id))",
+    )
+    .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_temp_table_insert_fails_for_an_unknown_table() {
+    let c = conn();
+    let err = run(&c, "insert into temp.nope values (1)").unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_use_schema_temp_is_rejected() {
+    let c = conn();
+    let err = run(&c, "use schema temp").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_create_schema_temp_is_rejected() {
+    let c = conn();
+    let err = run(&c, "create schema temp").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
 #[test]
@@ -265,17 +436,13 @@ fn test_execute_select_star_participates_in_a_multi_statement_batch() {
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 3);
 
-    let ResultType::Result(first) = &stmt.results[0] else {
-        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
-    };
-    assert_eq!(first.rows().len(), 1);
+    let (_, first_rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(first_rows.len(), 1);
 
-    assert!(matches!(stmt.results[1], ResultType::Count(1)));
+    assert!(matches!(nth_result(&stmt, 1), ResultType::Count(1)));
 
-    let ResultType::Result(third) = &stmt.results[2] else {
-        panic!("expected a ResultType::Result, got {:?}", stmt.results[2]);
-    };
-    assert_eq!(third.rows().len(), 2);
+    let (_, third_rows) = take_streaming_result(&mut stmt, 2);
+    assert_eq!(third_rows.len(), 2);
 }
 
 #[test]
@@ -288,7 +455,9 @@ fn test_new_rejects_select_with_an_explicit_column_list() {
 #[test]
 fn test_new_rejects_select_with_a_where_clause() {
     let c = conn();
-    let err = c.create_statement("select * from t where id = 1").unwrap_err();
+    let err = c
+        .create_statement("select * from t where id = 1")
+        .unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
@@ -366,15 +535,12 @@ fn test_execute_select_star_on_a_different_connection_does_not_see_uncommitted_i
 
 // Materializes a SELECT's row count via a fresh Statement — the direct
 // way every SELECT-visibility test below checks what a connection can
-// currently see, mirroring test_execute_select_star_returns_a_result_set's
-// own ResultType::Result inspection.
+// currently see, mirroring take_streaming_result's own draining.
 fn select_row_count(c: &Arc<Connection<MemFile>>, sql: &str) -> usize {
     let mut stmt = c.clone().create_statement(sql).unwrap();
     stmt.execute().unwrap();
-    let ResultType::Result(rs) = &stmt.results[0] else {
-        panic!("expected a ResultType::Result, got {:?}", stmt.results[0]);
-    };
-    rs.rows().len()
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    rows.len()
 }
 
 #[test]
@@ -554,7 +720,7 @@ fn result_string(r: &ResultType) -> &str {
 }
 
 #[test]
-fn test_get_results_returns_the_first_result_and_is_idempotent() {
+fn test_get_results_returns_the_first_result_then_takes_it() {
     let c = conn();
     let mut stmt = c.create_statement("create table t (id integer)").unwrap();
     stmt.execute().unwrap();
@@ -562,9 +728,12 @@ fn test_get_results_returns_the_first_result_and_is_idempotent() {
     let first = stmt.get_results().unwrap().unwrap();
     assert_eq!(result_string(&first), "Table 't' created");
 
-    // Calling it again without advancing returns the same result.
-    let again = stmt.get_results().unwrap().unwrap();
-    assert_eq!(result_string(&again), "Table 't' created");
+    // Calling it again without advancing no longer returns a second copy
+    // of the same result — a StreamingResult can't be cloned to produce
+    // one (see get_results' own doc comment), so every result, streaming
+    // or not, is retrievable exactly once. The slot at this position is
+    // already empty.
+    assert!(stmt.get_results().unwrap().is_none());
 }
 
 #[test]
@@ -591,10 +760,11 @@ fn test_get_nextresult_walks_through_multiple_statements() {
     assert_eq!(result_string(&second), "Table 't2' created");
 
     assert!(stmt.get_nextresult().unwrap().is_none());
-    // Cursor didn't move past the end — get_results() still returns the
-    // last valid result, not None.
-    let still_second = stmt.get_results().unwrap().unwrap();
-    assert_eq!(result_string(&still_second), "Table 't2' created");
+    // Cursor position didn't move past the end (still points at index
+    // 1), but the result *at* that position was already taken by the
+    // get_nextresult() call above — a second read finds the slot empty,
+    // same as test_get_results_returns_the_first_result_then_takes_it.
+    assert!(stmt.get_results().unwrap().is_none());
 }
 
 #[test]
@@ -620,13 +790,15 @@ fn test_execute_alter_table_add_column_records_a_result_string() {
         .unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    assert_eq!(result_string(&stmt.results[0]), "Table \"t\" altered");
+    assert_eq!(result_string(nth_result(&stmt, 0)), "Table \"t\" altered");
 }
 
 #[test]
 fn test_execute_alter_table_drop_column_fails_for_an_unknown_table() {
     let c = conn();
-    let mut stmt = c.create_statement("alter table nope drop column x").unwrap();
+    let mut stmt = c
+        .create_statement("alter table nope drop column x")
+        .unwrap();
     let err = stmt.execute().unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 }
@@ -684,15 +856,27 @@ fn test_new_rejects_alter_table_rename_table() {
 #[test]
 fn test_execute_alter_table_add_foreign_key_records_a_result_string() {
     let c = conn();
-    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
-    run(&c, "create table orders (id integer not null, customer_id integer, primary key(id))")
-        .unwrap();
+    run(
+        &c,
+        "create table customers (id integer not null, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "create table orders (id integer not null, customer_id integer, primary key(id))",
+    )
+    .unwrap();
     let mut stmt = c
-        .create_statement("alter table orders add foreign key (customer_id) references customers(id)")
+        .create_statement(
+            "alter table orders add foreign key (customer_id) references customers(id)",
+        )
         .unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    assert_eq!(result_string(&stmt.results[0]), "Table \"orders\" altered");
+    assert_eq!(
+        result_string(nth_result(&stmt, 0)),
+        "Table \"orders\" altered"
+    );
 }
 
 #[test]
@@ -752,7 +936,11 @@ fn test_new_tolerates_a_placeholder_in_ordinary_sql() {
 #[test]
 fn test_prepared_insert_executes_with_bound_values() {
     let c = conn();
-    run(&c, "create table t (id integer not null, name varchar(10), primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, name varchar(10), primary key(id))",
+    )
+    .unwrap();
     let mut stmt = c
         .clone()
         .create_prepared_statement("insert into t values (?, ?)")
@@ -766,12 +954,10 @@ fn test_prepared_insert_executes_with_bound_values() {
 
     let mut check = c.create_statement("select * from t").unwrap();
     check.execute().unwrap();
-    let ResultType::Result(rs) = &check.results[0] else {
-        panic!("expected a ResultType::Result");
-    };
+    let (_, rows) = take_streaming_result(&mut check, 0);
     assert_eq!(
-        rs.rows(),
-        &[vec![
+        rows,
+        vec![vec![
             ValueItem::Integer(1),
             ValueItem::Str(("alice".into(), 10))
         ]]
@@ -794,10 +980,7 @@ fn test_prepared_insert_can_be_reused_with_different_bound_values() {
 
     let mut check = c.create_statement("select * from t").unwrap();
     check.execute().unwrap();
-    let ResultType::Result(rs) = &check.results[0] else {
-        panic!("expected a ResultType::Result");
-    };
-    let mut rows = rs.rows().to_vec();
+    let (_, mut rows) = take_streaming_result(&mut check, 0);
     rows.sort_by_key(|r| match &r[0] {
         ValueItem::Integer(i) => *i,
         _ => panic!("expected an integer id"),
@@ -874,7 +1057,10 @@ fn test_prepared_statement_rejects_ddl() {
     let err = c
         .create_prepared_statement("create table t (id integer)")
         .unwrap_err();
-    assert!(matches!(err, SchemaError::BadPreparedStatement(_)), "got {err:?}");
+    assert!(
+        matches!(err, SchemaError::BadPreparedStatement(_)),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -920,7 +1106,10 @@ fn test_prepared_select_execute_errors_not_implemented() {
 
 #[test]
 fn test_execute_copy_into_records_load_counts() {
-    let path = std::env::temp_dir().join(format!("squeal_sql_stmt_copy_test_{}.csv", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "squeal_sql_stmt_copy_test_{}.csv",
+        std::process::id()
+    ));
     std::fs::write(&path, "id\n1\n2\n").unwrap();
 
     let c = conn();
@@ -930,7 +1119,10 @@ fn test_execute_copy_into_records_load_counts() {
         .unwrap();
     stmt.execute().unwrap();
     assert_eq!(stmt.results.len(), 1);
-    assert_eq!(result_string(&stmt.results[0]), "2 row(s) loaded, 0 row(s) failed");
+    assert_eq!(
+        result_string(nth_result(&stmt, 0)),
+        "2 row(s) loaded, 0 row(s) failed"
+    );
 
     std::fs::remove_file(path).ok();
 }
@@ -938,7 +1130,9 @@ fn test_execute_copy_into_records_load_counts() {
 #[test]
 fn test_execute_copy_into_fails_for_an_unknown_table() {
     let c = conn();
-    let mut stmt = c.create_statement("copy into nope from @/tmp/x.csv").unwrap();
+    let mut stmt = c
+        .create_statement("copy into nope from @/tmp/x.csv")
+        .unwrap();
     let err = stmt.execute().unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 }

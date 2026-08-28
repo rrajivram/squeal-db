@@ -14,6 +14,7 @@ use crate::{
     schema_ops::database::Database,
     schema_ops::schema::Schema,
     stmt::{PreparedStatement, Statement},
+    temp::{TEMP_SCHEMA_NAME, TempTables},
 };
 
 #[cfg(test)]
@@ -47,7 +48,7 @@ pub struct Connection<F: DBFile + 'static> {
     // Statement::execute) can repoint an *existing* connection at a
     // different database, unlike before where a Connection's database
     // was fixed at construction.
-    database: RwLock<Arc<Database<F>>>,
+    pub(crate) database: RwLock<Arc<Database<F>>>,
     current_schema: RwLock<Option<Arc<Schema<F>>>>,
     // Set by BEGIN/START TRANSACTION, cleared by COMMIT/ROLLBACK (see
     // Statement::execute's handling of those). While set, statements
@@ -57,7 +58,14 @@ pub struct Connection<F: DBFile + 'static> {
     // DDL (CREATE TABLE/DATABASE/SCHEMA) and USE always still manage
     // their own transaction regardless of this — deliberately out of
     // scope for this first pass.
-    current_txn: RwLock<Option<Transaction>>,
+    pub(crate) current_txn: RwLock<Option<Transaction>>,
+    // Connection-scoped temporary tables, addressed as `temp.<table>` —
+    // see crate::temp's own doc comment for why this lives here rather
+    // than as a real Schema. Cleared by use_database/create_database
+    // (see their own comments): a temp table's Run holds pages from a
+    // specific database's PageBuffer, so it can't survive this
+    // connection repointing at a different one.
+    temp_tables: TempTables<F>,
 }
 
 impl<F> ConnectionManager<F>
@@ -150,11 +158,24 @@ where
             database: RwLock::new(database),
             current_schema: RwLock::new(None),
             current_txn: RwLock::new(None),
+            temp_tables: TempTables::new(),
         }
+    }
+
+    pub(crate) fn temp_tables(&self) -> &TempTables<F> {
+        &self.temp_tables
     }
 
     pub(crate) fn current_schema(&self) -> Option<Arc<Schema<F>>> {
         self.current_schema.read().clone()
+    }
+
+    // Looks up any named schema in this connection's current database —
+    // not necessarily the current one, and doesn't change it (unlike
+    // use_schema). For resolving a schema-qualified table reference
+    // (`schema.table`) without a USE SCHEMA first.
+    pub(crate) fn schema(&self, name: &str) -> Result<Arc<Schema<F>>, SchemaError> {
+        self.database.read().get_schema(name)
     }
 
     pub(crate) fn database_name(&self) -> String {
@@ -162,12 +183,14 @@ where
     }
 
     pub fn use_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        reject_temp_schema_name(name)?;
         let schema = self.database.read().get_schema(name)?;
         self.current_schema.write().replace(schema);
         Ok(())
     }
 
     pub fn create_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
+        reject_temp_schema_name(name)?;
         let schema = self.database.read().create_schema(name)?;
         self.current_schema.write().replace(schema);
         Ok(())
@@ -180,6 +203,7 @@ where
         let database = self.mgr.open_or_get_database(name)?;
         *self.database.write() = database;
         self.current_schema.write().take();
+        self.temp_tables.clear();
         Ok(())
     }
 
@@ -189,11 +213,16 @@ where
         let database = self.mgr.create_database(name)?;
         *self.database.write() = database;
         self.current_schema.write().take();
+        self.temp_tables.clear();
         Ok(())
     }
 
     pub fn create_statement(self: Arc<Self>, sql: &str) -> Result<Statement<F>, SchemaError> {
         Statement::new(sql, self.clone())
+    }
+
+    pub fn list_schemas(self: &Arc<Self>) -> Result<Vec<String>, SchemaError> {
+        self.database.read().list_schemas()
     }
 
     // A single INSERT/UPDATE/DELETE/SELECT statement, "?"-parameterized
@@ -291,6 +320,20 @@ where
         let guard = self.current_txn.read();
         f(guard.as_ref())
     }
+}
+
+// `temp` is reserved for connection-scoped temporary tables (see
+// crate::temp's own doc comment) — it's never a real Schema, so both
+// USE SCHEMA temp and CREATE SCHEMA temp are rejected outright rather
+// than either silently doing nothing useful or (for CREATE) colliding
+// with the reserved name.
+fn reject_temp_schema_name(name: &str) -> Result<(), SchemaError> {
+    if name.eq_ignore_ascii_case(TEMP_SCHEMA_NAME) {
+        return Err(SchemaError::UserError(format!(
+            "{TEMP_SCHEMA_NAME:?} is reserved for temporary tables (temp.<table>) and cannot be used as a real schema"
+        )));
+    }
+    Ok(())
 }
 
 // store::Db (via Database) doesn't implement Debug, so this can't be
