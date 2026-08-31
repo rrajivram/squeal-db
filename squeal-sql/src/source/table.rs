@@ -10,8 +10,8 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    source::Source,
-    table::{Field, SqlTable, VersionedRow},
+    source::{ProjectedField, Source},
+    table::{SqlTable, VersionedRow},
 };
 
 pub struct TableSource<F: DBFile> {
@@ -56,8 +56,12 @@ where
         // expects a real dependency to chain.
     }
 
-    fn fields(&self) -> Arc<[Arc<Field>]> {
-        self.table.fields_arc()
+    fn fields(&self) -> Vec<ProjectedField> {
+        self.table
+            .fields_arc()
+            .iter()
+            .map(|f| ProjectedField::from(f.clone()))
+            .collect::<Vec<_>>()
     }
 }
 

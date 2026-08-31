@@ -11,10 +11,11 @@ use uuid::Uuid;
 
 use crate::{
     error::SchemaError,
-    schema_ops::database::Database,
-    schema_ops::schema::Schema,
+    plan::logical::HasFields,
+    schema_ops::{database::Database, schema::Schema},
     stmt::{PreparedStatement, Statement},
-    temp::{TEMP_SCHEMA_NAME, TempTables},
+    table::SqlTable,
+    temp::{TEMP_SCHEMA_NAME, TempTable, TempTables},
 };
 
 #[cfg(test)]
@@ -146,6 +147,70 @@ impl ConnectionManager<File> {
     }
 }
 
+// What a FROM-clause-style reference resolves to — the one shared
+// answer for every statement kind that needs to turn a parsed table
+// name into something to act on (INSERT, ALTER TABLE, COPY INTO,
+// SELECT's own table resolution in plan::logical), instead of each
+// reimplementing the same schema-vs-temp classification (see
+// Connection::resolve_table_ref's own doc comment for why that used to
+// drift).
+//
+// Real carries the already-resolved Arc<SqlTable> (not just its name) —
+// resolve_table_ref does that lookup itself, once, rather than every
+// caller (INSERT and plan::logical::QueryVisitor::validate_table both
+// used to) re-deriving the same "look it up, error if missing" step
+// immediately after getting a schema+name pair back. The Schema handle
+// is kept alongside it since the schema-level operations (insert_rows,
+// add_column, copy_csv_into, ...) still live on Schema, not SqlTable.
+//
+// Derived (a FROM-clause subquery, `(SELECT ...) AS x` — carries
+// nothing yet, see plan::logical's own TODO on actually planning one)
+// lives here too, not as a separate enum one layer up: it's another
+// answer to the exact same question ("what is this FROM item"), and
+// keeping it here means a future non-subquery producer of the same
+// shape — a VIEW, most plausibly, a stored query resolved by name the
+// same way a real table is — has one obvious place to plug into instead
+// of two enums to keep in sync.
+
+pub(crate) enum TableRef<F: DBFile + 'static> {
+    Real(Arc<Schema<F>>, Arc<SqlTable>),
+    // Carries the (lowercased) name alongside the handle, not just the
+    // handle — callers still want it for error messages/further lookups
+    // the way TableRef::Real's own Arc<SqlTable> carries its name via
+    // `.name`, and a TempTable has no separate "schema" object to get
+    // one from otherwise.
+    Temp(String, Arc<RwLock<TempTable<F>>>),
+    Derived,
+}
+
+// TempTable (via store::run::Run) doesn't implement Debug, so this can't
+// be derived — a minimal manual impl (variant + the name each carries)
+// is enough for {:?} logging and for
+// Result<(TableRef<F>, _), _>::unwrap_err() in tests.
+impl<F: DBFile + 'static> std::fmt::Debug for TableRef<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableRef::Real(schema, table) => f
+                .debug_tuple("Real")
+                .field(&schema.name)
+                .field(&table.name)
+                .finish(),
+            TableRef::Temp(name, _) => f.debug_tuple("Temp").field(name).finish(),
+            TableRef::Derived => f.debug_tuple("Derived").finish(),
+        }
+    }
+}
+
+impl<F: DBFile + 'static> Clone for TableRef<F> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Real(s, t) => Self::Real(s.clone(), t.clone()),
+            Self::Temp(s, t) => Self::Temp(s.clone(), t.clone()),
+            Self::Derived => Self::Derived,
+        }
+    }
+}
+
 impl<F> Connection<F>
 where
     F: DBFile + 'static,
@@ -178,6 +243,86 @@ where
         self.database.read().get_schema(name)
     }
 
+    // Resolves a possibly-qualified table (or table-plus-field) reference
+    // — `table`, `schema.table`, `schema.table.field`, `temp.table`, or
+    // `temp.table.field` — to either the Schema a table lives in (plus
+    // its own unqualified, lowercased name) or a connection-scoped temp
+    // table handle, alongside the trailing field name if the reference
+    // carried one (see the shapes documented on
+    // plan::logical::QueryVisitor::validate_object_name, which this is
+    // the shared building block for — that function still owns the
+    // shapes this can't disambiguate alone, `table.field` and a bare
+    // `field`, since telling those apart from `schema.table` and a bare
+    // `table` needs to know what tables are already in scope, which this
+    // method — unlike validate_object_name — doesn't take).
+    //
+    // The bare (one-part) form resolves against this connection's
+    // current schema; the two- and three-part forms look up that schema
+    // by name (see `schema`, above) unless the first part is the
+    // reserved `temp` name, in which case it's routed to this
+    // connection's own temp-table registry instead. More than three
+    // parts is always rejected — nothing in this engine lets a single
+    // statement reach across databases.
+    //
+    // The one place every table-reference-resolving statement (INSERT,
+    // ALTER TABLE, COPY INTO, SELECT's own resolution in
+    // plan::logical::QueryVisitor) goes through — previously each
+    // reimplemented this same schema-vs-temp-vs-too-many-parts
+    // classification separately, which had already drifted once (SELECT
+    // rejected a 3-part name with a different SchemaError variant than
+    // everything else did for the identical situation). Those four
+    // callers only ever pass a pure table reference (no trailing field)
+    // and reject a `Some` field themselves — a `schema.table.field`-
+    // shaped INSERT/ALTER TABLE/COPY INTO/FROM target doesn't mean
+    // anything, so it's on each of them to say so, not on this method to
+    // guess who's calling.
+    pub(crate) fn resolve_object_name_ref(
+        self: &Arc<Self>,
+        name: &sql_parser::ObjectName,
+    ) -> Result<(TableRef<F>, Option<String>), SchemaError> {
+        let parts: Vec<&str> = name.idents().map(|i| i.value.as_str()).collect();
+        let (head, field) = match parts.as_slice() {
+            [_, _, field] => (&parts[..2], Some(field.to_lowercase())),
+            _ => (parts.as_slice(), None),
+        };
+        if let Some(temp_name) = crate::temp::temp_table_name(head) {
+            let table = self
+                .temp_tables
+                .get(&temp_name)
+                .ok_or_else(|| SchemaError::BadTableName(format!("temp.{temp_name}")))?;
+            if let Some(field) = &field
+                && !table.has_field(field)
+            {
+                return Err(SchemaError::FieldNotFound(field.clone()));
+            }
+            return Ok((TableRef::Temp(temp_name, table), field));
+        }
+        let (schema, table_name) = match head {
+            [table] => (
+                self.current_schema().ok_or(SchemaError::NoSchemaSelected)?,
+                table.to_lowercase(),
+            ),
+            [schema, table] => (self.schema(schema)?, table.to_lowercase()),
+            _ => {
+                return Err(SchemaError::UserError(format!(
+                    "{:?} has too many parts — only <table>, <schema>.<table>, \
+                     <schema>.<table>.<field>, or temp.<table>[.<field>] is supported",
+                    name.to_dotted()
+                )));
+            }
+        };
+        let table = schema
+            .get_table(&table_name)
+            .ok_or(SchemaError::BadTableName(table_name))?;
+        if let Some(field) = &field
+            && !table.has_field(field)
+        {
+            return Err(SchemaError::FieldNotFound(field.clone()));
+        }
+        Ok((TableRef::Real(schema, table), field))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn database_name(&self) -> String {
         self.database.read().name().to_string()
     }

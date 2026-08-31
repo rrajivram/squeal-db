@@ -6,9 +6,31 @@
 // cuts that cost over the platform default with no logic changes elsewhere —
 // set globally (not feature-gated) since any binary linking this crate pays
 // the same allocation pattern.
+//
+// TrackingAllocator (see alloc.rs), not a bare mimalloc::MiMalloc: it
+// delegates every call straight to mimalloc (so the perf rationale
+// above is unaffected) while also counting bytes/peak/allocation sizes,
+// exposed via alloc::stats() — the only place that data can be read
+// from, since a process may have at most one #[global_allocator], and
+// this crate is the lowest-level one nearly everything else in the
+// workspace depends on.
+//
+// Under the dhat-heap feature, this becomes dhat::Alloc instead — real
+// call-site-attributed heap profiling (which allocation call site, not
+// just which size bucket) rather than our own counters, at the cost of
+// alloc::stats() (which needs a TrackingAllocator specifically) not
+// being available in that build. Still exactly one #[global_allocator]
+// either way — squeal-cli's own dhat-heap feature enables this one
+// rather than declaring a second, conflicting allocator itself.
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: alloc::TrackingAllocator = alloc::TrackingAllocator::new();
 
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+pub mod alloc;
 mod arclock;
 mod buffer;
 mod constant;

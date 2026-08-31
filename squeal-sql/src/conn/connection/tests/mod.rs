@@ -3,11 +3,31 @@ use std::sync::Arc;
 use store::memfile::MemFile;
 use store::named_memfile::NamedMemFile;
 
-use super::ConnectionManager;
+use super::{ConnectionManager, TableRef};
 use crate::error::SchemaError;
 
 fn manager() -> Arc<ConnectionManager<MemFile>> {
     Arc::new(ConnectionManager::new())
+}
+
+// Connection::resolve_table_ref takes a real sql_parser::ObjectName, not
+// a string — parsing a throwaway "SELECT * FROM <dotted>" and pulling
+// its FROM target out is the simplest way to build one without a direct
+// constructor (ObjectName has no public `from_str`/builder of its own).
+fn object_name(dotted: &str) -> sql_parser::ObjectName {
+    let stmts = sql_parser::parse_sql(&format!("select * from {dotted}")).unwrap();
+    let sql_parser::Statement::Select(query) = &stmts[0] else {
+        panic!("expected a SELECT statement");
+    };
+    let sql_parser::query::SetOperand::Select(core) = &query.body else {
+        panic!("expected a plain SELECT, not a set operation");
+    };
+    let sql_parser::query::TableFactor::Table { name, .. } =
+        &core.from.as_ref().unwrap().tables.head.relation
+    else {
+        panic!("expected a plain table reference, not a derived table");
+    };
+    name.clone()
 }
 
 #[test]
@@ -160,4 +180,129 @@ fn test_close_persists_state_for_a_later_reopen() {
     assert!(conn2.current_schema.read().is_some());
 
     NamedMemFile::delete(&path);
+}
+
+#[test]
+fn test_resolve_table_ref_bare_name_uses_current_schema_no_field() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    conn.use_schema("default").unwrap();
+    create_real_table(&conn, "t");
+
+    let (table_ref, field) = conn.resolve_object_name_ref(&object_name("t")).unwrap();
+    assert!(field.is_none());
+    let TableRef::Real(schema, table) = table_ref else {
+        panic!("expected TableRef::Real");
+    };
+    assert_eq!(schema.name, "default");
+    assert_eq!(table.name, "t");
+}
+
+#[test]
+fn test_resolve_table_ref_two_parts_is_schema_dot_table_no_field() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    conn.create_schema("other").unwrap();
+    create_real_table(&conn, "t");
+
+    let (table_ref, field) = conn
+        .resolve_object_name_ref(&object_name("other.t"))
+        .unwrap();
+    assert!(field.is_none());
+    let TableRef::Real(schema, table) = table_ref else {
+        panic!("expected TableRef::Real");
+    };
+    assert_eq!(schema.name, "other");
+    assert_eq!(table.name, "t");
+}
+
+#[test]
+fn test_resolve_table_ref_three_parts_is_schema_table_field() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    conn.create_schema("other").unwrap();
+    create_real_table(&conn, "t");
+
+    let (table_ref, field) = conn
+        .resolve_object_name_ref(&object_name("other.t.col"))
+        .unwrap();
+    assert_eq!(field.as_deref(), Some("col"));
+    let TableRef::Real(schema, table) = table_ref else {
+        panic!("expected TableRef::Real");
+    };
+    assert_eq!(schema.name, "other");
+    assert_eq!(table.name, "t");
+}
+
+// resolve_table_ref now looks the table itself up (not just its
+// schema), so a test exercising TableRef::Real needs one to actually
+// exist — creates it in whatever schema `conn` currently has selected.
+fn create_real_table(conn: &Arc<crate::conn::connection::Connection<MemFile>>, name: &str) {
+    let mut stmt = conn
+        .clone()
+        .create_statement(&format!("create table {name} (id integer)"))
+        .unwrap();
+    stmt.execute().unwrap();
+}
+
+// resolve_table_ref only ever looks a temp table up (never creates one),
+// so a test exercising the Temp branch needs one to already exist —
+// mirrors what `CREATE TABLE temp.<table> (...)` does under the hood
+// (see Statement::execute's own CreateTable arm).
+fn create_temp_table(conn: &Arc<crate::conn::connection::Connection<MemFile>>, name: &str) {
+    use crate::{datatype::DataType, table::Field};
+    let db = conn.database.read().db.clone();
+    let field = Field::new("col".to_string(), DataType::Integer, true, None).unwrap();
+    conn.temp_tables()
+        .create(&db, name.to_string(), vec![Arc::new(field)])
+        .unwrap();
+}
+
+#[test]
+fn test_resolve_table_ref_temp_two_parts_no_field() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    create_temp_table(&conn, "t");
+
+    let (table_ref, field) = conn
+        .resolve_object_name_ref(&object_name("temp.t"))
+        .unwrap();
+    assert!(field.is_none());
+    assert!(matches!(table_ref, TableRef::Temp(name, _) if name == "t"));
+}
+
+#[test]
+fn test_resolve_table_ref_temp_three_parts_is_temp_table_field() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    create_temp_table(&conn, "t");
+
+    let (table_ref, field) = conn
+        .resolve_object_name_ref(&object_name("temp.t.col"))
+        .unwrap();
+    assert_eq!(field.as_deref(), Some("col"));
+    assert!(matches!(table_ref, TableRef::Temp(name, _) if name == "t"));
+}
+
+#[test]
+fn test_resolve_table_ref_rejects_four_parts() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+    conn.use_schema("default").unwrap();
+
+    let err = conn
+        .resolve_object_name_ref(&object_name("a.b.c.d"))
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_resolve_table_ref_three_parts_fails_for_an_unknown_schema() {
+    let mgr = manager();
+    let conn = mgr.create_and_connect("db1").unwrap();
+
+    let err = conn
+        .resolve_object_name_ref(&object_name("nope.t.col"))
+        .unwrap_err();
+    assert!(matches!(err, SchemaError::SchemaNotFound(_)), "got {err:?}");
 }

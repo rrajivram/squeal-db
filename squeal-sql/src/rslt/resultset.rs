@@ -22,7 +22,11 @@ impl StreamingResultSet {
     }
 
     pub fn columns(&self) -> Vec<String> {
-        self.begin.fields().iter().map(|f| f.name.clone()).collect()
+        self.begin
+            .fields()
+            .iter()
+            .map(|f| f.display_name.clone())
+            .collect()
     }
 
     pub fn next_result(&mut self) -> Result<Option<IndexKey>, SchemaError> {

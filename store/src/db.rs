@@ -682,11 +682,17 @@ where
     }
 
     pub(crate) fn table_by_id(&self, id: TableIdType) -> Result<Arc<BPlusTree<F>>, StoreError> {
+        // ok_or_else, not ok_or: ok_or's argument is eager, so
+        // `id.to_string()` (a heap allocation) ran on every SUCCESSFUL
+        // lookup too, not just the error path — this is a hot path
+        // (once per row on every insert, via Schema::get_table), so that
+        // was a real, measured source of small allocations (confirmed
+        // via dhat: ~70K allocations across a 41K-row import).
         self.tables
             .read()
             .get(&id)
             .map(Arc::clone)
-            .ok_or(StoreError::TableNotFound(id.to_string()))
+            .ok_or_else(|| StoreError::TableNotFound(id.to_string()))
     }
 
     pub fn table_id_by_name<S: AsRef<str>>(

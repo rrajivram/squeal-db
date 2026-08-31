@@ -35,6 +35,28 @@ impl IndexKey {
         })
     }
 
+    // Like new_from, but takes ownership of `data` instead of borrowing
+    // it. `Arc::from(&[ValueItem])` (new_from's own `Arc::from`) has to
+    // clone every element to fill a new allocation it doesn't own yet —
+    // for a ValueItem::Str, that's a fresh heap copy of the whole
+    // string. `Arc::from(Vec<ValueItem>)` instead moves each element in
+    // (a plain struct-field copy — for a String, just its ptr/len/cap,
+    // not its character data) since it already owns them; the character
+    // data itself is never touched, let alone reallocated. Worth the
+    // separate entry point specifically for callers building a fresh,
+    // otherwise-about-to-be-dropped Vec<ValueItem> just to hand it to an
+    // IndexKey (e.g. Schema::insert_rows_in_txn's own row storage) —
+    // confirmed via allocation profiling as the single largest source
+    // of small (<10 byte) allocations in a bulk load.
+    pub fn new_from_owned(data: Vec<ValueItem>) -> Result<Self, StoreError> {
+        for d in &data {
+            d.validate()?;
+        }
+        Ok(Self {
+            data: Arc::from(data),
+        })
+    }
+
     pub fn size(&self) -> usize {
         size_of::<u64>() + self.data.iter().map(|d| d.size()).sum::<usize>()
     }

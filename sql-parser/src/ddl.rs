@@ -30,14 +30,21 @@ pub struct CreateTable {
 }
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct ShowTables {
-    pub create: kw::Show,
+    pub show: kw::Show,
     pub table: kw::Tables,
 }
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct ShowSchemas {
-    pub create: kw::Show,
+    pub show: kw::Show,
     pub schema: kw::Schemas,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct DescribeTable {
+    pub describe: kw::Describe,
+    pub table: kw::Table,
+    pub name: ObjectName,
 }
 
 impl CreateTable {

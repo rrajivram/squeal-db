@@ -5,3 +5,6 @@ store/profile.json.gz
 squeal-cli/history.txt
 history.txt
 /test_data
+squeal-cli/squeal.db
+squeal-cli/squeal.db.redo
+squeal-cli/squeal.db.undo

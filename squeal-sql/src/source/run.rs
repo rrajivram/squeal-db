@@ -1,15 +1,18 @@
-use std::{fmt::Debug, sync::Arc};
+use std::fmt::Debug;
 
 use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
 
-use crate::{error::SchemaError, source::Source, table::Field};
+use crate::{
+    error::SchemaError,
+    source::{ProjectedField, Source},
+};
 
 // Streams a temp table's rows — the Run-backed equivalent of TableSource
 // (see crate::temp::TempTable). Like TableSource, always a leaf: nothing
 // upstream of a bare table/temp-table scan to chain from.
 pub(crate) struct RunSource<F: DBFile + 'static> {
     cursor: RunCursor<F>,
-    fields: Arc<[Arc<Field>]>,
+    fields: Vec<ProjectedField>,
 }
 
 impl<F> RunSource<F>
@@ -17,7 +20,7 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn new(cursor: RunCursor<F>, fields: Arc<[Arc<Field>]>) -> Self {
+    pub(crate) fn new(cursor: RunCursor<F>, fields: Vec<ProjectedField>) -> Self {
         Self { cursor, fields }
     }
 }
@@ -33,7 +36,10 @@ where
         // like TableSource's real-table case, since a temp table has no
         // ALTER TABLE, so there's only ever one schema version to decode
         // against.
-        Ok(self.cursor.next()?.map(|tuple| IndexKey::from_bytes(tuple.data())))
+        Ok(self
+            .cursor
+            .next()?
+            .map(|tuple| IndexKey::from_bytes(tuple.data())))
     }
 
     fn chain(&mut self, _depends: Option<Box<dyn Source>>) {
@@ -41,7 +47,7 @@ where
         // TableSource, never expects a real dependency to chain.
     }
 
-    fn fields(&self) -> Arc<[Arc<Field>]> {
+    fn fields(&self) -> Vec<ProjectedField> {
         self.fields.clone()
     }
 }

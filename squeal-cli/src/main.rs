@@ -16,6 +16,13 @@ enum Backend {
 }
 
 fn main() -> Result<()> {
+    // Held for main()'s entire body (RAII — see dhat's own docs): dropping
+    // this at the end of main is what actually flushes dhat-heap.json.
+    // Started before anything else runs so the very first allocation of
+    // the session is captured, not just whatever happens after this point.
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
+
     let db_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/Users/rajiv/dev/rust/squeal_db/test_data/squeal.db".to_string());
@@ -37,7 +44,7 @@ fn main() -> Result<()> {
         }
     };
 
-    match backend {
+    let result = match backend {
         Backend::File => {
             // File-backed connections share the process-wide singleton
             // (see ConnectionManager::<File>::get_manager) rather than a
@@ -56,6 +63,45 @@ fn main() -> Result<()> {
             let mgr: Arc<ConnectionManager<NamedMemFile>> = Arc::new(ConnectionManager::new());
             run_repl(rl, connect_or_create(&mgr, &db_path), &db_path)
         }
+    };
+    // Under dhat-heap, store::alloc (which these stats read) is compiled
+    // out entirely — GLOBAL is dhat::Alloc there, not TrackingAllocator
+    // (see store/src/lib.rs) — and there's nothing to print here anyway:
+    // dhat writes its own dhat-heap.json when _profiler drops, at the end
+    // of this function.
+    #[cfg(not(feature = "dhat-heap"))]
+    print_memory_stats();
+    result
+}
+
+// Dumps store::alloc's accumulated stats (see its own doc comment for
+// why the tracking allocator itself lives there, not here) — meant to
+// be read right after a batch of work (e.g. piping a whole import
+// script into the REPL's stdin, then exiting) rather than mid-session,
+// since these are process-lifetime totals/peaks, not scoped to any one
+// statement.
+#[cfg(not(feature = "dhat-heap"))]
+fn print_memory_stats() {
+    let stats = store::alloc::stats();
+    println!();
+    println!("=== allocator stats ===");
+    println!("total allocated: {} bytes", stats.total_allocated);
+    println!("peak usage:      {} bytes", stats.peak_usage);
+    println!("current usage:   {} bytes", stats.current_usage);
+    println!(
+        "reallocs:        {} ({} grew, {} shrank)",
+        stats.realloc_count, stats.realloc_grew, stats.realloc_shrank
+    );
+    let width = store::alloc::SIZE_PER_BUCKET;
+    let last = store::alloc::BUCKET_COUNT - 1;
+    println!("allocation size histogram (bucket width = {width} bytes):");
+    for (i, count) in stats.size_histogram.iter().enumerate() {
+        let label = if i == last {
+            format!("{}+", i * width)
+        } else {
+            format!("{}-{}", i * width, (i + 1) * width - 1)
+        };
+        println!("  {label:>8}: {count}");
     }
 }
 

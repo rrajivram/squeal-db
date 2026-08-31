@@ -16,6 +16,15 @@ parking_lot = {version="0.12.5", features=["send_guard","serde"]}
 crossbeam = "0.8.4"
 memmap = "0.7.0"
 mimalloc = "0.1.52"
+dhat = { version = "0.3", optional = true }
+
+[features]
+# Swaps the #[global_allocator] (see lib.rs) from our own byte-counting
+# TrackingAllocator to dhat's — call-site-attributed heap profiling
+# instead of just size totals/histogram, at the cost of TrackingAllocator's
+# stats() becoming unavailable (dhat writes its own dhat-heap.json instead;
+# see squeal-cli's own dhat-heap feature, which drives this one).
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
 criterion = "0.5"

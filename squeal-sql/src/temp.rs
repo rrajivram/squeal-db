@@ -65,6 +65,7 @@ pub(crate) fn fields_from_create_table(c: &CreateTable) -> Result<Vec<Arc<Field>
 // table was never meant to support ALTER TABLE, constraints, or being
 // looked up by anything other than a straight sequential scan.
 pub(crate) struct TempTable<F: DBFile + 'static> {
+    pub(crate) name: String,
     fields: Arc<[Arc<Field>]>,
     run: Run<F>,
 }
@@ -133,10 +134,11 @@ where
         }
         let run = db.create_run()?;
         tables.insert(
-            name,
+            name.clone(),
             Arc::new(RwLock::new(TempTable {
                 fields: fields.into(),
                 run,
+                name,
             })),
         );
         Ok(())

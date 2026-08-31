@@ -53,6 +53,7 @@ fn conn() -> Arc<Connection<MemFile>> {
     c
 }
 
+#[allow(dead_code)]
 fn schema() -> Arc<Schema<MemFile>> {
     conn().current_schema().unwrap()
 }

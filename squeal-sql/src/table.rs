@@ -12,7 +12,7 @@ use store::db::DBFile;
 use store::table::TableIdType;
 use store::valueitem::{IndexKey, ValueItem};
 
-use crate::constant::MAX_TABLE_NAME_LEN;
+use crate::constant::{DEFAULT_VAR_SIZE, MAX_TABLE_NAME_LEN};
 use crate::datatype::DataType;
 use crate::error::SchemaError;
 use crate::schema_ops::schema::Schema;
@@ -248,6 +248,18 @@ impl Field {
     pub(crate) fn with_id(mut self, id: u32) -> Self {
         self.id = id;
         self
+    }
+}
+
+impl From<String> for Field {
+    fn from(value: String) -> Self {
+        Self {
+            id: 0,
+            datatype: DataType::Str(DEFAULT_VAR_SIZE as u32),
+            default: None,
+            name: value,
+            nullable: true,
+        }
     }
 }
 

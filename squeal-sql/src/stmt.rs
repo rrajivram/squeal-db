@@ -5,7 +5,8 @@ use store::{db::DBFile, valueitem::ValueItem};
 use uuid::Uuid;
 
 use crate::{
-    conn::connection::Connection,
+    conn::connection::{Connection, TableRef},
+    constant::DEFAULT_VAR_SIZE,
     error::SchemaError,
     plan::logical::LogicalPlan,
     rslt::resultset::{ResultSet, ResultType},
@@ -306,7 +307,7 @@ where
                 }
                 sql_parser::Statement::Insert(insert) => validate_insert(insert)?,
                 sql_parser::Statement::Select(query) => {
-                    parse_select_star(query)?;
+                    //parse_select_star(query)?;
                 }
                 sql_parser::Statement::AlterTable(alter) => {
                     parse_alter_table(alter)?;
@@ -351,7 +352,9 @@ where
                     if let Some(temp_name) = temp::temp_table_name(&parts) {
                         let fields = temp::fields_from_create_table(c)?;
                         let db = self.conn.database.read().db.clone();
-                        self.conn.temp_tables().create(&db, temp_name.clone(), fields)?;
+                        self.conn
+                            .temp_tables()
+                            .create(&db, temp_name.clone(), fields)?;
                         self.results.push(Some(ResultType::ResultString(format!(
                             "Table 'temp.{temp_name}' created"
                         ))));
@@ -419,29 +422,34 @@ where
                     None => {}
                 },
                 sql_parser::Statement::Insert(insert) => {
-                    let parts: Vec<&str> = insert.table.idents().map(|i| i.value.as_str()).collect();
-                    if let Some(temp_name) = temp::temp_table_name(&parts) {
-                        let handle = self.conn.temp_tables().get(&temp_name).ok_or_else(|| {
-                            SchemaError::BadTableName(format!(
-                                "Table \"temp.{temp_name}\" does not exist"
-                            ))
-                        })?;
-                        let fields = handle.read().fields();
-                        let rows = crate::table::build_insert_rows(&temp_name, &fields, insert)?;
-                        let count = handle.write().insert_rows(rows)?;
-                        self.results.push(Some(ResultType::Count(count)));
-                    } else {
-                        let (schema, table_name) = resolve_table(&self.conn, &insert.table)?;
-                        let table = schema.get_table(&table_name).ok_or_else(|| {
-                            SchemaError::BadTableName(format!(
-                                "Table {table_name:?} does not exist"
-                            ))
-                        })?;
-                        let rows = table.rows_from_insert(insert)?;
-                        let count = self
-                            .conn
-                            .with_current_txn(|txn| schema.insert_rows(&table_name, rows, txn))?;
-                        self.results.push(Some(ResultType::Count(count)));
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&insert.table)?;
+                    reject_qualified_field("INSERT INTO", field)?;
+                    match table_ref {
+                        TableRef::Temp(temp_name, handle) => {
+                            let fields = handle.read().fields();
+                            let rows =
+                                crate::table::build_insert_rows(&temp_name, &fields, insert)?;
+                            let count = handle.write().insert_rows(rows)?;
+                            self.results.push(Some(ResultType::Count(count)));
+                        }
+                        TableRef::Real(schema, table) => {
+                            let rows = table.rows_from_insert(insert)?;
+                            let count = self.conn.with_current_txn(|txn| {
+                                schema.insert_rows(&table.name, rows, txn)
+                            })?;
+                            self.results.push(Some(ResultType::Count(count)));
+                        }
+                        // resolve_table_ref never actually produces this —
+                        // it only resolves names, and a derived table has
+                        // none — but TableRef is one enum shared with
+                        // plan::logical's own FROM-item resolution (see its
+                        // own doc comment), so every match on it has to stay
+                        // exhaustive.
+                        TableRef::Derived => {
+                            return Err(SchemaError::InternalSchemaError(
+                                "resolve_table_ref unexpectedly returned Derived".into(),
+                            ));
+                        }
                     }
                 }
                 sql_parser::Statement::StartTransaction(_) => {
@@ -482,18 +490,21 @@ where
                 }
                 sql_parser::Statement::AlterTable(alter) => {
                     let (table_name_obj, op) = parse_alter_table(alter)?;
-                    let (schema, table_name) = resolve_table(&self.conn, &table_name_obj)?;
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&table_name_obj)?;
+                    reject_qualified_field("ALTER TABLE", field)?;
+                    let (schema, table) = expect_real(table_ref, "ALTER TABLE")?;
+                    let table_name = &table.name;
                     match op {
-                        AlterColumnOp::Add(field) => schema.add_column(&table_name, field)?,
-                        AlterColumnOp::Drop(name) => schema.drop_column(&table_name, &name)?,
+                        AlterColumnOp::Add(field) => schema.add_column(table_name, field)?,
+                        AlterColumnOp::Drop(name) => schema.drop_column(table_name, &name)?,
                         AlterColumnOp::Rename(old, new) => {
-                            schema.rename_column(&table_name, &old, &new)?
+                            schema.rename_column(table_name, &old, &new)?
                         }
                         AlterColumnOp::AddForeignKey(fk) => {
-                            schema.add_foreign_key(&table_name, fk)?
+                            schema.add_foreign_key(table_name, fk)?
                         }
                         AlterColumnOp::DropForeignKey(name) => {
-                            schema.drop_foreign_key(&table_name, &name)?
+                            schema.drop_foreign_key(table_name, &name)?
                         }
                     }
                     self.results.push(Some(ResultType::ResultString(format!(
@@ -502,10 +513,49 @@ where
                 }
                 sql_parser::Statement::CopyInto(c) => {
                     let (table_name_obj, path) = parse_copy_into(c);
-                    let (schema, table_name) = resolve_table(&self.conn, &table_name_obj)?;
-                    let (loaded, failed) = schema.copy_csv_into(&table_name, &path)?;
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&table_name_obj)?;
+                    reject_qualified_field("COPY INTO", field)?;
+                    let (schema, table) = expect_real(table_ref, "COPY INTO")?;
+                    let (loaded, failed) = schema.copy_csv_into(&table.name, &path)?;
                     self.results.push(Some(ResultType::ResultString(format!(
                         "{loaded} row(s) loaded, {failed} row(s) failed"
+                    ))));
+                }
+                sql_parser::Statement::DescribeTable(d) => {
+                    let (table_ref, _) = self.conn.resolve_object_name_ref(&d.name)?;
+                    let fields = ["Column", "Type", "Nullable", "Default"];
+                    let fields_arc = match table_ref {
+                        TableRef::Real(_s, t) => t.fields_arc(),
+                        TableRef::Temp(_s, t) => t.read().fields(),
+                        _ => {
+                            return Err(SchemaError::UnknownError(
+                                "Can't describe derived table".into(),
+                            ));
+                        }
+                    };
+                    let rows = fields_arc
+                        .iter()
+                        .map(|f| {
+                            let default = f
+                                .default
+                                .as_ref()
+                                .map(|v| v.to_string())
+                                .unwrap_or("".into());
+                            let nullable = f.nullable.to_string();
+                            let t = f.datatype.to_string();
+                            let name = f.name.clone();
+                            let sz = DEFAULT_VAR_SIZE as u32;
+                            vec![
+                                ValueItem::Str((name, sz)),
+                                ValueItem::Str((t, sz)),
+                                ValueItem::Str((nullable, sz)),
+                                ValueItem::Str((default, sz)),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    self.results.push(Some(ResultType::Result(ResultSet::new(
+                        fields.iter().map(|s| s.to_string()).collect(),
+                        rows,
                     ))));
                 }
                 _ => {}
@@ -669,42 +719,56 @@ fn validate_insert(insert: &sql_parser::dml::Insert) -> Result<(), SchemaError> 
     Ok(())
 }
 
+// Connection::resolve_table_ref accepts a trailing field
+// (schema.table.field) since that shape is meaningful for a column
+// reference — but INSERT/ALTER TABLE/COPY INTO always name a plain
+// table, with no column position a trailing field could qualify. Called
+// right after resolve_table_ref by each of those, instead of leaving a
+// `.field`-qualified table target to fail confusingly deeper in
+// (e.g. as a bogus table name once the field got silently balled into
+// it, or an "unknown table" from a name it was never meant to be).
+fn reject_qualified_field(what: &str, field: Option<String>) -> Result<(), SchemaError> {
+    if let Some(field) = field {
+        return Err(SchemaError::UserError(format!(
+            "{what} does not accept a field-qualified table reference (.{field})"
+        )));
+    }
+    Ok(())
+}
+
+// ALTER TABLE and COPY INTO's own target can only ever be a real,
+// durable table — neither has anything to do against a temp table yet
+// (schema-level operations like add_column/copy_csv_into only exist on
+// Schema, not TempTable), and Derived can't actually happen here at all
+// (resolve_table_ref only ever resolves names; a derived table has
+// none) but still has to be matched since TableRef is one enum shared
+// with plan::logical's own FROM-item resolution (see its own doc
+// comment).
+fn expect_real<F>(
+    table_ref: TableRef<F>,
+    what: &str,
+) -> Result<(Arc<Schema<F>>, Arc<SqlTable>), SchemaError>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    match table_ref {
+        TableRef::Real(schema, table) => Ok((schema, table)),
+        TableRef::Temp(name, _) => Err(SchemaError::UserError(format!(
+            "{what} is not supported on temp tables (temp.{name})"
+        ))),
+        TableRef::Derived => Err(SchemaError::InternalSchemaError(format!(
+            "resolve_table_ref unexpectedly returned Derived for {what}"
+        ))),
+    }
+}
+
 // Deliberately strict launchpad for real relational algebra support:
 // accepts exactly "SELECT * FROM <table>" and rejects (with a specific
 // message, not silent ignoring) anything else — WITH/CTEs, ORDER BY,
 // LIMIT/OFFSET, set operations, explicit column lists, WHERE, DISTINCT,
 // HAVING, GROUP BY, joins/multiple FROM tables, and subqueries/aliases
 // in FROM.
-// Resolves a possibly schema-qualified table reference (`table` or
-// `schema.table`) to the Schema it lives in and its own (unqualified,
-// lowercased) name. The bare form resolves against `conn`'s current
-// schema, same as always; the qualified form looks up that schema by
-// name (via Connection::schema — not necessarily the current one, and
-// doesn't change it, unlike USE SCHEMA). More than two parts
-// (db.schema.table) isn't supported yet — nothing in this engine lets a
-// single statement reach across databases.
-fn resolve_table<F>(
-    conn: &Arc<Connection<F>>,
-    name: &sql_parser::ObjectName,
-) -> Result<(Arc<Schema<F>>, String), SchemaError>
-where
-    F: DBFile + 'static,
-    F: DBFile<Item = F>,
-{
-    let parts: Vec<&str> = name.idents().map(|i| i.value.as_str()).collect();
-    match parts.as_slice() {
-        [table] => Ok((
-            conn.current_schema().ok_or(SchemaError::NoSchemaSelected)?,
-            table.to_lowercase(),
-        )),
-        [schema, table] => Ok((conn.schema(schema)?, table.to_lowercase())),
-        _ => Err(SchemaError::UserError(format!(
-            "{:?} has too many parts — only <table> or <schema>.<table> is supported",
-            name.to_dotted()
-        ))),
-    }
-}
-
 fn parse_select_star(query: &sql_parser::Query) -> Result<sql_parser::ObjectName, SchemaError> {
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
@@ -864,7 +928,10 @@ mod dummy_tests {
     };
     use store::named_memfile::NamedMemFile;
 
-    use crate::conn::connection::{Connection, ConnectionManager};
+    use crate::{
+        conn::connection::{Connection, ConnectionManager},
+        error::SchemaError,
+    };
 
     struct V;
     impl Visitor for V {
@@ -979,19 +1046,28 @@ mod dummy_tests {
         conn
     }
 
-    fn exec_sql(conn: Arc<Connection<NamedMemFile>>, sql: &str) {
-        let mut stmt = conn.create_statement(sql).unwrap();
-        stmt.execute().unwrap();
-        let mut next = stmt.get_results().unwrap();
+    fn exec_sql_safe(conn: Arc<Connection<NamedMemFile>>, sql: &str) -> Result<(), SchemaError> {
+        let mut stmt = conn.create_statement(sql)?;
+        stmt.execute()?;
+        let mut next = stmt.get_results()?;
         while let Some(res) = next {
             println!("{:?}", res);
-            next = stmt.get_nextresult().unwrap();
+            next = stmt.get_nextresult()?;
+        }
+        Ok(())
+    }
+    fn exec_sql(conn: Arc<Connection<NamedMemFile>>, sql: &str) {
+        let r = exec_sql_safe(conn, sql);
+        if let Err(r) = r {
+            println!("Error: {:?}", r);
+        } else {
+            println!("Success!!");
         }
     }
 
     #[test]
     fn test1() {
-        exec("select * from a.b ");
+        exec("select t.a,t.b from t");
     }
 
     #[test]
@@ -1001,6 +1077,6 @@ mod dummy_tests {
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
         // COUNT(*) yet.
-        exec_sql(conn, "select * from t1");
+        exec_sql(conn, "select ids from t1");
     }
 }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub enum DataType {
     Datetime,
     Str(u32),
     Blob(u32),
+    Null,
     Unsupported,
 }
 
@@ -57,6 +58,7 @@ impl DataType {
             DataType::Datetime => ValueItem::Datetime(0).size(),
             DataType::Str(l) => ValueItem::Str(("".into(), *l)).size(),
             DataType::Blob(l) => ValueItem::Blob((Arc::new([0u8]), *l)).size(),
+            DataType::Null => 0,
             DataType::Unsupported => 0,
         }
     }
@@ -65,7 +67,9 @@ impl DataType {
 // The length argument out of a parenthesized `(n)` / `(n, m)` type suffix
 // (VARCHAR(n), CHAR(n), ...) — None for the bare, unparenthesized form.
 fn args1_len(args: &sql_parser::datatype::Args1) -> Option<u32> {
-    args.as_ref().and_then(|(_, n, _)| n.as_i64()).map(|n| n as u32)
+    args.as_ref()
+        .and_then(|(_, n, _)| n.as_i64())
+        .map(|n| n as u32)
 }
 
 impl From<sql_parser::datatype::DataType> for DataType {
@@ -95,12 +99,10 @@ impl From<sql_parser::datatype::DataType> for DataType {
             | SqlDataType::Timestamp(_)
             | SqlDataType::Date(_)
             | SqlDataType::Time(_) => DataType::Datetime,
-            SqlDataType::Text(_) | SqlDataType::String(_) => {
-                DataType::Str(DEFAULT_VAR_SIZE as u32)
-            }
-            SqlDataType::Varchar(_, args) | SqlDataType::Char(_, args) | SqlDataType::Character(_, args) => {
-                DataType::Str(args1_len(&args).unwrap_or(32))
-            }
+            SqlDataType::Text(_) | SqlDataType::String(_) => DataType::Str(DEFAULT_VAR_SIZE as u32),
+            SqlDataType::Varchar(_, args)
+            | SqlDataType::Char(_, args)
+            | SqlDataType::Character(_, args) => DataType::Str(args1_len(&args).unwrap_or(32)),
             SqlDataType::Bytea(_) | SqlDataType::Binary(_) => {
                 DataType::Blob(DEFAULT_VAR_SIZE as u32)
             }
@@ -111,5 +113,21 @@ impl From<sql_parser::datatype::DataType> for DataType {
                 DataType::Unsupported
             }
         }
+    }
+}
+
+impl Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DataType::Integer => "int".into(),
+            DataType::Double => "float".into(),
+            DataType::Datetime => "datetime".into(),
+            DataType::Str(n) => format!("varchar({n})"),
+            DataType::Blob(n) => format!("blob({n})"),
+            DataType::Null => "(null)".into(),
+            DataType::Unsupported => "*err*".into(),
+        };
+        write!(f, "{s}")?;
+        Ok(())
     }
 }

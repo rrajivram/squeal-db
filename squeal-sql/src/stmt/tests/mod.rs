@@ -311,11 +311,27 @@ fn test_execute_insert_and_select_support_schema_qualified_table_names() {
 
 #[test]
 fn test_execute_rejects_a_table_reference_with_too_many_parts() {
+    // Three parts (schema.table.field) is now a legal, meaningful shape
+    // (see Connection::resolve_table_ref) — this needs a genuinely
+    // too-long, four-part reference to still exercise the "too many
+    // parts" rejection.
     let c = conn();
     run(&c, "create table t (id integer)").unwrap();
-    let mut stmt = c.create_statement("select * from db.default.t").unwrap();
+    let mut stmt = c.create_statement("select * from a.b.default.t").unwrap();
     let err = stmt.execute().unwrap_err();
-    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_execute_select_rejects_a_field_qualified_table_reference() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    // Three parts resolves to schema="default", table="t", field="id" —
+    // valid for resolve_table_ref, but a FROM target can't carry a
+    // trailing field (see QueryVisitor::validate_table's own rejection).
+    let mut stmt = c.create_statement("select * from default.t.id").unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
 #[test]

@@ -248,7 +248,11 @@ fn test_index_backing_table_size_reflects_field_datatypes() {
     // larger than a bare Integer key's budget), rather than asserting an
     // exact byte count tied to ValueItem's own wire format.
     let conn = conn();
-    execute(&conn, "create table small (id integer not null, primary key(id))").unwrap();
+    execute(
+        &conn,
+        "create table small (id integer not null, primary key(id))",
+    )
+    .unwrap();
     execute(
         &conn,
         "create table big (email varchar(100) not null, primary key(email))",

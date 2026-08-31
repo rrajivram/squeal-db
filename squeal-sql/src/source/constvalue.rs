@@ -1,14 +1,18 @@
-use std::{fmt::Debug, slice, sync::Arc};
+use std::{fmt::Debug, slice};
 
 use store::valueitem::{IndexKey, ValueItem};
 
-use crate::{datatype::DataType, source::Source, table::Field};
+use crate::{
+    datatype::DataType,
+    source::{ProjectedField, Source},
+    table::Field,
+};
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ConstValue {
     pub name: String,
     item: IndexKey,
-    field: Field,
+    field: ProjectedField,
 }
 
 impl ConstValue {
@@ -17,13 +21,13 @@ impl ConstValue {
         Self {
             item: IndexKey::new_from(slice::from_ref(&item)).unwrap(),
             name: name.clone(),
-            field: Field {
+            field: ProjectedField::from(Field {
                 id: 0,
                 name,
                 datatype: DataType::of(&item).unwrap(), // ok to unwrap here as this is not expected to be null
                 nullable: false,
                 default: None,
-            },
+            }),
         }
     }
 }
@@ -34,8 +38,8 @@ impl Source for ConstValue {
         // expects a real dependency to chain.
     }
 
-    fn fields(&self) -> Arc<[Arc<Field>]> {
-        Arc::new([Arc::new(self.field.clone())])
+    fn fields(&self) -> Vec<ProjectedField> {
+        vec![self.field.clone()]
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {

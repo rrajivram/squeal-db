@@ -11,10 +11,18 @@ fn select_rows(c: &Arc<Connection<MemFile>>, table_name: &str) -> Vec<Vec<ValueI
 #[test]
 fn test_add_column_backfills_default_for_rows_written_before_it_existed() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     execute(&c, "insert into users values (1)").unwrap();
 
-    execute(&c, "alter table users add column plan varchar(10) default 'free'").unwrap();
+    execute(
+        &c,
+        "alter table users add column plan varchar(10) default 'free'",
+    )
+    .unwrap();
     execute(&c, "insert into users (id, plan) values (2, 'pro')").unwrap();
 
     let mut rows = select_rows(&c, "users");
@@ -35,7 +43,11 @@ fn test_add_column_backfills_default_for_rows_written_before_it_existed() {
 #[test]
 fn test_add_column_nullable_without_default_backfills_null_for_old_rows() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     execute(&c, "insert into users values (1)").unwrap();
 
     execute(&c, "alter table users add column nickname varchar(10)").unwrap();
@@ -47,7 +59,11 @@ fn test_add_column_nullable_without_default_backfills_null_for_old_rows() {
 #[test]
 fn test_add_column_not_null_without_default_is_rejected() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users add column plan varchar(10) not null").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -55,7 +71,11 @@ fn test_add_column_not_null_without_default_is_rejected() {
 #[test]
 fn test_add_column_rejects_a_duplicate_name() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users add column id integer").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -73,14 +93,25 @@ fn test_insert_omitting_a_column_added_by_alter_uses_its_default() {
     // read-time backfill of rows that predate it (see Field::default's
     // own doc comment).
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
-    execute(&c, "alter table users add column plan varchar(10) default 'free'").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
+    execute(
+        &c,
+        "alter table users add column plan varchar(10) default 'free'",
+    )
+    .unwrap();
     execute(&c, "insert into users (id) values (1)").unwrap();
 
     let rows = select_rows(&c, "users");
     assert_eq!(
         rows,
-        vec![vec![ValueItem::Integer(1), ValueItem::Str(("free".into(), 10))]]
+        vec![vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("free".into(), 10))
+        ]]
     );
 }
 
@@ -130,7 +161,11 @@ fn test_drop_column_rejects_a_column_used_by_an_index() {
 #[test]
 fn test_drop_column_rejects_the_primary_key_column() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users drop column id").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -138,7 +173,11 @@ fn test_drop_column_rejects_the_primary_key_column() {
 #[test]
 fn test_drop_column_rejects_an_unknown_column() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users drop column nope").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -188,7 +227,11 @@ fn test_rename_column_rejects_a_duplicate_name() {
 #[test]
 fn test_rename_column_rejects_a_column_used_by_an_index() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users rename column id to uid").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -196,7 +239,11 @@ fn test_rename_column_rejects_a_column_used_by_an_index() {
 #[test]
 fn test_rename_column_rejects_an_unknown_column() {
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     let err = execute(&c, "alter table users rename column nope to id2").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
@@ -207,10 +254,18 @@ fn test_multiple_alters_stack_versions_and_every_generation_still_decodes() {
     // v0 (just id), one at v1 (id, plan added), one at v2 (id, plan,
     // rank added) — reproject must bridge every one of them onto v2.
     let c = conn();
-    execute(&c, "create table users (id integer not null, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table users (id integer not null, primary key(id))",
+    )
+    .unwrap();
     execute(&c, "insert into users values (1)").unwrap();
 
-    execute(&c, "alter table users add column plan varchar(10) default 'free'").unwrap();
+    execute(
+        &c,
+        "alter table users add column plan varchar(10) default 'free'",
+    )
+    .unwrap();
     execute(&c, "insert into users values (2, 'pro')").unwrap();
 
     execute(&c, "alter table users add column rank integer default 0").unwrap();
@@ -257,8 +312,12 @@ fn test_alter_table_metadata_and_old_rows_survive_close_and_reopen() {
 
     let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
     let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
-    create_table_directly(&s, "create table users (id integer not null, primary key(id))");
-    s.insert_rows("users", vec![vec![ValueItem::Integer(1)]], None).unwrap();
+    create_table_directly(
+        &s,
+        "create table users (id integer not null, primary key(id))",
+    );
+    s.insert_rows("users", vec![vec![ValueItem::Integer(1)]], None)
+        .unwrap();
     s.add_column(
         "users",
         crate::table::Field::new(

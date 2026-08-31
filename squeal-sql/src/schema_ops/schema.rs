@@ -336,10 +336,10 @@ where
         })?;
 
         match txn {
-            Some(txn) => self.insert_rows_in_txn(&table, &rows, txn),
+            Some(txn) => self.insert_rows_in_txn(&table, rows, txn),
             None => {
                 let txn = self.db.begin()?;
-                match self.insert_rows_in_txn(&table, &rows, &txn) {
+                match self.insert_rows_in_txn(&table, rows, &txn) {
                     Ok(count) => {
                         self.db.commit(txn)?;
                         Ok(count)
@@ -353,23 +353,55 @@ where
         }
     }
 
+    // Takes `rows` by value, not `&[Vec<ValueItem>]`: each row's own
+    // Vec<ValueItem> is moved into its row-storage IndexKey at the end
+    // of the loop body (see IndexKey::new_from_owned's own doc comment
+    // for why that avoids cloning every field) — everything that still
+    // needs to read a row's values (FK checks, the row key, each
+    // index's own key extraction) runs first, while `row` is still just
+    // borrowed.
     fn insert_rows_in_txn(
         self: &Arc<Self>,
         table: &SqlTable,
-        rows: &[Vec<ValueItem>],
+        rows: Vec<Vec<ValueItem>>,
         txn: &Transaction,
     ) -> Result<usize, SchemaError> {
         let mut count = 0usize;
         for row in rows {
-            self.check_foreign_keys(table, row, txn)?;
-            let row_key = self.row_key(table, row)?;
+            self.check_foreign_keys(table, &row, txn)?;
+            let row_key = self.row_key(table, &row)?;
+
+            // What every index's entry points back to: the row's own
+            // key, itself encoded as an IndexKey — the PRIMARY KEY's own
+            // IndexKey when there is one (so an index lookup can go
+            // straight to DBIdType::Rec of it), or a single-value
+            // IndexKey wrapping the auto-generated id otherwise. Built
+            // (and every index entry inserted) before `row` is moved
+            // into row_data below — extract_field_values below still
+            // needs to borrow it.
+            let identity = match &row_key {
+                DBIdType::Rec(ik) => ik.clone(),
+                DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+            };
+            for index in &table.indices {
+                let values = table.extract_field_values(&index.fields, &row);
+                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+                self.db.insert(
+                    index.db_table_id,
+                    Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
+                    txn,
+                )?;
+            }
+
             // Stamped with the table's CURRENT version — every new
             // insert is always written in the table's latest shape;
             // only rows written before an ALTER TABLE carry an older
-            // version (see VersionedRow, SqlTable::reproject).
+            // version (see VersionedRow, SqlTable::reproject). Moves
+            // `row` (see new_from_owned) — must be the last thing that
+            // touches it.
             let row_data = VersionedRow {
                 version: table.version(),
-                values: IndexKey::new_from(row)?,
+                values: IndexKey::new_from_owned(row)?,
             };
             self.db.insert(
                 table.db_table_id,
@@ -381,25 +413,6 @@ where
                 ),
                 txn,
             )?;
-
-            // What every index's entry points back to: the row's own
-            // key, itself encoded as an IndexKey — the PRIMARY KEY's own
-            // IndexKey when there is one (so an index lookup can go
-            // straight to DBIdType::Rec of it), or a single-value
-            // IndexKey wrapping the auto-generated id otherwise.
-            let identity = match &row_key {
-                DBIdType::Rec(ik) => ik.clone(),
-                DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
-            };
-            for index in &table.indices {
-                let values = table.extract_field_values(&index.fields, row);
-                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-                self.db.insert(
-                    index.db_table_id,
-                    Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
-                    txn,
-                )?;
-            }
             count += 1;
         }
         Ok(count)
@@ -468,6 +481,7 @@ where
     // not-yet-committed inserts, same as a real DB's read-your-own-writes;
     // None scans under a fresh transaction and so only ever sees committed
     // state, same as every other autocommit statement.
+    #[allow(unused)]
     pub(crate) fn select_all(
         self: &Arc<Self>,
         table_name: &str,
@@ -769,8 +783,8 @@ fn csv_field_to_value_item(
             .map(ValueItem::Datetime)
             .ok_or_else(|| SchemaError::UserError(format!("invalid datetime: {cell:?}"))),
         DataType::Str(cap) => Ok(ValueItem::Str((cell.to_string(), cap))),
-        DataType::Blob(_) | DataType::Unsupported => Err(SchemaError::UserError(format!(
-            "CSV loading into a {datatype:?} column is not supported yet"
-        ))),
+        DataType::Blob(_) | DataType::Unsupported | DataType::Null => Err(SchemaError::UserError(
+            format!("CSV loading into a {datatype:?} column is not supported yet"),
+        )),
     }
 }

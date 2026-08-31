@@ -5,9 +5,17 @@ use store::valueitem::IndexKey;
 use crate::{error::SchemaError, table::Field};
 
 pub mod constvalue;
+pub(crate) mod join;
 pub mod proj;
 pub(crate) mod run;
 pub mod table;
+
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub struct ProjectedField {
+    pub(crate) field: Arc<Field>,
+    pub(crate) display_name: String,
+}
 
 pub trait Source: Debug {
     // Takes ownership of `depends`, not a shared reference: a streaming
@@ -19,5 +27,5 @@ pub trait Source: Debug {
     // upstream, e.g. a table scan) just ignores `depends`/expects None.
     fn chain(&mut self, depends: Option<Box<dyn Source>>);
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
-    fn fields(&self) -> Arc<[Arc<Field>]>;
+    fn fields(&self) -> Vec<ProjectedField>;
 }

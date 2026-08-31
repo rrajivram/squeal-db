@@ -163,7 +163,8 @@ impl Visit for Statement {
             | Statement::Commit(_)
             | Statement::Rollback(_)
             | Statement::ShowTables(_)
-            | Statement::ShowSchemas(_) => {}
+            | Statement::ShowSchemas(_)
+            | Statement::DescribeTable(_) => {}
         }
         v.post_visit_statement(self)
     }

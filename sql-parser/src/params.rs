@@ -99,7 +99,8 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
         | Statement::Commit(_)
         | Statement::Rollback(_)
         | Statement::ShowTables(_)
-        | Statement::ShowSchemas(_) => {}
+        | Statement::ShowSchemas(_)
+        | Statement::DescribeTable(_) => {}
     }
 }
 

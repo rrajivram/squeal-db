@@ -1,9 +1,8 @@
-#![allow(dead_code)]
-
 pub mod conn;
 pub(crate) mod constant;
 pub mod datatype;
 pub(crate) mod datetime;
+pub(crate) mod ds;
 pub mod error;
 pub mod plan;
 pub mod rslt;

@@ -23,6 +23,7 @@ use crate::{
 // Database creates/loads shares this same `db`, so store-level table
 // names have to be schema-qualified (see Schema::qualify) to avoid two
 // schemas' same-named tables colliding in the shared, flat namespace.
+#[allow(unused)]
 pub struct Database<F: DBFile> {
     name: String,
     pub(crate) db: Arc<Db<F>>,
@@ -170,6 +171,7 @@ where
         Ok(schema)
     }
 
+    #[allow(unused)]
     pub(crate) fn schema_exists(self: &Arc<Self>, name: &str) -> bool {
         self.get_schema(name).is_ok()
     }

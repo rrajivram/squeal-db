@@ -11,6 +11,14 @@ pub enum SchemaError {
     KeyNotFound(DBIdType),
     #[error("Duplicate key : {0}")]
     DuplicateKey(DBIdType),
+    // Covers both "malformed name" and "no table by that name" — a
+    // second variant (TableNameNotFound) used to exist for the latter,
+    // introduced only in plan/logical.rs's own table resolution while
+    // every other resolution site (Schema::get_table, stmt.rs's INSERT/
+    // ALTER TABLE/COPY INTO) already used this one; removed once table
+    // resolution was unified (see Connection::resolve_table_ref) so
+    // there's one answer instead of two call sites disagreeing on which
+    // to use for the same situation.
     #[error("Invalid table name: {0}")]
     BadTableName(String),
     #[error("User error: {0}")]
@@ -25,6 +33,8 @@ pub enum SchemaError {
     SchemaInUseError(String),
     #[error("Schema not found : {0}")]
     SchemaNotFound(String),
+    #[error("Field not found : {0}")]
+    FieldNotFound(String),
     #[error("No schema selected on this connection")]
     NoSchemaSelected,
     #[error("A transaction is already active on this connection")]
@@ -37,6 +47,8 @@ pub enum SchemaError {
     BadPreparedStatement(String),
     #[error("Internal Error {0}")]
     InternalSchemaError(String),
+    #[error("Ambiguous field in query {0}")]
+    AmbiguousFieldError(String),
     // A blocking operator (hash join build side, sort, GROUP BY hash
     // table, ...) tried to buffer more than this query's own memory
     // budget allows — see plan::memory::QueryMemory. Distinct from
