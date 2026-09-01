@@ -17,6 +17,7 @@ use crate::{
 pub struct TableSource<F: DBFile> {
     cursor: TableCursor<F>,
     table: Arc<SqlTable>,
+    fields: Arc<[ProjectedField]>,
 }
 
 impl<F> TableSource<F>
@@ -33,7 +34,17 @@ where
             Some(txn) => db.table_scan_in_txn(table.db_table_id, txn)?,
             None => db.table_scan(table.db_table_id)?,
         };
-        Ok(Self { cursor, table })
+        let fields = table
+            .fields()
+            .iter()
+            .map(|f| ProjectedField::from(f.clone()))
+            .collect::<Vec<_>>();
+        let fields = Arc::from(fields);
+        Ok(Self {
+            cursor,
+            table,
+            fields,
+        })
     }
 }
 
@@ -51,17 +62,8 @@ where
         }
     }
 
-    fn chain(&mut self, _depends: Option<Box<dyn Source>>) {
-        // A table scan is always a leaf (nothing to pull from) — never
-        // expects a real dependency to chain.
-    }
-
-    fn fields(&self) -> Vec<ProjectedField> {
-        self.table
-            .fields_arc()
-            .iter()
-            .map(|f| ProjectedField::from(f.clone()))
-            .collect::<Vec<_>>()
+    fn fields(&self) -> Arc<[ProjectedField]> {
+        self.fields.clone()
     }
 }
 

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::source::{ProjectedField, Source};
 
 #[derive(Debug)]
@@ -6,9 +8,7 @@ pub(crate) struct UnionJoin {
 }
 
 impl Source for UnionJoin {
-    fn chain(&mut self, _depends: Option<Box<dyn Source>>) {}
-
-    fn fields(&self) -> Vec<ProjectedField> {
+    fn fields(&self) -> Arc<[ProjectedField]> {
         todo!()
     }
 

@@ -727,7 +727,7 @@ fn validate_insert(insert: &sql_parser::dml::Insert) -> Result<(), SchemaError> 
 // `.field`-qualified table target to fail confusingly deeper in
 // (e.g. as a bogus table name once the field got silently balled into
 // it, or an "unknown table" from a name it was never meant to be).
-fn reject_qualified_field(what: &str, field: Option<String>) -> Result<(), SchemaError> {
+pub(crate) fn reject_qualified_field(what: &str, field: Option<String>) -> Result<(), SchemaError> {
     if let Some(field) = field {
         return Err(SchemaError::UserError(format!(
             "{what} does not accept a field-qualified table reference (.{field})"
@@ -931,6 +931,7 @@ mod dummy_tests {
     use crate::{
         conn::connection::{Connection, ConnectionManager},
         error::SchemaError,
+        rslt::resultset::ResultType,
     };
 
     struct V;
@@ -1051,11 +1052,35 @@ mod dummy_tests {
         stmt.execute()?;
         let mut next = stmt.get_results()?;
         while let Some(res) = next {
-            println!("{:?}", res);
+            match res {
+                ResultType::Count(n) => println!("{n} rows affected"),
+                ResultType::ResultString(s) => println!("Output : {s}"),
+                ResultType::Result(r) => {
+                    print_row(r.columns());
+                    for r in r.rows_as_strings() {
+                        print_row(&r);
+                    }
+                }
+                ResultType::StreamingResult(r) => {
+                    let mut r = r;
+                    print_row(&r.columns());
+                    while let Some(row) = &r.next_result_as_strings().unwrap() {
+                        print_row(row);
+                    }
+                }
+            }
             next = stmt.get_nextresult()?;
         }
         Ok(())
     }
+
+    fn print_row(row: &[String]) {
+        for r in row {
+            print!("{r}|")
+        }
+        println!()
+    }
+
     fn exec_sql(conn: Arc<Connection<NamedMemFile>>, sql: &str) {
         let r = exec_sql_safe(conn, sql);
         if let Err(r) = r {
@@ -1074,9 +1099,11 @@ mod dummy_tests {
     fn test2() {
         let conn = get_conn();
         exec_sql(conn.clone(), "create table t1 (id int, name varchar(10))");
+        exec_sql(conn.clone(), "insert into t1 values(1,'raj')");
+        exec_sql(conn.clone(), "insert into t1 values(2,'kav')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
         // COUNT(*) yet.
-        exec_sql(conn, "select ids from t1");
+        exec_sql(conn, "select *,* from t1");
     }
 }

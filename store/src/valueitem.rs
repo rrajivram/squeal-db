@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, fmt::Display, hash::Hash, sync::Arc};
+use std::{cmp::Ordering, fmt::Display, hash::Hash, ops::Index, sync::Arc};
 
 use log::error;
 use serde::{Deserialize, Serialize};
@@ -109,6 +109,13 @@ impl IndexKey {
             [ValueItem::Str((s, _))] => Some(s.clone()),
             _ => None,
         }
+    }
+}
+
+impl Index<usize> for IndexKey {
+    type Output = ValueItem;
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.data[index]
     }
 }
 

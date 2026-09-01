@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, sync::Arc};
 
 use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
 
@@ -12,7 +12,7 @@ use crate::{
 // upstream of a bare table/temp-table scan to chain from.
 pub(crate) struct RunSource<F: DBFile + 'static> {
     cursor: RunCursor<F>,
-    fields: Vec<ProjectedField>,
+    fields: Arc<[ProjectedField]>,
 }
 
 impl<F> RunSource<F>
@@ -20,8 +20,11 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn new(cursor: RunCursor<F>, fields: Vec<ProjectedField>) -> Self {
-        Self { cursor, fields }
+    pub(crate) fn new(cursor: RunCursor<F>, fields: &[ProjectedField]) -> Self {
+        Self {
+            cursor,
+            fields: Arc::from(fields),
+        }
     }
 }
 
@@ -42,12 +45,7 @@ where
             .map(|tuple| IndexKey::from_bytes(tuple.data())))
     }
 
-    fn chain(&mut self, _depends: Option<Box<dyn Source>>) {
-        // A run scan is always a leaf (nothing to pull from) — same as
-        // TableSource, never expects a real dependency to chain.
-    }
-
-    fn fields(&self) -> Vec<ProjectedField> {
+    fn fields(&self) -> Arc<[ProjectedField]> {
         self.fields.clone()
     }
 }

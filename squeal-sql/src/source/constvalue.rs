@@ -1,4 +1,4 @@
-use std::{fmt::Debug, slice};
+use std::{fmt::Debug, slice, sync::Arc};
 
 use store::valueitem::{IndexKey, ValueItem};
 
@@ -33,13 +33,8 @@ impl ConstValue {
 }
 
 impl Source for ConstValue {
-    fn chain(&mut self, _depends: Option<Box<dyn Source>>) {
-        // A ConstValue is always a leaf (nothing to pull from) — never
-        // expects a real dependency to chain.
-    }
-
-    fn fields(&self) -> Vec<ProjectedField> {
-        vec![self.field.clone()]
+    fn fields(&self) -> Arc<[ProjectedField]> {
+        Arc::from([self.field.clone()])
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {

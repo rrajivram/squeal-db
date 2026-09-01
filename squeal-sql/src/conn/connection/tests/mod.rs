@@ -237,10 +237,15 @@ fn test_resolve_table_ref_three_parts_is_schema_table_field() {
 // resolve_table_ref now looks the table itself up (not just its
 // schema), so a test exercising TableRef::Real needs one to actually
 // exist — creates it in whatever schema `conn` currently has selected.
+// Carries a `col` column (not just `id`) since
+// test_resolve_table_ref_three_parts_is_schema_table_field resolves a
+// trailing `.col` field, and resolve_object_name_ref now checks a
+// resolved field actually exists on the table rather than accepting any
+// name.
 fn create_real_table(conn: &Arc<crate::conn::connection::Connection<MemFile>>, name: &str) {
     let mut stmt = conn
         .clone()
-        .create_statement(&format!("create table {name} (id integer)"))
+        .create_statement(&format!("create table {name} (id integer, col integer)"))
         .unwrap();
     stmt.execute().unwrap();
 }

@@ -1,8 +1,8 @@
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
 use parking_lot::RwLock;
 use sql_parser::{
-    Expr, ObjectName, Query,
+    Expr, Query,
     query::{Alias, FromClause, SelectItem, TableFactor},
     token::Comma,
     utils::Seq,
@@ -17,7 +17,7 @@ use crate::{
     error::SchemaError,
     plan::memory::QueryMemory,
     rslt::resultset::StreamingResultSet,
-    source::{ProjectedField, Source, proj::WildcardProj, run::RunSource, table::TableSource},
+    source::{ProjectedField, Source, proj::Projection, run::RunSource, table::TableSource},
     table::{Field, SqlTable},
     temp::TempTable,
 };
@@ -31,7 +31,6 @@ pub(crate) struct LogicalPlan<F: DBFile> {
     // through every step behind it down to the original leaf source.
     // None until the first add_step call.
     tail: Option<Box<dyn Source>>,
-    conn: Arc<Connection<F>>,
     // This query's own memory budget — separate from PageBuffer (a
     // shared, whole-database page cache every query reads through, not
     // something to partition per query). Handed out via `memory()` so a
@@ -41,6 +40,7 @@ pub(crate) struct LogicalPlan<F: DBFile> {
     // a caller already builds a step (e.g. TableSource::new) with
     // whatever else it needs before handing it off.
     mem: Arc<QueryMemory>,
+    _phanton: PhantomData<F>,
 }
 
 // Common interface between the two concrete shapes a resolved
@@ -126,7 +126,7 @@ where
         let cursor = guard.cursor()?;
         Ok(Box::new(RunSource::new(
             cursor,
-            guard
+            &guard
                 .fields()
                 .iter()
                 .map(|f| ProjectedField::from(f.clone()))
@@ -143,6 +143,7 @@ where
 // planning a subquery is real, unbuilt work, not a one-line stub, so
 // this stays a todo!() until that exists rather than pretending an
 // empty/placeholder answer would be meaningful.
+#[allow(unused)]
 impl<F> TableRef<F>
 where
     F: DBFile + 'static,
@@ -165,12 +166,14 @@ where
     }
 }
 
+#[allow(unused)]
 #[derive(Debug, Clone)]
 enum Frame<T> {
     Empty,
     Some(T),
 }
 
+#[allow(unused)]
 struct TableQuery<F: DBFile + 'static> {
     schema: String,
     table: String,
@@ -239,64 +242,21 @@ where
         if let Err(e) = proj {
             return std::ops::ControlFlow::Break(e);
         }
-        let proj = proj.unwrap();
+        let projected_fields = proj.unwrap().into_iter().flatten().collect::<Vec<_>>();
+        let mut sources = vec![];
         for table in tables.into_iter() {
             match table.resolved.open_source(&self.conn) {
                 Ok(source) => {
-                    self.steps.push(source);
+                    //    self.steps.push(source);
+                    sources.push(source);
                 }
                 Err(e) => return std::ops::ControlFlow::Break(e),
             }
         }
-        let proj = Box::new(WildcardProj::new(&proj));
-        self.steps.push(proj);
+        self.steps
+            .push(Box::new(Projection::new(sources, projected_fields)));
 
         std::ops::ControlFlow::Continue(())
-
-        /*         let _distinct = select
-                   .distinct
-                   .map(|_d| Some(true))
-                   .or(Some(Some(false)))
-                   .flatten()
-                   .unwrap();
-               /*         let proj = select.projection.head;
-                      match proj {
-                          sql_parser::query::SelectItem::QualifiedWildcard(object_name, period, asterisk) => todo!(),
-                          sql_parser::query::SelectItem::Wildcard(asterisk) => todo!(),
-                          sql_parser::query::SelectItem::Expr { expr, alias } => todo!(),
-                      }
-               */
-               let Some(Frame::Some(table)) = self.tables.pop() else {
-                   return std::ops::ControlFlow::Break(SchemaError::UnknownError(
-                       "No table found".into(),
-                   ));
-               };
-               let source: Result<Box<dyn Source>, SchemaError> = match table.resolved {
-                   ResolvedTable::Real(t) => self
-                       .conn
-                       .with_current_txn::<Result<Box<dyn Source>, SchemaError>>(|txn| {
-                           let ts = TableSource::new(self.conn.database.read().db.clone(), t, txn)?;
-                           Ok(Box::new(ts))
-                       }),
-                   // No transaction/visibility involvement at all, unlike the
-                   // real-table case above — a Run isn't MVCC-shared state (see
-                   // RunCursor's own doc comment), so there's nothing here that
-                   // needs `with_current_txn`.
-                   ResolvedTable::Temp(t) => {
-                       let guard = t.read();
-                       guard.cursor().map(|cursor| {
-                           Box::new(RunSource::new(cursor, guard.fields())) as Box<dyn Source>
-                       })
-                   }
-               };
-               match source {
-                   Ok(source) => {
-                       self.steps.push(source);
-                       std::ops::ControlFlow::Continue(())
-                   }
-                   Err(e) => std::ops::ControlFlow::Break(e),
-               }
-        */
     }
 }
 
@@ -335,9 +295,14 @@ where
             SelectItem::Expr { expr, alias } => Ok(vec![self.handle_expr(expr, alias, tables)?]),
             SelectItem::Wildcard(_) => {
                 let mut v = vec![];
-                for t in tables {
-                    for f in t.fields.iter() {
-                        v.push(ProjectedField::from(f.clone()));
+                for (sid, t) in tables.iter().enumerate() {
+                    for (fid, f) in t.fields.iter().enumerate() {
+                        v.push(ProjectedField::new_with_field(
+                            f.name.clone(),
+                            f.clone(),
+                            sid,
+                            fid,
+                        ));
                     }
                 }
                 Ok(v)
@@ -350,8 +315,13 @@ where
                         ob[0].eq_ignore_ascii_case(&n.alias) || ob[0].eq_ignore_ascii_case(&n.table)
                     })
                 {
-                    for f in tables[pos].fields.iter() {
-                        v.push(ProjectedField::from(f.clone()));
+                    for (fid, f) in tables[pos].fields.iter().enumerate() {
+                        v.push(ProjectedField::new_with_field(
+                            f.name.clone(),
+                            f.clone(),
+                            pos,
+                            fid,
+                        ));
                     }
                     return Ok(v);
                 }
@@ -366,44 +336,96 @@ where
         alias: &Option<Alias>,
         tables: &[TableQuery<F>],
     ) -> Result<ProjectedField, SchemaError> {
-        let dummy = "(None)".to_string();
-        let res = match expr {
+        let (name, field, source_id, field_id) = match expr {
             Expr::Column(c) => {
                 let idents = c.idents().collect::<Vec<_>>();
                 if idents.len() > 1 {
-                    let (_t, f) = self.conn.resolve_object_name_ref(c)?;
-                    if f.is_none() {
-                        return Err(SchemaError::FieldNotFound("(None)".into()));
+                    // A qualified column (`a.id`) is qualified by a FROM-item
+                    // alias/name already in scope, not by a schema — unlike a
+                    // table reference, so this can't go through
+                    // Connection::resolve_object_name_ref (which only knows
+                    // schema.table[.field] shapes and would treat `a` as a
+                    // schema name, failing with SchemaNotFound). Only a
+                    // single qualifier is supported for now (`alias.field`),
+                    // matching what SelectItem::QualifiedWildcard's own
+                    // `ob.len() == 1` case above supports.
+                    let field = idents.last().unwrap().value.clone();
+                    let qualifier = &idents[..idents.len() - 1];
+                    if qualifier.len() != 1 {
+                        return Err(SchemaError::UserError(format!(
+                            "{:?} has too many parts",
+                            c.to_dotted()
+                        )));
                     }
-                    f.unwrap()
+                    let table_name = &qualifier[0].value;
+                    let table_id = tables.iter().position(|t| {
+                        table_name.eq_ignore_ascii_case(&t.alias)
+                            || table_name.eq_ignore_ascii_case(&t.table)
+                    });
+                    let Some(table_id) = table_id else {
+                        return Err(SchemaError::BadTableName(table_name.clone()));
+                    };
+                    let table = &tables[table_id];
+                    let field_id = table
+                        .fields
+                        .iter()
+                        .position(|f| f.name.eq_ignore_ascii_case(&field));
+                    let Some(field_id) = field_id else {
+                        return Err(SchemaError::FieldNotFound(field));
+                    };
+                    (
+                        table.fields[field_id].name.clone(),
+                        table.fields[field_id].clone(),
+                        table_id,
+                        field_id,
+                    )
                 } else {
                     let field = idents[0].value.clone();
-                    self.validate_field(&field, tables)?;
-                    field
+                    self.validate_field(&field, tables)?
                 }
             }
-            Expr::Literal(_) => dummy.clone(),
-            _ => dummy.clone(),
+            Expr::Literal(_f) => panic!("Unknown literal"),
+            _ => panic!("Unknown"),
         };
-        if let Some(alias) = alias {
-            return Ok(ProjectedField::from(alias.name.value.clone()));
-        }
-        Ok(ProjectedField::from(res))
+        let display_name = if let Some(alias) = alias {
+            alias.name.value.clone()
+        } else {
+            name
+        };
+        Ok(ProjectedField::new_with_field(
+            display_name,
+            field,
+            source_id,
+            field_id,
+        ))
     }
 
-    fn validate_field(&self, field: &str, tables: &[TableQuery<F>]) -> Result<(), SchemaError> {
+    fn validate_field(
+        &self,
+        field: &str,
+        tables: &[TableQuery<F>],
+    ) -> Result<(String, Arc<Field>, usize, usize), SchemaError> {
         let mut found = false;
-        for t in tables {
-            let f = t.fields.iter().any(|f| f.name.eq_ignore_ascii_case(field));
-            if f && found {
+        let mut fid = 0;
+        let mut tid = 0;
+        for (sid, t) in tables.iter().enumerate() {
+            let f = t
+                .fields
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(field));
+            if f.is_some() && found {
                 return Err(SchemaError::AmbiguousFieldError(field.into()));
             }
-            found = f;
+            found = f.is_some();
+            if let Some(fd) = f {
+                fid = fd;
+                tid = sid;
+            }
         }
         if !found {
             return Err(SchemaError::FieldNotFound(field.into()));
         }
-        Ok(())
+        Ok((field.to_string(), tables[tid].fields[fid].clone(), tid, fid))
     }
 
     fn get_tables(&self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {
@@ -415,7 +437,8 @@ where
         let items = from.tables.items();
         for qtable in items {
             let tq = if let TableFactor::Table { name, alias } = &qtable.relation {
-                let (table, _) = self.conn.resolve_object_name_ref(name)?;
+                let (table, field) = self.conn.resolve_object_name_ref(name)?;
+                crate::stmt::reject_qualified_field("a FROM target", field)?;
                 if let TableRef::Real(schema, sqltable) = &table {
                     TableQuery {
                         alias: alias
@@ -450,6 +473,7 @@ where
     }
 }
 
+#[allow(unused)]
 impl<F> LogicalPlan<F>
 where
     F: DBFile + 'static,
@@ -462,8 +486,8 @@ where
     pub(crate) fn with_memory_limit(conn: Arc<Connection<F>>, limit: usize) -> Self {
         Self {
             tail: None,
-            conn,
             mem: QueryMemory::new(limit),
+            _phanton: PhantomData,
         }
     }
 
@@ -473,12 +497,14 @@ where
             return Err(e);
         }
         let mut this = Self {
-            conn,
             tail: None,
             mem: QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT),
+            _phanton: PhantomData,
         };
+        assert!(visitor.steps.len() == 1);
         for step in visitor.steps.into_iter().rev() {
-            this.add_step(step);
+            //this.add_step(step);
+            this.tail = Some(step)
         }
         Ok(this)
     }
@@ -495,23 +521,6 @@ where
         self.mem.clone()
     }
 
-    // Takes an already-owned Box<dyn Source> rather than being generic
-    // over S: Source — a caller building a concrete step (e.g.
-    // TableSource::new) boxes it at the call site (Box::new(step)); this
-    // way there's exactly one owned-Source type (Box<dyn Source>) used
-    // throughout LogicalPlan/QueryVisitor, instead of a generic one here
-    // and a trait-object one for `tail`/`steps` that can't convert into
-    // each other without a blanket `impl Source for Box<dyn Source>`
-    // this crate doesn't have.
-    pub(crate) fn add_step(&mut self, mut step: Box<dyn Source>) {
-        // Takes the *previous* tail (not the first-ever step) as this
-        // step's dependency — that's what makes this a chain (1 depends
-        // on nothing, 2 depends on 1, 3 depends on 2, ...) instead of
-        // every step fanning out from the same original source.
-        step.chain(self.tail.take());
-        self.tail = Some(step);
-    }
-
     pub(crate) fn execute(&mut self) -> Result<StreamingResultSet, SchemaError> {
         let tail = self
             .tail
@@ -519,14 +528,4 @@ where
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
         Ok(StreamingResultSet::new(tail))
     }
-}
-
-pub(crate) fn extract_object_name(obj_name: &ObjectName) -> Vec<String> {
-    let mut res = vec![obj_name.parts.head.value.clone()];
-    if obj_name.parts.len() > 1 {
-        for (_p, n) in &obj_name.parts.tail {
-            res.push(n.value.clone())
-        }
-    }
-    res
 }

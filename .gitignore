@@ -8,3 +8,4 @@ history.txt
 squeal-cli/squeal.db
 squeal-cli/squeal.db.redo
 squeal-cli/squeal.db.undo
+dhat-heap.json

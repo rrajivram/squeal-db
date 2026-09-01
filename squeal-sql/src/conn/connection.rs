@@ -313,7 +313,7 @@ where
         };
         let table = schema
             .get_table(&table_name)
-            .ok_or(SchemaError::BadTableName(table_name))?;
+            .ok_or(SchemaError::BadTableName(table_name.to_string()))?;
         if let Some(field) = &field
             && !table.has_field(field)
         {
