@@ -29,10 +29,7 @@ fn test_create_table_maps_datatypes() {
         ("name varchar(50)", "name", DataType::Str(50)),
         ("bio text", "bio", DataType::Str(32)),
         ("price double", "price", DataType::Double),
-        // sqlparser::ast::DataType::Boolean has no ValueItem counterpart
-        // yet, so it silently falls through to Unsupported instead of
-        // erroring — documents current behavior, not desired behavior.
-        ("active boolean", "active", DataType::Unsupported),
+        ("active boolean", "active", DataType::Boolean),
     ];
     for (col_sql, col_name, expected) in cases {
         let t = create_and_fetch(&format!("create table t ({col_sql})"), "t");

@@ -37,7 +37,8 @@ where
         let fields = table
             .fields()
             .iter()
-            .map(|f| ProjectedField::from(f.clone()))
+            .enumerate()
+            .map(|(i, f)| ProjectedField::from_field(f.clone(), 0, i))
             .collect::<Vec<_>>();
         let fields = Arc::from(fields);
         Ok(Self {

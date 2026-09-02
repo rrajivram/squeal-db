@@ -76,6 +76,7 @@ fn value_item_to_string(v: &ValueItem) -> String {
         ValueItem::Datetime(d) => d.to_string(),
         ValueItem::Str((s, _)) => s.clone(),
         ValueItem::Blob((b, _)) => format!("<blob, {} bytes>", b.len()),
+        ValueItem::Boolean(b) => b.to_string(),
     }
 }
 

@@ -15,9 +15,11 @@ use crate::{
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     ds::stack::Stack,
     error::SchemaError,
-    plan::memory::QueryMemory,
+    plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
-    source::{ProjectedField, Source, proj::Projection, run::RunSource, table::TableSource},
+    source::{
+        ProjectedField, Source, limit::Limit, proj::Projection, run::RunSource, table::TableSource,
+    },
     table::{Field, SqlTable},
     temp::TempTable,
 };
@@ -129,7 +131,8 @@ where
             &guard
                 .fields()
                 .iter()
-                .map(|f| ProjectedField::from(f.clone()))
+                .enumerate()
+                .map(|(i, f)| ProjectedField::from_field(f.clone(), 0, i))
                 .collect::<Vec<_>>(),
         )))
     }
@@ -174,17 +177,17 @@ enum Frame<T> {
 }
 
 #[allow(unused)]
-struct TableQuery<F: DBFile + 'static> {
-    schema: String,
-    table: String,
-    alias: String,
-    fields: Arc<[Arc<Field>]>,
+pub(crate) struct TableQuery<F: DBFile + 'static> {
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) alias: String,
+    pub(crate) fields: Arc<[Arc<Field>]>,
     // Resolved once, by resolve_table_ref (which does the schema/table-
     // name lookup itself) — carried alongside the name so
     // post_visit_select doesn't have to re-resolve or re-look-up
     // anything, nor treat "we already validated this" and "so of course
     // this lookup will succeed" as two separate, unwrap-worthy facts.
-    resolved: TableRef<F>,
+    pub(crate) resolved: TableRef<F>,
 }
 
 struct QueryVisitor<F: DBFile> {
@@ -253,8 +256,27 @@ where
                 Err(e) => return std::ops::ControlFlow::Break(e),
             }
         }
+
         self.steps
             .push(Box::new(Projection::new(sources, projected_fields)));
+
+        std::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        if let Some(limit) = &query.limit
+            && let Some(limit) = limit.count_i64()
+        {
+            if limit < 0 {
+                return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(limit));
+            } else {
+                if let Some(last_source) = self.steps.pop() {
+                    self.steps
+                        .push(Box::new(Limit::new(last_source, limit as usize)));
+                    return std::ops::ControlFlow::Continue(());
+                }
+            }
+        }
 
         std::ops::ControlFlow::Continue(())
     }
@@ -302,6 +324,7 @@ where
                             f.clone(),
                             sid,
                             fid,
+                            EvalExpr::Value(sid, fid),
                         ));
                     }
                 }
@@ -321,6 +344,7 @@ where
                             f.clone(),
                             pos,
                             fid,
+                            EvalExpr::Value(pos, fid),
                         ));
                     }
                     return Ok(v);
@@ -336,96 +360,8 @@ where
         alias: &Option<Alias>,
         tables: &[TableQuery<F>],
     ) -> Result<ProjectedField, SchemaError> {
-        let (name, field, source_id, field_id) = match expr {
-            Expr::Column(c) => {
-                let idents = c.idents().collect::<Vec<_>>();
-                if idents.len() > 1 {
-                    // A qualified column (`a.id`) is qualified by a FROM-item
-                    // alias/name already in scope, not by a schema — unlike a
-                    // table reference, so this can't go through
-                    // Connection::resolve_object_name_ref (which only knows
-                    // schema.table[.field] shapes and would treat `a` as a
-                    // schema name, failing with SchemaNotFound). Only a
-                    // single qualifier is supported for now (`alias.field`),
-                    // matching what SelectItem::QualifiedWildcard's own
-                    // `ob.len() == 1` case above supports.
-                    let field = idents.last().unwrap().value.clone();
-                    let qualifier = &idents[..idents.len() - 1];
-                    if qualifier.len() != 1 {
-                        return Err(SchemaError::UserError(format!(
-                            "{:?} has too many parts",
-                            c.to_dotted()
-                        )));
-                    }
-                    let table_name = &qualifier[0].value;
-                    let table_id = tables.iter().position(|t| {
-                        table_name.eq_ignore_ascii_case(&t.alias)
-                            || table_name.eq_ignore_ascii_case(&t.table)
-                    });
-                    let Some(table_id) = table_id else {
-                        return Err(SchemaError::BadTableName(table_name.clone()));
-                    };
-                    let table = &tables[table_id];
-                    let field_id = table
-                        .fields
-                        .iter()
-                        .position(|f| f.name.eq_ignore_ascii_case(&field));
-                    let Some(field_id) = field_id else {
-                        return Err(SchemaError::FieldNotFound(field));
-                    };
-                    (
-                        table.fields[field_id].name.clone(),
-                        table.fields[field_id].clone(),
-                        table_id,
-                        field_id,
-                    )
-                } else {
-                    let field = idents[0].value.clone();
-                    self.validate_field(&field, tables)?
-                }
-            }
-            Expr::Literal(_f) => panic!("Unknown literal"),
-            _ => panic!("Unknown"),
-        };
-        let display_name = if let Some(alias) = alias {
-            alias.name.value.clone()
-        } else {
-            name
-        };
-        Ok(ProjectedField::new_with_field(
-            display_name,
-            field,
-            source_id,
-            field_id,
-        ))
-    }
-
-    fn validate_field(
-        &self,
-        field: &str,
-        tables: &[TableQuery<F>],
-    ) -> Result<(String, Arc<Field>, usize, usize), SchemaError> {
-        let mut found = false;
-        let mut fid = 0;
-        let mut tid = 0;
-        for (sid, t) in tables.iter().enumerate() {
-            let f = t
-                .fields
-                .iter()
-                .position(|f| f.name.eq_ignore_ascii_case(field));
-            if f.is_some() && found {
-                return Err(SchemaError::AmbiguousFieldError(field.into()));
-            }
-            found = f.is_some();
-            if let Some(fd) = f {
-                fid = fd;
-                tid = sid;
-            }
-        }
-        if !found {
-            return Err(SchemaError::FieldNotFound(field.into()));
-        }
-        Ok((field.to_string(), tables[tid].fields[fid].clone(), tid, fid))
+        let field = EvalExpr::from_expr(expr, alias, tables)?;
+        Ok(*field)
     }
 
     fn get_tables(&self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {

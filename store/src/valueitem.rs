@@ -18,6 +18,7 @@ pub enum ValueItem {
     Datetime(u64) = 15,
     Str((String, u32)) = 20,
     Blob((Arc<[u8]>, u32)) = 25,
+    Boolean(bool) = 30,
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, Hash)]
@@ -181,6 +182,7 @@ impl ValueItem {
                     Ok(())
                 }
             }
+            ValueItem::Boolean(_) => Ok(()),
             ValueItem::Null => Ok(()),
         }
     }
@@ -192,6 +194,7 @@ impl ValueItem {
             ValueItem::Datetime(_) => size_of::<u64>(),
             ValueItem::Str(s) => s.1 as usize + size_of::<u32>() * 2,
             ValueItem::Blob(b) => b.1 as usize + size_of::<u32>() * 2,
+            ValueItem::Boolean(_) => size_of::<u8>(),
             ValueItem::Null => 0,
         };
         sz + 1
@@ -204,6 +207,7 @@ impl ValueItem {
             ValueItem::Datetime(_) => size_of::<u64>(),
             ValueItem::Str(_) => size_of::<u32>() * 2,
             ValueItem::Blob(_) => size_of::<u32>() * 2,
+            ValueItem::Boolean(_) => size_of::<u8>(),
             ValueItem::Null => 0,
         };
         sz + 1
@@ -218,6 +222,7 @@ impl ValueItem {
             ValueItem::Datetime(_) => 15,
             ValueItem::Str(_) => 20,
             ValueItem::Blob(_) => 25,
+            ValueItem::Boolean(_) => 30,
         };
         bytes.push(value);
         match self {
@@ -240,6 +245,7 @@ impl ValueItem {
                     bytes.extend_from_slice(&vec![0u8; b.1 as usize - b.0.len()]);
                 }
             }
+            ValueItem::Boolean(b) => bytes.push(*b as u8),
             ValueItem::Null => {}
         }
         bytes
@@ -253,6 +259,7 @@ impl ValueItem {
             ValueItem::Datetime(d) => *d,
             ValueItem::Str((s, _l)) => db_hash(s.as_bytes()),
             ValueItem::Blob((b, _)) => db_hash(b),
+            ValueItem::Boolean(b) => *b as u64,
         }
     }
 
@@ -314,6 +321,11 @@ impl ValueItem {
                 index += real_len.max(len as usize);
                 ValueItem::Blob((arc, len))
             }
+            30 => {
+                let v = bytes[index] != 0;
+                index += size_of::<u8>();
+                ValueItem::Boolean(v)
+            }
             i => {
                 error!("Unknown value item : {i}");
                 ValueItem::Null
@@ -340,6 +352,7 @@ impl Hash for ValueItem {
             ValueItem::Datetime(d) => d.hash(state),
             ValueItem::Integer(i) => i.hash(state),
             ValueItem::Str(s) => s.hash(state),
+            ValueItem::Boolean(b) => b.hash(state),
             ValueItem::Null => {}
         }
     }
@@ -353,6 +366,7 @@ impl Display for ValueItem {
             ValueItem::Datetime(dt) => write!(f, "{}", dt),
             ValueItem::Str(s) => write!(f, "{}", s.0),
             ValueItem::Blob(_) => write!(f, "(blob)"),
+            ValueItem::Boolean(b) => write!(f, "{}", b),
             ValueItem::Null => write!(f, "(null)"),
         }
     }
@@ -368,6 +382,7 @@ impl PartialOrd for ValueItem {
             (ValueItem::Double(a), ValueItem::Double(b)) => a.partial_cmp(b),
             (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.partial_cmp(b),
             (ValueItem::Str(a), ValueItem::Str(b)) => a.0.partial_cmp(&b.0),
+            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a.partial_cmp(b),
             (ValueItem::Blob(_), _) => panic!("Blobs cannot be compared."),
 
             (_, ValueItem::Null) => Some(std::cmp::Ordering::Greater),
@@ -375,6 +390,7 @@ impl PartialOrd for ValueItem {
             (ValueItem::Double(_), _) => panic!("Invalid comparison. F "),
             (ValueItem::Datetime(_), _) => panic!("Invalid comparison. D"),
             (ValueItem::Str(_), _) => panic!("Invalid comparison. S"),
+            (ValueItem::Boolean(_), _) => panic!("Invalid comparison. B"),
 
             (ValueItem::Null, _) => Some(std::cmp::Ordering::Less),
         }
@@ -441,6 +457,26 @@ mod valueitem_tests {
 
         assert!(ValueItem::Datetime(100) < ValueItem::Datetime(200));
         assert!(ValueItem::Datetime(0) == ValueItem::Datetime(0));
+    }
+
+    #[test]
+    fn test_cmp_boolean() {
+        assert!(ValueItem::Boolean(false) < ValueItem::Boolean(true));
+        assert!(ValueItem::Boolean(true) == ValueItem::Boolean(true));
+        assert!(ValueItem::Null < ValueItem::Boolean(false));
+        assert!(ValueItem::Boolean(true) > ValueItem::Null);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid comparison. B")]
+    fn test_partial_ord_boolean_vs_integer_panics() {
+        let _ = ValueItem::Boolean(true).partial_cmp(&ValueItem::Integer(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid comparison. I")]
+    fn test_partial_ord_integer_vs_boolean_panics() {
+        let _ = ValueItem::Integer(1).partial_cmp(&ValueItem::Boolean(true));
     }
 
     // The u32 alongside the String/blob data is a reserved on-disk capacity
@@ -546,6 +582,12 @@ mod valueitem_tests {
         assert_eq!(ValueItem::Integer(42).size(), 1 + size_of::<u64>());
         assert_eq!(ValueItem::Double(1.0).size(), 1 + size_of::<f64>());
         assert_eq!(ValueItem::Datetime(1).size(), 1 + size_of::<u64>());
+        assert_eq!(ValueItem::Boolean(true).size(), 1 + size_of::<u8>());
+        assert_eq!(
+            ValueItem::Boolean(true).size(),
+            ValueItem::Boolean(true).size_of_empty(),
+            "fixed-width variants have no empty/full distinction"
+        );
         assert_eq!(
             ValueItem::Integer(42).size(),
             ValueItem::Integer(42).size_of_empty(),
@@ -604,6 +646,10 @@ mod valueitem_tests {
         let nvalue = ValueItem::Null;
         let nbytes = nvalue.to_bytes();
         assert_eq!(nvalue, ValueItem::from_bytes_single(&nbytes));
+        for bvalue in [ValueItem::Boolean(true), ValueItem::Boolean(false)] {
+            let bbytes = bvalue.to_bytes();
+            assert_eq!(bvalue, ValueItem::from_bytes_single(&bbytes));
+        }
 
         let junk = vec![b'A'; 10];
         assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk));
@@ -742,6 +788,8 @@ mod valueitem_tests {
             ValueItem::Datetime(123),
             ValueItem::Str(("hello".into(), 10)),
             ValueItem::Blob((Arc::from(&b"hello"[..]), 10)),
+            ValueItem::Boolean(true),
+            ValueItem::Boolean(false),
         ] {
             assert_eq!(
                 v.hash(),
@@ -766,6 +814,8 @@ mod valueitem_tests {
         assert_eq!(format!("{}", ValueItem::Double(1.5)), "1.5");
         assert_eq!(format!("{}", ValueItem::Datetime(100)), "100");
         assert_eq!(format!("{}", ValueItem::Str(("hi".into(), 10))), "hi");
+        assert_eq!(format!("{}", ValueItem::Boolean(true)), "true");
+        assert_eq!(format!("{}", ValueItem::Boolean(false)), "false");
         assert_eq!(format!("{}", ValueItem::Null), "(null)");
         assert_eq!(
             format!("{}", ValueItem::Blob((Arc::from(&b"x"[..]), 1))),
@@ -781,6 +831,7 @@ mod valueitem_tests {
         assert_eq!(ValueItem::Datetime(0).discriminant(), 15);
         assert_eq!(ValueItem::Str(("".into(), 0)).discriminant(), 20);
         assert_eq!(ValueItem::Blob((Arc::from(&[][..]), 0)).discriminant(), 25);
+        assert_eq!(ValueItem::Boolean(true).discriminant(), 30);
     }
 
     #[test]

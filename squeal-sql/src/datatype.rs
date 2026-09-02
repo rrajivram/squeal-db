@@ -19,6 +19,11 @@ pub enum DataType {
     Blob(u32),
     Null,
     Unsupported,
+    // Appended last, not inserted among the existing variants — this enum
+    // derives Serialize/Deserialize and serde's derive keys variants by
+    // declaration index, so inserting here would silently rotate every
+    // already-serialized DataType (persisted inside Field, see table.rs).
+    Boolean,
 }
 
 impl DataType {
@@ -33,6 +38,7 @@ impl DataType {
             ValueItem::Datetime(_) => Some(DataType::Datetime),
             ValueItem::Str((_, cap)) => Some(DataType::Str(*cap)),
             ValueItem::Blob((_, cap)) => Some(DataType::Blob(*cap)),
+            ValueItem::Boolean(_) => Some(DataType::Boolean),
         }
     }
 
@@ -47,6 +53,7 @@ impl DataType {
             (DataType::Datetime, ValueItem::Datetime(_)) => true,
             (DataType::Str(cap), ValueItem::Str((_, vcap))) => vcap <= cap,
             (DataType::Blob(cap), ValueItem::Blob((_, vcap))) => vcap <= cap,
+            (DataType::Boolean, ValueItem::Boolean(_)) => true,
             _ => false,
         }
     }
@@ -58,6 +65,7 @@ impl DataType {
             DataType::Datetime => ValueItem::Datetime(0).size(),
             DataType::Str(l) => ValueItem::Str(("".into(), *l)).size(),
             DataType::Blob(l) => ValueItem::Blob((Arc::new([0u8]), *l)).size(),
+            DataType::Boolean => ValueItem::Boolean(false).size(),
             DataType::Null => 0,
             DataType::Unsupported => 0,
         }
@@ -106,9 +114,8 @@ impl From<sql_parser::datatype::DataType> for DataType {
             SqlDataType::Bytea(_) | SqlDataType::Binary(_) => {
                 DataType::Blob(DEFAULT_VAR_SIZE as u32)
             }
-            other @ (SqlDataType::Decimal(_, _)
-            | SqlDataType::Numeric(_, _)
-            | SqlDataType::Boolean(_)) => {
+            SqlDataType::Boolean(_) => DataType::Boolean,
+            other @ (SqlDataType::Decimal(_, _) | SqlDataType::Numeric(_, _)) => {
                 warn!("unsupported datatype: {:?}", other);
                 DataType::Unsupported
             }
@@ -124,6 +131,7 @@ impl Display for DataType {
             DataType::Datetime => "datetime".into(),
             DataType::Str(n) => format!("varchar({n})"),
             DataType::Blob(n) => format!("blob({n})"),
+            DataType::Boolean => "boolean".into(),
             DataType::Null => "(null)".into(),
             DataType::Unsupported => "*err*".into(),
         };

@@ -263,6 +263,12 @@ impl From<String> for Field {
     }
 }
 
+impl From<&str> for Field {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_string())
+    }
+}
+
 impl TableBuilder {
     pub(crate) fn new() -> Self {
         Self {
@@ -1155,6 +1161,7 @@ fn expr_to_value_item(
                 SchemaError::UserError(format!("invalid datetime literal: {:?}", s.value))
             }),
         (Literal::String(s), DataType::Str(cap)) => Ok(ValueItem::Str((s.value.clone(), cap))),
+        (Literal::Boolean(b), DataType::Boolean) => Ok(ValueItem::Boolean(b.value())),
         _ => Err(SchemaError::UserError(format!(
             "value {literal:?} does not match column type {datatype:?}"
         ))),

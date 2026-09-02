@@ -260,6 +260,11 @@ fn value_item_to_expr(v: &ValueItem) -> Result<sql_parser::Expr, SchemaError> {
                 "binding a Blob value into a prepared statement is not supported yet".into(),
             ));
         }
+        ValueItem::Boolean(b) => Literal::Boolean(sql_parser::literal::BooleanLiteral(if *b {
+            Either::Left(sql_parser::keyword::True::new(dummy_span))
+        } else {
+            Either::Right(sql_parser::keyword::False::new(dummy_span))
+        })),
     };
     Ok(Expr::Literal(literal))
 }
@@ -1092,18 +1097,23 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select t.a,t.b from t");
+        exec("select t.a,t.b from t limit 10");
     }
 
     #[test]
     fn test2() {
         let conn = get_conn();
-        exec_sql(conn.clone(), "create table t1 (id int, name varchar(10))");
-        exec_sql(conn.clone(), "insert into t1 values(1,'raj')");
-        exec_sql(conn.clone(), "insert into t1 values(2,'kav')");
+        exec_sql(
+            conn.clone(),
+            "create table t1 (id int,id1 int, name varchar(10))",
+        );
+        exec_sql(conn.clone(), "insert into t1 values(1,1,'raj')");
+        exec_sql(conn.clone(), "insert into t1 values(2,2,'kav')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
         // COUNT(*) yet.
-        exec_sql(conn, "select *,* from t1");
+        exec_sql(conn.clone(), "select name from t1 limit 5");
+        exec_sql(conn.clone(), "select 1+2 from t1 ");
+        exec_sql(conn.clone(), "select id+id1 from t1 ");
     }
 }

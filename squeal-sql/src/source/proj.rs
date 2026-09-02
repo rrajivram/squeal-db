@@ -4,7 +4,8 @@ use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{
     error::SchemaError,
-    source::{self, ProjectedField, Source},
+    plan::eval::EvalExpr,
+    source::{ProjectedField, Source},
     table::Field,
 };
 
@@ -41,70 +42,37 @@ impl Source for Projection {
                 "One of sources did not yield results.".into(),
             ));
         }
+        let res = res.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>();
         let mut out = vec![];
-        for f in &self.fields {
-            out.push(
-                res[f.source_id]
-                    .as_ref()
-                    .map_or(ValueItem::Null, |r| r[f.field_id].clone()),
-            )
+        for (i, f) in self.fields.iter().enumerate() {
+            out.push(f.expr.eval(&res, i)?);
         }
         Ok(Some(IndexKey::new_from_owned(out)?))
     }
 }
 
-impl From<String> for ProjectedField {
-    fn from(value: String) -> Self {
-        Self {
-            field: Arc::new(Field::from(value.clone())),
-            display_name: value,
-            source_id: 0,
-            field_id: 0,
-        }
-    }
-}
-
-impl From<Arc<Field>> for ProjectedField {
-    fn from(value: Arc<Field>) -> Self {
-        Self {
-            field: value.clone(),
-            display_name: value.name.clone(),
-            source_id: 0,
-            field_id: 0,
-        }
-    }
-}
-
-impl From<Field> for ProjectedField {
-    fn from(value: Field) -> Self {
-        Self {
-            display_name: value.name.clone(),
-            field: Arc::new(value),
-            source_id: 0,
-            field_id: 0,
-        }
-    }
-}
-
 impl ProjectedField {
-    pub(crate) fn new(name: String, source_id: usize, field_id: usize) -> Self {
-        Self {
-            display_name: name.clone(),
-            field: Arc::new(Field::from(name)),
-            source_id,
-            field_id,
-        }
-    }
-
     pub(crate) fn new_with_field(
         display_name: String,
         field: Arc<Field>,
         source_id: usize,
         field_id: usize,
+        expr: EvalExpr,
     ) -> Self {
         Self {
             display_name,
             field,
+            expr,
+            source_id,
+            field_id,
+        }
+    }
+
+    pub(crate) fn from_field(field: Arc<Field>, source_id: usize, field_id: usize) -> Self {
+        Self {
+            display_name: field.name.clone(),
+            field: field.clone(),
+            expr: EvalExpr::Value(source_id, field_id),
             source_id,
             field_id,
         }

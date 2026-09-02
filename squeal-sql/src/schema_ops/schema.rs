@@ -783,6 +783,10 @@ fn csv_field_to_value_item(
             .map(ValueItem::Datetime)
             .ok_or_else(|| SchemaError::UserError(format!("invalid datetime: {cell:?}"))),
         DataType::Str(cap) => Ok(ValueItem::Str((cell.to_string(), cap))),
+        DataType::Boolean => cell
+            .parse()
+            .map(ValueItem::Boolean)
+            .map_err(|_| SchemaError::UserError(format!("invalid boolean: {cell:?}"))),
         DataType::Blob(_) | DataType::Unsupported | DataType::Null => Err(SchemaError::UserError(
             format!("CSV loading into a {datatype:?} column is not supported yet"),
         )),

@@ -49,6 +49,10 @@ pub enum SchemaError {
     InternalSchemaError(String),
     #[error("Ambiguous field in query {0}")]
     AmbiguousFieldError(String),
+    #[error("Invalid limit value {0}")]
+    InvalidLimitValue(i64),
+    #[error("Invalid operation {0} on {1}")]
+    InvalidOperationOnOperand(String, String),
     // A blocking operator (hash join build side, sort, GROUP BY hash
     // table, ...) tried to buffer more than this query's own memory
     // budget allows — see plan::memory::QueryMemory. Distinct from
