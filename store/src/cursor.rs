@@ -13,6 +13,11 @@ use crate::{
 pub trait Cursor {
     type Item;
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError>;
+    // Rewinds back to this cursor's own starting position — same
+    // transaction/snapshot, same (start, end) range where applicable —
+    // so a caller (a nested-loop join's inner side, say) can re-scan
+    // from the top without re-opening a fresh cursor or transaction.
+    fn reset(&mut self) -> Result<(), StoreError>;
 }
 
 // A scan needs a reader TransactionId for find_visible_to, but who keeps
@@ -229,6 +234,19 @@ where
             }
         }
     }
+
+    // Same lookup `new()` did to find the leaf holding `start` — keeps
+    // the existing transaction (so a reset scan still reads a consistent
+    // snapshot rather than picking up concurrent writes) and start/end,
+    // which are already stored as fields rather than only consumed once
+    // at construction time.
+    fn reset(&mut self) -> Result<(), StoreError> {
+        let current_leaf = self.db.table_by_id(self.table)?.find_leaf_page(&self.start)?;
+        self.current_iter = current_leaf.iter();
+        self.current_leaf = current_leaf;
+        self.done = false;
+        Ok(())
+    }
 }
 
 impl<F: DBFile> Cursor for TableCursor<F>
@@ -261,6 +279,21 @@ where
                 None => return Ok(None),
             }
         }
+    }
+
+    // Same lookup `new()` did to find the table's first data page — keeps
+    // the existing transaction, so a reset scan still reads a consistent
+    // snapshot rather than picking up concurrent writes made between the
+    // original scan and this reset.
+    fn reset(&mut self) -> Result<(), StoreError> {
+        let current_page = self
+            .db
+            .table_by_id(self.table)?
+            .next_data_page(None)?
+            .ok_or(StoreError::UnknownError("No data page found".into()))?;
+        self.current_iter = current_page.iter();
+        self.current_page = current_page;
+        Ok(())
     }
 }
 
@@ -615,6 +648,61 @@ mod tests {
             found,
             vec![1, 3],
             "scan must skip the tombstoned key (2) and the uncommitted key (4)"
+        );
+    }
+
+    #[test]
+    fn test_table_cursor_reset_rescans_from_the_start() {
+        let db = Db::<MemFile>::create("cursor_reset_table.db").unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+
+        let t = db.begin().unwrap();
+        for i in 1u64..=10 {
+            db.insert(tid, Tuple::new(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+        }
+        db.commit(t).unwrap();
+
+        let mut cursor = db.table_scan(tid).unwrap();
+        let first_pass = std::iter::from_fn(|| cursor.next().unwrap()).count();
+        assert_eq!(first_pass, 10, "sanity: exhausted the cursor once");
+        assert!(
+            cursor.next().unwrap().is_none(),
+            "sanity: cursor is actually exhausted before reset"
+        );
+
+        cursor.reset().unwrap();
+        let second_pass = std::iter::from_fn(|| cursor.next().unwrap()).count();
+        assert_eq!(
+            second_pass, 10,
+            "reset must let the same cursor re-scan every row again"
+        );
+    }
+
+    #[test]
+    fn test_range_cursor_reset_rescans_the_same_range() {
+        let db = Db::<MemFile>::create("cursor_reset_range.db").unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+
+        let t = db.begin().unwrap();
+        for i in 1u64..=10 {
+            db.insert(tid, Tuple::new(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+        }
+        db.commit(t).unwrap();
+
+        let mut cursor = db
+            .range_scan(tid, DBIdType::Int(3), DBIdType::Int(7))
+            .unwrap();
+        let first_pass = int_ids(&std::iter::from_fn(|| cursor.next().unwrap()).collect::<Vec<_>>());
+        assert_eq!(first_pass, vec![3, 4, 5, 6], "sanity: first pass");
+
+        cursor.reset().unwrap();
+        let second_pass =
+            int_ids(&std::iter::from_fn(|| cursor.next().unwrap()).collect::<Vec<_>>());
+        assert_eq!(
+            second_pass, first_pass,
+            "reset must let the same cursor re-scan the identical (start, end) range"
         );
     }
 }

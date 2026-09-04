@@ -1,69 +1,102 @@
-use std::sync::Arc;
-
 use sql_parser::{
     Expr,
-    expr::{BinaryOp, UnaryOp},
-    query::Alias,
+    expr::{BinaryOp, FunctionArg, UnaryOp},
 };
 use store::{
     db::DBFile,
     valueitem::{IndexKey, ValueItem},
 };
 
-use crate::{error::SchemaError, plan::logical::TableQuery, source::ProjectedField, table::Field};
+use crate::{
+    error::SchemaError,
+    plan::{
+        funcs::{FuncArgs, FuncObj},
+        logical::TableQuery,
+    },
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CrateValueItem(ValueItem);
 
+pub(crate) struct ExprWrapper<'a, F: DBFile + 'static> {
+    pub(crate) expr: &'a Expr,
+    pub(crate) tables: &'a [TableQuery<F>],
+}
+
 #[derive(Debug, Clone)]
 pub enum EvalExpr {
     Literal(ValueItem),
-    Value(usize, usize),
+    // A flat offset into UnionJoin's single combined row (see its own
+    // extend_from_slice loop) — not a (table_id, field_id) pair. Every
+    // source's fields get concatenated in FROM-clause order into one
+    // IndexKey, so `data` handed to eval() below is always length 1
+    // regardless of how many tables are in play; resolving a column
+    // reference to its absolute position has to happen once, at build
+    // time in from_expr/validate_field (where each table's own field
+    // count is still known), not here.
+    Value(usize),
     Unary {
         op: UnaryOp,
-        field: Box<ProjectedField>,
+        field: Box<EvalExpr>,
     },
     Binary {
-        lhs: Box<ProjectedField>,
+        lhs: Box<EvalExpr>,
         op: BinaryOp,
-        rhs: Box<ProjectedField>,
+        rhs: Box<EvalExpr>,
     },
+    Function(FuncObj),
 }
 
 impl EvalExpr {
+    pub(crate) fn has_aggregate(&self) -> bool {
+        match self {
+            Self::Unary { field, .. } => field.has_aggregate(),
+            Self::Binary { lhs, rhs, .. } => lhs.has_aggregate() || rhs.has_aggregate(),
+            Self::Function(f) => f.is_aggregate(),
+            _ => false,
+        }
+    }
     pub(crate) fn eval(&self, data: &[IndexKey], _index: usize) -> Result<ValueItem, SchemaError> {
         let v = match self {
             Self::Literal(v) => v,
-            Self::Value(s, f) => &data[*s][*f],
+            Self::Value(pos) => &data[0][*pos],
             Self::Unary { op, field } => {
-                let v = field.expr.eval(data, _index)?;
+                let v = field.eval(data, _index)?;
                 &CrateValueItem::unary(&v, op)?
             }
             Self::Binary { lhs, op, rhs } => {
-                let lhs = lhs.expr.eval(data, _index)?;
-                let rhs = rhs.expr.eval(data, _index)?;
+                let lhs = lhs.eval(data, _index)?;
+                let rhs = rhs.eval(data, _index)?;
                 &CrateValueItem::binary(&lhs, &rhs, op)?
             }
+            // Not implemented yet — function evaluation (COUNT, ...) is
+            // its own separate, unfinished feature.
+            Self::Function { .. } => todo!(),
         };
         Ok(v.clone())
     }
 
+    // Builds just the evaluation tree for `expr` — no display name, no
+    // Field/source_id/field_id bookkeeping. Those only mean something for
+    // a top-level SELECT-list item (see plan::logical::QueryVisitor::
+    // handle_expr, the one place that wraps a returned EvalExpr in a
+    // ProjectedField), not for every nested sub-expression a Unary/Binary
+    // node carries — a `1` inside `a+1` has no name of its own to display.
     pub(crate) fn from_expr<F: DBFile + 'static>(
         expr: &Expr,
-        alias: &Option<Alias>,
         tables: &[TableQuery<F>],
-    ) -> Result<Box<ProjectedField>, SchemaError> {
-        let (name, field, source_id, field_id, expr) = match expr {
-            Expr::Unary { op, expr } => create_vals(Self::Unary {
+    ) -> Result<Box<EvalExpr>, SchemaError> {
+        let eval_expr = match expr {
+            Expr::Unary { op, expr } => Self::Unary {
                 op: *op,
-                field: Self::from_expr(expr, alias, tables)?,
-            }),
-            Expr::Binary { left, op, right } => create_vals(Self::Binary {
-                lhs: Self::from_expr(left, alias, tables)?,
+                field: Self::from_expr(expr, tables)?,
+            },
+            Expr::Binary { left, op, right } => Self::Binary {
+                lhs: Self::from_expr(left, tables)?,
                 op: *op,
-                rhs: Self::from_expr(right, alias, tables)?,
-            }),
-            Expr::Literal(l) => create_vals(match l {
+                rhs: Self::from_expr(right, tables)?,
+            },
+            Expr::Literal(l) => match l {
                 sql_parser::literal::Literal::Boolean(b) => {
                     Self::Literal(ValueItem::Boolean(b.value()))
                 }
@@ -79,7 +112,7 @@ impl EvalExpr {
                         Self::Literal(ValueItem::Integer(i))
                     }
                 },
-            }),
+            },
             Expr::Column(c) => {
                 let idents = c.idents().collect::<Vec<_>>();
                 if idents.len() > 1 {
@@ -116,39 +149,25 @@ impl EvalExpr {
                     let Some(field_id) = field_id else {
                         return Err(SchemaError::FieldNotFound(field));
                     };
-                    (
-                        table.fields[field_id].name.clone(),
-                        table.fields[field_id].clone(),
-                        table_id,
-                        field_id,
-                        EvalExpr::Value(table_id, field_id),
-                    )
+                    Self::Value(Self::flat_position(tables, table_id, field_id))
                 } else {
                     let field = idents[0].value.clone();
                     Self::validate_field(&field, tables)?
                 }
             }
+            Expr::Function { .. } => {
+                Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
+            }
 
             _ => panic!("Oops here {:?}", expr),
         };
-        let display_name = if let Some(alias) = alias {
-            alias.name.value.clone()
-        } else {
-            name
-        };
-        Ok(Box::new(ProjectedField::new_with_field(
-            display_name,
-            field,
-            source_id,
-            field_id,
-            expr,
-        )))
+        Ok(Box::new(eval_expr))
     }
 
     fn validate_field<F: DBFile + 'static>(
         field: &str,
         tables: &[TableQuery<F>],
-    ) -> Result<(String, Arc<Field>, usize, usize, EvalExpr), SchemaError> {
+    ) -> Result<EvalExpr, SchemaError> {
         let mut found = false;
         let mut fid = 0;
         let mut tid = 0;
@@ -169,24 +188,25 @@ impl EvalExpr {
         if !found {
             return Err(SchemaError::FieldNotFound(field.into()));
         }
-        Ok((
-            field.to_string(),
-            tables[tid].fields[fid].clone(),
-            tid,
-            fid,
-            EvalExpr::Value(tid, fid),
-        ))
+        Ok(EvalExpr::Value(Self::flat_position(tables, tid, fid)))
     }
-}
 
-fn create_vals(expr: EvalExpr) -> (String, Arc<Field>, usize, usize, EvalExpr) {
-    (
-        "none".into(),
-        Arc::new(Field::from("none".to_string())),
-        0,
-        0,
-        expr,
-    )
+    // Where (table_id, field_id) actually lands in UnionJoin's combined
+    // row: every field of table 0, then every field of table 1, and so
+    // on (see UnionJoin::next's own extend_from_slice loop) — so it's
+    // just the summed field count of every table before this one, plus
+    // this table's own field_id.
+    pub(crate) fn flat_position<F: DBFile + 'static>(
+        tables: &[TableQuery<F>],
+        table_id: usize,
+        field_id: usize,
+    ) -> usize {
+        tables[..table_id]
+            .iter()
+            .map(|t| t.fields.len())
+            .sum::<usize>()
+            + field_id
+    }
 }
 
 impl CrateValueItem {
@@ -353,6 +373,14 @@ fn values_equal(lhs: &ValueItem, rhs: &ValueItem) -> bool {
     match (lhs, rhs) {
         (ValueItem::Integer(a), ValueItem::Double(b)) => (*a as f64) == *b,
         (ValueItem::Double(a), ValueItem::Integer(b)) => *a == (*b as f64),
+        // Content only, not the reserved on-disk capacity riding along
+        // with it — same reason `compare` below (and ValueItem's own
+        // PartialOrd) ignore it: a `'raj'` literal (capacity 3, its own
+        // length) and a `raj` read out of a `varchar(10)` column
+        // (capacity 10) are the same *value* despite derived PartialEq on
+        // the whole tuple calling them unequal because 3 != 10.
+        (ValueItem::Str((a, _)), ValueItem::Str((b, _))) => a == b,
+        (ValueItem::Blob((a, _)), ValueItem::Blob((b, _))) => a == b,
         _ => lhs == rhs,
     }
 }

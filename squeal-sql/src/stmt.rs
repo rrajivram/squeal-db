@@ -336,6 +336,7 @@ where
                     self.results.push(Some(ResultType::Result(ResultSet::new(
                         vec!["Schema name".into()],
                         schemas,
+                        "".into(),
                     ))));
                 }
                 sql_parser::Statement::ShowTables(_) => {
@@ -350,6 +351,7 @@ where
                     self.results.push(Some(ResultType::Result(ResultSet::new(
                         vec!["Table name".into()],
                         tables,
+                        "".into(),
                     ))));
                 }
                 sql_parser::Statement::CreateTable(c) => {
@@ -561,6 +563,7 @@ where
                     self.results.push(Some(ResultType::Result(ResultSet::new(
                         fields.iter().map(|s| s.to_string()).collect(),
                         rows,
+                        "".into(),
                     ))));
                 }
                 _ => {}
@@ -1097,7 +1100,7 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select t.a,t.b from t limit 10");
+        exec("select count(distinct id) as id from t1");
     }
 
     #[test]
@@ -1107,13 +1110,23 @@ mod dummy_tests {
             conn.clone(),
             "create table t1 (id int,id1 int, name varchar(10))",
         );
+        exec_sql(
+            conn.clone(),
+            "create table t2 (id int,id1 int, name varchar(10))",
+        );
         exec_sql(conn.clone(), "insert into t1 values(1,1,'raj')");
         exec_sql(conn.clone(), "insert into t1 values(2,2,'kav')");
+        exec_sql(conn.clone(), "insert into t1 values(5,5,'gan')");
+        exec_sql(conn.clone(), "insert into t2 values(3,3,'ram')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
         // COUNT(*) yet.
         exec_sql(conn.clone(), "select name from t1 limit 5");
         exec_sql(conn.clone(), "select 1+2 from t1 ");
         exec_sql(conn.clone(), "select id+id1 from t1 ");
+        exec_sql(conn.clone(), "select * from t1 where id>1 ");
+        exec_sql(conn.clone(), "select * from t1 where name='raj' ");
+        exec_sql(conn.clone(), "select * from t1,t1 ");
+        exec_sql(conn.clone(), "select t1.*,t2.* from t1,t2 ");
     }
 }

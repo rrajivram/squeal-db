@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{error::SchemaError, source::Source};
@@ -10,15 +12,30 @@ use crate::{error::SchemaError, source::Source};
 pub struct ResultSet {
     columns: Vec<String>,
     rows: Vec<Vec<ValueItem>>,
+    message: String,
 }
 
 pub struct StreamingResultSet {
+    start: Instant,
     begin: Box<dyn Source>,
+    count: usize,
 }
 
 impl StreamingResultSet {
     pub(crate) fn new(begin: Box<dyn Source>) -> Self {
-        Self { begin }
+        Self {
+            begin,
+            start: Instant::now(),
+            count: 0,
+        }
+    }
+
+    pub fn get_final_message(&self) -> String {
+        format!(
+            "{} results in {} ms",
+            self.count,
+            self.start.elapsed().as_millis()
+        )
     }
 
     pub fn columns(&self) -> Vec<String> {
@@ -30,10 +47,14 @@ impl StreamingResultSet {
     }
 
     pub fn next_result(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        self.start = Instant::now();
+        self.count += 1;
         self.begin.as_mut().next()
     }
 
     pub fn next_result_as_strings(&mut self) -> Result<Option<Vec<String>>, SchemaError> {
+        self.start = Instant::now();
+        self.count += 1;
         Ok(self
             .begin
             .as_mut()
@@ -43,8 +64,12 @@ impl StreamingResultSet {
 }
 
 impl ResultSet {
-    pub(crate) fn new(columns: Vec<String>, rows: Vec<Vec<ValueItem>>) -> Self {
-        Self { columns, rows }
+    pub(crate) fn new(columns: Vec<String>, rows: Vec<Vec<ValueItem>>, message: String) -> Self {
+        Self {
+            columns,
+            rows,
+            message,
+        }
     }
 
     pub fn columns(&self) -> &[String] {
@@ -55,6 +80,9 @@ impl ResultSet {
         &self.rows
     }
 
+    pub fn get_final_message(&self) -> String {
+        self.message.clone()
+    }
     // Every row rendered as display strings, in column order — the
     // shape any tabular renderer (the CLI's comfy-table today, maybe
     // others later) wants directly, so the ValueItem -> String mapping

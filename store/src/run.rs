@@ -87,6 +87,7 @@ pub struct RunCursor<F: DBFile + 'static> {
     buffer: Arc<PageBuffer<F>>,
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
+    head: PageId,
 }
 
 impl<F> RunCursor<F>
@@ -101,6 +102,7 @@ where
             buffer,
             current_page,
             current_iter,
+            head,
         })
     }
 
@@ -133,5 +135,48 @@ where
 
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
         self.next_tuple()
+    }
+
+    // Same lookup `new()` did against this run's own head page — `buffer`
+    // and `head` are already stored as fields, unused after construction
+    // until now.
+    fn reset(&mut self) -> Result<(), StoreError> {
+        let current_page = self.buffer.get_page(self.head)?;
+        self.current_iter = current_page.iter();
+        self.current_page = current_page;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{cursor::Cursor, db::Db, memfile::MemFile};
+
+    #[test]
+    fn test_run_cursor_reset_rescans_from_the_head() {
+        let db = Db::<MemFile>::create("run_cursor_reset.db").unwrap();
+        let mut run = db.create_run().unwrap();
+        for i in 0..10u8 {
+            run.append(&[i]).unwrap();
+        }
+
+        let mut cursor = db.open_run(run.head()).unwrap();
+        let first_pass: Vec<u8> = std::iter::from_fn(|| cursor.next().unwrap())
+            .map(|t| t.data()[0])
+            .collect();
+        assert_eq!(first_pass, (0..10).collect::<Vec<_>>(), "sanity: first pass");
+        assert!(
+            cursor.next().unwrap().is_none(),
+            "sanity: cursor is actually exhausted before reset"
+        );
+
+        cursor.reset().unwrap();
+        let second_pass: Vec<u8> = std::iter::from_fn(|| cursor.next().unwrap())
+            .map(|t| t.data()[0])
+            .collect();
+        assert_eq!(
+            second_pass, first_pass,
+            "reset must let the same cursor re-read every record again, in the same order"
+        );
     }
 }

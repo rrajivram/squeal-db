@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use store::valueitem::{IndexKey, ValueItem};
+use store::valueitem::IndexKey;
 
 use crate::{
     error::SchemaError,
@@ -14,13 +14,13 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct Projection {
-    sources: Vec<Box<dyn Source>>,
+    source: Box<dyn Source>,
     fields: Vec<ProjectedField>,
 }
 
 impl Projection {
-    pub(crate) fn new(sources: Vec<Box<dyn Source>>, fields: Vec<ProjectedField>) -> Self {
-        Self { sources, fields }
+    pub(crate) fn new(source: Box<dyn Source>, fields: Vec<ProjectedField>) -> Self {
+        Self { source, fields }
     }
 }
 
@@ -30,24 +30,19 @@ impl Source for Projection {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
-        let mut res = vec![];
-        for s in &mut self.sources {
-            res.push(s.next()?);
+        if let Some(res) = self.source.next()? {
+            let mut out = vec![];
+            let res = &[res];
+            for (i, f) in self.fields.iter().enumerate() {
+                out.push(f.expr.eval(res, i)?);
+            }
+            return Ok(Some(IndexKey::new_from_owned(out)?));
         }
-        if res.iter().all(|f| f.is_none()) {
-            return Ok(None);
-        }
-        if res.iter().any(|f| f.is_none()) {
-            return Err(SchemaError::InternalSchemaError(
-                "One of sources did not yield results.".into(),
-            ));
-        }
-        let res = res.into_iter().map(|r| r.unwrap()).collect::<Vec<_>>();
-        let mut out = vec![];
-        for (i, f) in self.fields.iter().enumerate() {
-            out.push(f.expr.eval(&res, i)?);
-        }
-        Ok(Some(IndexKey::new_from_owned(out)?))
+        Ok(None)
+    }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        self.source.reset()
     }
 }
 
@@ -68,11 +63,16 @@ impl ProjectedField {
         }
     }
 
+    // Every call site describes one source's own fields before UnionJoin
+    // ever combines anything (source_id is always 0 here — see
+    // TableSource/RunSource/WhereSource's own construction) — so the flat
+    // position within that source's own not-yet-combined row is just
+    // field_id, not something flat_position needs to compute.
     pub(crate) fn from_field(field: Arc<Field>, source_id: usize, field_id: usize) -> Self {
         Self {
             display_name: field.name.clone(),
             field: field.clone(),
-            expr: EvalExpr::Value(source_id, field_id),
+            expr: EvalExpr::Value(field_id),
             source_id,
             field_id,
         }

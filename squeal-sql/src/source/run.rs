@@ -48,6 +48,10 @@ where
     fn fields(&self) -> Arc<[ProjectedField]> {
         self.fields.clone()
     }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        Ok(self.cursor.reset()?)
+    }
 }
 
 impl<F> Debug for RunSource<F>

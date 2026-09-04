@@ -25,6 +25,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    // `txn` only needs to live for this call — table_scan_in_txn only
+    // borrows it to read off its (cheap, owned) TransactionId, which is
+    // all TableCursor itself ever keeps (see its own doc comment). Not
+    // storing the borrow here is what lets a TableSource returned from
+    // Connection::with_current_txn's closure outlive the closure itself;
+    // reset() below doesn't need it back either, since TableCursor
+    // already remembers its own transaction internally.
     pub(crate) fn new(
         db: Arc<Db<F>>,
         table: Arc<SqlTable>,
@@ -65,6 +72,10 @@ where
 
     fn fields(&self) -> Arc<[ProjectedField]> {
         self.fields.clone()
+    }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        Ok(self.cursor.reset()?)
     }
 }
 

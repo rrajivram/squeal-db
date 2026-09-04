@@ -51,6 +51,8 @@ pub enum SchemaError {
     AmbiguousFieldError(String),
     #[error("Invalid limit value {0}")]
     InvalidLimitValue(i64),
+    #[error("Unknown function {0}")]
+    UnknownFunction(String),
     #[error("Invalid operation {0} on {1}")]
     InvalidOperationOnOperand(String, String),
     // A blocking operator (hash join build side, sort, GROUP BY hash

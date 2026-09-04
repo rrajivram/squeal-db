@@ -3,7 +3,7 @@ use std::{marker::PhantomData, sync::Arc};
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
-    query::{Alias, FromClause, SelectItem, TableFactor},
+    query::{self, Alias, FromClause, SelectItem, TableFactor},
     token::Comma,
     utils::Seq,
     visitor::{Visit, Visitor},
@@ -18,7 +18,8 @@ use crate::{
     plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
-        ProjectedField, Source, limit::Limit, proj::Projection, run::RunSource, table::TableSource,
+        ProjectedField, Source, join::UnionJoin, limit::Limit, proj::Projection, run::RunSource,
+        table::TableSource, where_source::WhereSource,
     },
     table::{Field, SqlTable},
     temp::TempTable,
@@ -246,6 +247,16 @@ where
             return std::ops::ControlFlow::Break(e);
         }
         let projected_fields = proj.unwrap().into_iter().flatten().collect::<Vec<_>>();
+        let wh_expr = if let Some(wh) = &select.where_clause {
+            let ex = EvalExpr::from_expr(&wh.expr, &tables);
+            if let Err(e) = ex {
+                return std::ops::ControlFlow::Break(e);
+            }
+            Some(*ex.unwrap())
+        } else {
+            None
+        };
+
         let mut sources = vec![];
         for table in tables.into_iter() {
             match table.resolved.open_source(&self.conn) {
@@ -256,9 +267,23 @@ where
                 Err(e) => return std::ops::ControlFlow::Break(e),
             }
         }
+        let union = UnionJoin::new(sources);
+        if let Err(e) = union {
+            return std::ops::ControlFlow::Break(e);
+        }
+        let union = union.unwrap();
+        let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
+            let r = WhereSource::new(Box::new(union), wh_expr);
+            if let Err(e) = r {
+                return std::ops::ControlFlow::Break(e);
+            }
+            Box::new(r.unwrap())
+        } else {
+            Box::new(union)
+        };
 
         self.steps
-            .push(Box::new(Projection::new(sources, projected_fields)));
+            .push(Box::new(Projection::new(for_proj, projected_fields)));
 
         std::ops::ControlFlow::Continue(())
     }
@@ -324,7 +349,7 @@ where
                             f.clone(),
                             sid,
                             fid,
-                            EvalExpr::Value(sid, fid),
+                            EvalExpr::Value(EvalExpr::flat_position(&tables, sid, fid)),
                         ));
                     }
                 }
@@ -344,7 +369,7 @@ where
                             f.clone(),
                             pos,
                             fid,
-                            EvalExpr::Value(pos, fid),
+                            EvalExpr::Value(EvalExpr::flat_position(&tables, pos, fid)),
                         ));
                     }
                     return Ok(v);
@@ -360,8 +385,33 @@ where
         alias: &Option<Alias>,
         tables: &[TableQuery<F>],
     ) -> Result<ProjectedField, SchemaError> {
-        let field = EvalExpr::from_expr(expr, alias, tables)?;
-        Ok(*field)
+        let eval_expr = EvalExpr::from_expr(expr, tables)?;
+        // The one place a display name/Field actually matter — a SELECT-
+        // list item needs a result-set column header — so this is where
+        // ProjectedField gets built now, not inside from_expr's own
+        // recursion (see EvalExpr::from_expr's own doc comment). An
+        // explicit alias always wins; a bare column reference falls back
+        // to its own name (`select id from t` still heads its column
+        // "id"); anything else (an expression, a function call, ...) has
+        // no name of its own yet.
+        let display_name = match alias {
+            Some(alias) => alias.name.value.clone(),
+            None => match expr {
+                Expr::Column(c) => c
+                    .idents()
+                    .last()
+                    .map(|i| i.value.clone())
+                    .unwrap_or_else(|| "none".into()),
+                _ => "none".into(),
+            },
+        };
+        Ok(ProjectedField::new_with_field(
+            display_name.clone(),
+            Arc::new(Field::from(display_name)),
+            0,
+            0,
+            *eval_expr,
+        ))
     }
 
     fn get_tables(&self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {

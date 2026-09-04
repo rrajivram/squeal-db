@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
@@ -492,6 +492,8 @@ where
         })?;
         let columns = table.fields().iter().map(|f| f.name.clone()).collect();
         let mut rows = Vec::new();
+        let start = Instant::now();
+        let mut count = 0;
         let mut cursor = match txn {
             Some(txn) => self.db.table_scan_in_txn(table.db_table_id, txn)?,
             None => self.db.table_scan(table.db_table_id)?,
@@ -499,8 +501,10 @@ where
         while let Some(tuple) = cursor.next()? {
             let row = from_bytes::<VersionedRow>(tuple.data())?;
             rows.push(table.reproject(&row)?.values().to_vec());
+            count += 1;
         }
-        Ok(ResultSet::new(columns, rows))
+        let message = format!("{} rows in {} ms", count, start.elapsed().as_millis());
+        Ok(ResultSet::new(columns, rows, message))
     }
 
     // Statement dispatch for ALTER TABLE lives in Statement::execute,

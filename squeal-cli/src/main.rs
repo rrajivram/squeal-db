@@ -226,6 +226,7 @@ fn print_result(r: &mut ResultType) {
                 table.add_row(row);
             }
             println!("{table}");
+            println!("{}", rs.get_final_message())
         }
         ResultType::StreamingResult(stream) => {
             let mut table = comfy_table::Table::new();
@@ -241,6 +242,7 @@ fn print_result(r: &mut ResultType) {
                 };
             }
             println!("{table}");
+            println!("{}", stream.get_final_message());
         }
     }
 }
