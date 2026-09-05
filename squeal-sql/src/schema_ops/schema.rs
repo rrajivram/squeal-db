@@ -5,6 +5,7 @@ use postcard::{from_bytes, to_allocvec};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
+    error::StoreError,
     table::TableIdType,
     tuple::{DBIdType, Tuple},
     txn::Transaction,
@@ -15,7 +16,7 @@ use crate::{
     constant::MAX_TABLE_NAME_LEN,
     error::SchemaError,
     rslt::resultset::ResultSet,
-    table::{Field, SqlForeignKey, SqlTable, VersionedRow},
+    table::{Field, SqlForeignKey, SqlIndex, SqlTable, VersionedRow},
 };
 
 #[derive(Clone)]
@@ -222,6 +223,13 @@ where
         // either, until the whole create_table call succeeds).
         let mut created_names: Vec<String> = Vec::with_capacity(table.indices.len() + 1);
         let mut created_generator = false;
+        // Computed before the mutable borrow below (table.indices.iter_mut())
+        // makes an immutable one unavailable — every one of these
+        // indices is always PRIMARY KEY/UNIQUE today (see SqlIndex::
+        // size's own doc comment), so this never actually adds anything
+        // here, but it's the same real value CREATE INDEX's own sizing
+        // uses, not a stand-in.
+        let identity_size = table.identity_size();
         let res: Result<(), SchemaError> = (|| {
             let row_table_id = self.db.create_table_with_index_entry_size(
                 row_table_name.clone(),
@@ -242,7 +250,7 @@ where
                 .iter_mut()
                 .zip(&index_names)
                 .try_for_each(|(i, qualified)| {
-                    let size = i.size();
+                    let size = i.size(identity_size);
                     let iid = self
                         .db
                         .create_table_with_index_entry_size(qualified.clone(), size as u64)?;
@@ -384,7 +392,18 @@ where
                 DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
             };
             for index in &table.indices {
-                let values = table.extract_field_values(&index.fields, &row);
+                let mut values = table.extract_field_values(&index.fields, &row);
+                // A PRIMARY KEY/UNIQUE index's own declared fields are
+                // already unique by definition — that's what makes the
+                // backing BPlusTree's own duplicate-key rejection enforce
+                // the constraint. A plain index has no such guarantee, so
+                // its key has to carry the row's own identity too, or two
+                // rows sharing the same indexed value would collide as
+                // the same physical key (see Schema::create_index's own
+                // doc comment, which this has to stay in lockstep with).
+                if !index.is_primary && !index.is_unique {
+                    values.extend_from_slice(identity.values());
+                }
                 let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
                 self.db.insert(
                     index.db_table_id,
@@ -629,6 +648,134 @@ where
         }
 
         self.alter_table(table_name, |t| t.alter_add_foreign_key(fk))
+    }
+
+    // CREATE [UNIQUE] INDEX <name> ON <table>(<columns>) against a table
+    // that (unlike CREATE TABLE's own inline PRIMARY KEY/UNIQUE) may
+    // already have rows in it — so this has to both create the index's
+    // own backing store table AND backfill it, not just create an empty
+    // one.
+    //
+    // For a UNIQUE index, the key is just the indexed columns' own
+    // values — same as PRIMARY KEY/UNIQUE has always worked, relying on
+    // the backing BPlusTree's own duplicate-key rejection to enforce the
+    // constraint for free. A plain, non-unique index has no such
+    // guarantee, so two rows sharing the same indexed value would
+    // otherwise collide as the same physical key — there's no multi-
+    // value-per-key facility in the store layer to fall back on. The fix
+    // doesn't need one: every row already has a unique identity (its own
+    // PRIMARY KEY, or the generated rowid when there isn't one — see
+    // Schema::row_key), so appending that to a non-unique index's key
+    // makes it unique by construction, the same way a composite PRIMARY
+    // KEY already works today. insert_rows_in_txn's own per-index loop
+    // has to make the identical choice for every row inserted after this
+    // index exists — the two must stay in lockstep.
+    pub(crate) fn create_index(
+        self: &Arc<Self>,
+        table_name: &str,
+        name: String,
+        column_names: &[String],
+        is_unique: bool,
+    ) -> Result<(), SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        if column_names.is_empty() {
+            return Err(SchemaError::UserError(
+                "CREATE INDEX needs at least one column".into(),
+            ));
+        }
+        let mut fields = Vec::with_capacity(column_names.len());
+        for cname in column_names {
+            let f = table
+                .fields()
+                .iter()
+                .find(|f| &f.name == cname)
+                .cloned()
+                .ok_or_else(|| {
+                    SchemaError::UserError(format!(
+                        "Table {table_name:?} has no column named {cname:?}"
+                    ))
+                })?;
+            fields.push(f);
+        }
+        if table
+            .indices
+            .iter()
+            .any(|i| i.name.as_deref() == Some(name.as_str()))
+        {
+            return Err(SchemaError::UserError(format!(
+                "Duplicate index name: {name}"
+            )));
+        }
+        let qualified = self.qualify(&name);
+        if self.db.table_id_by_name(&qualified)?.is_some() {
+            return Err(SchemaError::BadTableName(format!(
+                "Index name {name} is already in use"
+            )));
+        }
+
+        let identity_size = table.identity_size();
+        let sizing_index = SqlIndex {
+            name: Some(name.clone()),
+            db_table_id: TableIdType::none(),
+            is_primary: false,
+            is_unique,
+            fields: fields.clone().into(),
+        };
+        let index_table_id = self
+            .db
+            .create_table_with_index_entry_size(qualified.clone(), sizing_index.size(identity_size) as u64)?;
+
+        let backfill: Result<(), SchemaError> = (|| {
+            let txn = self.db.begin()?;
+            let mut cursor = self.db.table_scan_in_txn(table.db_table_id, &txn)?;
+            while let Some(tuple) = cursor.next()? {
+                let versioned = from_bytes::<VersionedRow>(tuple.data())?;
+                let row = table.reproject(&versioned)?;
+                let identity = match tuple.id() {
+                    DBIdType::Rec(ik) => ik.clone(),
+                    DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+                };
+                let mut values = table.extract_field_values(&fields, row.values());
+                if !is_unique {
+                    values.extend_from_slice(identity.values());
+                }
+                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+                self.db
+                    .insert(
+                        index_table_id,
+                        Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
+                        &txn,
+                    )
+                    .map_err(|e| match e {
+                        StoreError::DuplicateKey(_) if is_unique => SchemaError::UserError(format!(
+                            "cannot create unique index {name:?}: table {table_name:?} has \
+                             duplicate values for column(s) {column_names:?}"
+                        )),
+                        other => other.into(),
+                    })?;
+            }
+            self.db.commit(txn)?;
+            Ok(())
+        })();
+        if let Err(e) = backfill {
+            let _ = self.db.drop_table(&qualified);
+            return Err(e);
+        }
+
+        let index = SqlIndex {
+            name: Some(name),
+            db_table_id: index_table_id,
+            is_primary: false,
+            is_unique,
+            fields: fields.into(),
+        };
+        if let Err(e) = self.alter_table(table_name, |t| t.alter_add_index(index)) {
+            let _ = self.db.drop_table(&qualified);
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub(crate) fn drop_foreign_key(

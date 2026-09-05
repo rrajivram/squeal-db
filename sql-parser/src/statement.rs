@@ -14,7 +14,8 @@ use crate::{
     datatype::DataType,
     ddl::{
         AlterTable, CopyInto, CreateDatabase, CreateIndex, CreateTable, DescribeTable,
-        DropDatabase, DropIndex, DropTable, ShowSchemas, ShowTables, Truncate, UseStatement,
+        DropDatabase, DropIndex, DropTable, ShowSchemas, ShowTableIndex, ShowTables, Truncate,
+        UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -52,6 +53,7 @@ pub enum Statement {
     Rollback(kw::Rollback),
     ShowTables(ShowTables),
     ShowSchemas(ShowSchemas),
+    ShowTableIndex(ShowTableIndex),
     DescribeTable(DescribeTable),
 }
 

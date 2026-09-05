@@ -170,6 +170,10 @@ impl Tuple {
         &self.data
     }
 
+    pub fn id(&self) -> &DBIdType {
+        &self.id
+    }
+
     pub fn size(&self) -> DBSizeType {
         if self.serialized_size > 0 {
             self.serialized_size

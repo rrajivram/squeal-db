@@ -3,7 +3,8 @@ use std::{marker::PhantomData, sync::Arc};
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
-    query::{self, Alias, FromClause, SelectItem, TableFactor},
+    keyword::No,
+    query::{self, Alias, FromClause, OrderByClause, SelectItem, SetOperand, TableFactor},
     token::Comma,
     utils::Seq,
     visitor::{Visit, Visitor},
@@ -18,8 +19,8 @@ use crate::{
     plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
-        ProjectedField, Source, join::UnionJoin, limit::Limit, proj::Projection, run::RunSource,
-        table::TableSource, where_source::WhereSource,
+        ProjectableField, Source, join::UnionJoin, limit::Limit, proj::Projection, run::RunSource,
+        sort::SortSource, table::TableSource, where_source::WhereSource,
     },
     table::{Field, SqlTable},
     temp::TempTable,
@@ -133,7 +134,7 @@ where
                 .fields()
                 .iter()
                 .enumerate()
-                .map(|(i, f)| ProjectedField::from_field(f.clone(), 0, i))
+                .map(|(i, f)| ProjectableField::from_field(f.clone(), 0, i))
                 .collect::<Vec<_>>(),
         )))
     }
@@ -204,6 +205,13 @@ struct QueryVisitor<F: DBFile> {
     // and handing each entry to LogicalPlan::add_step below doesn't
     // need anything more than that.
     steps: Vec<Box<dyn Source>>,
+    limit: Option<usize>,
+    order: Option<OrderByClause>,
+}
+
+struct SourceHolder<F: DBFile + 'static> {
+    source: Box<dyn Source>,
+    tables: Vec<TableQuery<F>>,
 }
 
 impl<F> Visitor for QueryVisitor<F>
@@ -212,6 +220,16 @@ where
     F: DBFile<Item = F>,
 {
     type Break = SchemaError;
+
+    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+        if let Some(limit) = &query.limit
+            && let Some(order) = &query.order_by
+        {
+            self.limit = limit.count_i64().map(|l| l as usize);
+            self.order = Some(order.clone());
+        }
+        std::ops::ControlFlow::Continue(())
+    }
 
     fn pre_visit_table_factor(
         &mut self,
@@ -232,74 +250,42 @@ where
         std::ops::ControlFlow::Continue(())
     }
 
-    fn post_visit_select(
-        &mut self,
-        select: &sql_parser::query::SelectCore,
-    ) -> std::ops::ControlFlow<Self::Break> {
-        let _distinct = select.distinct.is_some();
-        let tables = self.get_tables(&select.from);
-        if let Err(e) = tables {
-            return std::ops::ControlFlow::Break(e);
-        }
-        let tables = tables.unwrap();
-        let proj = self.get_projections(&select.projection, &tables);
-        if let Err(e) = proj {
-            return std::ops::ControlFlow::Break(e);
-        }
-        let projected_fields = proj.unwrap().into_iter().flatten().collect::<Vec<_>>();
-        let wh_expr = if let Some(wh) = &select.where_clause {
-            let ex = EvalExpr::from_expr(&wh.expr, &tables);
-            if let Err(e) = ex {
-                return std::ops::ControlFlow::Break(e);
-            }
-            Some(*ex.unwrap())
-        } else {
-            None
-        };
-
-        let mut sources = vec![];
-        for table in tables.into_iter() {
-            match table.resolved.open_source(&self.conn) {
-                Ok(source) => {
-                    //    self.steps.push(source);
-                    sources.push(source);
-                }
-                Err(e) => return std::ops::ControlFlow::Break(e),
-            }
-        }
-        let union = UnionJoin::new(sources);
-        if let Err(e) = union {
-            return std::ops::ControlFlow::Break(e);
-        }
-        let union = union.unwrap();
-        let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
-            let r = WhereSource::new(Box::new(union), wh_expr);
-            if let Err(e) = r {
-                return std::ops::ControlFlow::Break(e);
-            }
-            Box::new(r.unwrap())
-        } else {
-            Box::new(union)
-        };
-
-        self.steps
-            .push(Box::new(Projection::new(for_proj, projected_fields)));
-
-        std::ops::ControlFlow::Continue(())
-    }
-
     fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        if let Some(limit) = &query.limit
-            && let Some(limit) = limit.count_i64()
-        {
-            if limit < 0 {
-                return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(limit));
-            } else {
-                if let Some(last_source) = self.steps.pop() {
-                    self.steps
-                        .push(Box::new(Limit::new(last_source, limit as usize)));
+        if let SetOperand::Select(select) = &query.body {
+            let holder = self.handle_select(select);
+            if let Err(e) = holder {
+                return std::ops::ControlFlow::Break(e);
+            }
+            let holder = holder.unwrap();
+            let step = holder.source;
+            let tables = holder.tables;
+
+            if let Some(limit) = &query.limit
+                && let Some(limit) = limit.count_i64()
+            {
+                if limit < 0 {
+                    return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(limit));
+                } else {
+                    if let Some(order) = &query.order_by {
+                        let order = SortSource::create_from(
+                            step,
+                            order,
+                            &tables,
+                            Some(limit as usize),
+                            self.conn.database.read().db.clone(),
+                        );
+                        if let Err(e) = order {
+                            return std::ops::ControlFlow::Break(e);
+                        }
+                        let step = order.unwrap();
+                        self.steps.push(Box::new(step));
+                    } else {
+                        self.steps.push(Box::new(Limit::new(step, limit as usize)));
+                    }
                     return std::ops::ControlFlow::Continue(());
                 }
+            } else {
+                self.steps.push(step);
             }
         }
 
@@ -318,14 +304,47 @@ where
             steps: vec![],
             tables: Stack::new(),
             projections: Stack::new(),
+            limit: None,
+            order: None,
         }
+    }
+
+    fn handle_select(
+        &mut self,
+        select: &sql_parser::query::SelectCore,
+    ) -> Result<SourceHolder<F>, SchemaError> {
+        let _distinct = select.distinct.is_some();
+        let tables = self.get_tables(&select.from)?;
+        let proj = self.get_projections(&select.projection, &tables)?;
+        let projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
+        let wh_expr = if let Some(wh) = &select.where_clause {
+            Some(*EvalExpr::from_expr(&wh.expr, &tables)?)
+        } else {
+            None
+        };
+
+        let mut sources = vec![];
+        for table in tables.iter() {
+            sources.push(table.resolved.open_source(&self.conn)?);
+        }
+        let union = UnionJoin::new(sources)?;
+        let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
+            Box::new(WhereSource::new(Box::new(union), wh_expr)?)
+        } else {
+            Box::new(union)
+        };
+
+        Ok(SourceHolder {
+            source: Box::new(Projection::new(for_proj, projected_fields)),
+            tables,
+        })
     }
 
     fn get_projections(
         &self,
         proj: &Seq<SelectItem, Comma>,
         tables: &[TableQuery<F>],
-    ) -> Result<Vec<Vec<ProjectedField>>, SchemaError> {
+    ) -> Result<Vec<Vec<ProjectableField>>, SchemaError> {
         let mut res = vec![];
         for i in proj.items() {
             res.push(self.get_proj(i, tables)?);
@@ -337,14 +356,14 @@ where
         &self,
         proj: &SelectItem,
         tables: &[TableQuery<F>],
-    ) -> Result<Vec<ProjectedField>, SchemaError> {
+    ) -> Result<Vec<ProjectableField>, SchemaError> {
         match proj {
             SelectItem::Expr { expr, alias } => Ok(vec![self.handle_expr(expr, alias, tables)?]),
             SelectItem::Wildcard(_) => {
                 let mut v = vec![];
                 for (sid, t) in tables.iter().enumerate() {
                     for (fid, f) in t.fields.iter().enumerate() {
-                        v.push(ProjectedField::new_with_field(
+                        v.push(ProjectableField::new_with_field(
                             f.name.clone(),
                             f.clone(),
                             sid,
@@ -364,7 +383,7 @@ where
                     })
                 {
                     for (fid, f) in tables[pos].fields.iter().enumerate() {
-                        v.push(ProjectedField::new_with_field(
+                        v.push(ProjectableField::new_with_field(
                             f.name.clone(),
                             f.clone(),
                             pos,
@@ -384,7 +403,7 @@ where
         expr: &Expr,
         alias: &Option<Alias>,
         tables: &[TableQuery<F>],
-    ) -> Result<ProjectedField, SchemaError> {
+    ) -> Result<ProjectableField, SchemaError> {
         let eval_expr = EvalExpr::from_expr(expr, tables)?;
         // The one place a display name/Field actually matter — a SELECT-
         // list item needs a result-set column header — so this is where
@@ -405,7 +424,7 @@ where
                 _ => "none".into(),
             },
         };
-        Ok(ProjectedField::new_with_field(
+        Ok(ProjectableField::new_with_field(
             display_name.clone(),
             Arc::new(Field::from(display_name)),
             0,

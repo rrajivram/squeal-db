@@ -10,14 +10,14 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    source::{ProjectedField, Source},
+    source::{ProjectableField, Source},
     table::{SqlTable, VersionedRow},
 };
 
 pub struct TableSource<F: DBFile> {
     cursor: TableCursor<F>,
     table: Arc<SqlTable>,
-    fields: Arc<[ProjectedField]>,
+    fields: Arc<[ProjectableField]>,
 }
 
 impl<F> TableSource<F>
@@ -45,7 +45,7 @@ where
             .fields()
             .iter()
             .enumerate()
-            .map(|(i, f)| ProjectedField::from_field(f.clone(), 0, i))
+            .map(|(i, f)| ProjectableField::from_field(f.clone(), 0, i))
             .collect::<Vec<_>>();
         let fields = Arc::from(fields);
         Ok(Self {
@@ -70,7 +70,7 @@ where
         }
     }
 
-    fn fields(&self) -> Arc<[ProjectedField]> {
+    fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }
 

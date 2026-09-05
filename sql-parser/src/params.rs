@@ -100,6 +100,7 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
         | Statement::Rollback(_)
         | Statement::ShowTables(_)
         | Statement::ShowSchemas(_)
+        | Statement::ShowTableIndex(_)
         | Statement::DescribeTable(_) => {}
     }
 }

@@ -262,11 +262,11 @@ fn test_index_backing_table_size_reflects_field_datatypes() {
     let small = s.get_table("small").unwrap();
     let big = s.get_table("big").unwrap();
     assert!(
-        big.indices[0].size() > small.indices[0].size(),
+        big.indices[0].size(0) > small.indices[0].size(0),
         "a varchar(100) key's index budget ({}) should be larger than a bare \
          integer key's ({})",
-        big.indices[0].size(),
-        small.indices[0].size()
+        big.indices[0].size(0),
+        small.indices[0].size(0)
     );
 }
 

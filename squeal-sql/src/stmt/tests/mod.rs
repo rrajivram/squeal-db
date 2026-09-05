@@ -33,6 +33,17 @@ fn nth_result(stmt: &Statement<MemFile>, i: usize) -> &ResultType {
         .unwrap_or_else(|| panic!("no result at index {i} (out of range, or already taken)"))
 }
 
+// Like nth_result, but for the non-streaming ResultType::Result case
+// (SHOW/DESCRIBE, which materialize eagerly) — unlike StreamingResult,
+// ResultSet is plain Clone-able data, so this can borrow via nth_result
+// instead of taking the slot.
+fn nth_result_as_result(stmt: &Statement<MemFile>, i: usize) -> (Vec<String>, Vec<Vec<ValueItem>>) {
+    match nth_result(stmt, i) {
+        ResultType::Result(rs) => (rs.columns().to_vec(), rs.rows().to_vec()),
+        other => panic!("expected a Result at index {i}, got {other:?}"),
+    }
+}
+
 // Drains a StreamingResultSet into plain (columns, rows) — the
 // streaming equivalent of ResultSet::columns()/rows(), for tests that
 // just want to assert on fully-materialized data rather than exercise
@@ -459,22 +470,6 @@ fn test_execute_select_star_participates_in_a_multi_statement_batch() {
 
     let (_, third_rows) = take_streaming_result(&mut stmt, 2);
     assert_eq!(third_rows.len(), 2);
-}
-
-#[test]
-fn test_new_rejects_select_with_an_explicit_column_list() {
-    let c = conn();
-    let err = c.create_statement("select id from t").unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
-}
-
-#[test]
-fn test_new_rejects_select_with_a_where_clause() {
-    let c = conn();
-    let err = c
-        .create_statement("select * from t where id = 1")
-        .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
 #[test]
@@ -1173,4 +1168,403 @@ fn test_new_rejects_copy_into_with_a_pattern_clause() {
         .create_statement("copy into t from @stage pattern = '.*.csv'")
         .unwrap_err();
     assert!(matches!(err, SchemaError::ParseError(_)), "got {err:?}");
+}
+
+// ---- WHERE clause ----
+
+#[test]
+fn test_execute_select_where_filters_by_integer_comparison() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    run(&c, "insert into t values (2)").unwrap();
+    run(&c, "insert into t values (3)").unwrap();
+    let mut stmt = c.create_statement("select * from t where id > 1").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(2)],
+            vec![ValueItem::Integer(3)],
+        ]
+    );
+}
+
+#[test]
+fn test_execute_select_where_filters_by_string_equality() {
+    // Regression test: a varchar(n) column's stored capacity (n) used to
+    // make this always compare unequal to a literal's own capacity (its
+    // length), so `WHERE name = 'raj'` matched nothing — see
+    // plan::eval::values_equal's own doc comment.
+    let c = conn();
+    run(&c, "create table t (name varchar(10))").unwrap();
+    run(&c, "insert into t values ('raj')").unwrap();
+    run(&c, "insert into t values ('kav')").unwrap();
+    let mut stmt = c
+        .create_statement("select * from t where name = 'raj'")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Str(("raj".into(), 10))]]);
+}
+
+#[test]
+fn test_execute_select_where_with_and_or() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    for i in 1..=5 {
+        run(&c, &format!("insert into t values ({i})")).unwrap();
+    }
+    let mut stmt = c
+        .clone()
+        .create_statement("select * from t where id > 1 and id < 4")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]);
+
+    let mut stmt = c
+        .create_statement("select * from t where id = 1 or id = 5")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(5)]]);
+}
+
+#[test]
+fn test_execute_select_where_on_unknown_column_fails() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let err = run(&c, "select * from t where nope = 1").unwrap_err();
+    assert!(matches!(err, SchemaError::FieldNotFound(_)), "got {err:?}");
+}
+
+// ---- boolean columns ----
+
+#[test]
+fn test_execute_create_table_with_boolean_column_insert_and_select() {
+    let c = conn();
+    run(&c, "create table t (active boolean)").unwrap();
+    run(&c, "insert into t values (true)").unwrap();
+    run(&c, "insert into t values (false)").unwrap();
+    let mut stmt = c.create_statement("select * from t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Boolean(true)],
+            vec![ValueItem::Boolean(false)],
+        ]
+    );
+}
+
+#[test]
+fn test_execute_select_where_boolean_equals_true() {
+    let c = conn();
+    run(&c, "create table t (id integer, active boolean)").unwrap();
+    run(&c, "insert into t values (1, true)").unwrap();
+    run(&c, "insert into t values (2, false)").unwrap();
+    let mut stmt = c
+        .create_statement("select * from t where active = true")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(1), ValueItem::Boolean(true)]]
+    );
+}
+
+// ---- multi-table FROM / cross join ----
+
+#[test]
+fn test_execute_select_two_tables_produces_the_full_cross_product() {
+    let c = conn();
+    run(&c, "create table t1 (id integer)").unwrap();
+    run(&c, "create table t2 (code integer)").unwrap();
+    run(&c, "insert into t1 values (1)").unwrap();
+    run(&c, "insert into t1 values (2)").unwrap();
+    run(&c, "insert into t2 values (10)").unwrap();
+    run(&c, "insert into t2 values (20)").unwrap();
+    let mut stmt = c.create_statement("select * from t1, t2").unwrap();
+    stmt.execute().unwrap();
+    let (columns, mut rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, vec!["id".to_string(), "code".to_string()]);
+    rows.sort_by_key(|r| match (&r[0], &r[1]) {
+        (ValueItem::Integer(a), ValueItem::Integer(b)) => (*a, *b),
+        _ => panic!("unexpected row shape"),
+    });
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Integer(10)],
+            vec![ValueItem::Integer(1), ValueItem::Integer(20)],
+            vec![ValueItem::Integer(2), ValueItem::Integer(10)],
+            vec![ValueItem::Integer(2), ValueItem::Integer(20)],
+        ]
+    );
+}
+
+#[test]
+fn test_execute_select_qualified_columns_across_two_different_tables() {
+    // Regression test: EvalExpr::Value used to be a (table_id, field_id)
+    // pair indexed directly into UnionJoin's single combined row, so any
+    // column from a table after the first silently read the wrong
+    // table's value at that same position — see
+    // EvalExpr::flat_position's own doc comment.
+    let c = conn();
+    run(&c, "create table t1 (id integer, name varchar(10))").unwrap();
+    run(&c, "create table t2 (code integer, label varchar(10))").unwrap();
+    run(&c, "insert into t1 values (1, 'raj')").unwrap();
+    run(&c, "insert into t2 values (99, 'zzz')").unwrap();
+    let mut stmt = c.create_statement("select * from t1, t2").unwrap();
+    stmt.execute().unwrap();
+    let (columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        columns,
+        vec!["id".to_string(), "name".to_string(), "code".to_string(), "label".to_string()]
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("raj".into(), 10)),
+            ValueItem::Integer(99),
+            ValueItem::Str(("zzz".into(), 10)),
+        ]]
+    );
+}
+
+#[test]
+fn test_execute_select_self_join_produces_the_full_cross_product() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    run(&c, "insert into t values (2)").unwrap();
+    run(&c, "insert into t values (3)").unwrap();
+    let mut stmt = c.create_statement("select * from t, t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows.len(), 9, "3x3 self-join must produce 9 rows, not 3");
+}
+
+#[test]
+fn test_execute_select_unqualified_ambiguous_column_across_tables_fails() {
+    let c = conn();
+    run(&c, "create table t1 (id integer)").unwrap();
+    run(&c, "create table t2 (id integer)").unwrap();
+    run(&c, "insert into t1 values (1)").unwrap();
+    run(&c, "insert into t2 values (2)").unwrap();
+    let err = run(&c, "select id from t1, t2").unwrap_err();
+    assert!(matches!(err, SchemaError::AmbiguousFieldError(_)), "got {err:?}");
+}
+
+// ---- LIMIT ----
+
+#[test]
+fn test_execute_select_limit_caps_rows() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    for i in 1..=5 {
+        run(&c, &format!("insert into t values ({i})")).unwrap();
+    }
+    let mut stmt = c.create_statement("select * from t limit 2").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn test_execute_select_limit_larger_than_row_count_returns_every_row() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    let mut stmt = c.create_statement("select * from t limit 100").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows.len(), 1);
+}
+
+// ---- computed SELECT-list expressions ----
+
+#[test]
+fn test_execute_select_computed_arithmetic_expression() {
+    let c = conn();
+    run(&c, "create table t (a integer, b integer)").unwrap();
+    run(&c, "insert into t values (2, 3)").unwrap();
+    let mut stmt = c.create_statement("select a+b from t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(5)]]);
+}
+
+#[test]
+fn test_execute_select_literal_expression_with_no_from_clause() {
+    let c = conn();
+    let mut stmt = c.create_statement("select 1+2").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(3)]]);
+}
+
+// ---- SHOW TABLE INDEX ----
+
+#[test]
+fn test_show_table_index_lists_primary_key_and_unique_index() {
+    // Only PRIMARY KEY and UNIQUE are achievable today: standalone
+    // CREATE INDEX parses but isn't wired up in Statement::execute() at
+    // all (falls through its `_ => {}` catch-all, silently a no-op), and
+    // CREATE TABLE's own grammar has no plain, non-unique index
+    // constraint — so there's no way yet to produce a bare "INDEX" kind
+    // row to also assert on here.
+    let c = conn();
+    run(
+        &c,
+        "create table customers (id integer not null, email varchar(50) not null, \
+         name varchar(50), primary key(id), unique(email))",
+    )
+    .unwrap();
+
+    let mut stmt = c.create_statement("show table index customers").unwrap();
+    stmt.execute().unwrap();
+    let (columns, rows) = nth_result_as_result(&stmt, 0);
+    assert_eq!(columns, vec!["Name", "Kind", "Columns", "Details"]);
+
+    let kinds = rows
+        .iter()
+        .map(|r| match &r[1] {
+            ValueItem::Str((s, _)) => s.clone(),
+            other => panic!("expected a Str, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"PRIMARY KEY".to_string()), "got {kinds:?}");
+    assert!(kinds.contains(&"UNIQUE".to_string()), "got {kinds:?}");
+}
+
+#[test]
+fn test_show_table_index_lists_foreign_keys() {
+    let c = conn();
+    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table orders (id integer not null, customer_id integer \
+         references customers(id), primary key(id))",
+    )
+    .unwrap();
+
+    let mut stmt = c.create_statement("show table index orders").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = nth_result_as_result(&stmt, 0);
+
+    let fk_row = rows
+        .iter()
+        .find(|r| matches!(&r[1], ValueItem::Str((s, _)) if s == "FOREIGN KEY"))
+        .unwrap_or_else(|| panic!("no FOREIGN KEY row in {rows:?}"));
+    assert_eq!(fk_row[2], ValueItem::Str(("customer_id".into(), DEFAULT_VAR_SIZE as u32)));
+    assert_eq!(
+        fk_row[3],
+        ValueItem::Str(("-> customers.id".into(), DEFAULT_VAR_SIZE as u32))
+    );
+}
+
+#[test]
+fn test_show_table_index_fails_for_an_unknown_table() {
+    let c = conn();
+    let err = run(&c, "show table index nope").unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_show_table_index_fails_for_a_temp_table() {
+    let c = conn();
+    run(&c, "create table temp.t (id integer)").unwrap();
+    let err = run(&c, "show table index temp.t").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+// ---- CREATE INDEX ----
+
+#[test]
+fn test_create_index_unique_succeeds_and_shows_up_in_show_table_index() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 10)").unwrap();
+    run(&c, "insert into t values (2, 20)").unwrap();
+    run(&c, "create unique index idx_code on t(code)").unwrap();
+
+    let mut stmt = c.create_statement("show table index t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = nth_result_as_result(&stmt, 0);
+    let row = rows
+        .iter()
+        .find(|r| r[0] == ValueItem::Str(("idx_code".into(), DEFAULT_VAR_SIZE as u32)))
+        .unwrap_or_else(|| panic!("no idx_code row in {rows:?}"));
+    assert_eq!(row[1], ValueItem::Str(("UNIQUE".into(), DEFAULT_VAR_SIZE as u32)));
+}
+
+#[test]
+fn test_create_unique_index_rejects_existing_duplicate_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 10)").unwrap();
+    run(&c, "insert into t values (2, 10)").unwrap();
+    let err = run(&c, "create unique index idx_code on t(code)").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    // Must not leave a half-created index behind.
+    assert!(c.current_schema().unwrap().get_table("t").unwrap().indices.len() == 1);
+}
+
+#[test]
+fn test_create_plain_index_tolerates_and_survives_duplicate_values() {
+    // The actual point of appending the row's own identity to a
+    // non-unique index's key (see Schema::create_index's own doc
+    // comment): both the backfill over already-duplicated data and a
+    // later INSERT adding yet another duplicate must succeed, not hit
+    // the backing BPlusTree's own duplicate-key rejection.
+    let c = conn();
+    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 10)").unwrap();
+    run(&c, "insert into t values (2, 10)").unwrap();
+    run(&c, "create index idx_code on t(code)").unwrap();
+    run(&c, "insert into t values (3, 10)").unwrap();
+
+    let mut stmt = c.create_statement("select * from t").unwrap();
+    stmt.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows.len(), 3, "all three duplicate-valued rows must survive");
+}
+
+#[test]
+fn test_create_index_if_not_exists_is_idempotent() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    run(&c, "create index idx_id on t(id)").unwrap();
+    run(&c, "create index if not exists idx_id on t(id)").unwrap();
+    assert_eq!(c.current_schema().unwrap().get_table("t").unwrap().indices.len(), 1);
+}
+
+#[test]
+fn test_create_index_rejects_a_duplicate_name_without_if_not_exists() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    run(&c, "create index idx_id on t(id)").unwrap();
+    let err = run(&c, "create index idx_id on t(id)").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_create_index_fails_for_an_unknown_column() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let err = run(&c, "create index idx_nope on t(nope)").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_create_index_fails_for_an_unknown_table() {
+    let c = conn();
+    let err = run(&c, "create index idx_id on nope(id)").unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 }

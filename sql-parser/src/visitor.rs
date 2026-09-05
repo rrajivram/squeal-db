@@ -164,6 +164,7 @@ impl Visit for Statement {
             | Statement::Rollback(_)
             | Statement::ShowTables(_)
             | Statement::ShowSchemas(_)
+            | Statement::ShowTableIndex(_)
             | Statement::DescribeTable(_) => {}
         }
         v.post_visit_statement(self)

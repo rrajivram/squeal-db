@@ -423,3 +423,289 @@ fn compare(
 fn operand_error_msg(v1: &str, v2: &str) -> Result<ValueItem, SchemaError> {
     Err(SchemaError::InvalidOperationOnOperand(v1.into(), v2.into()))
 }
+
+#[cfg(test)]
+mod tests {
+    use sql_parser::expr::{BinaryOp, UnaryOp};
+
+    use super::*;
+    use crate::plan::funcs::Count;
+
+    fn int(i: i64) -> ValueItem {
+        ValueItem::Integer(i)
+    }
+    fn dbl(f: f64) -> ValueItem {
+        ValueItem::Double(f)
+    }
+    fn str_val(s: &str) -> ValueItem {
+        ValueItem::Str((s.to_string(), s.len() as u32))
+    }
+    fn str_cap(s: &str, cap: u32) -> ValueItem {
+        ValueItem::Str((s.to_string(), cap))
+    }
+    fn bin(lhs: &ValueItem, op: BinaryOp, rhs: &ValueItem) -> Result<ValueItem, SchemaError> {
+        CrateValueItem::binary(lhs, rhs, &op)
+    }
+    fn un(op: UnaryOp, v: &ValueItem) -> Result<ValueItem, SchemaError> {
+        CrateValueItem::unary(v, &op)
+    }
+
+    // ---- unary ----
+
+    #[test]
+    fn test_unary_not_on_boolean() {
+        assert_eq!(un(UnaryOp::Not, &ValueItem::Boolean(true)).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(un(UnaryOp::Not, &ValueItem::Boolean(false)).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_unary_minus_and_plus_on_integer_and_double() {
+        assert_eq!(un(UnaryOp::Minus, &int(5)).unwrap(), int(-5));
+        assert_eq!(un(UnaryOp::Plus, &int(5)).unwrap(), int(5));
+        assert_eq!(un(UnaryOp::Minus, &dbl(1.5)).unwrap(), dbl(-1.5));
+        assert_eq!(un(UnaryOp::Plus, &dbl(1.5)).unwrap(), dbl(1.5));
+    }
+
+    #[test]
+    fn test_unary_null_passes_through_for_any_op() {
+        assert_eq!(un(UnaryOp::Minus, &ValueItem::Null).unwrap(), ValueItem::Null);
+        assert_eq!(un(UnaryOp::Not, &ValueItem::Null).unwrap(), ValueItem::Null);
+    }
+
+    #[test]
+    fn test_unary_rejects_mismatched_op_and_type() {
+        assert!(un(UnaryOp::Minus, &ValueItem::Boolean(true)).is_err());
+        assert!(un(UnaryOp::Not, &int(1)).is_err());
+        assert!(un(UnaryOp::Not, &dbl(1.0)).is_err());
+    }
+
+    #[test]
+    fn test_unary_rejects_blob_str_and_datetime() {
+        assert!(un(UnaryOp::Minus, &str_val("x")).is_err());
+        assert!(un(UnaryOp::Minus, &ValueItem::Datetime(0)).is_err());
+        assert!(un(UnaryOp::Minus, &ValueItem::Blob((std::sync::Arc::from(&b"x"[..]), 1))).is_err());
+    }
+
+    // ---- binary: NULL propagation ----
+
+    #[test]
+    fn test_binary_null_propagates_for_every_op() {
+        for op in [
+            BinaryOp::Plus,
+            BinaryOp::Eq,
+            BinaryOp::Lt,
+            BinaryOp::And,
+            BinaryOp::Concat,
+        ] {
+            assert_eq!(bin(&ValueItem::Null, op, &int(1)).unwrap(), ValueItem::Null, "{op:?}");
+            assert_eq!(bin(&int(1), op, &ValueItem::Null).unwrap(), ValueItem::Null, "{op:?}");
+        }
+    }
+
+    // ---- binary: arithmetic ----
+
+    #[test]
+    fn test_binary_arithmetic_integer_and_double() {
+        assert_eq!(bin(&int(2), BinaryOp::Plus, &int(3)).unwrap(), int(5));
+        assert_eq!(bin(&int(2), BinaryOp::Minus, &int(3)).unwrap(), int(-1));
+        assert_eq!(bin(&int(2), BinaryOp::Multiply, &int(3)).unwrap(), int(6));
+        assert_eq!(bin(&int(6), BinaryOp::Divide, &int(3)).unwrap(), int(2));
+        assert_eq!(bin(&int(7), BinaryOp::Modulo, &int(3)).unwrap(), int(1));
+
+        assert_eq!(bin(&dbl(2.5), BinaryOp::Plus, &dbl(1.0)).unwrap(), dbl(3.5));
+    }
+
+    #[test]
+    fn test_binary_arithmetic_promotes_mixed_integer_and_double() {
+        assert_eq!(bin(&int(2), BinaryOp::Plus, &dbl(0.5)).unwrap(), dbl(2.5));
+        assert_eq!(bin(&dbl(0.5), BinaryOp::Plus, &int(2)).unwrap(), dbl(2.5));
+    }
+
+    #[test]
+    fn test_binary_integer_overflow_is_an_error_not_a_panic() {
+        assert!(bin(&int(i64::MAX), BinaryOp::Plus, &int(1)).is_err());
+        assert!(bin(&int(i64::MIN), BinaryOp::Minus, &int(1)).is_err());
+        assert!(bin(&int(i64::MAX), BinaryOp::Multiply, &int(2)).is_err());
+    }
+
+    #[test]
+    fn test_binary_integer_division_and_modulo_by_zero_is_an_error_not_a_panic() {
+        assert!(bin(&int(1), BinaryOp::Divide, &int(0)).is_err());
+        assert!(bin(&int(1), BinaryOp::Modulo, &int(0)).is_err());
+    }
+
+    #[test]
+    fn test_binary_double_division_by_zero_yields_infinity_not_an_error() {
+        let r = bin(&dbl(1.0), BinaryOp::Divide, &dbl(0.0)).unwrap();
+        assert_eq!(r, dbl(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_binary_arithmetic_rejects_non_numeric_operands() {
+        assert!(bin(&str_val("x"), BinaryOp::Plus, &int(1)).is_err());
+        assert!(bin(&ValueItem::Boolean(true), BinaryOp::Plus, &int(1)).is_err());
+    }
+
+    // ---- binary: concat ----
+
+    #[test]
+    fn test_binary_concat_strings() {
+        assert_eq!(
+            bin(&str_val("foo"), BinaryOp::Concat, &str_val("bar")).unwrap(),
+            str_val("foobar")
+        );
+    }
+
+    #[test]
+    fn test_binary_concat_rejects_non_string_operands() {
+        assert!(bin(&int(1), BinaryOp::Concat, &str_val("x")).is_err());
+    }
+
+    // ---- binary: equality ----
+
+    #[test]
+    fn test_binary_eq_ignores_str_reserved_capacity() {
+        // Regression test: a literal's capacity (its own length) and a
+        // column's declared capacity (e.g. varchar(10)) must still compare
+        // equal by content — see values_equal's own doc comment for the
+        // bug this guards against (WHERE name = 'raj' matching nothing).
+        assert_eq!(
+            bin(&str_cap("raj", 3), BinaryOp::Eq, &str_cap("raj", 10)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&str_cap("raj", 3), BinaryOp::NotEq, &str_cap("raj", 10)).unwrap(),
+            ValueItem::Boolean(false)
+        );
+    }
+
+    #[test]
+    fn test_binary_eq_promotes_mixed_integer_and_double() {
+        assert_eq!(bin(&int(1), BinaryOp::Eq, &dbl(1.0)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&dbl(1.5), BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Boolean(false));
+    }
+
+    #[test]
+    fn test_binary_eq_across_mismatched_types_is_false_not_an_error() {
+        assert_eq!(
+            bin(&int(1), BinaryOp::Eq, &str_val("1")).unwrap(),
+            ValueItem::Boolean(false)
+        );
+        assert_eq!(
+            bin(&int(1), BinaryOp::NotEq, &str_val("1")).unwrap(),
+            ValueItem::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_binary_eq_on_booleans() {
+        assert_eq!(
+            bin(&ValueItem::Boolean(true), BinaryOp::Eq, &ValueItem::Boolean(true)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&ValueItem::Boolean(true), BinaryOp::Eq, &ValueItem::Boolean(false)).unwrap(),
+            ValueItem::Boolean(false)
+        );
+    }
+
+    // ---- binary: ordering ----
+
+    #[test]
+    fn test_binary_ordering_integer_double_str_boolean_datetime() {
+        assert_eq!(bin(&int(1), BinaryOp::Lt, &int(2)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&dbl(1.0), BinaryOp::Lt, &dbl(2.0)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&str_val("apple"), BinaryOp::Lt, &str_val("banana")).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&ValueItem::Boolean(false), BinaryOp::Lt, &ValueItem::Boolean(true)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&ValueItem::Datetime(1), BinaryOp::Lt, &ValueItem::Datetime(2)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(bin(&int(2), BinaryOp::GtEq, &int(2)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&int(1), BinaryOp::LtEq, &int(2)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&int(2), BinaryOp::Gt, &int(1)).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_binary_ordering_ignores_str_reserved_capacity() {
+        assert_eq!(
+            bin(&str_cap("apple", 5), BinaryOp::Lt, &str_cap("banana", 500)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_binary_ordering_promotes_mixed_integer_and_double() {
+        assert_eq!(bin(&int(1), BinaryOp::Lt, &dbl(1.5)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&dbl(1.5), BinaryOp::Gt, &int(1)).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_binary_ordering_rejects_blob_and_mismatched_types_as_an_error_not_a_panic() {
+        let blob = ValueItem::Blob((std::sync::Arc::from(&b"x"[..]), 1));
+        assert!(bin(&blob, BinaryOp::Lt, &blob).is_err());
+        assert!(bin(&int(1), BinaryOp::Lt, &str_val("x")).is_err());
+    }
+
+    // ---- binary: and/or ----
+
+    #[test]
+    fn test_binary_and_or_on_booleans() {
+        let (t, f) = (ValueItem::Boolean(true), ValueItem::Boolean(false));
+        assert_eq!(bin(&t, BinaryOp::And, &f).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(bin(&t, BinaryOp::And, &t).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&f, BinaryOp::Or, &f).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(bin(&t, BinaryOp::Or, &f).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_binary_and_or_rejects_non_boolean_operands() {
+        assert!(bin(&int(1), BinaryOp::And, &ValueItem::Boolean(true)).is_err());
+        assert!(bin(&int(1), BinaryOp::Or, &int(0)).is_err());
+    }
+
+    // ---- has_aggregate ----
+
+    #[test]
+    fn test_has_aggregate_false_for_plain_values_and_literals() {
+        assert!(!EvalExpr::Literal(int(1)).has_aggregate());
+        assert!(!EvalExpr::Value(0).has_aggregate());
+    }
+
+    #[test]
+    fn test_has_aggregate_true_when_a_function_is_an_aggregate() {
+        let count = FuncObj::Count(Count::new(vec![FuncArgs::Wildcard], false, None).unwrap());
+        assert!(EvalExpr::Function(count).has_aggregate());
+    }
+
+    #[test]
+    fn test_has_aggregate_propagates_through_unary_and_binary() {
+        let count = FuncObj::Count(Count::new(vec![FuncArgs::Wildcard], false, None).unwrap());
+        let agg = Box::new(EvalExpr::Function(count));
+        let unary = EvalExpr::Unary { op: UnaryOp::Not, field: agg.clone() };
+        assert!(unary.has_aggregate());
+
+        let binary = EvalExpr::Binary {
+            lhs: Box::new(EvalExpr::Literal(int(1))),
+            op: BinaryOp::Plus,
+            rhs: agg,
+        };
+        assert!(binary.has_aggregate());
+    }
+
+    // ---- flat_position ----
+
+    #[test]
+    fn test_flat_position_is_field_id_for_the_first_table() {
+        // No TableQuery construction needed for table_id == 0: the slice
+        // `tables[..0]` is empty regardless of what's actually in `tables`.
+        let tables: Vec<TableQuery<store::memfile::MemFile>> = vec![];
+        assert_eq!(EvalExpr::flat_position(&tables, 0, 3), 3);
+    }
+}

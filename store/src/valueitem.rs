@@ -8,7 +8,7 @@ use crate::{
     error::StoreError,
 };
 
-#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum ValueItem {
     #[default]
@@ -19,6 +19,34 @@ pub enum ValueItem {
     Str((String, u32)) = 20,
     Blob((Arc<[u8]>, u32)) = 25,
     Boolean(bool) = 30,
+}
+
+// Hand-written, not derived, for exactly one reason: Double. `impl Hash
+// for ValueItem` (below) already hashes a Double by its bit pattern
+// (`f.to_bits()`), not by IEEE-754 `==` — derived PartialEq would use
+// `==` instead, which disagrees with that on -0.0 vs 0.0 (`-0.0 == 0.0`
+// is true, but their bit patterns differ), a real violation of Hash's
+// own contract (`a == b` must imply `hash(a) == hash(b)`). Bit-pattern
+// equality fixes that, and is also exactly what makes `Ord`'s own
+// `total_cmp`-based ordering agree with `==` (two f64s compare `Equal`
+// under `total_cmp` iff their bits match) — same reasoning `ordered-
+// float`-style crates use. The one deliberate, known consequence: NaN
+// == NaN becomes true and -0.0 == 0.0 becomes false, the opposite of
+// plain IEEE-754 `==` (see test_double_equality_is_bit_pattern_based).
+// Every other variant just does what derive would already do.
+impl PartialEq for ValueItem {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ValueItem::Null, ValueItem::Null) => true,
+            (ValueItem::Integer(a), ValueItem::Integer(b)) => a == b,
+            (ValueItem::Double(a), ValueItem::Double(b)) => a.to_bits() == b.to_bits(),
+            (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a == b,
+            (ValueItem::Str(a), ValueItem::Str(b)) => a == b,
+            (ValueItem::Blob(a), ValueItem::Blob(b)) => a == b,
+            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, Hash)]
@@ -374,25 +402,31 @@ impl Display for ValueItem {
 
 impl PartialOrd for ValueItem {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ValueItem {
+    fn cmp(&self, other: &Self) -> Ordering {
         if *self == ValueItem::Null && *other == ValueItem::Null {
-            return Some(std::cmp::Ordering::Equal);
+            return std::cmp::Ordering::Equal;
         }
         match (self, other) {
-            (ValueItem::Integer(a), ValueItem::Integer(b)) => a.partial_cmp(b),
-            (ValueItem::Double(a), ValueItem::Double(b)) => a.partial_cmp(b),
-            (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.partial_cmp(b),
-            (ValueItem::Str(a), ValueItem::Str(b)) => a.0.partial_cmp(&b.0),
-            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a.partial_cmp(b),
+            (ValueItem::Integer(a), ValueItem::Integer(b)) => a.cmp(b),
+            (ValueItem::Double(a), ValueItem::Double(b)) => a.total_cmp(b),
+            (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.cmp(b),
+            (ValueItem::Str(a), ValueItem::Str(b)) => a.0.cmp(&b.0),
+            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a.cmp(b),
             (ValueItem::Blob(_), _) => panic!("Blobs cannot be compared."),
 
-            (_, ValueItem::Null) => Some(std::cmp::Ordering::Greater),
+            (_, ValueItem::Null) => std::cmp::Ordering::Greater,
             (ValueItem::Integer(_), _) => panic!("Invalid comparison. I"),
             (ValueItem::Double(_), _) => panic!("Invalid comparison. F "),
             (ValueItem::Datetime(_), _) => panic!("Invalid comparison. D"),
             (ValueItem::Str(_), _) => panic!("Invalid comparison. S"),
             (ValueItem::Boolean(_), _) => panic!("Invalid comparison. B"),
 
-            (ValueItem::Null, _) => Some(std::cmp::Ordering::Less),
+            (ValueItem::Null, _) => std::cmp::Ordering::Less,
         }
     }
 }
@@ -457,6 +491,51 @@ mod valueitem_tests {
 
         assert!(ValueItem::Datetime(100) < ValueItem::Datetime(200));
         assert!(ValueItem::Datetime(0) == ValueItem::Datetime(0));
+    }
+
+    // Double's PartialEq is bit-pattern equality (a.to_bits() ==
+    // b.to_bits()), not plain IEEE-754 `==` — see the impl's own doc
+    // comment for why (it's what keeps Hash, PartialEq, and Ord all
+    // agreeing with each other). The direct, intentional consequence:
+    // this disagrees with `==` on regular f64 in exactly the two cases
+    // where IEEE-754 equality and bit-pattern equality diverge.
+    // std::hash::Hash's own trait method, not ValueItem's unrelated
+    // inherent hash(&self) -> u64 (a separate, coarser FNV-style hash
+    // IndexKey uses — calling `.hash()` directly would resolve to that
+    // one instead, which isn't what's being verified here).
+    fn std_hash(v: &ValueItem) -> u64 {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(v, &mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn test_double_equality_is_bit_pattern_based_not_ieee754() {
+        // NaN == NaN is true here, unlike plain f64 (NaN != NaN always).
+        assert_eq!(ValueItem::Double(f64::NAN), ValueItem::Double(f64::NAN));
+        // -0.0 == 0.0 is false here, unlike plain f64 (-0.0 == 0.0 is true).
+        assert_ne!(ValueItem::Double(-0.0), ValueItem::Double(0.0));
+
+        // And consistent with std::hash::Hash: equal ValueItems must hash
+        // equally, which plain IEEE-754 equality would have broken for
+        // -0.0/0.0 (see this impl's own doc comment) since Hash already
+        // hashes by bit pattern.
+        assert_eq!(
+            std_hash(&ValueItem::Double(0.0)),
+            std_hash(&ValueItem::Double(0.0))
+        );
+        assert_ne!(
+            std_hash(&ValueItem::Double(-0.0)),
+            std_hash(&ValueItem::Double(0.0))
+        );
+
+        // And consistent with Ord: equal under PartialEq iff equal under
+        // partial_cmp, which was the whole point.
+        assert_eq!(
+            ValueItem::Double(f64::NAN).partial_cmp(&ValueItem::Double(f64::NAN)),
+            Some(std::cmp::Ordering::Equal)
+        );
     }
 
     #[test]

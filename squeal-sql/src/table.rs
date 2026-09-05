@@ -630,6 +630,19 @@ impl SqlTable {
         tb.build()
     }
 
+    // The byte footprint of a row's own identity (its PRIMARY KEY, or
+    // the generated rowid when there isn't one) — what a non-unique
+    // index's key has to grow by to stay unique (see alter_add_index's
+    // own doc comment on why: every backing table here is a BPlusTree
+    // with its own duplicate-key rejection, and a plain, non-unique
+    // index has to survive two rows sharing the same indexed value).
+    pub(crate) fn identity_size(&self) -> usize {
+        match self.primary_key() {
+            Some(pk) => pk.fields.iter().map(|f| f.datatype.size()).sum::<usize>(),
+            None => store::valueitem::ValueItem::Integer(0).size(),
+        }
+    }
+
     pub(crate) fn primary_key(&self) -> Option<&SqlIndex> {
         self.indices.iter().find(|i| i.is_primary)
     }
@@ -959,6 +972,28 @@ impl SqlTable {
         Ok(())
     }
 
+    // Structural validation only (no duplicate index name) — Schema::
+    // create_index is responsible for everything that needs to look
+    // outside this one table's own field list: resolving each column
+    // name to its Arc<Field>, checking the store-level backing-table
+    // name isn't taken, creating and backfilling that backing table
+    // before this ever gets called (the fully-built SqlIndex it hands
+    // in — db_table_id included — is just appended here).
+    pub(crate) fn alter_add_index(&mut self, index: SqlIndex) -> Result<(), SchemaError> {
+        if let Some(name) = &index.name
+            && self
+                .indices
+                .iter()
+                .any(|i| i.name.as_deref() == Some(name.as_str()))
+        {
+            return Err(SchemaError::UserError(format!(
+                "Duplicate index name: {name}"
+            )));
+        }
+        self.indices.push(index);
+        Ok(())
+    }
+
     pub(crate) fn alter_drop_foreign_key(&mut self, name: &str) -> Result<(), SchemaError> {
         let pos = self
             .foreign_keys
@@ -1169,9 +1204,20 @@ fn expr_to_value_item(
 }
 
 impl SqlIndex {
-    // Plus ENTRY_OVERHEAD_BYTES — see its own comment on SqlTable::row_size.
-    pub(crate) fn size(&self) -> usize {
-        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + ENTRY_OVERHEAD_BYTES
+    // Plus ENTRY_OVERHEAD_BYTES — see its own comment on SqlTable::
+    // row_size. `identity_size` (SqlTable::identity_size's own return
+    // value) only actually adds anything for a plain, non-unique index —
+    // a PRIMARY KEY/UNIQUE index's own declared fields are already the
+    // whole key (that's what makes the backing BPlusTree's own duplicate-
+    // key rejection enforce the constraint); every other caller can just
+    // pass 0 to say "this index doesn't need it."
+    pub(crate) fn size(&self, identity_size: usize) -> usize {
+        let extra = if self.is_primary || self.is_unique {
+            0
+        } else {
+            identity_size
+        };
+        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + extra + ENTRY_OVERHEAD_BYTES
     }
 }
 

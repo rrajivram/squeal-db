@@ -4,7 +4,7 @@ use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
 
 use crate::{
     error::SchemaError,
-    source::{ProjectedField, Source},
+    source::{ProjectableField, Source},
 };
 
 // Streams a temp table's rows — the Run-backed equivalent of TableSource
@@ -12,7 +12,7 @@ use crate::{
 // upstream of a bare table/temp-table scan to chain from.
 pub(crate) struct RunSource<F: DBFile + 'static> {
     cursor: RunCursor<F>,
-    fields: Arc<[ProjectedField]>,
+    fields: Arc<[ProjectableField]>,
 }
 
 impl<F> RunSource<F>
@@ -20,7 +20,7 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn new(cursor: RunCursor<F>, fields: &[ProjectedField]) -> Self {
+    pub(crate) fn new(cursor: RunCursor<F>, fields: &[ProjectableField]) -> Self {
         Self {
             cursor,
             fields: Arc::from(fields),
@@ -45,7 +45,7 @@ where
             .map(|tuple| IndexKey::from_bytes(tuple.data())))
     }
 
-    fn fields(&self) -> Arc<[ProjectedField]> {
+    fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }
 

@@ -47,6 +47,14 @@ pub struct DescribeTable {
     pub name: ObjectName,
 }
 
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct ShowTableIndex {
+    pub show: kw::Show,
+    pub table: kw::Table,
+    pub index: kw::Index,
+    pub name: ObjectName,
+}
+
 impl CreateTable {
     pub fn columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.elements.items().filter_map(|e| match e {

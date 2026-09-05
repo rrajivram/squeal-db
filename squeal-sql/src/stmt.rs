@@ -317,6 +317,9 @@ where
                 sql_parser::Statement::AlterTable(alter) => {
                     parse_alter_table(alter)?;
                 }
+                sql_parser::Statement::CreateIndex(c) => {
+                    parse_create_index(c)?;
+                }
                 _ => {}
             }
         }
@@ -562,6 +565,90 @@ where
                         .collect::<Vec<_>>();
                     self.results.push(Some(ResultType::Result(ResultSet::new(
                         fields.iter().map(|s| s.to_string()).collect(),
+                        rows,
+                        "".into(),
+                    ))));
+                }
+                sql_parser::Statement::CreateIndex(c) => {
+                    let columns = parse_create_index(c)?;
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&c.table)?;
+                    reject_qualified_field("CREATE INDEX", field)?;
+                    let (schema, table) = expect_real(table_ref, "CREATE INDEX")?;
+                    let name = c.name.value.to_lowercase();
+                    if c.if_not_exists.is_some()
+                        && table
+                            .indices
+                            .iter()
+                            .any(|i| i.name.as_deref() == Some(name.as_str()))
+                    {
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Index {name:?} already exists"
+                        ))));
+                    } else {
+                        schema.create_index(
+                            &table.name,
+                            name.clone(),
+                            &columns,
+                            c.unique.is_some(),
+                        )?;
+                        self.results.push(Some(ResultType::ResultString(format!(
+                            "Index {name:?} created"
+                        ))));
+                    }
+                }
+                sql_parser::Statement::ShowTableIndex(s) => {
+                    let (table_ref, _) = self.conn.resolve_object_name_ref(&s.name)?;
+                    let table = match table_ref {
+                        TableRef::Real(_schema, t) => t,
+                        // A temp table is backed by an append-only Run
+                        // (see crate::temp's own doc comment) — no
+                        // indices, no foreign keys, nothing to show.
+                        TableRef::Temp(name, _) => {
+                            return Err(SchemaError::UserError(format!(
+                                "temp.{name} has no indices or foreign keys"
+                            )));
+                        }
+                        TableRef::Derived => {
+                            return Err(SchemaError::UnknownError(
+                                "Can't show indices for a derived table".into(),
+                            ));
+                        }
+                    };
+                    let columns = ["Name", "Kind", "Columns", "Details"];
+                    let sz = DEFAULT_VAR_SIZE as u32;
+                    let str_row = |name: String, kind: &str, cols: String, details: String| {
+                        vec![
+                            ValueItem::Str((name, sz)),
+                            ValueItem::Str((kind.to_string(), sz)),
+                            ValueItem::Str((cols, sz)),
+                            ValueItem::Str((details, sz)),
+                        ]
+                    };
+                    let mut rows = Vec::new();
+                    for idx in &table.indices {
+                        let kind = if idx.is_primary {
+                            "PRIMARY KEY"
+                        } else if idx.is_unique {
+                            "UNIQUE"
+                        } else {
+                            "INDEX"
+                        };
+                        let cols = idx
+                            .fields
+                            .iter()
+                            .map(|f| f.name.clone())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let name = idx.name.clone().unwrap_or_else(|| "(unnamed)".into());
+                        rows.push(str_row(name, kind, cols, "".into()));
+                    }
+                    for fk in &table.foreign_keys {
+                        let name = fk.name.clone().unwrap_or_else(|| "(unnamed)".into());
+                        let details = format!("-> {}.{}", fk.ref_table, fk.ref_column);
+                        rows.push(str_row(name, "FOREIGN KEY", fk.column.clone(), details));
+                    }
+                    self.results.push(Some(ResultType::Result(ResultSet::new(
+                        columns.iter().map(|s| s.to_string()).collect(),
                         rows,
                         "".into(),
                     ))));
@@ -904,6 +991,43 @@ fn parse_alter_table(
     Ok((table_name, op))
 }
 
+// Structural validation only (see parse_alter_table's own doc comment
+// on why this and Statement::execute's own CreateIndex arm both call
+// this) — extracts and lowercases each column name, rejecting anything
+// this engine doesn't back: an expression instead of a bare column
+// reference, or an ASC/DESC/NULLS ordering spec (nothing here actually
+// orders by it — an index's own key order is just its declared field
+// order, the same as a composite PRIMARY KEY's).
+fn parse_create_index(c: &sql_parser::ddl::CreateIndex) -> Result<Vec<String>, SchemaError> {
+    let mut names = Vec::new();
+    for item in c.columns.items() {
+        if item.direction.is_some() || item.nulls.is_some() {
+            return Err(SchemaError::UserError(
+                "CREATE INDEX does not support ASC/DESC or NULLS FIRST/LAST yet".into(),
+            ));
+        }
+        let sql_parser::Expr::Column(col) = &item.expr else {
+            return Err(SchemaError::UserError(
+                "CREATE INDEX only supports plain column names, not expressions".into(),
+            ));
+        };
+        let idents = col.idents().collect::<Vec<_>>();
+        if idents.len() != 1 {
+            return Err(SchemaError::UserError(format!(
+                "{:?} is not a plain column name",
+                col.to_dotted()
+            )));
+        }
+        names.push(idents[0].value.to_lowercase());
+    }
+    if names.is_empty() {
+        return Err(SchemaError::UserError(
+            "CREATE INDEX needs at least one column".into(),
+        ));
+    }
+    Ok(names)
+}
+
 // COPY INTO's grammar (sql_parser::ddl::CopyInto) is already exactly as
 // strict as this crate needs — "COPY INTO <table> FROM @<path>" and
 // nothing else parses at all — so unlike parse_select_star/
@@ -1100,7 +1224,7 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select count(distinct id) as id from t1");
+        exec("select count(1) as id from t1");
     }
 
     #[test]
@@ -1114,9 +1238,9 @@ mod dummy_tests {
             conn.clone(),
             "create table t2 (id int,id1 int, name varchar(10))",
         );
-        exec_sql(conn.clone(), "insert into t1 values(1,1,'raj')");
+        exec_sql(conn.clone(), "insert into t1 values(1,3,'raj')");
         exec_sql(conn.clone(), "insert into t1 values(2,2,'kav')");
-        exec_sql(conn.clone(), "insert into t1 values(5,5,'gan')");
+        exec_sql(conn.clone(), "insert into t1 values(5,1,'kav')");
         exec_sql(conn.clone(), "insert into t2 values(3,3,'ram')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
@@ -1128,5 +1252,9 @@ mod dummy_tests {
         exec_sql(conn.clone(), "select * from t1 where name='raj' ");
         exec_sql(conn.clone(), "select * from t1,t1 ");
         exec_sql(conn.clone(), "select t1.*,t2.* from t1,t2 ");
+        exec_sql(
+            conn.clone(),
+            "select * from t1 order by name desc,id asc limit 3 ",
+        );
     }
 }

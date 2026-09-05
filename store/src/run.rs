@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     buffer::PageBuffer,
     cursor::Cursor,
-    db::DBFile,
+    db::{DBFile, Db},
     error::StoreError,
     page::{Page, PageId, PageTupleIterator},
     tuple::Tuple,
@@ -164,7 +164,11 @@ mod tests {
         let first_pass: Vec<u8> = std::iter::from_fn(|| cursor.next().unwrap())
             .map(|t| t.data()[0])
             .collect();
-        assert_eq!(first_pass, (0..10).collect::<Vec<_>>(), "sanity: first pass");
+        assert_eq!(
+            first_pass,
+            (0..10).collect::<Vec<_>>(),
+            "sanity: first pass"
+        );
         assert!(
             cursor.next().unwrap().is_none(),
             "sanity: cursor is actually exhausted before reset"
