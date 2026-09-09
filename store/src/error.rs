@@ -38,6 +38,8 @@ pub enum StoreError {
     MissingKey(String),
     #[error("value too large: {0} byte(s), maximum allowed is {1} byte(s)")]
     TupleTooLarge(DBSizeType, usize),
+    #[error("run page index {0} out of range (run has {1} page(s))")]
+    RunPageIndexOutOfRange(usize, usize),
     #[error("Undo log error : {0}")]
     UndoLogError(String),
     #[error("Table not found : {0}")]

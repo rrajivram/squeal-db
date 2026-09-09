@@ -1224,7 +1224,7 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select count(1) as id from t1");
+        exec("select distinct id from t1");
     }
 
     #[test]
@@ -1241,6 +1241,7 @@ mod dummy_tests {
         exec_sql(conn.clone(), "insert into t1 values(1,3,'raj')");
         exec_sql(conn.clone(), "insert into t1 values(2,2,'kav')");
         exec_sql(conn.clone(), "insert into t1 values(5,1,'kav')");
+        exec_sql(conn.clone(), "insert into t1 values(6,3,'kav')");
         exec_sql(conn.clone(), "insert into t2 values(3,3,'ram')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
@@ -1252,9 +1253,10 @@ mod dummy_tests {
         exec_sql(conn.clone(), "select * from t1 where name='raj' ");
         exec_sql(conn.clone(), "select * from t1,t1 ");
         exec_sql(conn.clone(), "select t1.*,t2.* from t1,t2 ");
-        exec_sql(
-            conn.clone(),
-            "select * from t1 order by name desc,id asc limit 3 ",
-        );
+        exec_sql(conn.clone(), "select * from t1 order by name desc,id asc ");
+        exec_sql(conn.clone(), "select count(*) as C from t1");
+        exec_sql(conn.clone(), "select count(distinct name) as C from t1");
+        exec_sql(conn.clone(), "select distinct name from t1");
+        exec_sql(conn.clone(), "select count(*) ,name from t1");
     }
 }

@@ -4,7 +4,9 @@ use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
     keyword::No,
-    query::{self, Alias, FromClause, OrderByClause, SelectItem, SetOperand, TableFactor},
+    query::{
+        self, Alias, FromClause, GroupByClause, OrderByClause, SelectItem, SetOperand, TableFactor,
+    },
     token::Comma,
     utils::Seq,
     visitor::{Visit, Visitor},
@@ -16,11 +18,12 @@ use crate::{
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     ds::stack::Stack,
     error::SchemaError,
-    plan::{eval::EvalExpr, memory::QueryMemory},
+    plan::{eval::EvalExpr, funcs::FuncTrait, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
-        ProjectableField, Source, join::UnionJoin, limit::Limit, proj::Projection, run::RunSource,
-        sort::SortSource, table::TableSource, where_source::WhereSource,
+        ProjectableField, Source, aggr::AggregatingSource, group::GroupSource, join::UnionJoin,
+        limit::Limit, proj::Projection, run::RunSource, sort::SortSource, table::TableSource,
+        where_source::WhereSource,
     },
     table::{Field, SqlTable},
     temp::TempTable,
@@ -207,6 +210,7 @@ struct QueryVisitor<F: DBFile> {
     steps: Vec<Box<dyn Source>>,
     limit: Option<usize>,
     order: Option<OrderByClause>,
+    mem: Arc<QueryMemory>,
 }
 
 struct SourceHolder<F: DBFile + 'static> {
@@ -273,6 +277,7 @@ where
                             &tables,
                             Some(limit as usize),
                             self.conn.database.read().db.clone(),
+                            self.mem.clone(),
                         );
                         if let Err(e) = order {
                             return std::ops::ControlFlow::Break(e);
@@ -298,7 +303,7 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn new(conn: Arc<Connection<F>>) -> Self {
+    fn new(conn: Arc<Connection<F>>, mem: Arc<QueryMemory>) -> Self {
         Self {
             conn,
             steps: vec![],
@@ -306,6 +311,7 @@ where
             projections: Stack::new(),
             limit: None,
             order: None,
+            mem,
         }
     }
 
@@ -313,10 +319,13 @@ where
         &mut self,
         select: &sql_parser::query::SelectCore,
     ) -> Result<SourceHolder<F>, SchemaError> {
-        let _distinct = select.distinct.is_some();
+        let distinct = select.distinct.is_some();
         let tables = self.get_tables(&select.from)?;
         let proj = self.get_projections(&select.projection, &tables)?;
         let projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
+        let has_aggregation = projected_fields.iter().any(|f| f.expr.has_aggregate());
+        let projected_field_count = projected_fields.len();
+
         let wh_expr = if let Some(wh) = &select.where_clause {
             Some(*EvalExpr::from_expr(&wh.expr, &tables)?)
         } else {
@@ -334,10 +343,59 @@ where
             Box::new(union)
         };
 
-        Ok(SourceHolder {
-            source: Box::new(Projection::new(for_proj, projected_fields)),
-            tables,
-        })
+        // A GROUP BY (or a bare aggregate with no GROUP BY at all, i.e.
+        // one implicit group over the whole table) has to accumulate
+        // over *raw* rows, one row at a time, before ever evaluating the
+        // SELECT list — an aggregate's own output column changes on
+        // every row it's fed, so evaluating the SELECT list eagerly per
+        // raw row first (what DISTINCT's path below does, and what an
+        // earlier version of this tried to reuse for GROUP BY too) can
+        // never collapse anything: no two rows in the same group would
+        // ever compare equal on their already-evaluated aggregate
+        // column. See GroupSource's own doc comment.
+        let projected: Box<dyn Source> = if has_aggregation {
+            let key_positions =
+                self.validate_aggreations(&projected_fields, &tables, &select.group_by)?;
+            let grouped_source: Box<dyn Source> = if key_positions.is_empty() {
+                for_proj
+            } else {
+                Box::new(SortSource::with_fields(
+                    for_proj,
+                    self.conn.database.read().db.clone(),
+                    self.mem.clone(),
+                    &key_positions,
+                )?)
+            };
+            Box::new(GroupSource::new(
+                grouped_source,
+                projected_fields.clone(),
+                key_positions,
+            ))
+        } else {
+            Box::new(Projection::new(for_proj, projected_fields.clone()))
+        };
+        // DISTINCT has to dedup on the *projected* row, not the raw table
+        // row: AggregatingSource compares whole rows, so it only sees
+        // duplicates once every column it's comparing has actually been
+        // narrowed down to the SELECT list first. Sorting/deduping the
+        // wide raw row and projecting afterward (an earlier version of
+        // this) is why every row came back unchanged — two rows with the
+        // same `name` but a different value in any other column of the
+        // table (an id column, say) still compare unequal on the raw
+        // row, so nothing ever collapsed.
+        let source = if distinct {
+            let sorted = SortSource::with_fields(
+                projected,
+                self.conn.database.read().db.clone(),
+                self.mem.clone(),
+                &(0..projected_field_count).collect::<Vec<_>>(),
+            )?;
+            Box::new(AggregatingSource::new(Box::new(sorted))?)
+        } else {
+            projected
+        };
+
+        Ok(SourceHolder { source, tables })
     }
 
     fn get_projections(
@@ -476,6 +534,66 @@ where
         }
         Ok(tables)
     }
+
+    // Returns the raw table field positions to group by — empty means
+    // "no GROUP BY clause at all," i.e. one implicit group over the
+    // whole table (a bare aggregate like `SELECT COUNT(*) FROM t`), a
+    // legitimate case in its own right, not something to skip grouping
+    // for (see GroupSource, which treats an empty key list the same
+    // way: one group covering every row, even zero rows).
+    fn validate_aggreations(
+        &self,
+        fields: &[ProjectableField],
+        tables: &[TableQuery<F>],
+        group: &Option<GroupByClause>,
+    ) -> Result<Vec<usize>, SchemaError> {
+        let group_by = if let Some(group) = group {
+            let mut v = vec![];
+            for f in group.exprs.items() {
+                v.push(self.handle_expr(f, &None, tables)?);
+            }
+            v
+        } else {
+            vec![]
+        };
+        let non_agg_fields = fields
+            .iter()
+            .flat_map(|f| f.expr.get_non_agg_fields())
+            .collect::<Vec<_>>();
+        if !non_agg_fields.is_empty() && group_by.is_empty() {
+            let mut names = String::new();
+            for n in fields {
+                if !n.expr.has_aggregate() {
+                    names += format!("{},", n.display_name.clone()).as_str();
+                }
+            }
+            return Err(SchemaError::GroupByMissingField(names));
+        }
+        let group_by_positions = group_by
+            .iter()
+            .filter_map(|g| match &g.expr {
+                EvalExpr::Value(u) => Some(*u),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Standard SQL rule, and the reverse of what this checked
+        // before: every non-aggregate SELECT column must appear in
+        // GROUP BY (so its value is well-defined once rows collapse
+        // into groups) — but a GROUP BY column need NOT appear in the
+        // SELECT list at all (`GROUP BY category` alone, selecting only
+        // `count(*)`, is perfectly valid).
+        for n in fields {
+            if n.expr.has_aggregate() {
+                continue;
+            }
+            for pos in n.expr.get_non_agg_fields() {
+                if !group_by_positions.contains(&pos) {
+                    return Err(SchemaError::GroupByMissingField(n.display_name.clone()));
+                }
+            }
+        }
+        Ok(group_by_positions)
+    }
 }
 
 #[allow(unused)]
@@ -497,13 +615,14 @@ where
     }
 
     pub(crate) fn build(conn: Arc<Connection<F>>, query: &Query) -> Result<Self, SchemaError> {
-        let mut visitor = QueryVisitor::new(conn.clone());
+        let mem = QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT);
+        let mut visitor = QueryVisitor::new(conn.clone(), mem.clone());
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);
         }
         let mut this = Self {
             tail: None,
-            mem: QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT),
+            mem,
             _phanton: PhantomData,
         };
         assert!(visitor.steps.len() == 1);

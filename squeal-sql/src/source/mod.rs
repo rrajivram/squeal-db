@@ -4,7 +4,9 @@ use store::valueitem::IndexKey;
 
 use crate::{error::SchemaError, plan::eval::EvalExpr, table::Field};
 
-pub mod group;
+pub mod aggr;
+pub(crate) mod group;
+pub mod hash;
 pub(crate) mod join;
 pub mod limit;
 pub mod proj;

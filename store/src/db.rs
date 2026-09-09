@@ -17,8 +17,7 @@ use crate::logger::Operation;
 use crate::logger::Record;
 use crate::memfile::MemFile;
 use crate::page::Page;
-use crate::page::PageId;
-use crate::run::{Run, RunCursor};
+use crate::run::Run;
 use crate::table::Table;
 use crate::table::TableIdType;
 use crate::tables::bplustree;
@@ -96,8 +95,26 @@ pub trait Opener: Any {
     fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize>;
 }
 
+// Opener<Item = Self>, not just Opener: every real implementor (MemFile,
+// std::fs::File, NamedMemFile — see their own `impl Opener` blocks)
+// already has Item = Self, so this makes that already-universal fact
+// part of DBFile's own contract instead of leaving it as a separate
+// bound (`F: DBFile<Item = F>`) that every generic struct/impl touching
+// a DBFile has to restate by hand to use anything gated on it (e.g.
+// PageBuffer's page I/O methods, which need Item = F to open/clone the
+// underlying file). Without this, adding a single new struct in that
+// dependency chain that needs Item = F (see store::run::RunPages) forces
+// every OTHER generic type that merely stores one of that struct's
+// ancestors as a field to restate the bound too, cascading arbitrarily
+// far up an unrelated type graph just to keep each struct's own
+// declaration well-formed.
 pub trait DBFile:
-    std::io::Write + std::io::Read + std::io::Seek + std::marker::Send + std::marker::Sync + Opener
+    std::io::Write
+    + std::io::Read
+    + std::io::Seek
+    + std::marker::Send
+    + std::marker::Sync
+    + Opener<Item = Self>
 {
 }
 pub(crate) type DBSizeType = u64;
@@ -108,7 +125,7 @@ impl<T> DBFile for T where
         + std::io::Seek
         + std::marker::Send
         + std::marker::Sync
-        + Opener
+        + Opener<Item = T>
 {
 }
 
@@ -859,13 +876,6 @@ where
     /// machinery, so this only needs `&self`, not `&Arc<Self>`.
     pub fn create_run(&self) -> Result<Run<F>, StoreError> {
         Run::create(self.buffer.clone())
-    }
-
-    /// Reads back a Run written earlier (by this Db instance or another
-    /// owner) from its head page — e.g. a merge step reading several
-    /// already-written input runs.
-    pub fn open_run(&self, head: PageId) -> Result<RunCursor<F>, StoreError> {
-        RunCursor::new(self.buffer.clone(), head)
     }
 
     pub fn range_scan(
@@ -1783,7 +1793,7 @@ mod tests {
             run.append(r).unwrap();
         }
 
-        let mut cursor = db.open_run(run.head()).unwrap();
+        let mut cursor = run.cursor().unwrap();
         let mut read_back = Vec::new();
         while let Some(t) = cursor.next().unwrap() {
             read_back.push(t.data().to_vec());
@@ -1795,26 +1805,8 @@ mod tests {
     }
 
     #[test]
-    fn test_open_run_reads_a_run_by_head_page_id_alone() {
-        // A reader doesn't need the original Run handle — just the head
-        // page id, e.g. a later merge step reading runs an earlier phase
-        // wrote and has since dropped.
-        let db: Arc<TestDB> = TestDB::create_with_page_size("run_by_head.db", 512).unwrap();
-        let mut run = db.create_run().unwrap();
-        run.append(b"a").unwrap();
-        run.append(b"b").unwrap();
-        let head = run.head();
-        drop(run);
-
-        let mut cursor = db.open_run(head).unwrap();
-        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"a");
-        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"b");
-        assert!(cursor.next().unwrap().is_none());
-    }
-
-    #[test]
-    fn test_run_free_releases_every_page_in_the_chain() {
-        let db: Arc<TestDB> = TestDB::create_with_page_size("run_free.db", 512).unwrap();
+    fn test_dropping_a_run_frees_its_pages_once_nothing_else_references_them() {
+        let db: Arc<TestDB> = TestDB::create_with_page_size("run_drop_frees.db", 512).unwrap();
         let mut run = db.create_run().unwrap();
         for i in 0..50u32 {
             run.append(&i.to_be_bytes()).unwrap();
@@ -1822,11 +1814,11 @@ mod tests {
         let head = run.head();
         assert_eq!(db.buffer.get_free_pages().len(), 0);
 
-        run.free().unwrap();
+        drop(run);
 
         assert!(
             db.buffer.get_free_pages().contains(&head),
-            "freeing a run must reclaim its own head page, not just later ones"
+            "dropping a run's last reference must reclaim its own head page, not just later ones"
         );
         assert!(
             db.buffer.get_free_pages().len() >= 2,
@@ -1835,31 +1827,34 @@ mod tests {
     }
 
     #[test]
-    fn test_run_survives_close_and_reopen() {
-        // Not a durability guarantee for a Run's own bookkeeping (see
-        // Run's own doc comment) — just confirms RunPage's registered
-        // PageContentKind round-trips through a real close/reopen like
-        // any other page content would.
-        let db_name = temp_db_path("run_close_reopen");
-        FileDB::delete(&db_name).unwrap_or_default();
-
-        let db = FileDB::create(&db_name).unwrap();
+    fn test_a_live_cursor_keeps_a_dropped_runs_pages_from_being_freed() {
+        // A cursor holds its own Arc onto the same page chain the Run
+        // does (see RunPages) — dropping the Run it came from must not
+        // free pages the cursor is still reading, and the pages must
+        // finally free once the cursor itself is also dropped.
+        let db: Arc<TestDB> = TestDB::create_with_page_size("run_cursor_keeps_alive.db", 512)
+            .unwrap();
         let mut run = db.create_run().unwrap();
-        run.append(b"hello").unwrap();
-        run.append(b"world").unwrap();
+        run.append(b"a").unwrap();
+        run.append(b"b").unwrap();
         let head = run.head();
-        // Run holds its own Arc<PageBuffer<F>> clone (like BPlusTree) —
-        // Db::close needs unique ownership, same as with a live cursor.
-        drop(run);
-        let (f, u, r) = db.close().unwrap();
 
-        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
-        let mut cursor = db2.open_run(head).unwrap();
-        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"hello");
-        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"world");
+        let mut cursor = run.cursor().unwrap();
+        drop(run);
+        assert!(
+            !db.buffer.get_free_pages().contains(&head),
+            "the run's pages must survive as long as a cursor still references them"
+        );
+
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"a");
+        assert_eq!(cursor.next().unwrap().unwrap().data().to_vec(), b"b");
         assert!(cursor.next().unwrap().is_none());
 
-        FileDB::delete(&db_name).unwrap_or_default();
+        drop(cursor);
+        assert!(
+            db.buffer.get_free_pages().contains(&head),
+            "once the last cursor referencing it drops too, the run's pages must free"
+        );
     }
 
     // ── transactional insert / find ───────────────────────────────────────────

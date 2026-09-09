@@ -1,13 +1,50 @@
 use std::sync::Arc;
 
+use log::error;
+
 use crate::{
     buffer::PageBuffer,
     cursor::Cursor,
-    db::{DBFile, Db},
+    db::{DBFile, DBSizeType, Db},
     error::StoreError,
-    page::{Page, PageId, PageTupleIterator},
+    page::{Page, PageId, PageTupleIterator, USABLE_DATA_MARGIN},
     tuple::Tuple,
 };
+
+/// The actual owner of a run's on-disk page chain — held behind an `Arc`
+/// shared between the writing `Run` and every `RunCursor` cloned from it
+/// (see `Run::cursor`), and freed automatically, exactly once, on
+/// whichever of those drops last.
+///
+/// This indirection is what makes cleanup automatic without `RunCursor`
+/// having to *borrow* `&Run`: a borrow would force every cursor to live
+/// no longer than the `Run` that produced it, but this crate's cursors
+/// are deliberately built to detach and outlive their producer (e.g.
+/// `TempTable::open_source` releases its read lock and returns a
+/// cursor-backed `Source` that keeps running long after). An `Arc` clone
+/// gets the same "can't free out from under a live reader" safety via
+/// reference counting instead of a lifetime, without that constraint.
+pub(crate) struct RunPages<F: DBFile + 'static> {
+    buffer: Arc<PageBuffer<F>>,
+    head: PageId,
+}
+
+impl<F: DBFile + 'static> Drop for RunPages<F> {
+    fn drop(&mut self) {
+        // Can't propagate a failure out of Drop::drop (it returns ()),
+        // and panicking mid-drop — especially during an unrelated panic's
+        // unwind — risks aborting the whole process over what would
+        // otherwise just be a leak. Freeing a run's pages failing at all
+        // should be rare (I/O error, corrupted state); log it and move
+        // on rather than lose the failure silently.
+        if let Err(e) = self.buffer.free_page_chain(self.head) {
+            error!(
+                "failed to free run page chain starting at {:?}: {e:?}",
+                self.head
+            );
+        }
+    }
+}
 
 /// An append-only, unkeyed chain of pages holding raw byte records in the
 /// order they were written — the building block for query-execution
@@ -15,15 +52,23 @@ use crate::{
 /// as opposed to a table's B+Tree-indexed, MVCC-visible row storage.
 ///
 /// Deliberately not transactional: nothing written through `append` is
-/// undo/redo-logged, and a Run's pages are freed only by an explicit call
-/// to `free` — not tracked across close/reopen or replayed by crash
-/// recovery. A Run is scratch space owned by whichever query is building
-/// it, for exactly as long as that query runs; it was never meant to
-/// survive a restart, so it doesn't try to.
+/// undo/redo-logged. Its pages are freed automatically (see `RunPages`)
+/// once nothing references them anymore, rather than through an explicit
+/// call — not tracked across close/reopen or replayed by crash recovery
+/// either way. A Run is scratch space for whichever query is building
+/// it; it was never meant to survive a restart, so it doesn't try to.
 pub struct Run<F: DBFile + 'static> {
-    buffer: Arc<PageBuffer<F>>,
-    head: PageId,
+    pages: Arc<RunPages<F>>,
     tail: PageId,
+    pg_count: usize,
+    // Every page id this run has ever allocated, in chain order (index 0
+    // is always `head`, last is always `tail`) — lets a caller address a
+    // specific page by position (`set_content_at`/`get_content_at`)
+    // instead of only ever reading/writing the current tail or walking
+    // the whole chain sequentially via `cursor()`. Needed for anything
+    // that wants true random access over a run's pages, e.g. a hash
+    // index mapping bucket number -> page directly.
+    page_ids: Vec<PageId>,
 }
 
 impl<F> Run<F>
@@ -34,17 +79,35 @@ where
     pub(crate) fn create(buffer: Arc<PageBuffer<F>>) -> Result<Self, StoreError> {
         let head = buffer.alloc_run_page()?;
         Ok(Self {
-            buffer,
-            head,
+            pages: Arc::new(RunPages { buffer, head }),
             tail: head,
+            pg_count: 1,
+            page_ids: vec![head],
         })
     }
 
-    /// The chain's first page — hand this to `Db::open_run` to read this
-    /// run back, including from a different owner than whoever wrote it
-    /// (e.g. a merge step reading several already-written input runs).
+    /// Every page id this run has allocated, in chain order — index `i`
+    /// is the `(i+1)`th page allocated (`head` is index 0, `tail` is the
+    /// last entry). Use with `set_content_at`/`get_content_at` for direct
+    /// access to a specific page by position, e.g. a hash index mapping
+    /// bucket number straight to a page instead of scanning for it.
+    pub fn page_ids(&self) -> &[PageId] {
+        &self.page_ids
+    }
+
+    /// The chain's first page.
     pub fn head(&self) -> PageId {
-        self.head
+        self.pages.head
+    }
+
+    /// The chain's current last page — where `append` is currently
+    /// writing, and what `set_content`/`get_content` operate against (see
+    /// their own docs). Exposed for callers doing their own page-by-page
+    /// writes via `new_page`/`set_content` who want to record which page
+    /// each chunk landed on (e.g. to build an index over a run's pages),
+    /// the same way `head` lets a reader locate the start of the chain.
+    pub fn tail(&self) -> PageId {
+        self.tail
     }
 
     /// Appends one record, in the order given. Every tuple a Run stores
@@ -53,29 +116,129 @@ where
     pub fn append(&mut self, data: &[u8]) -> Result<(), StoreError> {
         let tuple = Tuple::new(0, data);
         loop {
-            let handle = self.buffer.get_page_mut(self.tail)?;
+            let handle = self.pages.buffer.get_page_mut(self.tail)?;
             if handle.page.can_store(&tuple) {
                 handle.page.add_tuple(tuple)?;
-                self.buffer.write_locked_page(handle)?;
+                self.pages.buffer.write_locked_page(handle)?;
                 return Ok(());
             }
             drop(handle);
-            let new_id = self.buffer.alloc_run_page()?;
-            self.buffer.set_data_chain_next(self.tail, new_id)?;
+            let new_id = self.pages.buffer.alloc_run_page()?;
+            self.pg_count += 1;
+            self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
             self.tail = new_id;
+            self.page_ids.push(new_id);
         }
     }
 
-    /// Frees every page in this run. Call once its contents are no
-    /// longer needed (e.g. after a merge step has consumed it) — nothing
-    /// else reclaims a Run's pages on its own.
-    pub fn free(self) -> Result<(), StoreError> {
-        self.buffer.free_page_chain(self.head)
+    pub fn available_size(&self) -> DBSizeType {
+        self.pages.buffer.page_size() - Page::get_overhead()
+    }
+
+    /// The largest single blob `set_content` will accept without erroring.
+    /// Same margin `Page::usable_data_size` reserves below `available_size`
+    /// for page-serialization framing that no individual tuple's own
+    /// `size()` accounts for (see USABLE_DATA_MARGIN) — kept in sync with
+    /// it here since a Page's own version is private to `page.rs`.
+    pub fn data_size(&self) -> DBSizeType {
+        self.available_size().saturating_sub(USABLE_DATA_MARGIN)
+    }
+
+    /// Grows the chain by one page and moves onto it: allocates a fresh
+    /// page, links the current tail to it, and makes it the new tail —
+    /// the same two steps `append`'s internal retry loop takes when the
+    /// current tail is full, just exposed directly so a caller writing
+    /// through `set_content` (which, unlike `append`, never allocates a
+    /// page on its own) can control exactly when the chain grows. Returns
+    /// the new page's id, e.g. to remember alongside whatever chunk gets
+    /// written to it next.
+    pub fn new_page(&mut self) -> Result<PageId, StoreError> {
+        let new_id = self.pages.buffer.alloc_run_page()?;
+        self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
+        self.tail = new_id;
+        self.pg_count += 1;
+        self.page_ids.push(new_id);
+        Ok(self.tail)
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pg_count
+    }
+
+    /// Directly stores `data` as the current tail page's entire content,
+    /// replacing whatever was there — skipping append's per-record
+    /// tuple-then-retry-on-a-new-page loop, cheaper than `append` when the
+    /// caller already holds one contiguous blob known to fit on a single
+    /// page. Unlike `append`, oversized content here is a caller mistake
+    /// to surface immediately, not something to transparently spill
+    /// across an overflow chain — so this checks against `data_size` up
+    /// front and errors instead.
+    ///
+    /// A Run never grows its chain on its own outside of `append`, so
+    /// writing more content than one page holds is on the caller: call
+    /// `new_page` to advance the tail, then `set_content` again for the
+    /// next chunk. Reading a multi-page run back is just `cursor()` —
+    /// every page `set_content` ever wrote holds exactly one Tuple, so
+    /// the existing tuple-by-tuple RunCursor already walks chunk-by-chunk,
+    /// page-by-page, in write order; nothing about it is specific to
+    /// `append`.
+    pub fn set_content(&mut self, data: &[u8]) -> Result<(), StoreError> {
+        self.set_content_at(self.page_ids.len() - 1, data)
+    }
+
+    /// Reads back whatever `set_content` last wrote to the current tail
+    /// page — `None` if nothing has been written to it yet. For anything
+    /// written before the most recent `new_page` (i.e. earlier pages in
+    /// the chain), use `cursor()` instead.
+    pub fn get_content(&self) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_content_at(self.page_ids.len() - 1)
+    }
+
+    /// `set_content`, but addressable by page position instead of always
+    /// the current tail — lets a caller with a fixed, page-per-bucket
+    /// layout (e.g. a hash index) write straight to a specific page
+    /// without disturbing the run's own tail/append state. `index` is
+    /// into `page_ids()` (0 is always the head); out of range errors
+    /// rather than panicking, same as any other caller-suppliable index
+    /// into this crate's storage (see e.g. `BadRowNumber`).
+    pub fn set_content_at(&mut self, index: usize, data: &[u8]) -> Result<(), StoreError> {
+        let page_id = *self
+            .page_ids
+            .get(index)
+            .ok_or(StoreError::RunPageIndexOutOfRange(index, self.page_ids.len()))?;
+        let tuple = Tuple::new(0, data);
+        let max = self.data_size();
+        if tuple.size() > max {
+            return Err(StoreError::TupleTooLarge(tuple.size(), max as usize));
+        }
+        let handle = self.pages.buffer.get_page_mut(page_id)?;
+        handle.page.clear()?;
+        handle.page.add_tuple(tuple)?;
+        self.pages.buffer.write_locked_page(handle)?;
+        Ok(())
+    }
+
+    /// `get_content`, but addressable by page position instead of always
+    /// the current tail — the read-side counterpart to `set_content_at`.
+    pub fn get_content_at(&self, index: usize) -> Result<Option<Vec<u8>>, StoreError> {
+        let page_id = *self
+            .page_ids
+            .get(index)
+            .ok_or(StoreError::RunPageIndexOutOfRange(index, self.page_ids.len()))?;
+        let page = self.pages.buffer.get_page(page_id)?;
+        Ok(page.iter().next().map(|t| t.data().to_vec()))
     }
 
     /// A fresh cursor over this run's own pages, starting from its head.
+    /// Holds its own `Arc` clone onto the same underlying page chain this
+    /// `Run` owns (see `RunPages`) — so those pages stay alive for as
+    /// long as either this `Run` or the returned cursor (or any further
+    /// clone taken from either) still exists, independent of this
+    /// particular `Run` value's own lifetime. There's no separate way to
+    /// read a run by page id alone; a cursor always comes from a live
+    /// `Run`.
     pub fn cursor(&self) -> Result<RunCursor<F>, StoreError> {
-        RunCursor::new(self.buffer.clone(), self.head)
+        RunCursor::new(self.pages.clone())
     }
 }
 
@@ -83,11 +246,17 @@ where
 /// bytes in the order they were appended. No visibility filtering at
 /// all — unlike TableCursor, a Run isn't MVCC-shared state, so every
 /// record physically present is unconditionally returned.
+///
+/// Holds its own `Arc<RunPages<F>>` clone rather than borrowing `&Run` —
+/// deliberately, so it can be boxed and handed off past whatever produced
+/// it (e.g. `TempTable::open_source` releases its read lock and returns
+/// a cursor-backed `Source` that keeps running afterward). That same Arc
+/// clone is what keeps the underlying pages alive for as long as this
+/// cursor exists, even after the `Run` it came from is gone.
 pub struct RunCursor<F: DBFile + 'static> {
-    buffer: Arc<PageBuffer<F>>,
+    pages: Arc<RunPages<F>>,
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
-    head: PageId,
 }
 
 impl<F> RunCursor<F>
@@ -95,14 +264,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn new(buffer: Arc<PageBuffer<F>>, head: PageId) -> Result<Self, StoreError> {
-        let current_page = buffer.get_page(head)?;
+    pub(crate) fn new(pages: Arc<RunPages<F>>) -> Result<Self, StoreError> {
+        let current_page = pages.buffer.get_page(pages.head)?;
         let current_iter = current_page.iter();
         Ok(Self {
-            buffer,
+            pages,
             current_page,
             current_iter,
-            head,
         })
     }
 
@@ -118,7 +286,7 @@ where
         // TableCursor's own next_tuple relies on.
         let next = self.current_page.get_next_page();
         if next.is_valid_next_page() {
-            self.current_page = self.buffer.get_page(next)?;
+            self.current_page = self.pages.buffer.get_page(next)?;
             self.current_iter = self.current_page.iter();
             Ok(self.current_iter.next())
         } else {
@@ -137,11 +305,9 @@ where
         self.next_tuple()
     }
 
-    // Same lookup `new()` did against this run's own head page — `buffer`
-    // and `head` are already stored as fields, unused after construction
-    // until now.
+    // Same lookup `new()` did against this run's own head page.
     fn reset(&mut self) -> Result<(), StoreError> {
-        let current_page = self.buffer.get_page(self.head)?;
+        let current_page = self.pages.buffer.get_page(self.pages.head)?;
         self.current_iter = current_page.iter();
         self.current_page = current_page;
         Ok(())
@@ -150,6 +316,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::{cursor::Cursor, db::Db, memfile::MemFile};
 
     #[test]
@@ -160,7 +328,7 @@ mod tests {
             run.append(&[i]).unwrap();
         }
 
-        let mut cursor = db.open_run(run.head()).unwrap();
+        let mut cursor = run.cursor().unwrap();
         let first_pass: Vec<u8> = std::iter::from_fn(|| cursor.next().unwrap())
             .map(|t| t.data()[0])
             .collect();
@@ -181,6 +349,195 @@ mod tests {
         assert_eq!(
             second_pass, first_pass,
             "reset must let the same cursor re-read every record again, in the same order"
+        );
+    }
+
+    #[test]
+    fn test_set_content_get_content_round_trip() {
+        let db = Db::<MemFile>::create("run_set_content_round_trip.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        assert_eq!(
+            run.get_content().unwrap(),
+            None,
+            "a fresh run has no content yet"
+        );
+
+        run.set_content(b"hello").unwrap();
+        assert_eq!(run.get_content().unwrap(), Some(b"hello".to_vec()));
+
+        // A second call replaces the first, rather than appending to it.
+        run.set_content(b"goodbye").unwrap();
+        assert_eq!(run.get_content().unwrap(), Some(b"goodbye".to_vec()));
+    }
+
+    #[test]
+    fn test_set_content_rejects_data_larger_than_data_size() {
+        let db = Db::<MemFile>::create("run_set_content_too_large.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        let too_big = vec![0u8; run.data_size() as usize + 1];
+        let err = run.set_content(&too_big).unwrap_err();
+        assert!(
+            matches!(err, crate::error::StoreError::TupleTooLarge(_, _)),
+            "expected TupleTooLarge, got {err:?}"
+        );
+
+        // The failed set_content must not have left a half-written page.
+        assert_eq!(run.get_content().unwrap(), None);
+    }
+
+    #[test]
+    fn test_set_content_accepts_data_up_to_data_size() {
+        let db = Db::<MemFile>::create("run_set_content_near_cap.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        // Comfortably under data_size() to leave room for the constructed
+        // Tuple's own serialization framing (id/flags/length-prefix) on
+        // top of the raw bytes, which data_size() itself doesn't subtract
+        // for — this is checking "a large payload near the cap still
+        // works", not pinning the exact byte-for-byte boundary.
+        let almost_max = vec![0u8; run.data_size() as usize - 64];
+        run.set_content(&almost_max).unwrap();
+        assert_eq!(run.get_content().unwrap(), Some(almost_max));
+    }
+
+    #[test]
+    fn test_new_page_lets_set_content_span_multiple_pages() {
+        let db = Db::<MemFile>::create("run_set_content_multi_page.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        let head = run.head();
+        assert_eq!(run.tail(), head, "a fresh run's tail starts at its head");
+
+        run.set_content(b"chunk one").unwrap();
+
+        let second_page = run.new_page().unwrap();
+        assert_eq!(run.tail(), second_page);
+        assert_ne!(second_page, head, "new_page must actually grow the chain");
+        assert_eq!(
+            run.get_content().unwrap(),
+            None,
+            "a freshly allocated page has no content until set_content writes to it"
+        );
+        run.set_content(b"chunk two").unwrap();
+
+        let third_page = run.new_page().unwrap();
+        run.set_content(b"chunk three").unwrap();
+        assert_eq!(run.tail(), third_page);
+
+        // The write side used new_page/set_content exclusively (no
+        // append) — reading back through the ordinary cursor should walk
+        // all three pages' single tuples in write order regardless, since
+        // nothing about RunCursor's traversal is specific to append.
+        let mut cursor = run.cursor().unwrap();
+        let chunks: Vec<Vec<u8>> = std::iter::from_fn(|| cursor.next().unwrap())
+            .map(|t| t.data().to_vec())
+            .collect();
+        assert_eq!(
+            chunks,
+            vec![
+                b"chunk one".to_vec(),
+                b"chunk two".to_vec(),
+                b"chunk three".to_vec(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_page_ids_tracks_every_allocated_page_in_chain_order() {
+        let db = Db::<MemFile>::create("run_page_ids_tracking.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        assert_eq!(
+            run.page_ids(),
+            &[run.head()],
+            "a fresh run has exactly its own head page"
+        );
+
+        let second = run.new_page().unwrap();
+        assert_eq!(run.page_ids(), &[run.head(), second]);
+
+        let third = run.new_page().unwrap();
+        assert_eq!(run.page_ids(), &[run.head(), second, third]);
+        assert_eq!(run.page_ids().last(), Some(&run.tail()));
+    }
+
+    #[test]
+    fn test_page_ids_tracks_pages_new_page_and_append_both_allocate() {
+        // append()'s own internal page-growth loop must also register
+        // into page_ids, not just the explicit new_page() path.
+        let db: Arc<Db<MemFile>> = Db::create_with_page_size("run_page_ids_append.db", 512).unwrap();
+        let mut run = db.create_run().unwrap();
+        for i in 0..100u32 {
+            run.append(&i.to_be_bytes()).unwrap();
+        }
+        assert!(
+            run.page_ids().len() > 1,
+            "100 records at a 512-byte page size must span more than one page"
+        );
+        assert_eq!(
+            run.page_ids().len(),
+            run.page_count(),
+            "page_ids and page_count must always agree"
+        );
+        assert_eq!(run.page_ids()[0], run.head());
+        assert_eq!(*run.page_ids().last().unwrap(), run.tail());
+    }
+
+    #[test]
+    fn test_get_content_at_and_set_content_at_random_access_by_index() {
+        let db = Db::<MemFile>::create("run_content_at.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        // Build a run with 3 pages, each independently addressable —
+        // the shape a hash index (bucket i -> page i) would rely on.
+        run.set_content(b"bucket 0").unwrap();
+        run.new_page().unwrap();
+        run.set_content(b"bucket 1").unwrap();
+        run.new_page().unwrap();
+        run.set_content(b"bucket 2").unwrap();
+
+        // Random access, not just sequential: read them back out of order.
+        assert_eq!(
+            run.get_content_at(2).unwrap(),
+            Some(b"bucket 2".to_vec())
+        );
+        assert_eq!(
+            run.get_content_at(0).unwrap(),
+            Some(b"bucket 0".to_vec())
+        );
+        assert_eq!(
+            run.get_content_at(1).unwrap(),
+            Some(b"bucket 1".to_vec())
+        );
+
+        // Overwriting an earlier page directly (not the current tail)
+        // must not disturb the others.
+        run.set_content_at(0, b"rehashed bucket 0").unwrap();
+        assert_eq!(
+            run.get_content_at(0).unwrap(),
+            Some(b"rehashed bucket 0".to_vec())
+        );
+        assert_eq!(run.get_content_at(1).unwrap(), Some(b"bucket 1".to_vec()));
+        assert_eq!(run.get_content_at(2).unwrap(), Some(b"bucket 2".to_vec()));
+    }
+
+    #[test]
+    fn test_content_at_out_of_range_index_errors_instead_of_panicking() {
+        let db = Db::<MemFile>::create("run_content_at_oob.db").unwrap();
+        let mut run = db.create_run().unwrap();
+
+        let err = run.get_content_at(5).unwrap_err();
+        assert!(
+            matches!(err, crate::error::StoreError::RunPageIndexOutOfRange(5, 1)),
+            "expected RunPageIndexOutOfRange(5, 1), got {err:?}"
+        );
+
+        let err = run.set_content_at(5, b"x").unwrap_err();
+        assert!(
+            matches!(err, crate::error::StoreError::RunPageIndexOutOfRange(5, 1)),
+            "expected RunPageIndexOutOfRange(5, 1), got {err:?}"
         );
     }
 }

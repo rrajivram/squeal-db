@@ -59,11 +59,15 @@ pub(crate) fn fields_from_create_table(c: &CreateTable) -> Result<Vec<Arc<Field>
 
 // A connection-scoped temporary table: a column list (for INSERT
 // type-checking and a Source's own fields()) plus a store::run::Run for
-// storage — append-only, unindexed, no undo/redo, freed only when this
-// TempTable is dropped (see Run's own doc comment). No versions, no
-// indices, no foreign keys, no db_table_id: unlike SqlTable, a temp
-// table was never meant to support ALTER TABLE, constraints, or being
-// looked up by anything other than a straight sequential scan.
+// storage — append-only, unindexed, no undo/redo. Its pages free
+// automatically once nothing references them anymore: this TempTable's
+// own Run, plus any RunSource/cursor a still-running query cloned from
+// it (see Run's own doc comment), so a query already scanning this
+// table keeps working even past this TempTable being dropped/replaced.
+// No versions, no indices, no foreign keys, no db_table_id: unlike
+// SqlTable, a temp table was never meant to support ALTER TABLE,
+// constraints, or being looked up by anything other than a straight
+// sequential scan.
 pub(crate) struct TempTable<F: DBFile + 'static> {
     pub(crate) name: String,
     fields: Arc<[Arc<Field>]>,

@@ -120,13 +120,26 @@ impl IndexKey {
         Self::new_from(&data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap())
     }
 
-    pub fn hash(&self) -> u64 {
+    /// Combines each field's own hash with an FNV-1a-style XOR+multiply
+    /// mixer — field order and each field's own value both affect the
+    /// result (see `test_hash_mixes_field_order_not_just_bitwise_union`).
+    /// Takes any `&ValueItem` iterator rather than requiring a real
+    /// IndexKey, so a caller that only wants a hash over a subset of a
+    /// row's fields (e.g. a hash index's key columns) can hash straight
+    /// off references into that row — building an IndexKey first would
+    /// mean validating every field and allocating an `Arc<[ValueItem]>`
+    /// just to hash it once and immediately discard it.
+    pub fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a ValueItem>) -> u64 {
         let mut h = 0x811C9DC5;
-        for d in self.data.iter() {
+        for d in fields {
             h ^= d.hash();
             h = (h * 0x01000193) & 0xFFFFFFFF;
         }
         h
+    }
+
+    pub fn hash(&self) -> u64 {
+        Self::hash_fields(self.data.iter())
     }
 
     // Extracts the content back out of a single-field, Str-only key — the
@@ -283,7 +296,7 @@ impl ValueItem {
         match self {
             ValueItem::Null => 0,
             ValueItem::Integer(i) => *i as u64,
-            ValueItem::Double(f) => f.abs() as u64,
+            ValueItem::Double(f) => f.to_bits(),
             ValueItem::Datetime(d) => *d,
             ValueItem::Str((s, _l)) => db_hash(s.as_bytes()),
             ValueItem::Blob((b, _)) => db_hash(b),
@@ -878,6 +891,53 @@ mod valueitem_tests {
         }
     }
 
+    // hash() uses Double(f).to_bits(), not a lossy `f as u64` truncating
+    // cast — the latter would silently collide any two doubles with the
+    // same integer part (e.g. 1.5 and 1.9 both truncate to 1), and more
+    // importantly would violate Hash's own contract against this type's
+    // hand-written PartialEq (see its own doc comment), which is already
+    // bit-pattern equality (`a.to_bits() == b.to_bits()`), not `==`.
+    #[test]
+    fn test_double_hash_is_bit_pattern_based_not_a_lossy_cast() {
+        // A naive `f as u64` cast would collide every value in this group
+        // (all truncate to 1) despite having distinct bit patterns.
+        let a = ValueItem::Double(1.1).hash();
+        let b = ValueItem::Double(1.5).hash();
+        let c = ValueItem::Double(1.9).hash();
+        assert_ne!(a, b, "1.1 and 1.5 must not collide under a bit-pattern hash");
+        assert_ne!(b, c, "1.5 and 1.9 must not collide under a bit-pattern hash");
+        assert_ne!(a, c, "1.1 and 1.9 must not collide under a bit-pattern hash");
+
+        // Hash/Eq consistency (Hash's own contract: a == b must imply
+        // hash(a) == hash(b)) for the two cases where this type's
+        // bit-pattern PartialEq deliberately disagrees with plain
+        // IEEE-754 `==` — see test_double_equality_is_bit_pattern_based.
+        let nan1 = ValueItem::Double(f64::NAN);
+        let nan2 = ValueItem::Double(f64::NAN);
+        assert_eq!(nan1, nan2, "sanity: bit-identical NaNs are equal under this type's PartialEq");
+        assert_eq!(
+            nan1.hash(),
+            nan2.hash(),
+            "equal (per this type's own PartialEq) values must hash equal"
+        );
+
+        let pos_zero = ValueItem::Double(0.0);
+        let neg_zero = ValueItem::Double(-0.0);
+        assert_ne!(
+            pos_zero, neg_zero,
+            "sanity: 0.0 and -0.0 are NOT equal under this type's bit-pattern PartialEq"
+        );
+        // Not required by the Hash contract (unequal values are allowed
+        // to collide), but a to_bits()-based hash will in fact differ
+        // here, since 0.0 and -0.0 have different bit patterns — pinning
+        // that down as the concrete, expected behavior of this hash.
+        assert_ne!(
+            pos_zero.hash(),
+            neg_zero.hash(),
+            "0.0 and -0.0 have different bit patterns, so a bit-pattern hash distinguishes them"
+        );
+    }
+
     #[test]
     fn test_hash_str_and_blob_ignore_reserved_capacity() {
         // hash() delegates Str/Blob to db_hash() of the content only.
@@ -1104,6 +1164,37 @@ mod indexkey_tests {
         let k =
             IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Str(("a".into(), 1))]).unwrap();
         assert_eq!(k.hash(), k.hash());
+    }
+
+    #[test]
+    fn test_hash_fields_matches_hash_of_an_equivalent_index_key() {
+        let values = [ValueItem::Integer(1), ValueItem::Str(("a".into(), 1))];
+        let k = IndexKey::new_from(&values).unwrap();
+        assert_eq!(
+            IndexKey::hash_fields(values.iter()),
+            k.hash(),
+            "hashing field references directly must agree with hashing a real IndexKey \
+             built from the same fields"
+        );
+    }
+
+    #[test]
+    fn test_hash_fields_works_over_a_subset_of_a_wider_row() {
+        // The actual motivating use case: hashing just the key columns of
+        // a wider row (e.g. a hash index's chosen columns), without first
+        // collecting them into a fresh Vec<ValueItem>/IndexKey.
+        let row = [
+            ValueItem::Integer(1),
+            ValueItem::Str(("ignored".into(), 10)),
+            ValueItem::Integer(2),
+        ];
+        let key_columns = [0usize, 2usize];
+        let subset_hash = IndexKey::hash_fields(key_columns.iter().map(|&i| &row[i]));
+
+        let expected = IndexKey::new_from(&[row[0].clone(), row[2].clone()])
+            .unwrap()
+            .hash();
+        assert_eq!(subset_hash, expected);
     }
 
     // hash() mixes per-field hashes with an FNV-1a-style XOR+multiply

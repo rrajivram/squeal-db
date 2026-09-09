@@ -298,6 +298,107 @@ fn test_execute_select_star_returns_a_result_set() {
 }
 
 #[test]
+fn test_execute_select_distinct_deduplicates_on_the_projected_column_not_the_raw_row() {
+    // Regression test: DISTINCT used to sort/dedup the raw table row
+    // (every column) and project down to just `name` afterward — so two
+    // rows sharing a `name` but differing in `id` never compared equal,
+    // and every row came back unchanged instead of collapsing.
+    let c = conn();
+    run(
+        &c,
+        "create table t1 (id integer not null, name varchar(50), primary key(id))",
+    )
+    .unwrap();
+    run(&c, "insert into t1 values (1, 'alice')").unwrap();
+    run(&c, "insert into t1 values (2, 'bob')").unwrap();
+    run(&c, "insert into t1 values (3, 'alice')").unwrap();
+
+    let mut stmt = c.create_statement("select distinct name from t1").unwrap();
+    stmt.execute().unwrap();
+    let (columns, mut rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, vec!["name".to_string()]);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![store::valueitem::ValueItem::Str(("alice".into(), 50))],
+            vec![store::valueitem::ValueItem::Str(("bob".into(), 50))],
+        ],
+        "alice's two rows (different id, same name) must collapse into one"
+    );
+}
+
+#[test]
+fn test_execute_select_group_by_collapses_rows_sharing_a_group_key() {
+    // Regression test: GROUP BY used to not collapse anything — the SELECT
+    // list (including the COUNT(*) call) was evaluated once per raw row,
+    // before grouping, and AggregatingSource compared whole already-
+    // evaluated rows, so the ever-changing count column meant no two rows
+    // ever compared equal.
+    let c = conn();
+    run(
+        &c,
+        "create table t (id integer not null, category varchar(10), primary key(id))",
+    )
+    .unwrap();
+    run(&c, "insert into t values (1, 'a')").unwrap();
+    run(&c, "insert into t values (2, 'a')").unwrap();
+    run(&c, "insert into t values (3, 'b')").unwrap();
+
+    let mut stmt = c
+        .create_statement("select category, count(*) from t group by category")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (columns, mut rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, vec!["category".to_string(), "none".to_string()]);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                store::valueitem::ValueItem::Str(("a".into(), 10)),
+                store::valueitem::ValueItem::Integer(2)
+            ],
+            vec![
+                store::valueitem::ValueItem::Str(("b".into(), 10)),
+                store::valueitem::ValueItem::Integer(1)
+            ],
+        ]
+    );
+}
+
+#[test]
+fn test_execute_select_bare_aggregate_with_no_group_by_collapses_to_one_row() {
+    // Regression test: a bare aggregate with no GROUP BY clause at all
+    // (an implicit single group over the whole table) used to return one
+    // row per input row instead of collapsing to exactly one.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "insert into t values (1)").unwrap();
+    run(&c, "insert into t values (2)").unwrap();
+    run(&c, "insert into t values (3)").unwrap();
+
+    let mut stmt = c.create_statement("select count(*) from t").unwrap();
+    stmt.execute().unwrap();
+    let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![store::valueitem::ValueItem::Integer(3)]]);
+}
+
+#[test]
+fn test_execute_select_bare_aggregate_over_an_empty_table_still_reports_zero() {
+    // COUNT(*) over an empty table is 0, not "no rows" — the one case a
+    // real GROUP BY (a non-empty key list) must NOT do, where zero input
+    // rows correctly means zero groups.
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+
+    let mut stmt = c.create_statement("select count(*) from t").unwrap();
+    stmt.execute().unwrap();
+    let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(rows, vec![vec![store::valueitem::ValueItem::Integer(0)]]);
+}
+
+#[test]
 fn test_execute_insert_and_select_support_schema_qualified_table_names() {
     let c = conn();
     // "default" is the schema `conn()` already selected — create a

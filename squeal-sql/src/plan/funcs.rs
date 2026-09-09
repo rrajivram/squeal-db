@@ -1,5 +1,10 @@
-use std::{collections::HashSet, fmt::Debug, sync::Arc};
+use std::{
+    collections::HashSet,
+    fmt::Debug,
+    sync::{Arc, atomic::AtomicUsize},
+};
 
+use parking_lot::RwLock;
 use sql_parser::{Expr, Ident, expr::FunctionArg};
 use store::{
     db::DBFile,
@@ -11,11 +16,19 @@ use crate::{
     plan::eval::{EvalExpr, ExprWrapper},
 };
 
-pub(crate) trait FuncTrait: Debug + Clone {
+pub(crate) trait FuncTrait: Debug {
     fn name(&self) -> String;
-    fn eval(&mut self, args: &[IndexKey], index: usize) -> Result<ValueItem, SchemaError>;
-    fn is_aggregator() -> bool;
-    fn reset(&mut self) -> Result<(), SchemaError>;
+    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError>;
+    fn is_aggregate(&self) -> bool;
+    fn reset(&self) -> Result<(), SchemaError>;
+    fn fields(&self) -> Vec<usize>;
+    /// The function's current accumulated value, without feeding it
+    /// another row the way `eval` would. Only needed for a grand-total
+    /// aggregate (no GROUP BY at all) over a completely empty input:
+    /// there's no row to call `eval` with, but the query still owes
+    /// exactly one output row reporting each aggregate's freshly-`reset`
+    /// state (e.g. `COUNT(*)` over an empty table is 0, not "no rows").
+    fn current(&self) -> ValueItem;
 }
 
 #[derive(Debug, Clone)]
@@ -27,15 +40,17 @@ pub(crate) enum FuncArgs {
     Field(Box<EvalExpr>),
 }
 
+// Which SQL function a call resolved to, one variant per concrete
+// implementation — not a `Box<dyn FuncTrait>`. A trait object can't be
+// Clone (Clone isn't object-safe: it returns `Self`, whose size the
+// vtable can't know), but EvalExpr — which holds a FuncObj — needs to be
+// Clone (see e.g. CrateHeap building per-row copies of sort expressions).
+// A closed enum sidesteps that entirely: every variant's inner type
+// (Count, eventually Sum/Avg/...) derives Clone on its own, so this can
+// too, and dispatch is a plain match instead of a vtable call.
 #[derive(Debug, Clone)]
 pub(crate) enum FuncObj {
     Count(Count),
-}
-
-impl FuncObj {
-    pub(crate) fn is_aggregate(&self) -> bool {
-        matches!(self, Self::Count(_))
-    }
 }
 
 impl<'a, F> TryFrom<&'a ExprWrapper<'a, F>> for FuncObj
@@ -58,7 +73,7 @@ where
                     FunctionArg::Expr(e) => FuncArgs::Field(EvalExpr::from_expr(e, value.tables)?),
                 });
             }
-            Ok(Self::get_fn(name, distinct, func_args)?)
+            Self::get_fn(name, distinct, func_args)
         } else {
             panic!("Shouldnt be here");
         }
@@ -68,19 +83,57 @@ where
 impl FuncObj {
     fn get_fn(name: &Ident, distinct: &bool, args: Vec<FuncArgs>) -> Result<Self, SchemaError> {
         match name.value.as_str() {
-            "count" => Ok(Self::Count(Count::new(args, *distinct, None)?)),
+            "count" => Ok(FuncObj::Count(Count::new(args, *distinct, None)?)),
             _ => Err(SchemaError::UnknownFunction(name.value.clone())),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+impl FuncTrait for FuncObj {
+    fn name(&self) -> String {
+        match self {
+            FuncObj::Count(c) => c.name(),
+        }
+    }
+
+    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+        match self {
+            FuncObj::Count(c) => c.eval(args),
+        }
+    }
+
+    fn is_aggregate(&self) -> bool {
+        match self {
+            FuncObj::Count(c) => c.is_aggregate(),
+        }
+    }
+
+    fn reset(&self) -> Result<(), SchemaError> {
+        match self {
+            FuncObj::Count(c) => c.reset(),
+        }
+    }
+
+    fn fields(&self) -> Vec<usize> {
+        match self {
+            FuncObj::Count(c) => c.fields(),
+        }
+    }
+
+    fn current(&self) -> ValueItem {
+        match self {
+            FuncObj::Count(c) => c.current(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct Count {
     name: String,
-    values: HashSet<IndexKey>,
+    values: Arc<RwLock<HashSet<ValueItem>>>,
     distinct: bool,
     args: FuncArgs,
-    count: usize,
+    count: AtomicUsize,
 }
 
 impl Count {
@@ -102,26 +155,34 @@ impl Count {
         }
         let mut args = args;
         Ok(Self {
-            values: HashSet::new(),
+            values: Arc::new(RwLock::new(HashSet::new())),
             args: args.pop().unwrap(),
             distinct,
-            count: 0,
+            count: AtomicUsize::new(0),
             name,
         })
     }
 }
 
 impl FuncTrait for Count {
-    fn eval(&mut self, args: &[IndexKey], index: usize) -> Result<ValueItem, SchemaError> {
-        if self.distinct {
-            todo!()
+    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+        let res = if self.distinct {
+            let item = match &self.args {
+                FuncArgs::Field(exp) => exp.eval(args, 0)?,
+                FuncArgs::Wildcard => ValueItem::Integer(1),
+            };
+            let mut v = self.values.write();
+            v.insert(item);
+            v.len()
         } else {
-            self.count += 1;
-        }
-        todo!()
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        };
+        Ok(ValueItem::Integer(res as i64))
     }
 
-    fn is_aggregator() -> bool {
+    fn is_aggregate(&self) -> bool {
         true
     }
 
@@ -129,7 +190,34 @@ impl FuncTrait for Count {
         "count".into()
     }
 
-    fn reset(&mut self) -> Result<(), SchemaError> {
+    fn reset(&self) -> Result<(), SchemaError> {
+        self.count.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.values.write().clear();
         Ok(())
+    }
+
+    fn fields(&self) -> Vec<usize> {
+        vec![] // We already validate that only one non-wildcard argument is provided. And this is specifically called only to indetify non-agg fields, which does not apply here
+    }
+
+    fn current(&self) -> ValueItem {
+        let res = if self.distinct {
+            self.values.read().len()
+        } else {
+            self.count.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        ValueItem::Integer(res as i64)
+    }
+}
+
+impl Clone for Count {
+    fn clone(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            args: self.args.clone(),
+            distinct: self.distinct,
+            count: AtomicUsize::new(self.count.load(std::sync::atomic::Ordering::Relaxed)),
+            name: self.name.clone(),
+        }
     }
 }

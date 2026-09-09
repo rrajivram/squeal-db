@@ -10,7 +10,7 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::{
-        funcs::{FuncArgs, FuncObj},
+        funcs::{FuncArgs, FuncObj, FuncTrait},
         logical::TableQuery,
     },
 };
@@ -56,6 +56,48 @@ impl EvalExpr {
             _ => false,
         }
     }
+    pub(crate) fn get_non_agg_fields(&self) -> Vec<usize> {
+        match self {
+            Self::Unary { field, .. } => field.get_non_agg_fields(),
+            Self::Binary { lhs, rhs, .. } => {
+                let mut v = vec![];
+                v.extend_from_slice(&lhs.get_non_agg_fields());
+                v.extend_from_slice(&rhs.get_non_agg_fields());
+                v
+            }
+            Self::Literal(_) => {
+                vec![]
+            }
+            Self::Value(u) => {
+                vec![*u]
+            }
+            Self::Function(f) => {
+                if !f.is_aggregate() {
+                    f.fields()
+                } else {
+                    vec![]
+                }
+            }
+        }
+    }
+
+    pub(crate) fn get_funcs(&self) -> Vec<&FuncObj> {
+        match self {
+            Self::Unary { field, .. } => field.get_funcs(),
+            Self::Binary { lhs, rhs, .. } => {
+                let mut v = vec![];
+                v.extend_from_slice(&lhs.get_funcs());
+                v.extend_from_slice(&rhs.get_funcs());
+                v
+            }
+            Self::Literal(_) | Self::Value(_) => {
+                vec![]
+            }
+            Self::Function(f) => {
+                vec![f]
+            }
+        }
+    }
     pub(crate) fn eval(&self, data: &[IndexKey], _index: usize) -> Result<ValueItem, SchemaError> {
         let v = match self {
             Self::Literal(v) => v,
@@ -70,8 +112,11 @@ impl EvalExpr {
                 &CrateValueItem::binary(&lhs, &rhs, op)?
             }
             // Not implemented yet — function evaluation (COUNT, ...) is
-            // its own separate, unfinished feature.
-            Self::Function { .. } => todo!(),
+            // its own separate, unfinished feature: FuncObj::eval takes
+            // already-resolved &[ValueItem], but nothing here resolves
+            // its stored FuncArgs against `data`/`_index` to produce
+            // them yet.
+            Self::Function(obj) => &obj.eval(data)?,
         };
         Ok(v.clone())
     }
@@ -454,8 +499,14 @@ mod tests {
 
     #[test]
     fn test_unary_not_on_boolean() {
-        assert_eq!(un(UnaryOp::Not, &ValueItem::Boolean(true)).unwrap(), ValueItem::Boolean(false));
-        assert_eq!(un(UnaryOp::Not, &ValueItem::Boolean(false)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            un(UnaryOp::Not, &ValueItem::Boolean(true)).unwrap(),
+            ValueItem::Boolean(false)
+        );
+        assert_eq!(
+            un(UnaryOp::Not, &ValueItem::Boolean(false)).unwrap(),
+            ValueItem::Boolean(true)
+        );
     }
 
     #[test]
@@ -468,7 +519,10 @@ mod tests {
 
     #[test]
     fn test_unary_null_passes_through_for_any_op() {
-        assert_eq!(un(UnaryOp::Minus, &ValueItem::Null).unwrap(), ValueItem::Null);
+        assert_eq!(
+            un(UnaryOp::Minus, &ValueItem::Null).unwrap(),
+            ValueItem::Null
+        );
         assert_eq!(un(UnaryOp::Not, &ValueItem::Null).unwrap(), ValueItem::Null);
     }
 
@@ -483,7 +537,13 @@ mod tests {
     fn test_unary_rejects_blob_str_and_datetime() {
         assert!(un(UnaryOp::Minus, &str_val("x")).is_err());
         assert!(un(UnaryOp::Minus, &ValueItem::Datetime(0)).is_err());
-        assert!(un(UnaryOp::Minus, &ValueItem::Blob((std::sync::Arc::from(&b"x"[..]), 1))).is_err());
+        assert!(
+            un(
+                UnaryOp::Minus,
+                &ValueItem::Blob((std::sync::Arc::from(&b"x"[..]), 1))
+            )
+            .is_err()
+        );
     }
 
     // ---- binary: NULL propagation ----
@@ -497,8 +557,16 @@ mod tests {
             BinaryOp::And,
             BinaryOp::Concat,
         ] {
-            assert_eq!(bin(&ValueItem::Null, op, &int(1)).unwrap(), ValueItem::Null, "{op:?}");
-            assert_eq!(bin(&int(1), op, &ValueItem::Null).unwrap(), ValueItem::Null, "{op:?}");
+            assert_eq!(
+                bin(&ValueItem::Null, op, &int(1)).unwrap(),
+                ValueItem::Null,
+                "{op:?}"
+            );
+            assert_eq!(
+                bin(&int(1), op, &ValueItem::Null).unwrap(),
+                ValueItem::Null,
+                "{op:?}"
+            );
         }
     }
 
@@ -581,8 +649,14 @@ mod tests {
 
     #[test]
     fn test_binary_eq_promotes_mixed_integer_and_double() {
-        assert_eq!(bin(&int(1), BinaryOp::Eq, &dbl(1.0)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&dbl(1.5), BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(
+            bin(&int(1), BinaryOp::Eq, &dbl(1.0)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&dbl(1.5), BinaryOp::Eq, &int(1)).unwrap(),
+            ValueItem::Boolean(false)
+        );
     }
 
     #[test]
@@ -600,11 +674,21 @@ mod tests {
     #[test]
     fn test_binary_eq_on_booleans() {
         assert_eq!(
-            bin(&ValueItem::Boolean(true), BinaryOp::Eq, &ValueItem::Boolean(true)).unwrap(),
+            bin(
+                &ValueItem::Boolean(true),
+                BinaryOp::Eq,
+                &ValueItem::Boolean(true)
+            )
+            .unwrap(),
             ValueItem::Boolean(true)
         );
         assert_eq!(
-            bin(&ValueItem::Boolean(true), BinaryOp::Eq, &ValueItem::Boolean(false)).unwrap(),
+            bin(
+                &ValueItem::Boolean(true),
+                BinaryOp::Eq,
+                &ValueItem::Boolean(false)
+            )
+            .unwrap(),
             ValueItem::Boolean(false)
         );
     }
@@ -613,23 +697,48 @@ mod tests {
 
     #[test]
     fn test_binary_ordering_integer_double_str_boolean_datetime() {
-        assert_eq!(bin(&int(1), BinaryOp::Lt, &int(2)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&dbl(1.0), BinaryOp::Lt, &dbl(2.0)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&int(1), BinaryOp::Lt, &int(2)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&dbl(1.0), BinaryOp::Lt, &dbl(2.0)).unwrap(),
+            ValueItem::Boolean(true)
+        );
         assert_eq!(
             bin(&str_val("apple"), BinaryOp::Lt, &str_val("banana")).unwrap(),
             ValueItem::Boolean(true)
         );
         assert_eq!(
-            bin(&ValueItem::Boolean(false), BinaryOp::Lt, &ValueItem::Boolean(true)).unwrap(),
+            bin(
+                &ValueItem::Boolean(false),
+                BinaryOp::Lt,
+                &ValueItem::Boolean(true)
+            )
+            .unwrap(),
             ValueItem::Boolean(true)
         );
         assert_eq!(
-            bin(&ValueItem::Datetime(1), BinaryOp::Lt, &ValueItem::Datetime(2)).unwrap(),
+            bin(
+                &ValueItem::Datetime(1),
+                BinaryOp::Lt,
+                &ValueItem::Datetime(2)
+            )
+            .unwrap(),
             ValueItem::Boolean(true)
         );
-        assert_eq!(bin(&int(2), BinaryOp::GtEq, &int(2)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&int(1), BinaryOp::LtEq, &int(2)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&int(2), BinaryOp::Gt, &int(1)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&int(2), BinaryOp::GtEq, &int(2)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&int(1), BinaryOp::LtEq, &int(2)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&int(2), BinaryOp::Gt, &int(1)).unwrap(),
+            ValueItem::Boolean(true)
+        );
     }
 
     #[test]
@@ -642,8 +751,14 @@ mod tests {
 
     #[test]
     fn test_binary_ordering_promotes_mixed_integer_and_double() {
-        assert_eq!(bin(&int(1), BinaryOp::Lt, &dbl(1.5)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&dbl(1.5), BinaryOp::Gt, &int(1)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&int(1), BinaryOp::Lt, &dbl(1.5)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&dbl(1.5), BinaryOp::Gt, &int(1)).unwrap(),
+            ValueItem::Boolean(true)
+        );
     }
 
     #[test]
@@ -658,9 +773,18 @@ mod tests {
     #[test]
     fn test_binary_and_or_on_booleans() {
         let (t, f) = (ValueItem::Boolean(true), ValueItem::Boolean(false));
-        assert_eq!(bin(&t, BinaryOp::And, &f).unwrap(), ValueItem::Boolean(false));
-        assert_eq!(bin(&t, BinaryOp::And, &t).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&f, BinaryOp::Or, &f).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(
+            bin(&t, BinaryOp::And, &f).unwrap(),
+            ValueItem::Boolean(false)
+        );
+        assert_eq!(
+            bin(&t, BinaryOp::And, &t).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&f, BinaryOp::Or, &f).unwrap(),
+            ValueItem::Boolean(false)
+        );
         assert_eq!(bin(&t, BinaryOp::Or, &f).unwrap(), ValueItem::Boolean(true));
     }
 
@@ -688,7 +812,10 @@ mod tests {
     fn test_has_aggregate_propagates_through_unary_and_binary() {
         let count = FuncObj::Count(Count::new(vec![FuncArgs::Wildcard], false, None).unwrap());
         let agg = Box::new(EvalExpr::Function(count));
-        let unary = EvalExpr::Unary { op: UnaryOp::Not, field: agg.clone() };
+        let unary = EvalExpr::Unary {
+            op: UnaryOp::Not,
+            field: agg.clone(),
+        };
         assert!(unary.has_aggregate());
 
         let binary = EvalExpr::Binary {

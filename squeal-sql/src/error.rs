@@ -1,3 +1,4 @@
+use serde::{Deserialize, de};
 use store::{error::StoreError, tuple::DBIdType};
 use thiserror::Error;
 
@@ -55,6 +56,8 @@ pub enum SchemaError {
     UnknownFunction(String),
     #[error("Invalid operation {0} on {1}")]
     InvalidOperationOnOperand(String, String),
+    #[error("Group by missing field {0}")]
+    GroupByMissingField(String),
     // A blocking operator (hash join build side, sort, GROUP BY hash
     // table, ...) tried to buffer more than this query's own memory
     // budget allows — see plan::memory::QueryMemory. Distinct from
@@ -87,6 +90,7 @@ impl From<StoreError> for SchemaError {
             | StoreError::DuplicatePageContentKind(_)
             | StoreError::InvalidPageMagic(_)
             | StoreError::PageChecksumMismatch(_)
+            | StoreError::RunPageIndexOutOfRange(_, _)
             | StoreError::LockContentionError => Self::InternalError(value),
             // Not internal — "this value is too big to fit in its
             // declared size" (a VARCHAR/BLOB literal longer than the

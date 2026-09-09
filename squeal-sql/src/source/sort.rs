@@ -1,20 +1,36 @@
-use std::{cmp::Ordering, collections::BinaryHeap, fmt::Debug, slice::Iter, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, VecDeque},
+    fmt::Debug,
+    iter,
+    slice::Iter,
+    sync::Arc,
+    vec::IntoIter,
+};
 
+use postcard::{from_bytes, to_allocvec};
 use sql_parser::{keyword::No, query::OrderByClause};
 use store::{
+    cursor::Cursor,
     db::{DBFile, Db},
+    error::StoreError,
+    run::{Run, RunCursor},
+    tuple::Tuple,
     valueitem::{IndexKey, ValueItem},
 };
 
 use crate::{
     error::SchemaError,
-    plan::{eval::EvalExpr, logical::TableQuery},
+    plan::{
+        eval::EvalExpr,
+        logical::TableQuery,
+        memory::{MemReservation, QueryMemory},
+    },
     source::Source,
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct SortField {
-    expr: EvalExpr,
     asc: bool,
     null_first: bool,
     index: usize,
@@ -26,6 +42,8 @@ pub(crate) struct SortSource<F: DBFile + 'static> {
     limit: Option<usize>,
     results: Option<Vec<IndexKey>>,
     db: Arc<Db<F>>,
+    mem: Arc<QueryMemory>,
+    progress: Option<SortProgress<F>>,
 }
 
 #[derive(Debug)]
@@ -41,6 +59,18 @@ struct CrateHeap<'a> {
     limit: usize,
 }
 
+struct SortProgress<F: DBFile + 'static> {
+    run: RunCursor<F>,
+    iter: Option<IntoIter<IndexKey>>,
+}
+
+struct SortedRuns<F: DBFile + 'static> {
+    runs: Vec<Run<F>>,
+    count: usize,
+    mem: Vec<MemReservation>,
+    record_size: usize,
+}
+
 impl<F> SortSource<F>
 where
     F: DBFile + 'static,
@@ -52,6 +82,7 @@ where
         tables: &[TableQuery<F>],
         limit: Option<usize>,
         db: Arc<Db<F>>,
+        mem: Arc<QueryMemory>,
     ) -> Result<Self, SchemaError> {
         let mut items = vec![];
         for c in clause.items.items() {
@@ -68,7 +99,6 @@ where
             let null_first = c.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
             items.push(SortField {
                 asc,
-                expr: *expr,
                 null_first,
                 index,
             });
@@ -79,7 +109,281 @@ where
             limit,
             results: None,
             db,
+            mem,
+            progress: None,
         })
+    }
+
+    pub(crate) fn with_fields(
+        source: Box<dyn Source>,
+        db: Arc<Db<F>>,
+        mem: Arc<QueryMemory>,
+        fields: &[usize],
+    ) -> Result<Self, SchemaError> {
+        let sort_fields = fields
+            .iter()
+            .map(|f| SortField {
+                asc: true,
+                null_first: true,
+                index: *f,
+            })
+            .collect::<Vec<_>>();
+        Ok(Self {
+            sort_fields,
+            source,
+            progress: None,
+            db,
+            mem,
+            limit: None,
+            results: None,
+        })
+    }
+
+    fn build_sort(&mut self) -> Result<SortProgress<F>, SchemaError> {
+        let record_size = self
+            .source
+            .fields()
+            .iter()
+            .map(|f| f.field.datatype.size())
+            .sum::<usize>();
+        if record_size == 0 {
+            return Err(SchemaError::UnknownError("Record size is 0".into()));
+        }
+        let mut run = self.build_initial_runs(record_size)?;
+        // merge_runs is strictly 2-way (see its own pairwise pop loop), so
+        // reducing `run.runs.len()` initial runs down to 1 always takes
+        // ceil(log2(run.runs.len())) rounds — computed directly from the
+        // actual run count build_initial_runs just returned, not
+        // re-derived from `count`/`mem.len()` (mem.len() tracks pages
+        // reserved for buffering, frozen once the memory budget is first
+        // exhausted, which has no fixed relationship to how many runs
+        // that ends up producing).
+        let num_passes = (run.runs.len() as f64).log2().ceil() as usize;
+        for _ in 0..num_passes {
+            run = self.merge_runs(run, record_size)?;
+        }
+        assert!(run.runs.len() == 1);
+        let mut cursor = run.runs.pop().unwrap().cursor()?;
+        let iter = cursor
+            .next()?
+            .map(|t| Self::from_tuple(t).map(|v| v.into_iter()))
+            .transpose()?;
+
+        Ok(SortProgress { run: cursor, iter })
+    }
+
+    fn merge_runs(
+        &mut self,
+        runs: SortedRuns<F>,
+        record_size: usize,
+    ) -> Result<SortedRuns<F>, SchemaError> {
+        let mut runs = runs;
+        let mut new_runs = vec![];
+        assert!(runs.runs.len() > 1);
+        let len = runs.runs.len();
+        for _ in (0..len - 1).step_by(2) {
+            let lhs = runs.runs.pop().unwrap();
+            let rhs = runs.runs.pop().unwrap();
+            new_runs.push(self.merge_two(lhs, rhs, record_size)?);
+        }
+        if !runs.runs.is_empty() {
+            new_runs.push(runs.runs.pop().unwrap())
+        }
+
+        Ok(SortedRuns {
+            runs: new_runs,
+            count: runs.count,
+            mem: runs.mem,
+            record_size: runs.record_size,
+        })
+    }
+
+    // A real streaming merge of two sorted runs, not a page-at-a-time
+    // zipper: `lhs`/`rhs` each keep a small pending buffer of whatever's
+    // left from the page most recently pulled off their cursor, refilled
+    // one page at a time only once that buffer runs dry. Comparing and
+    // emitting record-by-record (rather than merging exactly one page
+    // from each side per iteration) is what makes this correct when the
+    // two runs don't have the same page count or aligned page
+    // boundaries — pairing whole pages positionally previously let
+    // whichever side ran out of pages first dump its remaining pages
+    // through unmerged, out of order relative to data already written
+    // from the other side.
+    fn merge_two(
+        &mut self,
+        lhs: Run<F>,
+        rhs: Run<F>,
+        record_size: usize,
+    ) -> Result<Run<F>, SchemaError> {
+        let mut run = self.db.create_run()?;
+        let mut lhs_cursor = lhs.cursor()?;
+        let mut rhs_cursor = rhs.cursor()?;
+        let records_per_page = run.data_size() as usize / record_size;
+
+        let mut lhs_buf: VecDeque<IndexKey> = VecDeque::new();
+        let mut rhs_buf: VecDeque<IndexKey> = VecDeque::new();
+        let mut lhs_done = false;
+        let mut rhs_done = false;
+        let mut out: Vec<IndexKey> = Vec::with_capacity(records_per_page);
+
+        loop {
+            if lhs_buf.is_empty() && !lhs_done {
+                match lhs_cursor.next()? {
+                    Some(t) => lhs_buf.extend(Self::from_tuple(t)?),
+                    None => lhs_done = true,
+                }
+            }
+            if rhs_buf.is_empty() && !rhs_done {
+                match rhs_cursor.next()? {
+                    Some(t) => rhs_buf.extend(Self::from_tuple(t)?),
+                    None => rhs_done = true,
+                }
+            }
+
+            let take_left = match (lhs_buf.front(), rhs_buf.front()) {
+                (Some(l), Some(r)) => {
+                    let l = CrateItem {
+                        key: l.clone(),
+                        order: &self.sort_fields,
+                    };
+                    let r = CrateItem {
+                        key: r.clone(),
+                        order: &self.sort_fields,
+                    };
+                    l <= r
+                }
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let item = if take_left {
+                lhs_buf.pop_front().unwrap()
+            } else {
+                rhs_buf.pop_front().unwrap()
+            };
+            out.push(item);
+            if out.len() == records_per_page {
+                run.set_content(&to_allocvec(&out)?)?;
+                run.new_page()?;
+                out.clear();
+            }
+        }
+
+        if !out.is_empty() {
+            run.set_content(&to_allocvec(&out)?)?;
+        }
+
+        Ok(run)
+    }
+
+    fn from_tuple(tuple: Tuple) -> Result<Vec<IndexKey>, SchemaError> {
+        Ok(from_bytes(tuple.data())?)
+    }
+
+    fn build_initial_runs(&mut self, record_size: usize) -> Result<SortedRuns<F>, SchemaError> {
+        let mut run = self.db.create_run()?;
+        let mut runs = vec![];
+        let mut mems = vec![];
+        let records_per_page = run.data_size() as usize / record_size;
+        let mut page_count_in_run = 0;
+        let mut pages_per_run = 0;
+        let mut total_count = 0;
+        let mut mem_filled = false;
+        let mut heap = BinaryHeap::with_capacity(records_per_page);
+        let mem = self.mem.try_reserve(run.data_size() as usize)?;
+        mems.push(mem);
+        while let Some(r) = self.source.next()? {
+            total_count += 1;
+            // Pushed unconditionally, before the fullness check below —
+            // checking heap.len() == records_per_page first and only
+            // pushing `r` in the else branch (the original shape here)
+            // silently drops the exact row that fills the heap on every
+            // single flush, since it never goes into the batch that gets
+            // serialized OR into the next heap.
+            heap.push(CrateItem {
+                key: r,
+                order: &self.sort_fields,
+            });
+            if heap.len() == records_per_page {
+                let data = heap.into_sorted_vec();
+                let data = to_allocvec(
+                    &data
+                        .into_iter()
+                        .map(|r: CrateItem<'_>| r.key)
+                        .collect::<Vec<_>>(),
+                )?;
+                assert!(data.len() <= run.data_size() as usize);
+                run.set_content(&data)?;
+                if mem_filled {
+                    // Counts the page whose content was just set above —
+                    // incrementing before comparing (rather than after,
+                    // the original order here) is what makes a run
+                    // actually close out at `pages_per_run` pages instead
+                    // of `pages_per_run + 1`: the old order always called
+                    // new_page() once unconditionally before the count
+                    // and the target could ever compare equal.
+                    page_count_in_run += 1;
+                    if page_count_in_run == pages_per_run {
+                        page_count_in_run = 0;
+                        runs.push(run);
+                        run = self.db.create_run()?;
+                    } else {
+                        run.new_page()?;
+                    }
+                } else {
+                    let new_mem = self.mem.try_reserve(run.data_size() as usize);
+                    if let Err(_e) = new_mem {
+                        mem_filled = true;
+                        // reached max buffers , create a new run
+                        runs.push(run);
+                        run = self.db.create_run()?;
+                        pages_per_run = mems.len();
+                        page_count_in_run = 0;
+                    } else {
+                        mems.push(new_mem.unwrap());
+                        run.new_page()?;
+                        page_count_in_run += 1;
+                    }
+                }
+                heap = BinaryHeap::with_capacity(records_per_page);
+            }
+        }
+        let data = to_allocvec(
+            &heap
+                .into_sorted_vec()
+                .into_iter()
+                .map(|r| r.key)
+                .collect::<Vec<_>>(),
+        )?;
+        assert!(data.len() <= run.data_size() as usize);
+        run.set_content(&data)?;
+        runs.push(run);
+
+        Ok(SortedRuns {
+            runs,
+            count: total_count,
+            mem: mems,
+            record_size,
+        })
+    }
+}
+
+impl<F: DBFile + 'static> SortProgress<F> {
+    fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        if let Some(iter) = &mut self.iter {
+            if let Some(res) = iter.next() {
+                Ok(Some(res))
+            } else {
+                self.iter = self
+                    .run
+                    .next()?
+                    .map(|t| SortSource::<F>::from_tuple(t).map(|v| v.into_iter()))
+                    .transpose()?;
+                self.next()
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -122,7 +426,14 @@ where
             self.results = Some(sorted);
             self.next()
         } else {
-            todo!()
+            if let Some(progress) = &mut self.progress {
+                progress.next()
+            } else {
+                {
+                    self.progress = Some(self.build_sort()?);
+                }
+                self.next()
+            }
         }
     }
 
@@ -249,7 +560,6 @@ mod tests {
     // implemented), so a dummy literal is fine here.
     fn field(index: usize, asc: bool, null_first: bool) -> SortField {
         SortField {
-            expr: EvalExpr::Literal(ValueItem::Null),
             asc,
             null_first,
             index,
@@ -403,6 +713,8 @@ mod tests {
             limit: Some(limit),
             results: None,
             db,
+            mem: QueryMemory::new(1024),
+            progress: None,
         }
     }
 
@@ -483,5 +795,292 @@ mod tests {
                 &ValueItem::Str(("raj".into(), 3)),
             ]
         );
+    }
+
+    // ---- unlimited sort (no LIMIT clause): build_initial_runs, merge_runs,
+    // merge_two, and the num_passes calculation that ties them together ----
+
+    // `limit: None` is what routes SortSource::next through build_sort's
+    // external-merge-sort path instead of CrateHeap's in-memory top-K —
+    // the one thing sort_source()/`Some(limit)` above never exercises.
+    fn unlimited_sort_source(
+        rows: Vec<Vec<ValueItem>>,
+        mem_limit: usize,
+    ) -> SortSource<store::memfile::MemFile> {
+        let source: Box<dyn Source> = Box::new(VecSource::new(&["n"], rows));
+        let db = store::db::Db::<store::memfile::MemFile>::create("unlimited_sort_test").unwrap();
+        SortSource {
+            source,
+            sort_fields: vec![field(0, true, false)],
+            limit: None,
+            results: None,
+            db,
+            mem: QueryMemory::new(mem_limit),
+            progress: None,
+        }
+    }
+
+    // record_size as SortSource itself computes it for a single-column
+    // VecSource: every VecSource field is a Field::from(name), which is
+    // always a Str(DEFAULT_VAR_SIZE) column regardless of what ValueItem
+    // kind actually ends up in the rows (VecSource has no schema inference
+    // — see its own `fields()`), so this is the one true record_size for
+    // every test below, not just an estimate.
+    fn probe_record_size() -> usize {
+        crate::datatype::DataType::Str(crate::constant::DEFAULT_VAR_SIZE as u32).size()
+    }
+
+    // A run's own data_size() only depends on the (fixed) database page
+    // size, so a throwaway run from a fresh Db reports the same value
+    // every SortSource-owned run in these tests will too.
+    fn probe_data_size() -> usize {
+        let db = store::db::Db::<store::memfile::MemFile>::create("probe_data_size").unwrap();
+        db.create_run().unwrap().data_size() as usize
+    }
+
+    fn int_rows(n: i64) -> Vec<Vec<ValueItem>> {
+        // Descending input — sorting ascending has to actually reorder
+        // everything, not just pass an already-sorted source through.
+        (0..n).rev().map(|i| vec![ValueItem::Integer(i)]).collect()
+    }
+
+    fn run_contents(run: &Run<store::memfile::MemFile>) -> Vec<IndexKey> {
+        let mut cursor = run.cursor().unwrap();
+        let mut out = vec![];
+        while let Some(t) = cursor.next().unwrap() {
+            out.extend(SortSource::<store::memfile::MemFile>::from_tuple(t).unwrap());
+        }
+        out
+    }
+
+    #[test]
+    fn test_build_initial_runs_single_run_when_budget_is_generous() {
+        let record_size = probe_record_size();
+        let mut sort = unlimited_sort_source(int_rows(5), 10_000_000);
+        let runs = sort.build_initial_runs(record_size).unwrap();
+        assert_eq!(runs.runs.len(), 1);
+        assert_eq!(runs.count, 5);
+        assert_eq!(
+            run_contents(&runs.runs[0])
+                .iter()
+                .map(|k| k.values()[0].clone())
+                .collect::<Vec<_>>(),
+            (0..5).map(ValueItem::Integer).collect::<Vec<_>>(),
+            "the one run's own content must already be sorted ascending"
+        );
+    }
+
+    #[test]
+    fn test_build_initial_runs_drops_no_rows_across_a_forced_multi_run_split() {
+        // Regression test: build_initial_runs used to discard the exact
+        // row that filled the in-memory heap on every flush (the row
+        // that triggered `heap.len() == records_per_page` was never
+        // pushed into either the flushed batch or the next heap).
+        let record_size = probe_record_size();
+        let data_size = probe_data_size();
+        let records_per_page = data_size / record_size;
+        let total_rows = records_per_page * 4;
+
+        // A budget of exactly one page forces a new run on every flush.
+        let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+        let runs = sort.build_initial_runs(record_size).unwrap();
+
+        let total_recovered: usize = runs.runs.iter().map(|r| run_contents(r).len()).sum();
+        assert_eq!(
+            runs.count, total_rows,
+            "SortedRuns.count must reflect every row consumed from the source"
+        );
+        assert_eq!(
+            total_recovered, total_rows,
+            "every row fed in must be recoverable by reading every returned run"
+        );
+    }
+
+    #[test]
+    fn test_build_initial_runs_gives_every_run_the_same_page_budget() {
+        // Regression test: a run past the first used to end up with one
+        // MORE page than `pages_per_run` (the page-count budget derived
+        // from how much fit in the first run before memory ran out),
+        // since a page got added unconditionally before the "is this run
+        // full yet" check ever compared against the just-written page.
+        let record_size = probe_record_size();
+        let data_size = probe_data_size();
+        let records_per_page = data_size / record_size;
+        let total_rows = records_per_page * 4;
+
+        let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+        let runs = sort.build_initial_runs(record_size).unwrap();
+
+        // Every run except a possible smaller trailing leftover should
+        // hold exactly one page's worth (the budget here is one page).
+        for (i, run) in runs.runs.iter().enumerate() {
+            let n = run_contents(run).len();
+            assert!(
+                n == records_per_page || (i == runs.runs.len() - 1 && n <= records_per_page),
+                "run {i} has {n} records, expected {records_per_page} (or a smaller trailing leftover)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_num_passes_reduces_any_run_count_to_exactly_one() {
+        // Exercises build_sort's num_passes calculation indirectly across
+        // several run counts (odd/even/exact/leftover) — if it's wrong in
+        // either direction, build_sort's own `assert!(run.runs.len() ==
+        // 1)` fails: too few passes leaves more than one run, and
+        // merge_runs itself asserts `runs.len() > 1` on entry, so one
+        // pass too many would panic outright rather than silently no-op.
+        let record_size = probe_record_size();
+        let data_size = probe_data_size();
+        let records_per_page = data_size / record_size;
+
+        for extra_pages in [0usize, 1, 2, 3, 4, 7] {
+            let total_rows = records_per_page * (extra_pages + 1);
+            let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+            let out = drain(&mut sort);
+            assert_eq!(
+                out.len(),
+                total_rows,
+                "extra_pages={extra_pages}: row count must be preserved"
+            );
+        }
+    }
+
+    // A handful of end-to-end shapes covering: an exact multiple of the
+    // per-run page budget (4 runs), an odd initial run count (3 runs,
+    // exercising merge_runs's leftover-run carry-over), and a leftover
+    // partial run on top of several full ones (5 runs + a short 6th).
+    // Each checks the FULL output is complete and correctly ordered, not
+    // just the right length — the specific thing that used to fail: every
+    // row present, but merged chunks landing in the wrong relative order
+    // whenever the two runs being merged didn't have matching page counts.
+    #[test]
+    fn test_unlimited_sort_end_to_end_exact_page_multiple() {
+        let data_size = probe_data_size();
+        let record_size = probe_record_size();
+        let total_rows = (data_size / record_size) * 4;
+        let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+        let out = drain(&mut sort);
+        let vals: Vec<i64> = out
+            .iter()
+            .map(|r| match &r[0] {
+                ValueItem::Integer(i) => *i,
+                _ => panic!("expected Integer"),
+            })
+            .collect();
+        assert_eq!(vals, (0..total_rows as i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_unlimited_sort_end_to_end_odd_run_count() {
+        let data_size = probe_data_size();
+        let record_size = probe_record_size();
+        let total_rows = (data_size / record_size) * 3;
+        let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+        let out = drain(&mut sort);
+        let vals: Vec<i64> = out
+            .iter()
+            .map(|r| match &r[0] {
+                ValueItem::Integer(i) => *i,
+                _ => panic!("expected Integer"),
+            })
+            .collect();
+        assert_eq!(vals, (0..total_rows as i64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_unlimited_sort_end_to_end_uneven_leftover_partial_run() {
+        let data_size = probe_data_size();
+        let record_size = probe_record_size();
+        let total_rows = (data_size / record_size) * 5 + 137;
+        let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
+        let out = drain(&mut sort);
+        let vals: Vec<i64> = out
+            .iter()
+            .map(|r| match &r[0] {
+                ValueItem::Integer(i) => *i,
+                _ => panic!("expected Integer"),
+            })
+            .collect();
+        assert_eq!(vals, (0..total_rows as i64).collect::<Vec<_>>());
+    }
+
+    // The property sort-based GROUP BY actually depends on: every row for
+    // a given key ends up contiguous in the final output, even when that
+    // key's own rows are numerous enough to span multiple pages within
+    // one initial run AND get split across several separate initial runs
+    // (built independently from arrival-order batches, with no idea the
+    // batches share a key) that later have to be merged back together.
+    #[test]
+    fn test_unlimited_sort_keeps_a_key_contiguous_when_it_spans_multiple_pages_and_runs() {
+        let data_size = probe_data_size();
+        let record_size = probe_record_size();
+        let records_per_page = data_size / record_size;
+
+        // Each count is deliberately not a multiple of records_per_page,
+        // and well over one page, so every key's own rows straddle at
+        // least one page boundary within whatever initial run(s) they
+        // land in. Fed key 2, then 0, then 1 (not already sorted), so
+        // producing ascending output requires genuine cross-run merging,
+        // not runs that already happened to land in the right order.
+        let counts: [(i64, usize); 3] = [
+            (2, records_per_page * 2 + 137),
+            (0, records_per_page + 50),
+            (1, records_per_page * 3 + 9),
+        ];
+
+        let mut rows: Vec<Vec<ValueItem>> = vec![];
+        for (key, count) in counts {
+            for _ in 0..count {
+                rows.push(vec![ValueItem::Integer(key)]);
+            }
+        }
+
+        // A one-page memory budget forces multiple initial runs (see
+        // build_initial_runs), so a single key's ~1000+ rows are
+        // virtually guaranteed to be split across several of them.
+        let mut sort = unlimited_sort_source(rows, data_size);
+        let out = drain(&mut sort);
+
+        let total: usize = counts.iter().map(|(_, c)| c).sum();
+        assert_eq!(out.len(), total, "no rows dropped or duplicated");
+
+        let vals: Vec<i64> = out
+            .iter()
+            .map(|r| match &r[0] {
+                ValueItem::Integer(i) => *i,
+                _ => panic!("expected Integer"),
+            })
+            .collect();
+        assert!(
+            vals.is_sorted(),
+            "output must be fully ascending, not just grouped"
+        );
+
+        // Contiguity: once the sort moves past a key, it must never
+        // reappear later — the exact thing a streaming sort-then-group
+        // aggregation depends on.
+        let mut seen_keys = vec![];
+        let mut prev = None;
+        for &v in &vals {
+            if Some(v) != prev {
+                assert!(
+                    !seen_keys.contains(&v),
+                    "key {v} reappeared after the sort had already moved past it — \
+                     its rows got split apart instead of staying contiguous"
+                );
+                seen_keys.push(v);
+                prev = Some(v);
+            }
+        }
+
+        // Every row survived, per key.
+        for (key, count) in counts {
+            let actual = vals.iter().filter(|&&v| v == key).count();
+            assert_eq!(
+                actual, count,
+                "key {key}: expected {count} rows, got {actual}"
+            );
+        }
     }
 }

@@ -340,6 +340,10 @@ impl Page {
         }
     }
 
+    pub(crate) fn get_overhead() -> DBSizeType {
+        PAGE_OVERHEAD as DBSizeType
+    }
+
     // Builds a PageHeader from an already-held `inner` read guard, folding
     // has_overflow (tracked in `inner`, see PageInner's own comment) into
     // the other, still-atomic flag bits into the one combined `u16` the
