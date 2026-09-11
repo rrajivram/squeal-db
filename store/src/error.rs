@@ -28,6 +28,32 @@ pub enum StoreError {
     DuplicateKey(DBIdType),
     #[error("Key not found {0}")]
     KeyNotFound(DBIdType),
+    // Someone else's write to this exact row can't safely be built on top
+    // of: its writer is still active, was active when the conflicting
+    // transaction began (even if it has since committed), or began at or
+    // after the conflicting transaction did. See Db::check_write_conflict
+    // for the full three-way test this guards against a blind overwrite.
+    #[error("Write conflict on key {0} — row was concurrently modified by another transaction")]
+    WriteConflict(DBIdType),
+    // Like WriteConflict, but the transaction's ConflictPolicy was
+    // AbortOnConflict, so the conflict didn't just fail this one
+    // operation — the entire transaction was automatically rolled back.
+    // By the time this error is returned, the transaction is already
+    // fully finished; any further operation against it returns
+    // TransactionAlreadyFinished below.
+    #[error(
+        "Write conflict on key {0} — row was concurrently modified by another transaction; \
+         the entire transaction was rolled back"
+    )]
+    WriteConflictTransactionAborted(DBIdType),
+    // A write (insert/update/remove) or commit was attempted using a
+    // TransactionId that is no longer active — most commonly because
+    // AbortOnConflict already rolled the whole transaction back after an
+    // earlier operation's WriteConflict. Distinguishes "you're trying to
+    // keep using a transaction that's already gone" from a normal
+    // KeyNotFound/WriteConflict on the operation itself.
+    #[error("transaction is no longer active (already committed or rolled back)")]
+    TransactionAlreadyFinished,
     #[error("Table name max length is {0}, got {1}")]
     TableNameInvalid(usize, usize),
     #[error("Unknown error {0}")]

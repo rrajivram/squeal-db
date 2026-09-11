@@ -1,11 +1,24 @@
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
-use store::valueitem::IndexKey;
+use sql_parser::expr::BinaryOp;
+use store::{
+    db::{DBFile, Db},
+    valueitem::IndexKey,
+};
 
 use crate::{
     error::SchemaError,
-    source::{ProjectableField, Source},
+    plan::{eval::EvalExpr, memory::QueryMemory},
+    source::{ProjectableField, Source, hash::HashedSource},
 };
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
 
 /// A comma-joined FROM clause (`FROM a, b, c`), i.e. a full cross join
 /// across every source — every combination of one row from each source,
@@ -20,6 +33,141 @@ pub(crate) struct UnionJoin {
     // digit works when counting past 9. `None` before the first `next()`
     // call, and again once every combination has been produced.
     current: Option<Vec<IndexKey>>,
+}
+
+// Hash-join wrapper: resolves `on_expr` down to the equi-join field
+// positions HashedSource needs, then delegates the actual build/probe/
+// scan work (including LEFT/RIGHT/FULL's unmatched-row handling) to it
+// entirely — see HashedSource::next's own doc comments.
+pub(crate) struct JoinSource<F: DBFile + 'static> {
+    fields: Arc<[ProjectableField]>,
+    join_type: JoinType,
+    hashed: HashedSource<F>,
+}
+
+impl<F: DBFile + 'static> JoinSource<F> {
+    pub(crate) fn new(
+        left_source: Box<dyn Source>,
+        right_source: Box<dyn Source>,
+        on_expr: EvalExpr,
+        join_type: JoinType,
+        db: Arc<Db<F>>,
+        mem: Arc<QueryMemory>,
+    ) -> Result<Self, SchemaError> {
+        let fields = Arc::from(
+            left_source
+                .fields()
+                .iter()
+                .cloned()
+                .chain(right_source.fields().iter().cloned())
+                .collect::<Vec<_>>(),
+        );
+        let left_field_count = left_source.fields().len();
+        let (left_fields, right_fields) =
+            equi_join_fields(&on_expr, left_field_count).map_err(SchemaError::UserError)?;
+        let hashed = HashedSource::new(
+            left_source,
+            right_source,
+            db,
+            mem,
+            &left_fields,
+            &right_fields,
+            join_type,
+        )?;
+        Ok(Self {
+            fields,
+            join_type,
+            hashed,
+        })
+    }
+}
+
+// Resolves an ON clause down to the equi-join field positions
+// HashedSource needs: a plain equality between a left and a right
+// column (`a.x = b.y`), or an AND-chain of such (composite keys). Every
+// EvalExpr::Value(pos) here is a flat offset into the combined left++
+// right row (see EvalExpr::Value's own doc comment) — positions below
+// `left_field_count` are left columns, at or above it are right columns
+// (offset by `left_field_count` to become right-row-relative, which is
+// what HashedSource's own left_fields/right_fields expect: positions
+// within each SIDE's own row, not the combined space).
+fn equi_join_fields(
+    on_expr: &EvalExpr,
+    left_field_count: usize,
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    let mut left_fields = vec![];
+    let mut right_fields = vec![];
+    collect_equi_join_fields(
+        on_expr,
+        left_field_count,
+        &mut left_fields,
+        &mut right_fields,
+    )?;
+    Ok((left_fields, right_fields))
+}
+
+fn collect_equi_join_fields(
+    expr: &EvalExpr,
+    left_field_count: usize,
+    left_fields: &mut Vec<usize>,
+    right_fields: &mut Vec<usize>,
+) -> Result<(), String> {
+    match expr {
+        EvalExpr::Binary {
+            lhs,
+            op: BinaryOp::And,
+            rhs,
+        } => {
+            collect_equi_join_fields(lhs, left_field_count, left_fields, right_fields)?;
+            collect_equi_join_fields(rhs, left_field_count, left_fields, right_fields)
+        }
+        EvalExpr::Binary {
+            lhs,
+            op: BinaryOp::Eq,
+            rhs,
+        } => match (lhs.as_ref(), rhs.as_ref()) {
+            (EvalExpr::Value(l), EvalExpr::Value(r)) => {
+                let (left_pos, right_pos) = match (*l < left_field_count, *r < left_field_count) {
+                    (true, false) => (*l, *r - left_field_count),
+                    (false, true) => (*r, *l - left_field_count),
+                    _ => {
+                        return Err(
+                            "hash join ON clause must equate one left column with one right \
+                             column, not two columns from the same side"
+                                .into(),
+                        );
+                    }
+                };
+                left_fields.push(left_pos);
+                right_fields.push(right_pos);
+                Ok(())
+            }
+            _ => Err(
+                "hash join only supports equi-join conditions between plain columns, not \
+                      computed expressions"
+                    .into(),
+            ),
+        },
+        _ => Err(
+            "hash join ON clause must be an equality, or an AND of equalities, between a \
+                  left and a right column"
+                .into(),
+        ),
+    }
+}
+
+impl<F: DBFile + 'static> Source for JoinSource<F> {
+    fn fields(&self) -> Arc<[ProjectableField]> {
+        self.fields.clone()
+    }
+
+    fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        self.hashed.next()
+    }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        self.hashed.reset()
+    }
 }
 
 impl UnionJoin {
@@ -113,6 +261,15 @@ impl Source for UnionJoin {
         }
         self.current = None;
         Ok(())
+    }
+}
+
+impl<F: DBFile + 'static> Debug for JoinSource<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Join")
+            .field("type", &self.join_type)
+            .field("hashed", &self.hashed)
+            .finish()
     }
 }
 
@@ -241,5 +398,302 @@ mod tests {
             .map(|f| f.display_name.clone())
             .collect::<Vec<_>>();
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod hash_join_tests {
+    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
+
+    use super::*;
+    use crate::source::test_support::{VecSource, drain};
+
+    fn make_db() -> Arc<Db<MemFile>> {
+        Db::<MemFile>::create("join_source_test.db").unwrap()
+    }
+
+    fn left_source() -> Box<dyn Source> {
+        Box::new(VecSource::new(
+            &["id", "val"],
+            vec![
+                vec![ValueItem::Integer(1), ValueItem::Integer(100)],
+                vec![ValueItem::Integer(2), ValueItem::Integer(200)],
+                vec![ValueItem::Integer(3), ValueItem::Integer(300)],
+            ],
+        ))
+    }
+
+    fn right_source() -> Box<dyn Source> {
+        Box::new(VecSource::new(
+            &["user_id", "amount"],
+            vec![
+                vec![ValueItem::Integer(2), ValueItem::Integer(9002)],
+                vec![ValueItem::Integer(3), ValueItem::Integer(9003)],
+                vec![ValueItem::Integer(99), ValueItem::Integer(9099)],
+            ],
+        ))
+    }
+
+    // left.id (position 0) = right.user_id (flat position 2, since left
+    // has 2 columns).
+    fn on_id_eq_user_id() -> EvalExpr {
+        EvalExpr::Binary {
+            lhs: Box::new(EvalExpr::Value(0)),
+            op: BinaryOp::Eq,
+            rhs: Box::new(EvalExpr::Value(2)),
+        }
+    }
+
+    #[test]
+    fn test_inner_join_emits_only_matched_pairs() {
+        let mut join = JoinSource::new(
+            left_source(),
+            right_source(),
+            on_id_eq_user_id(),
+            JoinType::Inner,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.contains(&vec![
+            ValueItem::Integer(2),
+            ValueItem::Integer(200),
+            ValueItem::Integer(2),
+            ValueItem::Integer(9002),
+        ]));
+        assert!(rows.contains(&vec![
+            ValueItem::Integer(3),
+            ValueItem::Integer(300),
+            ValueItem::Integer(3),
+            ValueItem::Integer(9003),
+        ]));
+    }
+
+    #[test]
+    fn test_left_join_emits_unmatched_left_rows_paired_with_right_nulls() {
+        let mut join = JoinSource::new(
+            left_source(),
+            right_source(),
+            on_id_eq_user_id(),
+            JoinType::Left,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        assert_eq!(rows.len(), 3, "{rows:?}"); // ids 1,2,3 — 1 unmatched
+        assert!(rows.contains(&vec![
+            ValueItem::Integer(1),
+            ValueItem::Integer(100),
+            ValueItem::Null,
+            ValueItem::Null,
+        ]));
+    }
+
+    #[test]
+    fn test_right_join_emits_unmatched_right_rows_paired_with_left_nulls() {
+        let mut join = JoinSource::new(
+            left_source(),
+            right_source(),
+            on_id_eq_user_id(),
+            JoinType::Right,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        assert_eq!(rows.len(), 3, "{rows:?}"); // right rows 2,3,99 — 99 unmatched
+        assert!(rows.contains(&vec![
+            ValueItem::Null,
+            ValueItem::Null,
+            ValueItem::Integer(99),
+            ValueItem::Integer(9099),
+        ]));
+    }
+
+    #[test]
+    fn test_full_join_emits_unmatched_rows_from_both_sides() {
+        let mut join = JoinSource::new(
+            left_source(),
+            right_source(),
+            on_id_eq_user_id(),
+            JoinType::Full,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows.contains(&vec![
+            ValueItem::Integer(1),
+            ValueItem::Integer(100),
+            ValueItem::Null,
+            ValueItem::Null,
+        ]));
+        assert!(rows.contains(&vec![
+            ValueItem::Null,
+            ValueItem::Null,
+            ValueItem::Integer(99),
+            ValueItem::Integer(9099),
+        ]));
+    }
+
+    #[test]
+    fn test_on_expr_comparing_two_columns_from_the_same_side_is_rejected() {
+        // left.id (0) = left.val (1) — both positions are < left_field_count.
+        let bad_on = EvalExpr::Binary {
+            lhs: Box::new(EvalExpr::Value(0)),
+            op: BinaryOp::Eq,
+            rhs: Box::new(EvalExpr::Value(1)),
+        };
+        let result = JoinSource::new(
+            left_source(),
+            right_source(),
+            bad_on,
+            JoinType::Inner,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        );
+        assert!(
+            matches!(result, Err(SchemaError::UserError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn test_composite_equi_join_key_with_and() {
+        // left: (id, val) both must match right: (user_id, amount) at
+        // flat positions 2 and 3.
+        let left = Box::new(VecSource::new(
+            &["id", "val"],
+            vec![
+                vec![ValueItem::Integer(1), ValueItem::Integer(10)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(20)],
+            ],
+        ));
+        let right = Box::new(VecSource::new(
+            &["user_id", "amount"],
+            vec![vec![ValueItem::Integer(1), ValueItem::Integer(20)]],
+        ));
+        let on_expr = EvalExpr::Binary {
+            lhs: Box::new(EvalExpr::Binary {
+                lhs: Box::new(EvalExpr::Value(0)),
+                op: BinaryOp::Eq,
+                rhs: Box::new(EvalExpr::Value(2)),
+            }),
+            op: BinaryOp::And,
+            rhs: Box::new(EvalExpr::Binary {
+                lhs: Box::new(EvalExpr::Value(1)),
+                op: BinaryOp::Eq,
+                rhs: Box::new(EvalExpr::Value(3)),
+            }),
+        };
+        let mut join = JoinSource::new(
+            left,
+            right,
+            on_expr,
+            JoinType::Inner,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        assert_eq!(
+            rows,
+            vec![vec![
+                ValueItem::Integer(1),
+                ValueItem::Integer(20),
+                ValueItem::Integer(1),
+                ValueItem::Integer(20),
+            ]],
+            "only the (id=1, val=20) left row matches (user_id=1, amount=20) on both key parts"
+        );
+    }
+
+    // Regression test: multiple right rows matching the same left key
+    // used to silently collapse to just the last one probed
+    // (HashedSource.HashValue.right_value was a single Option<IndexKey>
+    // per left-row slot). HashedSource was since rewritten to stream
+    // the right side and walk the full probe chain per right row
+    // instead of pre-computing a single match into the table, which
+    // fixes this at the source JoinSource delegates to.
+    #[test]
+    fn test_multiple_right_matches_for_the_same_left_key_all_produce_output_rows() {
+        let left = Box::new(VecSource::new(
+            &["id", "val"],
+            vec![vec![ValueItem::Integer(1), ValueItem::Integer(100)]],
+        ));
+        let right = Box::new(VecSource::new(
+            &["user_id", "amount"],
+            vec![
+                vec![ValueItem::Integer(1), ValueItem::Integer(9001)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(9002)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(9003)],
+            ],
+        ));
+        let mut join = JoinSource::new(
+            left,
+            right,
+            on_id_eq_user_id(),
+            JoinType::Inner,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        let amounts: std::collections::HashSet<i64> = rows
+            .iter()
+            .map(|r| match r[3] {
+                ValueItem::Integer(v) => v,
+                _ => panic!("expected an integer"),
+            })
+            .collect();
+        assert_eq!(
+            amounts,
+            [9001, 9002, 9003].into_iter().collect(),
+            "every matching right row must produce its own output row: {rows:?}"
+        );
+    }
+
+    // Mirror case: multiple LEFT rows sharing a key, one matching right
+    // row — every left row must also get its own output row.
+    #[test]
+    fn test_multiple_left_matches_for_the_same_right_key_all_produce_output_rows() {
+        let left = Box::new(VecSource::new(
+            &["id", "val"],
+            vec![
+                vec![ValueItem::Integer(1), ValueItem::Integer(10)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(20)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(30)],
+            ],
+        ));
+        let right = Box::new(VecSource::new(
+            &["user_id", "amount"],
+            vec![vec![ValueItem::Integer(1), ValueItem::Integer(9001)]],
+        ));
+        let mut join = JoinSource::new(
+            left,
+            right,
+            on_id_eq_user_id(),
+            JoinType::Inner,
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let rows = drain(&mut join);
+        let vals: std::collections::HashSet<i64> = rows
+            .iter()
+            .map(|r| match r[1] {
+                ValueItem::Integer(v) => v,
+                _ => panic!("expected an integer"),
+            })
+            .collect();
+        assert_eq!(
+            vals,
+            [10, 20, 30].into_iter().collect(),
+            "every matching left row must produce its own output row: {rows:?}"
+        );
     }
 }

@@ -28,10 +28,33 @@ pub struct TransactionInner {
     ts: u128,
 }
 
+/// How a transaction wants a `WriteConflict` (see `crate::error::StoreError`)
+/// handled — set once at `begin()` time, similar to a SQL engine's
+/// "continue/ignore on error" transaction option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConflictPolicy {
+    /// The conflicting operation fails and returns the error, but the
+    /// transaction itself stays open and usable for further operations —
+    /// this was the only behavior before ConflictPolicy existed, and
+    /// remains the default so existing callers see no change.
+    #[default]
+    ContinueOnConflict,
+    /// The conflicting operation fails AND the entire transaction is
+    /// immediately, automatically rolled back — matching a SQL engine's
+    /// `ignore_errors = false` behavior. The transaction is fully finished
+    /// by the time the failing call returns; any further operation against
+    /// it (insert/update/remove/commit) returns
+    /// `StoreError::TransactionAlreadyFinished`. An explicit `db.rollback`
+    /// afterward is still safe (a harmless no-op), matching how ROLLBACK
+    /// on an already-aborted transaction behaves in most SQL engines.
+    AbortOnConflict,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TransactionData {
     id: TransactionId,
     snapshot: HashSet<TransactionId>,
+    policy: ConflictPolicy,
 }
 
 const TXN_GENERATOR_NANE: &str = "__system.transactions";
@@ -130,15 +153,56 @@ impl TransactionManager {
         Ok(self.active_transactions.read().iter().cloned().collect())
     }
 
-    pub(crate) fn create_transaction(&self) -> Result<TransactionId, StoreError> {
-        let snapshot = self.get_active_transactions()?;
-        let txn = TransactionId::new(self.gens.gen_key(TXN_GENERATOR_NANE)?);
-        self.active_transactions.write().insert(txn.clone());
+    pub(crate) fn create_transaction(
+        &self,
+        policy: ConflictPolicy,
+    ) -> Result<TransactionId, StoreError> {
+        // The numeric id can be generated outside the lock below (its own
+        // uniqueness comes from the generator, independent of lock
+        // ordering) — but ts() must NOT be: see the comment on the block
+        // below for why it's stamped inside the same critical section as
+        // snapshot capture/registration, not here.
+        let id = self.gens.gen_key(TXN_GENERATOR_NANE)?;
+        // Assigning ts(), capturing the snapshot, and registering as active
+        // must all happen under ONE lock acquisition, not stamped/read/
+        // written separately, or two transactions beginning at nearly the
+        // same moment can end up with a snapshot inconsistent with their
+        // own ts() ordering — two distinct bugs that both manifested as
+        // the same symptom (confirmed via direct repro: two threads racing
+        // an update to the same row, synchronized with a Barrier, both
+        // returning Ok):
+        //   1. Read-then-insert as two separate lock acquisitions left a
+        //      gap where a second transaction beginning in between could
+        //      read the same "before I was added" snapshot as the first —
+        //      each absent from the other's snapshot.
+        //   2. Even after fixing (1), TransactionId::new() (which stamps
+        //      ts() from timestamp()) used to run BEFORE this lock was
+        //      acquired — so which thread's write-lock acquisition
+        //      actually went first (and therefore whose snapshot saw
+        //      whom) could disagree with which thread's ts() was
+        //      numerically smaller, since OS scheduling can reorder "call
+        //      timestamp()" independently of "acquire the lock". That
+        //      breaks check_write_conflict's fallback `writer.ts() >=
+        //      txn.ts()` test — it needs ts() ordering to always agree
+        //      with snapshot-registration ordering, which is only
+        //      guaranteed if both happen under the same lock.
+        // Stamping ts() here, while holding the write lock, makes both
+        // properties hold by construction: only one thread's
+        // create_transaction body ever runs at a time, so whichever one
+        // acquires the lock first necessarily stamps the smaller ts() too.
+        let (txn, snapshot) = {
+            let mut active = self.active_transactions.write();
+            let txn = TransactionId::new(id);
+            let snapshot = active.iter().cloned().collect::<HashSet<_>>();
+            active.insert(txn.clone());
+            (txn, snapshot)
+        };
         self.transaction_data.write().insert(
             txn.0.id,
             TransactionData {
                 id: txn.clone(),
                 snapshot,
+                policy,
             },
         );
         Ok(txn)
@@ -147,8 +211,11 @@ impl TransactionManager {
     /// Creates a `Transaction` RAII guard that auto-rolls back on drop.
     /// Requires `self: &Arc<Self>` so the guard can hold a reference back to
     /// this manager for its deferred rollback.
-    pub(crate) fn begin(self: &Arc<Self>) -> Result<Transaction, StoreError> {
-        let id = self.create_transaction()?;
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        policy: ConflictPolicy,
+    ) -> Result<Transaction, StoreError> {
+        let id = self.create_transaction(policy)?;
         Ok(Transaction {
             id: Some(id),
             mgr: Arc::clone(self),
@@ -157,6 +224,20 @@ impl TransactionManager {
 
     pub(crate) fn is_transaction_active(&self, txn: &TransactionId) -> bool {
         self.active_transactions.read().contains(txn)
+    }
+
+    /// The policy `txn` was `begin()`-ed with — defaults to
+    /// `ContinueOnConflict` for an id this manager has no record of (e.g.
+    /// a synthetic id built for tests via `TransactionId::for_test`, or a
+    /// transaction that's already fully finished), matching the
+    /// pre-ConflictPolicy behavior rather than surprising an unrelated
+    /// caller with an abort they never asked for.
+    pub(crate) fn conflict_policy(&self, txn: &TransactionId) -> ConflictPolicy {
+        self.transaction_data
+            .read()
+            .get(&txn.0.id)
+            .map(|d| d.policy)
+            .unwrap_or_default()
     }
 
     /// A transaction's writes are visible ("committed") only if it is neither
@@ -241,6 +322,18 @@ impl TransactionId {
             id,
             ts: timestamp(),
         }))
+    }
+
+    // Test-only: builds a TransactionId with an explicit, caller-chosen
+    // `ts` instead of a fresh `timestamp()` call — needed to deterministically
+    // construct two distinct transactions with a colliding `ts` (real
+    // wall-clock collisions are rare and impossible to force from outside
+    // this module, since TransactionInner's fields are private to it).
+    // Used by db.rs's own tests to pin down check_write_conflict's
+    // tie-breaking behavior.
+    #[cfg(test)]
+    pub(crate) fn for_test(id: u64, ts: u128) -> Self {
+        Self(Arc::new(TransactionInner { id, ts }))
     }
 
     /// The transaction's creation timestamp — used to order two
@@ -356,7 +449,7 @@ mod tests {
 
     use crate::{
         generator::Generator,
-        txn::{TransactionId, TransactionInner, TransactionManager},
+        txn::{ConflictPolicy, TransactionId, TransactionInner, TransactionManager},
     };
 
     fn make_mgr() -> TransactionManager {
@@ -372,15 +465,15 @@ mod tests {
     #[test]
     fn test_create_unique_transactions() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
-        let t2 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert_ne!(t1, t2);
     }
 
     #[test]
     fn test_is_transaction_active() {
         let mgr = make_mgr();
-        let t = mgr.create_transaction().unwrap();
+        let t = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(mgr.is_transaction_active(&t));
         assert!(!mgr.is_transaction_active(&TransactionId::from(99999u64)));
     }
@@ -388,7 +481,7 @@ mod tests {
     #[test]
     fn test_commit_removes_transaction() {
         let mgr = make_mgr();
-        let t = mgr.create_transaction().unwrap();
+        let t = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(mgr.is_transaction_active(&t));
         mgr.commit(t.clone()).unwrap();
         assert!(!mgr.is_transaction_active(&t));
@@ -397,7 +490,7 @@ mod tests {
     #[test]
     fn test_rollback_removes_transaction() {
         let mgr = make_mgr();
-        let t = mgr.create_transaction().unwrap();
+        let t = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(mgr.is_transaction_active(&t));
         mgr.rollback(t.clone()).unwrap();
         assert!(!mgr.is_transaction_active(&t));
@@ -407,9 +500,9 @@ mod tests {
     fn test_active_count_tracks_lifecycle() {
         let mgr = make_mgr();
         assert_eq!(mgr.active_count(), 0);
-        let t1 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert_eq!(mgr.active_count(), 1);
-        let _t2 = mgr.create_transaction().unwrap();
+        let _t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert_eq!(mgr.active_count(), 2);
         mgr.commit(t1).unwrap();
         assert_eq!(mgr.active_count(), 1);
@@ -418,8 +511,8 @@ mod tests {
     #[test]
     fn test_get_active_transactions_contains_all() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
-        let t2 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         let ids = mgr.get_active_transactions().unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&t1));
@@ -429,8 +522,8 @@ mod tests {
     #[test]
     fn test_committed_not_in_active_list() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
-        let t2 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         mgr.commit(t1.clone()).unwrap();
         let ids = mgr.get_active_transactions().unwrap();
         assert!(!ids.contains(&t1));
@@ -473,15 +566,15 @@ mod tests {
     #[test]
     fn test_txn_first_has_empty_snapshot() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(mgr.snapshot(&t1).unwrap().is_empty());
     }
 
     #[test]
     fn test_txn_snapshot_captures_active_txns() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
-        let t2 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(mgr.snapshot(&t2).unwrap().contains(&t1));
         assert!(!mgr.snapshot(&t1).unwrap().contains(&t2));
     }
@@ -489,9 +582,9 @@ mod tests {
     #[test]
     fn test_txn_snapshot_excludes_committed_txns() {
         let mgr = make_mgr();
-        let t1 = mgr.create_transaction().unwrap();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         mgr.commit(t1.clone()).unwrap();
-        let t2 = mgr.create_transaction().unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert!(!mgr.snapshot(&t2).unwrap().contains(&t1));
     }
 
@@ -507,7 +600,7 @@ mod tests {
     fn test_transaction_drop_rolls_back_automatically() {
         let mgr = make_mgr_arc();
         let id = {
-            let txn = mgr.begin().unwrap();
+            let txn = mgr.begin(ConflictPolicy::ContinueOnConflict).unwrap();
             let id = txn.id();
             assert!(
                 mgr.is_transaction_active(&id),
@@ -526,7 +619,7 @@ mod tests {
     #[test]
     fn test_transaction_commit_does_not_trigger_rollback() {
         let mgr = make_mgr_arc();
-        let txn = mgr.begin().unwrap();
+        let txn = mgr.begin(ConflictPolicy::ContinueOnConflict).unwrap();
         let id = txn.id();
         txn.commit().unwrap();
         // If Drop had mis-fired a rollback after commit, the txn would still be
@@ -538,7 +631,7 @@ mod tests {
     #[test]
     fn test_transaction_explicit_rollback_removes_txn() {
         let mgr = make_mgr_arc();
-        let txn = mgr.begin().unwrap();
+        let txn = mgr.begin(ConflictPolicy::ContinueOnConflict).unwrap();
         let id = txn.id();
         txn.rollback().unwrap();
         assert!(!mgr.is_transaction_active(&id));
@@ -550,7 +643,7 @@ mod tests {
         // Cloning the raw TransactionId (e.g. to pass to insert/find) must not
         // cause rollback when the clone is dropped.
         let mgr = make_mgr_arc();
-        let txn = mgr.begin().unwrap();
+        let txn = mgr.begin(ConflictPolicy::ContinueOnConflict).unwrap();
         let id = txn.id(); // this clone is dropped at end of block below
         {
             let _clone = id.clone(); // simulate passing id to a method

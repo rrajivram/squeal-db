@@ -408,6 +408,80 @@ where
         }
     }
 
+    /// Like `update`, but with two hooks that run *inside* the same
+    /// page-lock critical section as the read-and-replace, closing the
+    /// TOCTOU gap a separate `find()` followed later by `update()` leaves
+    /// open: two callers racing through that pair can both read the row,
+    /// both pass whatever check they run in between, and then race on the
+    /// final replace, with the loser's already-"passed" check now stale.
+    /// Confirmed as a real, reproducible gap before this existed (see
+    /// store's db.rs test
+    /// `test_conflict_check_and_physical_write_are_not_atomic_so_a_racer_in_between_wins`,
+    /// which manually replays that exact interleaving).
+    ///
+    /// `build` receives the row's current tuple, freshly read under this
+    /// same lock — not a possibly-stale earlier read — and returns a
+    /// `(pre_image, new_tuple)` pair: `pre_image` is what a caller wants
+    /// preserved as the undo record's content (e.g. `find_last_committed`'s
+    /// result), `new_tuple` is what actually gets physically written. This
+    /// is where an ownership/conflict check belongs, since nothing can
+    /// invalidate its premise between the check and the write anymore.
+    ///
+    /// `before_write` runs after `build` succeeds but before the physical
+    /// replace, given `(&pre_image, &new_tuple)` — this is where undo/redo
+    /// logging belongs, preserving the existing invariant that the log
+    /// record must exist before a concurrent reader can observe the new
+    /// tuple's undo_id (see the plain `update`'s own callers for why that
+    /// ordering matters).
+    pub(crate) fn update_checked(
+        &self,
+        id: DBIdType,
+        build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
+        before_write: impl Fn(&Tuple, &Tuple) -> Result<(), StoreError>,
+    ) -> Result<Tuple, StoreError> {
+        let pid = self
+            .find_page(id.clone(), self.table.first_index_page)?
+            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+        let h = self.buffer.get_page_mut(pid)?;
+        let current = h
+            .page
+            .get(id.clone())?
+            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+        let (pre_image, tuple) = build(&current)?;
+        before_write(&pre_image, &tuple)?;
+
+        // From here down, identical to update() — see its own comments on
+        // why the fits-in-place check exists and what the relocation
+        // branch does.
+        let header = h.page.header();
+        let old_size = current.size();
+        let fits_in_place = h.page.count()? <= 1
+            || header.used_size().saturating_sub(old_size) + tuple.size()
+                <= header.usable_data_size();
+        if fits_in_place {
+            let old = h.page.replace_tuple(&id, tuple)?;
+            self.buffer.write_locked_page(h)?;
+            Ok(old)
+        } else {
+            let old = h.page.remove_tuple(id.clone())?;
+            self.buffer.write_locked_page(h)?;
+            let new_page_id = self.write_data(&tuple)?;
+            if new_page_id != pid {
+                let txn = tuple.txn_id.clone().unwrap_or_default();
+                retry_on_contention(|| {
+                    self.update_index_entry(
+                        id.clone(),
+                        new_page_id,
+                        txn.clone(),
+                        self.table.first_index_page,
+                        None,
+                    )
+                })?;
+            }
+            Ok(old)
+        }
+    }
+
     // Redo-replay counterpart to update(), mirroring insert_if_needed:
     // tolerates the row already reflecting this exact write (the common
     // case when a crash happens after the corresponding page write already

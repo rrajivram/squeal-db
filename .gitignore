@@ -9,3 +9,9 @@ squeal-cli/squeal.db
 squeal-cli/squeal.db.redo
 squeal-cli/squeal.db.undo
 dhat-heap.json
+regress.js
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

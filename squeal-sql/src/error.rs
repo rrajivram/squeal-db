@@ -12,6 +12,25 @@ pub enum SchemaError {
     KeyNotFound(DBIdType),
     #[error("Duplicate key : {0}")]
     DuplicateKey(DBIdType),
+    // Not a bad-input error like DuplicateKey/KeyNotFound — the row was
+    // concurrently modified by another transaction in a way this
+    // transaction can't safely build on top of (see
+    // store::db::Db::check_write_conflict). The caller's own statement
+    // was fine; retrying the transaction is the correct response, not
+    // fixing the query.
+    #[error("Write conflict : {0}")]
+    WriteConflict(DBIdType),
+    // Like WriteConflict, but the transaction's ConflictPolicy was
+    // AbortOnConflict, so the whole transaction was automatically rolled
+    // back, not just this one statement — the transaction is already
+    // finished by the time this error surfaces.
+    #[error("Write conflict : {0} — the entire transaction was rolled back")]
+    WriteConflictTransactionAborted(DBIdType),
+    // A statement was executed against a transaction that's already
+    // finished (committed, rolled back, or auto-aborted by
+    // AbortOnConflict on an earlier statement).
+    #[error("transaction is no longer active (already committed or rolled back)")]
+    TransactionAlreadyFinished,
     // Covers both "malformed name" and "no table by that name" — a
     // second variant (TableNameNotFound) used to exist for the latter,
     // introduced only in plan/logical.rs's own table resolution while
@@ -103,6 +122,11 @@ impl From<StoreError> for SchemaError {
             StoreError::TupleTooLarge(_, _) => Self::UserError(value.to_string()),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),
+            StoreError::WriteConflict(dbid_type) => Self::WriteConflict(dbid_type),
+            StoreError::WriteConflictTransactionAborted(dbid_type) => {
+                Self::WriteConflictTransactionAborted(dbid_type)
+            }
+            StoreError::TransactionAlreadyFinished => Self::TransactionAlreadyFinished,
             StoreError::TableNameInvalid(_, _)
             | StoreError::TableNotFound(_)
             | StoreError::DuplicateName(_) => Self::BadTableName(value.to_string()),

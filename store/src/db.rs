@@ -24,6 +24,7 @@ use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
+use crate::txn::ConflictPolicy;
 use crate::txn::Transaction;
 use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
@@ -165,6 +166,25 @@ struct NeededObjects<F: DBFile + 'static> {
     logger: Arc<Logger>,
     txn_mgr: Arc<TransactionManager>,
     buffer: Arc<PageBuffer<F>>,
+}
+
+// resolve_visible's outcome when no version satisfying its `is_visible`
+// predicate was found — distinguishes two very different reasons, because
+// only one of them is safe to paper over with a "just show the latest
+// committed data" fallback (see Db::find_visible_to):
+//   - NoAncestor: the walk reached a tuple whose own undo_id is None — a
+//     genuine dead end, since only a fresh INSERT's tuple ever has no
+//     undo_id (every update()/remove() always sets one). There is no
+//     earlier version to find because none ever existed.
+//   - MissingUndoRecord: the walk needed to go further back, but the undo
+//     log entry for that step was already gone (discarded concurrently,
+//     e.g. an aborting txn's undo being reverted, or the narrow
+//     discard-timing race find_visible_to's own comment describes). An
+//     ancestor DID exist — we just lost track of it.
+enum Visibility<'a> {
+    Found(Cow<'a, Tuple>),
+    NoAncestor,
+    MissingUndoRecord,
 }
 
 impl<F: DBFile + 'static> Db<F>
@@ -526,7 +546,21 @@ where
         Ok(count)
     }
 
+    /// Begins a transaction with the default conflict policy
+    /// (`ConflictPolicy::ContinueOnConflict` — a `WriteConflict` fails just
+    /// the conflicting operation, leaving the transaction open). Use
+    /// `begin_with_conflict_policy` for `AbortOnConflict` behavior.
     pub fn begin(&self) -> Result<Transaction, StoreError> {
+        self.begin_with_conflict_policy(ConflictPolicy::ContinueOnConflict)
+    }
+
+    /// Like `begin`, but lets the caller choose how a `WriteConflict` on any
+    /// operation within this transaction is handled — see `ConflictPolicy`'s
+    /// own doc comment.
+    pub fn begin_with_conflict_policy(
+        &self,
+        policy: ConflictPolicy,
+    ) -> Result<Transaction, StoreError> {
         // Reclaim any transactions abandoned via Transaction::drop (parked in
         // `aborting`) before starting new work: they are already invisible, this
         // physically reverts them so their rows don't linger and a re-insert of
@@ -545,7 +579,7 @@ where
         {
             self.checkpoint()?;
         }
-        self.tx_mgr.begin()
+        self.tx_mgr.begin(policy)
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<(), StoreError> {
@@ -555,6 +589,12 @@ where
         // The transaction simply stays active (and correctly invisible) until
         // a retried commit completes successfully.
         let id = txn.into_id();
+        // AbortOnConflict may already have rolled this transaction back
+        // entirely (see update_checked_with_retry) — without this check,
+        // tx_mgr.commit's active-set removal below would be a silent no-op
+        // for an id that's already gone, and this would incorrectly report
+        // success for a transaction that was actually rolled back.
+        self.require_active(&id)?;
         // Capture the tombstoned rows to reclaim BEFORE writing the commit
         // marker: logging a Commit op discards this txn's undo records (see
         // Logger::log_undo), so we must read them first.
@@ -628,17 +668,31 @@ where
         // See the comment in `commit` above — `into_id` prevents Drop's default
         // rollback so this is the single place the txn changes state.
         let id = txn.into_id();
+        self.rollback_by_id(&id)
+    }
+
+    // The actual work of rollback(), keyed off a borrowed TransactionId
+    // rather than an owned Transaction guard — needed by
+    // update_checked_with_retry's AbortOnConflict path, which only ever has
+    // `&TransactionId` (the caller's own Transaction guard is borrowed, not
+    // owned, by insert/update/remove). Calling this twice for the same id
+    // (e.g. this fires here, and the caller's own Transaction guard later
+    // still gets an explicit db.rollback or a Drop-triggered one) is safe:
+    // revert_txn_writes' per-row ownership checks make every step a no-op
+    // once the first pass already reverted it, and finish_rolled_back /
+    // logging a second Rollback marker for an already-gone id are harmless.
+    fn rollback_by_id(&self, id: &TransactionId) -> Result<(), StoreError> {
         // Revert while the txn is STILL ACTIVE. Active transactions are invisible
         // (is_committed == false) and are never scanned by drain_aborting, so the
         // owner reverts its own writes with zero cross-thread interference — no
         // other thread can observe or reclaim this txn mid-revert. Only once the
         // writes are physically undone do we retire it from the active set.
         // Revert BEFORE the Rollback marker, which discards the undo records.
-        self.revert_txn_writes(&id)?;
+        self.revert_txn_writes(id)?;
         let op = Operation::Rollback(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
-        self.tx_mgr.finish_rolled_back(id);
+        self.tx_mgr.finish_rolled_back(id.clone());
         Ok(())
     }
 
@@ -731,6 +785,7 @@ where
         txn: &Transaction,
     ) -> Result<(), StoreError> {
         let tx_id = txn.id();
+        self.require_active(&tx_id)?;
         let mut tuple = tuple;
         tuple.set_txn_id(tx_id.clone());
         let page_id = self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
@@ -774,36 +829,45 @@ where
         txn_id: &Transaction,
     ) -> Result<(), StoreError> {
         let txn = txn_id.id();
+        self.require_active(&txn)?;
         let table = self.table_by_id(tid)?;
-        let tuple = table.find(new_tuple.id.clone())?;
-        if let Some(tuple) = tuple {
-            // old_tuple is the pre-update, already-committed version. It's kept
-            // (with its original txn_id) as the undo record's content, so a
-            // rollback restores the exact prior state and concurrent readers
-            // can walk the undo chain back to a value that's actually visible.
+        let id = new_tuple.id.clone();
+        // build/before_write both run under table.update_checked's own
+        // page lock, atomically with the physical write — see that
+        // method's doc comment for why that matters (closes a TOCTOU gap
+        // a separate find()-then-update() pair used to leave open).
+        let build = |current: &Tuple| {
+            self.check_write_conflict(current, &txn)?;
+            // old_tuple is the pre-update, already-committed version. It's
+            // kept (with its original txn_id) as the undo record's content,
+            // so a rollback restores the exact prior state and concurrent
+            // readers can walk the undo chain back to a value that's
+            // actually visible.
             let old_tuple = self
-                .find_last_committed(&tuple)
-                .ok_or(StoreError::KeyNotFound(new_tuple.id.clone()))?
+                .find_last_committed(current)
+                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
                 .into_owned();
             let mut updated = old_tuple.clone();
             updated.set_txn_id(txn.clone());
             updated.set_undo_id(self.logger.next_undo_id(txn.clone())?);
             updated.set_data(&new_tuple.data);
-            // Undo log must be written BEFORE the tree is mutated: once
-            // `updated` (carrying undo_id) lands in the tree, a concurrent
-            // reader on another thread can observe it immediately and try to
-            // resolve that undo_id via find_last_committed. If the undo entry
-            // doesn't exist yet, that lookup panics (find_undo_tuple returns
-            // None where the code expects Some).
+            Ok((old_tuple, updated))
+        };
+        // Undo log must be written BEFORE the tree is mutated: once
+        // `updated` (carrying undo_id) lands in the tree, a concurrent
+        // reader on another thread can observe it immediately and try to
+        // resolve that undo_id via find_last_committed. If the undo entry
+        // doesn't exist yet, that lookup panics (find_undo_tuple returns
+        // None where the code expects Some).
+        let before_write = |old_tuple: &Tuple, updated: &Tuple| {
             let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone(), None));
-            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple, None));
+            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple.clone(), None));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
-            table.update(updated)?;
             Ok(())
-        } else {
-            Err(StoreError::KeyNotFound(new_tuple.id))
-        }
+        };
+        self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)?;
+        Ok(())
     }
 
     pub fn remove(
@@ -813,32 +877,92 @@ where
         txn_id: &Transaction,
     ) -> Result<Tuple, StoreError> {
         let txn = txn_id.id();
+        self.require_active(&txn)?;
         let table = self.table_by_id(tid)?;
-        let tuple = table.find(id.clone())?;
-        if let Some(tuple) = tuple {
+        let build = |current: &Tuple| {
+            self.check_write_conflict(current, &txn)?;
             // old_tuple is the pre-remove, already-committed (non-tombstoned)
-            // version, kept as the undo record's content so a rollback restores
-            // the row exactly (including clearing the tombstone flag) and
-            // concurrent readers see it instead of the in-flight tombstone.
+            // version, kept as the undo record's content so a rollback
+            // restores the row exactly (including clearing the tombstone
+            // flag) and concurrent readers see it instead of the in-flight
+            // tombstone.
             let old_tuple = self
-                .find_last_committed(&tuple)
-                .ok_or(StoreError::KeyNotFound(tuple.id.clone()))?
+                .find_last_committed(current)
+                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
                 .into_owned();
             let mut tombstoned = old_tuple.clone();
             tombstoned.set_txn_id(txn.clone());
             tombstoned.tombstone();
             tombstoned.set_undo_id(self.logger.next_undo_id(txn.clone())?);
-            // Same ordering requirement as update(): log undo/redo before the
-            // tombstoned tuple becomes visible in the tree, so a concurrent
-            // reader can never observe an undo_id that doesn't resolve yet.
+            Ok((old_tuple, tombstoned))
+        };
+        // Same ordering requirement as update(): log undo/redo before the
+        // tombstoned tuple becomes visible in the tree, so a concurrent
+        // reader can never observe an undo_id that doesn't resolve yet.
+        let before_write = |old_tuple: &Tuple, tombstoned: &Tuple| {
             let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone(), None));
-            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple, None));
+            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple.clone(), None));
             self.logger.log_redo(redo_op)?;
             self.logger.log_undo(undo_op)?;
-            table.update(tombstoned.clone())?;
-            Ok(tombstoned)
+            Ok(())
+        };
+        self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)
+    }
+
+    // Runs table.update_checked with one opportunistic retry: if the first
+    // attempt hits a WriteConflict, the row's current writer might be a
+    // merely *dropped* (not explicitly db.rollback()'d) transaction sitting
+    // in `aborting`, undrained — drain_aborting only ever runs from
+    // begin(), so a caller that only ever calls update()/remove() directly
+    // (never begins a fresh, throwaway transaction elsewhere) would
+    // otherwise spin forever on a conflict that's already logically
+    // resolved. One drain-and-retry costs nothing when there was nothing
+    // to drain: a conflict against a genuinely still-active writer fails
+    // again, identically, on the retry.
+    fn update_checked_with_retry(
+        &self,
+        table: &BPlusTree<F>,
+        id: DBIdType,
+        txn: &TransactionId,
+        build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
+        before_write: impl Fn(&Tuple, &Tuple) -> Result<(), StoreError>,
+    ) -> Result<Tuple, StoreError> {
+        let result = match table.update_checked(id.clone(), &build, &before_write) {
+            Err(StoreError::WriteConflict(_)) => {
+                self.drain_aborting();
+                table.update_checked(id.clone(), build, before_write)
+            }
+            other => other,
+        };
+        // AbortOnConflict: a conflict that survives the opportunistic
+        // drain-and-retry above takes down the WHOLE transaction, not just
+        // this operation — matching a SQL engine's `ignore_errors = false`.
+        // ContinueOnConflict (the default) leaves the transaction open, so
+        // the caller can retry or move on, exactly as before ConflictPolicy
+        // existed.
+        if let Err(StoreError::WriteConflict(key)) = &result
+            && self.tx_mgr.conflict_policy(txn) == ConflictPolicy::AbortOnConflict
+        {
+            self.rollback_by_id(txn)?;
+            return Err(StoreError::WriteConflictTransactionAborted(key.clone()));
+        }
+        result
+    }
+
+    // Guards insert/update/remove/commit against being called with a
+    // TransactionId that's no longer active — most commonly because
+    // AbortOnConflict already rolled the whole transaction back after an
+    // earlier operation's conflict (see update_checked_with_retry). Without
+    // this, a caller unaware the transaction was already finished could
+    // keep writing under a dead id (silently invisible forever, since
+    // nothing commits it) or, worse, have `commit()` report success for a
+    // transaction that was actually rolled back — `tx_mgr.commit` removing
+    // a non-member from its active set is a silent no-op, not an error.
+    fn require_active(&self, txn: &TransactionId) -> Result<(), StoreError> {
+        if self.tx_mgr.is_transaction_active(txn) {
+            Ok(())
         } else {
-            Err(StoreError::KeyNotFound(id))
+            Err(StoreError::TransactionAlreadyFinished)
         }
     }
 
@@ -898,29 +1022,40 @@ where
         &self,
         tuple: &'a Tuple,
         is_visible: impl Fn(&TransactionId) -> bool,
-    ) -> Option<Cow<'a, Tuple>> {
+    ) -> Visibility<'a> {
         if let Some(txn) = tuple.txn_id.clone() {
             if is_visible(&txn) {
-                Some(Cow::Borrowed(tuple))
+                Visibility::Found(Cow::Borrowed(tuple))
             } else {
                 let mut tuple = tuple.clone();
                 let mut txn = txn;
                 loop {
-                    tuple.undo_id?;
-                    let undo_id = tuple.undo_id.unwrap();
+                    // A genuine dead end: this tuple has no prior version
+                    // at all (only true of a fresh INSERT), so there is
+                    // nothing further back to find. Must NOT be treated
+                    // the same as a missing undo record below — see
+                    // Visibility's own doc comment.
+                    let Some(undo_id) = tuple.undo_id else {
+                        return Visibility::NoAncestor;
+                    };
 
                     // Tolerate a missing undo record: an aborting txn's undo can
                     // be discarded concurrently once its rows are reverted. If we
-                    // can't walk further, treat the row as not-yet-visible
-                    // (invisible) rather than panicking.
-                    let next_tuple = self.logger.find_undo_tuple(txn.clone(), undo_id)?;
-                    let next_txn = next_tuple.txn_id.clone()?;
+                    // can't walk further, treat the row as ambiguous rather than
+                    // panicking or silently asserting it has no ancestor.
+                    let Some(next_tuple) = self.logger.find_undo_tuple(txn.clone(), undo_id)
+                    else {
+                        return Visibility::MissingUndoRecord;
+                    };
+                    let Some(next_txn) = next_tuple.txn_id.clone() else {
+                        return Visibility::NoAncestor;
+                    };
                     if is_visible(&next_txn) {
                         // next_tuple is the visible ancestor we walked back
                         // to — return it, not the in-flight `tuple` we started
                         // from (which belongs to a not-yet-visible txn and must
                         // stay invisible to other readers).
-                        return Some(Cow::Owned(next_tuple));
+                        return Visibility::Found(Cow::Owned(next_tuple));
                     }
                     tuple = next_tuple;
                     txn = next_txn;
@@ -931,18 +1066,72 @@ where
         }
     }
 
+    // Write-write conflict guard for update()/remove(), called against the
+    // row's raw, current physical tuple (whoever last wrote it) before
+    // building on top of it. Page-level locks (ArcLock) only serialize the
+    // *physical* write — they say nothing about whether blindly overwriting
+    // the row is *logically* safe — so without this, two transactions
+    // updating the same row concurrently both silently succeed and both
+    // commit, with the first one's write simply gone. Confirmed via direct
+    // repro before this existed: T1 and T2 both begin, both update() the
+    // same row, both update() calls and both commit() calls return Ok, and
+    // the final value is T2's, with no error ever surfaced to T1.
+    //
+    // `current`'s writer is safe to build on top of only if it's exactly
+    // the set find_visible_to already treats as visible to `txn` as a
+    // *reader* — this is deliberately that same predicate, negated:
+    //   - writer == txn: txn is re-writing its own not-yet-committed row.
+    //   - writer committed strictly before txn began, AND wasn't still
+    //     active when txn's snapshot was captured (i.e. txn's own
+    //     find()-then-update is building on exactly the state its
+    //     snapshot already accounts for).
+    // Anything else is a conflict:
+    //   - writer is active right now (a live, in-flight competing write).
+    //   - writer was active when txn began (in txn's own snapshot) — even
+    //     if it has since committed, txn's snapshot didn't (and couldn't)
+    //     account for that write, so building on it would silently
+    //     discard it.
+    //   - writer began at or after txn did — concurrent work by
+    //     definition, since txn couldn't have observed it at its own
+    //     begin() regardless of commit order.
+    fn check_write_conflict(&self, current: &Tuple, txn: &TransactionId) -> Result<(), StoreError> {
+        let writer = current
+            .txn_id
+            .clone()
+            .expect("tuple returned by table.find() must carry a txn_id");
+        if &writer == txn {
+            return Ok(());
+        }
+        let was_active_when_txn_began = self
+            .tx_mgr
+            .snapshot(txn)
+            .map(|s| s.contains(&writer))
+            .unwrap_or(false);
+        if self.tx_mgr.is_transaction_active(&writer)
+            || was_active_when_txn_began
+            || writer.ts() >= txn.ts()
+        {
+            return Err(StoreError::WriteConflict(current.id.clone()));
+        }
+        Ok(())
+    }
+
     // Latest committed version, full stop — no snapshot filtering. Used
     // internally by update()/remove() to resolve the current pre-image for
-    // undo-log construction: write paths must act against the true latest
-    // committed state (conflicting writers are already serialized via
-    // page-level locks — see ArcLock — so there's no lost-update risk to
-    // guard against here), not a reader's potentially-stale snapshot.
+    // undo-log construction once check_write_conflict has already
+    // confirmed the row's current writer is safe to build on top of.
     pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
         // Visible iff the writer COMMITTED — i.e. it is neither still active
         // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
         // in `aborting` and is therefore correctly invisible here even
-        // though it has left the active set.
-        self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn))
+        // though it has left the active set. No snapshot filtering here, so
+        // (unlike find_visible_to) there's no meaningful difference between
+        // NoAncestor and MissingUndoRecord to preserve — either way, no
+        // committed version was found.
+        match self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn)) {
+            Visibility::Found(t) => Some(t),
+            Visibility::NoAncestor | Visibility::MissingUndoRecord => None,
+        }
     }
 
     // Snapshot-isolated visibility for reads (Db::find, TableCursor,
@@ -995,34 +1184,49 @@ where
             .map(|s| s.clone())
             .unwrap_or_default();
         let reader_ts = reader.ts();
-        if let Some(t) = self.resolve_visible(tuple, |txn| {
+        match self.resolve_visible(tuple, |txn| {
             txn == reader
                 || (self.tx_mgr.is_committed(txn)
                     && txn.ts() < reader_ts
                     && !reader_snapshot.contains(txn))
         }) {
-            return Some(t);
+            Visibility::Found(t) => Some(t),
+            // A genuine dead end — this version has no ancestor at all, so
+            // there is nothing to fall back to. Critically, this is also
+            // exactly what a phantom row looks like: a fresh INSERT by a
+            // writer that isn't visible to `reader` (began at/after reader,
+            // or was in reader's own snapshot) has undo_id == None, so the
+            // walk above hits this case on its very first step. Must NOT
+            // fall through to find_last_committed below — that used to
+            // unhide exactly this case, making a row inserted and
+            // committed by someone else after `reader` began visible to
+            // `reader` anyway. Confirmed via direct repro before this
+            // distinction existed (see store's db.rs test
+            // test_find_does_not_see_a_row_inserted_and_committed_by_another_txn_after_this_txn_began).
+            Visibility::NoAncestor => None,
+            // Unlike NoAncestor, an ancestor genuinely existed here — we
+            // just lost track of it (a discarded undo record). Falling
+            // back to the latest committed version instead of hiding a row
+            // that genuinely, currently exists is safe in THIS case only.
+            // In the common case discard_or_defer_undo already keeps the
+            // needed pre-image around for exactly as long as `reader`
+            // could still be asking, so this path is rarely taken — but it
+            // can still be reached by a narrow race: Db::commit captures
+            // its "who's still active" waiter set with a plain (non-atomic,
+            // w.r.t. TransactionManager's own locks) read before actually
+            // committing, so a brand new reader beginning in that exact
+            // window wouldn't be counted as a waiter, and could see its
+            // undo trail discarded immediately if no one else was active
+            // at that moment. Confirmed the hard way that this fallback
+            // matters: an earlier version of this function returned None
+            // unconditionally here (before discard_or_defer_undo existed),
+            // which made Db::find incorrectly report a real, committed,
+            // currently-existing row as missing after a concurrent commit.
+            // The guarantee this preserves: a row that exists, is
+            // committed, AND has a genuine (if untraceable) ancestor is
+            // never reported as absent.
+            Visibility::MissingUndoRecord => self.find_last_committed(tuple),
         }
-        // No version satisfying `reader`'s exact snapshot survives in the
-        // retained undo history — fall back to the latest committed
-        // version instead of hiding a row that genuinely, currently
-        // exists. In the common case discard_or_defer_undo already keeps
-        // the needed pre-image around for exactly as long as `reader`
-        // could still be asking, so this path is rarely taken — but it can
-        // still be reached by a narrow race: Db::commit captures its
-        // "who's still active" waiter set with a plain (non-atomic, w.r.t.
-        // TransactionManager's own locks) read before actually committing,
-        // so a brand new reader beginning in that exact window wouldn't be
-        // counted as a waiter, and could see its undo trail discarded
-        // immediately if no one else was active at that moment. Confirmed
-        // the hard way that this fallback matters: an earlier version of
-        // this function returned None here entirely (before
-        // discard_or_defer_undo existed), which made Db::find incorrectly
-        // report a real, committed, currently-existing row as missing after
-        // a concurrent commit. The one guarantee that must hold
-        // unconditionally, even in that race window: a row that exists and
-        // is committed is never reported as absent.
-        self.find_last_committed(tuple)
     }
 
     /// Convenience wrapper around `create_table_with_index_entry_size` using
@@ -1384,6 +1588,7 @@ mod tests {
         memfile::MemFile,
         table::TableIdType,
         tuple::{DBIdType, Tuple},
+        txn::{ConflictPolicy, TransactionId},
     };
     use postcard::take_from_bytes;
     use std::fs::File;
@@ -2139,6 +2344,719 @@ mod tests {
         );
 
         db.commit(txn2).unwrap();
+    }
+
+    // Regression test: before check_write_conflict existed, two
+    // transactions both update()ing the same row concurrently both
+    // succeeded and both commit()ted with no error at all — the first
+    // writer's change was just silently gone. Confirmed via direct repro
+    // (this exact sequence) before the fix landed.
+    #[test]
+    fn test_concurrent_updates_to_the_same_row_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        let result = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(
+            matches!(result, Err(StoreError::WriteConflict(_))),
+            "T2 must be rejected while T1's write to the same row is still live: {result:?}"
+        );
+
+        db.commit(txn1).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn3).unwrap();
+        drop(txn3);
+        assert_eq!(
+            found.expect("row must exist").data.to_vec(),
+            b"from_t1",
+            "T1's committed write must survive, not be silently overwritten"
+        );
+    }
+
+    // Same conflict, but caught the other direction: T1 begins, updates and
+    // *commits* first; T2 (which began before T1 committed, so its
+    // snapshot never accounted for T1's write) must still be rejected when
+    // it tries to update the same row — first-committer-wins, not
+    // first-caller-of-update()-wins.
+    #[test]
+    fn test_update_after_a_concurrent_transaction_already_committed_the_same_row_conflicts() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        db.commit(txn1).unwrap();
+
+        let result = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(
+            matches!(result, Err(StoreError::WriteConflict(_))),
+            "T2 must be rejected — T1 committed a change to this row after T2's snapshot was \
+             taken: {result:?}"
+        );
+    }
+
+    // The non-conflict case: T1 begins and commits its update to row 1
+    // entirely before T2 even begins. T2's own update must succeed —
+    // conflict detection must not become so conservative that it blocks
+    // ordinary sequential writes.
+    #[test]
+    fn test_update_after_a_prior_transaction_fully_committed_does_not_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        db.commit(txn1).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t2"), &txn2).unwrap();
+        db.commit(txn2).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn3).unwrap();
+        drop(txn3);
+        assert_eq!(found.expect("row must exist").data.to_vec(), b"from_t2");
+    }
+
+    // Two transactions updating two DIFFERENT rows concurrently must not
+    // conflict with each other at all — the guard is keyed on the row's
+    // own current writer, not on "any other transaction is active".
+    #[test]
+    fn test_concurrent_updates_to_different_rows_do_not_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.insert(tid, row(2, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        db.update(tid, row(2, b"from_t2"), &txn2).unwrap();
+
+        db.commit(txn1).unwrap();
+        db.commit(txn2).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &txn3).unwrap().unwrap().data.to_vec(),
+            b"from_t1"
+        );
+        assert_eq!(
+            db.find(tid, id(2), &txn3).unwrap().unwrap().data.to_vec(),
+            b"from_t2"
+        );
+    }
+
+    // remove() must be guarded the same way update() is — a concurrent
+    // remove of a row another still-active transaction just wrote must be
+    // rejected, not silently tombstone the row out from under it.
+    #[test]
+    fn test_concurrent_remove_and_update_of_the_same_row_conflicts() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        let result = db.remove(tid, id(1), &txn2);
+        assert!(
+            matches!(result, Err(StoreError::WriteConflict(_))),
+            "T2's remove must be rejected while T1's write to the same row is still live: \
+             {result:?}"
+        );
+    }
+
+    // A transaction re-updating its OWN not-yet-committed row must never
+    // be treated as a conflict against itself.
+    #[test]
+    fn test_a_transaction_updating_its_own_row_twice_does_not_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        db.update(tid, row(1, b"v1"), &txn1).unwrap();
+        db.update(tid, row(1, b"v2"), &txn1).unwrap();
+        db.commit(txn1).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        let found = db.find(tid, id(1), &txn2).unwrap();
+        drop(txn2);
+        assert_eq!(found.expect("row must exist").data.to_vec(), b"v2");
+    }
+
+    // ── txn hardening: edge cases from TXN_HARDENING.md ────────────────────
+
+    // Regression test for the TOCTOU gap (see TXN_HARDENING.md's first
+    // critical item): before BPlusTree::update_checked existed, Db::update
+    // did table.find() (its own page lock, released immediately), then
+    // check_write_conflict() with no lock held at all, then — much later —
+    // a separate table.update() call (a fresh page lock). Two real threads
+    // racing through that pair could both read+pass-the-check before
+    // either wrote, then race on the final replace, silently losing one
+    // commit. This was proven deterministically at the time (manually
+    // replaying that exact interleaving) — now that the check, the
+    // pre-image resolution, and the physical write all run inside
+    // update_checked's single page-lock critical section, there is no
+    // longer a seam to inject a racer into at all, so the only way left to
+    // exercise this is genuine concurrent threads: two transactions began
+    // before either attempts to write (each sees the other as active in
+    // its own snapshot), then race an update to the same row through a
+    // Barrier to maximize overlap. Whichever thread's update_checked call
+    // acquires the page lock first always wins (the row still belongs to
+    // the original committed writer at that point); the second is
+    // guaranteed to conflict, because it began while the first was already
+    // active. Exactly one must ever win — never both, never neither.
+    #[test]
+    fn test_concurrent_updates_to_the_same_row_never_produce_two_winners_or_a_lost_commit() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let db_a = db.clone();
+        let barrier_a = barrier.clone();
+        let a = std::thread::spawn(move || {
+            let txn = db_a.begin().unwrap();
+            barrier_a.wait();
+            match db_a.update(tid, row(1, b"from_a"), &txn) {
+                Ok(()) => {
+                    db_a.commit(txn).unwrap();
+                    true
+                }
+                Err(StoreError::WriteConflict(_)) => {
+                    db_a.rollback(txn).unwrap();
+                    false
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        });
+
+        let db_b = db.clone();
+        let barrier_b = barrier.clone();
+        let b = std::thread::spawn(move || {
+            let txn = db_b.begin().unwrap();
+            barrier_b.wait();
+            match db_b.update(tid, row(1, b"from_b"), &txn) {
+                Ok(()) => {
+                    db_b.commit(txn).unwrap();
+                    true
+                }
+                Err(StoreError::WriteConflict(_)) => {
+                    db_b.rollback(txn).unwrap();
+                    false
+                }
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        });
+
+        let a_won = a.join().unwrap();
+        let b_won = b.join().unwrap();
+        assert!(
+            a_won ^ b_won,
+            "exactly one of the two racing updates must win — a_won={a_won}, b_won={b_won}"
+        );
+
+        let reader = db.begin().unwrap();
+        let found = db.find(tid, id(1), &reader).unwrap().unwrap();
+        drop(reader);
+        let expected: &[u8] = if a_won { b"from_a" } else { b"from_b" };
+        assert_eq!(
+            found.data.to_vec(),
+            expected,
+            "the committed value must match whichever update actually won, never a mix and \
+             never the loser's"
+        );
+    }
+
+    // Documents ConflictPolicy::ContinueOnConflict (the default, used by
+    // plain db.begin()): a WriteConflict does not poison the transaction —
+    // nothing marks it as doomed, so it can go on to do unrelated work and
+    // commit successfully. Contrast with AbortOnConflict below.
+    #[test]
+    fn test_a_transaction_can_still_commit_after_one_of_its_writes_hits_a_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.insert(tid, row(2, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+
+        let conflict = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(matches!(conflict, Err(StoreError::WriteConflict(_))));
+
+        // txn2 goes on to touch an unrelated row and commit anyway.
+        db.update(tid, row(2, b"t2_unrelated"), &txn2).unwrap();
+        db.commit(txn2).unwrap();
+        db.commit(txn1).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(2), &txn3).unwrap().unwrap().data.to_vec(),
+            b"t2_unrelated"
+        );
+    }
+
+    // Mirrors the ContinueOnConflict test above, but with
+    // ConflictPolicy::AbortOnConflict: a WriteConflict must now take down
+    // the WHOLE transaction — the caller gets a distinct
+    // WriteConflictTransactionAborted error (not a plain WriteConflict),
+    // and by the time it returns, the losing row's own update has already
+    // been rolled back too (not just the conflicting operation refused).
+    #[test]
+    fn test_abort_on_conflict_rolls_back_the_whole_transaction_on_a_single_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.insert(tid, row(2, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db
+            .begin_with_conflict_policy(ConflictPolicy::AbortOnConflict)
+            .unwrap();
+
+        // txn2 does some other, perfectly valid work first...
+        db.update(tid, row(2, b"t2_row2"), &txn2).unwrap();
+        // ...then conflicts with txn1 on row 1.
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        let result = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(
+            matches!(result, Err(StoreError::WriteConflictTransactionAborted(_))),
+            "{result:?}"
+        );
+
+        // txn2 is now fully finished — ANY further use of it, including its
+        // earlier, perfectly valid write to row 2, must be rejected: the
+        // whole transaction was rolled back, not just the conflicting op.
+        let further = db.update(tid, row(2, b"t2_row2_again"), &txn2);
+        assert!(
+            matches!(further, Err(StoreError::TransactionAlreadyFinished)),
+            "{further:?}"
+        );
+        let commit_result = db.commit(txn2);
+        assert!(
+            matches!(commit_result, Err(StoreError::TransactionAlreadyFinished)),
+            "committing an already-auto-aborted transaction must not silently succeed: \
+             {commit_result:?}"
+        );
+
+        db.commit(txn1).unwrap();
+
+        // Row 2's earlier, valid write from txn2 must be gone too — the
+        // WHOLE transaction rolled back, not just row 1's conflicting op.
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"from_t1"
+        );
+        assert_eq!(
+            db.find(tid, id(2), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0",
+            "txn2's earlier write to row 2 must have been rolled back along with everything \
+             else in its transaction"
+        );
+    }
+
+    // An explicit db.rollback() on a transaction AbortOnConflict already
+    // auto-aborted must be a safe, harmless no-op — matching how ROLLBACK
+    // on an already-aborted transaction behaves in most SQL engines, and
+    // matching this codebase's own idempotent revert primitives
+    // (update_if_txn/remove_if_txn).
+    #[test]
+    fn test_explicit_rollback_after_an_auto_abort_is_a_harmless_no_op() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db
+            .begin_with_conflict_policy(ConflictPolicy::AbortOnConflict)
+            .unwrap();
+
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        let result = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(matches!(
+            result,
+            Err(StoreError::WriteConflictTransactionAborted(_))
+        ));
+
+        db.rollback(txn2).unwrap();
+        db.commit(txn1).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"from_t1"
+        );
+    }
+
+    // A transaction that never conflicts at all behaves identically under
+    // either policy — AbortOnConflict only changes behavior when a
+    // conflict actually happens.
+    #[test]
+    fn test_abort_on_conflict_does_not_change_behavior_when_nothing_conflicts() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db
+            .begin_with_conflict_policy(ConflictPolicy::AbortOnConflict)
+            .unwrap();
+        db.update(tid, row(1, b"v1"), &txn1).unwrap();
+        db.commit(txn1).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v1"
+        );
+    }
+
+    #[test]
+    fn test_winner_of_a_conflict_rolling_back_still_frees_the_row_for_a_third_txn() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        assert!(db.update(tid, row(1, b"from_t2"), &txn2).is_err());
+
+        db.rollback(txn1).unwrap(); // winner backs out instead of committing
+
+        let txn3 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t3"), &txn3).unwrap();
+        db.commit(txn3).unwrap();
+
+        let txn4 = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &txn4).unwrap().unwrap().data.to_vec(),
+            b"from_t3"
+        );
+    }
+
+    #[test]
+    fn test_after_a_conflicting_transaction_gives_up_a_third_transaction_can_proceed() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        assert!(db.update(tid, row(1, b"from_t2"), &txn2).is_err());
+        db.rollback(txn2).unwrap(); // t2 gives up
+
+        db.commit(txn1).unwrap();
+
+        let txn3 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t3"), &txn3).unwrap();
+        db.commit(txn3).unwrap();
+
+        let txn4 = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &txn4).unwrap().unwrap().data.to_vec(),
+            b"from_t3"
+        );
+    }
+
+    // An update against a row another transaction has inserted but not yet
+    // committed must be a genuine write conflict — not KeyNotFound (the
+    // row IS physically present) and not a silent success (that would
+    // clobber an insert that might still commit).
+    #[test]
+    fn test_update_against_an_uncommitted_insert_from_another_txn_conflicts() {
+        let (db, tid) = make_db_with_table();
+        let txn1 = db.begin().unwrap();
+        db.insert(tid, row(1, b"from_t1"), &txn1).unwrap();
+
+        let txn2 = db.begin().unwrap();
+        let result = db.update(tid, row(1, b"from_t2"), &txn2);
+        assert!(
+            matches!(result, Err(StoreError::WriteConflict(_))),
+            "must be a write conflict, not KeyNotFound or a silent success: {result:?}"
+        );
+    }
+
+    // Pins down check_write_conflict's tie-breaking behavior
+    // (`writer.ts() >= txn.ts()`) directly and deterministically, using
+    // TransactionId::for_test to force a ts collision — a real wall-clock
+    // collision between two distinct transactions is rare and can't be
+    // forced from outside txn.rs otherwise. Calls check_write_conflict
+    // directly (rather than via update()) so this isolates exactly the
+    // comparison being tested, independent of tx_mgr's active/snapshot
+    // state (both TransactionIds here are synthetic and were never
+    // actually begin()'d).
+    #[test]
+    fn test_check_write_conflict_treats_a_colliding_timestamp_as_conflicting() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let reader = TransactionId::for_test(9002, 500);
+
+        // Exact tie: writer's ts equals reader's ts. Must conflict — the
+        // conservative choice, since we can't prove the writer actually
+        // finished before the reader began at this resolution.
+        let tied_writer = TransactionId::for_test(9001, 500);
+        let mut current = row(1, b"from_tied_writer");
+        current.set_txn_id(tied_writer);
+        assert!(
+            matches!(
+                db.check_write_conflict(&current, &reader),
+                Err(StoreError::WriteConflict(_))
+            ),
+            "a colliding ts must be treated as concurrent/conflicting, not as \"writer began \
+             before me\""
+        );
+
+        // Contrast: a writer with a strictly EARLIER ts (no tie) in the
+        // same "tx_mgr has never heard of it" state must NOT conflict —
+        // confirms the case above is specifically about the tie, not just
+        // "any unrecognized writer automatically conflicts".
+        let earlier_writer = TransactionId::for_test(9003, 100);
+        let mut current2 = row(1, b"from_earlier_writer");
+        current2.set_txn_id(earlier_writer);
+        assert!(
+            db.check_write_conflict(&current2, &reader).is_ok(),
+            "a writer with a strictly earlier, non-colliding ts must not conflict"
+        );
+    }
+
+    // TXN_HARDENING.md's second critical item, now fixed: dropping a guard
+    // (rather than an explicit db.rollback()) parks the transaction in
+    // `aborting` without reverting its write — drain_aborting only ever
+    // runs from Db::begin(), so a conflict caused by it used to never
+    // clear no matter how many times the blocked caller retried
+    // update()/remove() alone; only some OTHER transaction calling
+    // begin() elsewhere would unblock it. update()/remove() now
+    // opportunistically drain the aborting set and retry once on a
+    // WriteConflict (see Db::update_checked_with_retry), so this self-heals
+    // within the SAME call — no caller-visible retry loop needed.
+    #[test]
+    fn test_update_self_heals_a_conflict_against_a_dropped_but_undrained_transaction() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn_stale = db.begin().unwrap();
+        let txn_check = db.begin().unwrap(); // snapshot includes txn_stale as active
+
+        db.update(tid, row(1, b"stale"), &txn_stale).unwrap();
+        drop(txn_stale); // abandoned, not db.rollback()'d — revert is deferred
+
+        // txn_check's own snapshot recorded txn_stale as active, so a
+        // naive single attempt would conflict — but this now succeeds on
+        // the first call: the internal retry drains txn_stale (reverting
+        // its write back to txn0's committed value) and re-checks against
+        // that, which txn_check's snapshot has no quarrel with.
+        db.update(tid, row(1, b"check"), &txn_check).unwrap();
+        db.commit(txn_check).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"check"
+        );
+    }
+
+    // Extends the existing single-intervening-commit repeatable-read test
+    // to a longer chain: a reader's snapshot must survive ANY number of
+    // concurrent commits landing in between its reads, not just one.
+    #[test]
+    fn test_find_is_repeatable_across_more_than_one_intervening_commit() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0"
+        );
+
+        for v in ["v1", "v2", "v3"] {
+            let w = db.begin().unwrap();
+            db.update(tid, row(1, v.as_bytes()), &w).unwrap();
+            db.commit(w).unwrap();
+            assert_eq!(
+                db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+                b"v0",
+                "reader must still see its original snapshot after commit of {v}"
+            );
+        }
+        drop(reader);
+    }
+
+    // table_scan must not observe a write left behind by a transaction
+    // that was dropped (not explicitly rolled back) and hasn't been
+    // drained yet — mirrors the existing tombstoned/uncommitted scan
+    // tests, but specifically for this transient "aborting" state.
+    #[test]
+    fn test_table_scan_does_not_see_a_dropped_but_undrained_transactions_write() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let stale = db.begin().unwrap();
+        db.update(tid, row(1, b"stale"), &stale).unwrap();
+        drop(stale); // aborting, not yet drained
+
+        let mut cursor = db.table_scan(tid).unwrap();
+        let found = cursor.next().unwrap().expect("row must be scanned");
+        assert_eq!(
+            found.data.to_vec(),
+            b"v0",
+            "scan must not observe a dropped-but-undrained transaction's write"
+        );
+    }
+
+    // Phantom-insert check, mirroring the existing update-based repeatable
+    // read tests: a row inserted AND committed by someone else after this
+    // transaction began must stay invisible to it, not just an updated
+    // value on a pre-existing row.
+    #[test]
+    fn test_find_does_not_see_a_row_inserted_and_committed_by_another_txn_after_this_txn_began() {
+        let (db, tid) = make_db_with_table();
+        let reader = db.begin().unwrap();
+
+        assert!(db.find(tid, id(1), &reader).unwrap().is_none());
+
+        let writer = db.begin().unwrap();
+        db.insert(tid, row(1, b"new"), &writer).unwrap();
+        db.commit(writer).unwrap();
+
+        assert!(
+            db.find(tid, id(1), &reader).unwrap().is_none(),
+            "a transaction must not see a row inserted+committed by someone else after it began"
+        );
+        drop(reader);
+
+        let later = db.begin().unwrap();
+        assert!(db.find(tid, id(1), &later).unwrap().is_some());
+    }
+
+    // A sequence that only succeeds because a write conflict was correctly
+    // detected and resolved (t2 conflicts, rolls back; t1's write is what
+    // actually commits) must survive an ordinary close/reopen — replay
+    // itself never calls check_write_conflict (it applies committed redo
+    // records directly via insert_if_needed/update_if_needed), so this
+    // pins down that the conflict feature has no surprising interaction
+    // with persistence.
+    #[test]
+    fn test_close_reopen_preserves_data_written_after_a_resolved_write_conflict() {
+        let (db, tid) = make_db_with_table();
+        let txn0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
+        db.commit(txn0).unwrap();
+
+        let txn1 = db.begin().unwrap();
+        let txn2 = db.begin().unwrap();
+        db.update(tid, row(1, b"from_t1"), &txn1).unwrap();
+        assert!(db.update(tid, row(1, b"from_t2"), &txn2).is_err());
+        db.commit(txn1).unwrap();
+        db.rollback(txn2).unwrap();
+
+        let (f, u, r) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+
+        let reader = db2.begin().unwrap();
+        let found = db2.find(tid, id(1), &reader).unwrap();
+        drop(reader);
+        assert_eq!(
+            found.expect("row must survive close/reopen").data.to_vec(),
+            b"from_t1"
+        );
+    }
+
+    // Real multi-threaded stress test: several threads hammering a small,
+    // shared set of rows with a retry-on-conflict update loop. The main
+    // things this guards against: a panic or deadlock anywhere in the
+    // conflict-check/commit/rollback path under genuine contention, and
+    // (best-effort — the TOCTOU window above is narrow) a chance at
+    // empirically catching the same lost-update gap the deterministic test
+    // above proves directly.
+    #[test]
+    fn test_concurrent_writers_stress_no_panics_no_deadlocks_no_missing_rows() {
+        const ROWS: u64 = 4;
+        const THREADS: usize = 8;
+        const ITERS: usize = 50;
+
+        let (db, tid) = make_db_with_table();
+        let setup = db.begin().unwrap();
+        for i in 0..ROWS {
+            db.insert(tid, row(i, b"init"), &setup).unwrap();
+        }
+        db.commit(setup).unwrap();
+
+        let mut handles = vec![];
+        for t in 0..THREADS {
+            let db = db.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..ITERS {
+                    let key = (i as u64 + t as u64) % ROWS;
+                    let val = format!("t{t}-{i}");
+                    loop {
+                        let txn = db.begin().unwrap();
+                        match db.update(tid, row(key, val.as_bytes()), &txn) {
+                            Ok(()) => {
+                                db.commit(txn).unwrap();
+                                break;
+                            }
+                            Err(StoreError::WriteConflict(_)) => {
+                                db.rollback(txn).unwrap();
+                            }
+                            Err(e) => panic!("unexpected error: {e:?}"),
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let reader = db.begin().unwrap();
+        for i in 0..ROWS {
+            assert!(
+                db.find(tid, id(i), &reader).unwrap().is_some(),
+                "row {i} must still exist after concurrent contention"
+            );
+        }
     }
 
     // Regression test for snapshot-isolation visibility (Db::find_visible_to)
