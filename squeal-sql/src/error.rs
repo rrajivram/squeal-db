@@ -77,6 +77,8 @@ pub enum SchemaError {
     InvalidOperationOnOperand(String, String),
     #[error("Group by missing field {0}")]
     GroupByMissingField(String),
+    #[error("Unsupported feature {0}")]
+    UnsupportedFeature(String),
     // A blocking operator (hash join build side, sort, GROUP BY hash
     // table, ...) tried to buffer more than this query's own memory
     // budget allows — see plan::memory::QueryMemory. Distinct from

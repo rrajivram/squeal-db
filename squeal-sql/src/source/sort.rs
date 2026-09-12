@@ -9,7 +9,7 @@ use std::{
 };
 
 use postcard::{from_bytes, to_allocvec};
-use sql_parser::{keyword::No, query::OrderByClause};
+use sql_parser::{Expr, keyword::No, query::OrderByClause};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
@@ -21,12 +21,8 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    plan::{
-        eval::EvalExpr,
-        logical::TableQuery,
-        memory::{MemReservation, QueryMemory},
-    },
-    source::Source,
+    plan::memory::{MemReservation, QueryMemory},
+    source::{ProjectableField, Source},
 };
 
 #[derive(Debug, Clone)]
@@ -76,25 +72,30 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    // Resolves ORDER BY column references against `source`'s OWN field
+    // list — i.e. the query's SELECT-list output — not the raw
+    // FROM-clause tables. `source` here is always already the fully
+    // projected row (handle_select applies Projection/GroupSource before
+    // ORDER BY ever runs), so a raw-table-based position and this
+    // source's actual row width can disagree the moment the SELECT list
+    // doesn't project every FROM-clause column in its original order —
+    // confirmed via direct repro: `SELECT rank FROM t ORDER BY rank`
+    // resolved `rank` to its raw position in `t` (1, since `t` also has
+    // `id` at 0) and then indexed a 1-column projected row with it,
+    // panicking. Resolving against source.fields() instead can't go out
+    // of sync with the row actually being sorted, since it's read
+    // directly off the same object.
     pub(crate) fn create_from(
         source: Box<dyn Source>,
         clause: &OrderByClause,
-        tables: &[TableQuery<F>],
         limit: Option<usize>,
         db: Arc<Db<F>>,
         mem: Arc<QueryMemory>,
     ) -> Result<Self, SchemaError> {
+        let fields = source.fields();
         let mut items = vec![];
         for c in clause.items.items() {
-            let expr = EvalExpr::from_expr(&c.expr, tables)?;
-            let index = match expr.as_ref() {
-                EvalExpr::Value(n) => *n,
-                _ => {
-                    return Err(SchemaError::UnknownError(
-                        "Do not know how to process non-value sort value".into(),
-                    ));
-                }
-            };
+            let index = Self::resolve_order_by_index(&c.expr, &fields)?;
             let asc = c.direction.map(|a| a.is_left()).unwrap_or(true);
             let null_first = c.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
             items.push(SortField {
@@ -112,6 +113,38 @@ where
             mem,
             progress: None,
         })
+    }
+
+    // ORDER BY only ever supports a plain column reference (matching
+    // the pre-existing limit here — a computed expression like `a+b`
+    // already fell through to the same "non-value sort value" error via
+    // EvalExpr::from_expr, since only EvalExpr::Value survived the match
+    // below it). Resolves by matching the column's own (possibly
+    // qualified, e.g. `t.rank`) last name segment against each
+    // projected field's display_name — the position found is directly
+    // the row position, since `fields` IS the projected row's own field
+    // list, one for one.
+    fn resolve_order_by_index(expr: &Expr, fields: &[ProjectableField]) -> Result<usize, SchemaError> {
+        let Expr::Column(c) = expr else {
+            return Err(SchemaError::UnknownError(
+                "Do not know how to process non-value sort value".into(),
+            ));
+        };
+        let name = c
+            .idents()
+            .last()
+            .map(|i| i.value.clone())
+            .ok_or_else(|| SchemaError::UnknownError("empty column reference in ORDER BY".into()))?;
+        let mut found = None;
+        for (i, f) in fields.iter().enumerate() {
+            if f.display_name.eq_ignore_ascii_case(&name) {
+                if found.is_some() {
+                    return Err(SchemaError::AmbiguousFieldError(name));
+                }
+                found = Some(i);
+            }
+        }
+        found.ok_or(SchemaError::FieldNotFound(name))
     }
 
     pub(crate) fn with_fields(

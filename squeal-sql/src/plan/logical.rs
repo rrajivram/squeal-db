@@ -5,7 +5,8 @@ use sql_parser::{
     Expr, Query,
     keyword::No,
     query::{
-        self, Alias, FromClause, GroupByClause, OrderByClause, SelectItem, SetOperand, TableFactor,
+        self, Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause,
+        SelectItem, SetOperand, TableFactor, TableWithJoins,
     },
     token::Comma,
     utils::Seq,
@@ -21,8 +22,15 @@ use crate::{
     plan::{eval::EvalExpr, funcs::FuncTrait, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
-        ProjectableField, Source, aggr::AggregatingSource, group::GroupSource, join::UnionJoin,
-        limit::Limit, proj::Projection, run::RunSource, sort::SortSource, table::TableSource,
+        ProjectableField, Source,
+        aggr::AggregatingSource,
+        group::GroupSource,
+        join::{JoinSource, JoinType, UnionJoin},
+        limit::Limit,
+        proj::Projection,
+        run::RunSource,
+        sort::SortSource,
+        table::TableSource,
         where_source::WhereSource,
     },
     table::{Field, SqlTable},
@@ -193,6 +201,13 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     // anything, nor treat "we already validated this" and "so of course
     // this lookup will succeed" as two separate, unwrap-worthy facts.
     pub(crate) resolved: TableRef<F>,
+    pub(crate) joins: Vec<JoinRelation<F>>,
+}
+
+pub(crate) struct JoinRelation<F: DBFile + 'static> {
+    pub(crate) join_type: JoinType,
+    pub(crate) relation: TableQuery<F>,
+    pub(crate) on_expr: EvalExpr,
 }
 
 struct QueryVisitor<F: DBFile> {
@@ -213,9 +228,8 @@ struct QueryVisitor<F: DBFile> {
     mem: Arc<QueryMemory>,
 }
 
-struct SourceHolder<F: DBFile + 'static> {
+struct SourceHolder {
     source: Box<dyn Source>,
-    tables: Vec<TableQuery<F>>,
 }
 
 impl<F> Visitor for QueryVisitor<F>
@@ -261,37 +275,46 @@ where
                 return std::ops::ControlFlow::Break(e);
             }
             let holder = holder.unwrap();
-            let step = holder.source;
-            let tables = holder.tables;
+            let mut step = holder.source;
 
-            if let Some(limit) = &query.limit
-                && let Some(limit) = limit.count_i64()
-            {
-                if limit < 0 {
-                    return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(limit));
-                } else {
-                    if let Some(order) = &query.order_by {
-                        let order = SortSource::create_from(
-                            step,
-                            order,
-                            &tables,
-                            Some(limit as usize),
-                            self.conn.database.read().db.clone(),
-                            self.mem.clone(),
-                        );
-                        if let Err(e) = order {
-                            return std::ops::ControlFlow::Break(e);
-                        }
-                        let step = order.unwrap();
-                        self.steps.push(Box::new(step));
-                    } else {
-                        self.steps.push(Box::new(Limit::new(step, limit as usize)));
+            // Resolved once, up front, and used by BOTH the ORDER BY and
+            // no-ORDER-BY paths below — previously this was only ever
+            // computed (and therefore ORDER BY only ever applied) inside
+            // the `if let Some(limit) = ...` branch, so a bare `ORDER BY`
+            // with no `LIMIT` at all silently did nothing: the query
+            // still succeeded, just returned rows in scan order.
+            let limit_count = match &query.limit {
+                Some(limit) => match limit.count_i64() {
+                    Some(n) if n < 0 => {
+                        return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(n));
                     }
-                    return std::ops::ControlFlow::Continue(());
-                }
-            } else {
-                self.steps.push(step);
+                    Some(n) => Some(n as usize),
+                    // A LIMIT that isn't a literal count (e.g. a bound
+                    // parameter) can't be resolved here — pre-existing
+                    // behavior, unchanged: treated as no limit rather
+                    // than erroring.
+                    None => None,
+                },
+                None => None,
+            };
+
+            if let Some(order) = &query.order_by {
+                let order = SortSource::create_from(
+                    step,
+                    order,
+                    limit_count,
+                    self.conn.database.read().db.clone(),
+                    self.mem.clone(),
+                );
+                step = match order {
+                    Ok(s) => Box::new(s),
+                    Err(e) => return std::ops::ControlFlow::Break(e),
+                };
+            } else if let Some(limit_count) = limit_count {
+                step = Box::new(Limit::new(step, limit_count));
             }
+
+            self.steps.push(step);
         }
 
         std::ops::ControlFlow::Continue(())
@@ -318,23 +341,65 @@ where
     fn handle_select(
         &mut self,
         select: &sql_parser::query::SelectCore,
-    ) -> Result<SourceHolder<F>, SchemaError> {
+    ) -> Result<SourceHolder, SchemaError> {
         let distinct = select.distinct.is_some();
         let tables = self.get_tables(&select.from)?;
-        let proj = self.get_projections(&select.projection, &tables)?;
+        // `tables` mirrors the FROM clause: one entry per top-level item,
+        // each possibly carrying its own joined-in relations nested
+        // inside `.joins`. Every column-reference resolver (wildcard/
+        // qualified-wildcard expansion, validate_field, flat_position)
+        // only ever walks a flat `&[TableQuery<F>]` list matching
+        // UnionJoin's own combined-row layout — none of them descend
+        // into `.joins` — so without flattening first, a joined table's
+        // columns are invisible to `SELECT *`, an explicit qualified
+        // reference (`SELECT t2.val ...`), WHERE, and GROUP BY alike,
+        // even though the physical JoinSource that actually produces the
+        // row includes them. flat_tables is what every resolution call
+        // below uses instead — `tables` itself is kept only for the
+        // physical-source building loop right below, which needs the
+        // nested `.joins` structure to know what to actually construct.
+        // (ORDER BY is different: it resolves against the already-
+        // projected SELECT-list output, not the raw FROM-clause tables
+        // at all — see SortSource::create_from's own doc comment.)
+        let flat_tables = Self::flatten_tables(&tables);
+        let proj = self.get_projections(&select.projection, &flat_tables)?;
         let projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
         let has_aggregation = projected_fields.iter().any(|f| f.expr.has_aggregate());
         let projected_field_count = projected_fields.len();
 
         let wh_expr = if let Some(wh) = &select.where_clause {
-            Some(*EvalExpr::from_expr(&wh.expr, &tables)?)
+            Some(*EvalExpr::from_expr(&wh.expr, &flat_tables)?)
         } else {
             None
         };
 
+        // Each top-level FROM item's joins fold into a single left-deep
+        // chain: the running `combined` source becomes the LEFT input to
+        // the next join, so a query like `t1 JOIN t2 ON ... JOIN t3 ON
+        // ...` produces ONE combined (t1++t2)++t3 source, not two
+        // independent t1⋈t2 / t1⋈t3 pairings later cross-producted by
+        // UnionJoin. That used to not just multiply the row count
+        // wrong — since flatten_tables' logical column numbering
+        // (t1, t2, t3 concatenated) already assumed this left-deep
+        // layout, the mismatch against the OLD independent-pairings
+        // layout made a plain SELECT read the wrong physical column
+        // outright (confirmed via direct repro: an integer column came
+        // back holding a string value from an unrelated table).
         let mut sources = vec![];
         for table in tables.iter() {
-            sources.push(table.resolved.open_source(&self.conn)?);
+            let mut combined = table.resolved.open_source(&self.conn)?;
+            for j in &table.joins {
+                let relation = j.relation.resolved.open_source(&self.conn)?;
+                combined = Box::new(JoinSource::new(
+                    combined,
+                    relation,
+                    j.on_expr.clone(),
+                    j.join_type,
+                    self.conn.database.read().db.clone(),
+                    self.mem.clone(),
+                )?);
+            }
+            sources.push(combined);
         }
         let union = UnionJoin::new(sources)?;
         let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
@@ -355,7 +420,7 @@ where
         // column. See GroupSource's own doc comment.
         let projected: Box<dyn Source> = if has_aggregation {
             let key_positions =
-                self.validate_aggreations(&projected_fields, &tables, &select.group_by)?;
+                self.validate_aggreations(&projected_fields, &flat_tables, &select.group_by)?;
             let grouped_source: Box<dyn Source> = if key_positions.is_empty() {
                 for_proj
             } else {
@@ -395,7 +460,7 @@ where
             projected
         };
 
-        Ok(SourceHolder { source, tables })
+        Ok(SourceHolder { source })
     }
 
     fn get_projections(
@@ -491,6 +556,31 @@ where
         ))
     }
 
+    // Expands each top-level FROM item's nested `.joins` into its own
+    // flat entry, matching the physical row layout UnionJoin/JoinSource
+    // actually produce (this table's fields, then its joined relation's
+    // fields, in order) — see handle_select's own comment on why every
+    // column-reference resolver needs this instead of the nested
+    // `tables` list. One level of flattening is enough: `get_tables`
+    // only ever pushes joins onto the FIRST table of a FROM item
+    // (mirroring TableWithJoins' own shape — a Join's own `relation` is
+    // just a TableFactor, never something with joins of its own), so a
+    // joined-in relation's own `.joins` is always empty already.
+    fn flatten_tables(tables: &[TableQuery<F>]) -> Vec<TableQuery<F>> {
+        let mut flat = vec![];
+        for t in tables {
+            // Base table's own fields come first in the physical row —
+            // see handle_select's source-building loop: JoinSource's
+            // combine() always emits left (this table) ++ right (the
+            // joined relation).
+            flat.push(t.clone());
+            for j in &t.joins {
+                flat.push(j.relation.clone());
+            }
+        }
+        flat
+    }
+
     fn get_tables(&self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {
         if from.is_none() {
             return Ok(vec![]);
@@ -499,42 +589,109 @@ where
         let mut tables = vec![];
         let items = from.tables.items();
         for qtable in items {
-            let tq = if let TableFactor::Table { name, alias } = &qtable.relation {
-                let (table, field) = self.conn.resolve_object_name_ref(name)?;
-                crate::stmt::reject_qualified_field("a FROM target", field)?;
-                if let TableRef::Real(schema, sqltable) = &table {
-                    TableQuery {
-                        alias: alias
-                            .clone()
-                            .map(|a| a.name.value.clone())
-                            .unwrap_or(sqltable.name.clone()),
-                        resolved: table.clone(),
-                        fields: sqltable.fields_arc(),
-                        schema: schema.name.clone(),
-                        table: sqltable.name.clone(),
-                    }
-                } else if let TableRef::Temp(schema, temptable) = &table {
-                    TableQuery {
-                        schema: schema.clone(),
-                        table: temptable.read().name.clone(),
-                        alias: alias
-                            .clone()
-                            .map(|a| a.name.value.clone())
-                            .unwrap_or(temptable.read().name.clone()),
-                        fields: temptable.resolved_fields(),
-                        resolved: table.clone(),
+            let mut table = self.get_table(&qtable.relation)?;
+            // Every join in this FROM item folds into a single left-deep
+            // chain at execution time (see handle_select's
+            // source-building loop: each JoinSource's own output becomes
+            // the NEXT join's left input) — so a later join's ON clause
+            // can reference ANY table already joined so far, not just
+            // the base `table`, and its column positions must be
+            // resolved against that FULL running list (matching the
+            // running left side's actual field width at that point), not
+            // just a throwaway [table, relation] pair. Getting this
+            // wrong doesn't just reject a valid reference to an earlier
+            // joined table — it can silently miscompute BOTH sides'
+            // positions for a join that only references the base table
+            // too, since a position encoded relative to a 2-table
+            // [table, relation] resolution can come out numerically
+            // valid-but-wrong once interpreted against the wider running
+            // left side.
+            let mut joined_so_far = vec![table.clone()];
+            for j in &qtable.joins {
+                let join_type = match &j.operator {
+                    JoinOperator::Cross(_, _) => JoinType::Cross,
+                    JoinOperator::FullOuter(_, _, _) => JoinType::Full,
+                    JoinOperator::Inner(_, _) => JoinType::Inner,
+                    JoinOperator::LeftOuter(_, _, _) => JoinType::Left,
+                    JoinOperator::Plain(_) => JoinType::Inner,
+                    JoinOperator::RightOuter(_, _, _) => JoinType::Right,
+                };
+                let relation = self.get_table(&j.relation)?;
+                let on_expr = if let Some(constraint) = &j.constraint {
+                    match constraint {
+                        JoinConstraint::On(_, expr) => {
+                            if matches!(join_type, JoinType::Cross) {
+                                return Err(SchemaError::UserError(
+                                    "Cross joins cannot have ON clause".into(),
+                                ));
+                            }
+                            let mut resolve_against = joined_so_far.clone();
+                            resolve_against.push(relation.clone());
+                            let proj = self.handle_expr(expr, &None, &resolve_against)?;
+                            proj.expr
+                        }
+                        JoinConstraint::Using(_, _, _, _) => {
+                            return Err(SchemaError::UnsupportedFeature(
+                                "joins with USING. Use ON instead.".into(),
+                            ));
+                        }
                     }
                 } else {
-                    todo!()
-                }
-            } else {
-                todo!()
-            };
-            tables.push(tq);
+                    if !matches!(join_type, JoinType::Cross) {
+                        return Err(SchemaError::UserError(
+                            "Non cross joins need a join constraint".into(),
+                        ));
+                    }
+                    EvalExpr::None
+                };
+                joined_so_far.push(relation.clone());
+                table.joins.push(JoinRelation {
+                    join_type,
+                    relation,
+                    on_expr,
+                })
+            }
+            tables.push(table);
         }
         Ok(tables)
     }
 
+    fn get_table(&self, factor: &TableFactor) -> Result<TableQuery<F>, SchemaError> {
+        let tq = if let TableFactor::Table { name, alias } = &factor {
+            let (table, field) = self.conn.resolve_object_name_ref(name)?;
+            crate::stmt::reject_qualified_field("a FROM target", field)?;
+            if let TableRef::Real(schema, sqltable) = &table {
+                TableQuery {
+                    alias: alias
+                        .clone()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or(sqltable.name.clone()),
+                    resolved: table.clone(),
+                    fields: sqltable.fields_arc(),
+                    schema: schema.name.clone(),
+                    table: sqltable.name.clone(),
+                    joins: vec![],
+                }
+            } else if let TableRef::Temp(schema, temptable) = &table {
+                TableQuery {
+                    schema: schema.clone(),
+                    table: temptable.read().name.clone(),
+                    alias: alias
+                        .clone()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or(temptable.read().name.clone()),
+                    fields: temptable.resolved_fields(),
+                    resolved: table.clone(),
+                    joins: vec![],
+                }
+            } else {
+                todo!()
+            }
+        } else {
+            todo!()
+        };
+        Ok(tq)
+    }
     // Returns the raw table field positions to group by — empty means
     // "no GROUP BY clause at all," i.e. one implicit group over the
     // whole table (a bare aggregate like `SELECT COUNT(*) FROM t`), a
@@ -651,5 +808,28 @@ where
             .take()
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
         Ok(StreamingResultSet::new(tail))
+    }
+}
+
+impl<F: DBFile + 'static> Clone for TableQuery<F> {
+    fn clone(&self) -> Self {
+        Self {
+            alias: self.alias.clone(),
+            fields: self.fields.clone(),
+            joins: self.joins.clone(),
+            resolved: self.resolved.clone(),
+            schema: self.schema.clone(),
+            table: self.table.clone(),
+        }
+    }
+}
+
+impl<F: DBFile + 'static> Clone for JoinRelation<F> {
+    fn clone(&self) -> Self {
+        Self {
+            join_type: self.join_type,
+            on_expr: self.on_expr.clone(),
+            relation: self.relation.clone(),
+        }
     }
 }

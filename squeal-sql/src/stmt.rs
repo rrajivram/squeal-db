@@ -1224,7 +1224,7 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select distinct id from t1");
+        exec("select a.*,b.* from (select c.* from c ) as a, (select d.* from d ) as b");
     }
 
     #[test]
@@ -1240,9 +1240,10 @@ mod dummy_tests {
         );
         exec_sql(conn.clone(), "insert into t1 values(1,3,'raj')");
         exec_sql(conn.clone(), "insert into t1 values(2,2,'kav')");
-        exec_sql(conn.clone(), "insert into t1 values(5,1,'kav')");
-        exec_sql(conn.clone(), "insert into t1 values(6,3,'kav')");
-        exec_sql(conn.clone(), "insert into t2 values(3,3,'ram')");
+        exec_sql(conn.clone(), "insert into t1 values(5,1,'ram')");
+        exec_sql(conn.clone(), "insert into t1 values(6,3,'rad')");
+        exec_sql(conn.clone(), "insert into t2 values(1,3,'computer')");
+        exec_sql(conn.clone(), "insert into t2 values(2,3,'radish')");
         // SELECT only supports "SELECT * FROM <table>" right now (see
         // parse_select_star) — no column lists or aggregates like
         // COUNT(*) yet.
@@ -1258,5 +1259,14 @@ mod dummy_tests {
         exec_sql(conn.clone(), "select count(distinct name) as C from t1");
         exec_sql(conn.clone(), "select distinct name from t1");
         exec_sql(conn.clone(), "select count(*) ,name from t1");
+        exec_sql(
+            conn.clone(),
+            "select t1.id,t1.name,t2.name  from t1,t2 where t1.id = t2.id",
+        );
+    }
+
+    #[test]
+    fn test3() {
+        let conn = get_conn();
     }
 }

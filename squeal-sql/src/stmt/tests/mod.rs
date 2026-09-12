@@ -574,12 +574,17 @@ fn test_execute_select_star_participates_in_a_multi_statement_batch() {
 }
 
 #[test]
-fn test_new_rejects_select_with_a_join() {
+fn test_new_accepts_select_with_a_join() {
+    // Was test_new_rejects_select_with_a_join: joins weren't implemented
+    // at all when this was written, so Statement::new correctly rejected
+    // any query containing one. Full JOIN support (see
+    // stmt::tests::join_tests) means this exact query is now valid and
+    // must be accepted, not rejected.
     let c = conn();
-    let err = c
-        .create_statement("select * from t join u on t.id = u.id")
-        .unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table u (id integer not null, primary key(id))").unwrap();
+    c.create_statement("select * from t join u on t.id = u.id")
+        .unwrap();
 }
 
 #[test]
@@ -1668,4 +1673,345 @@ fn test_create_index_fails_for_an_unknown_table() {
     let c = conn();
     let err = run(&c, "create index idx_id on nope(id)").unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+// KNOWN BUG, not join-specific — found while testing ORDER BY on a
+// joined column, but reproduces with a single table too: post_visit_query
+// only ever applies query.order_by inside the `if let Some(limit) = ...`
+// branch. A bare `ORDER BY` with no `LIMIT` is silently discarded — the
+// query still succeeds, just returns rows in scan order instead of the
+// requested order.
+#[test]
+fn test_order_by_without_limit_is_applied() {
+    // Regression test: post_visit_query used to only ever apply
+    // query.order_by inside the `if let Some(limit) = ...` branch, so a
+    // bare ORDER BY with no LIMIT silently did nothing.
+    //
+    // Sorting by `rank`, not the primary key `id` — a table scan
+    // naturally comes back in primary-key (B+tree) order, so ordering
+    // by `id` itself would "accidentally" look correct even if ORDER BY
+    // were a complete no-op. `rank` is deliberately inserted in the
+    // OPPOSITE order from `id` so the two orderings can't coincide.
+    let c = conn();
+    run(&c, "create table t (id integer not null, rank integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 30)").unwrap();
+    run(&c, "insert into t values (2, 20)").unwrap();
+    run(&c, "insert into t values (3, 10)").unwrap();
+
+    let mut stmt = c.create_statement("select rank from t order by rank").unwrap();
+    stmt.execute().unwrap();
+    let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(10)],
+            vec![ValueItem::Integer(20)],
+            vec![ValueItem::Integer(30)],
+        ]
+    );
+}
+
+#[test]
+fn test_order_by_desc_without_limit_is_applied() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, rank integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 10)").unwrap();
+    run(&c, "insert into t values (2, 20)").unwrap();
+    run(&c, "insert into t values (3, 30)").unwrap();
+
+    let mut stmt = c
+        .create_statement("select rank from t order by rank desc")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(30)],
+            vec![ValueItem::Integer(20)],
+            vec![ValueItem::Integer(10)],
+        ]
+    );
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+
+    fn setup(c: &Arc<Connection<MemFile>>) {
+        run(c, "create table t1 (id integer not null, name varchar(20), primary key(id))")
+            .unwrap();
+        run(c, "create table t2 (id integer not null, val integer, primary key(id))").unwrap();
+        run(c, "insert into t1 values (1, 'alice')").unwrap();
+        run(c, "insert into t1 values (2, 'bob')").unwrap();
+        run(c, "insert into t2 values (2, 200)").unwrap();
+        run(c, "insert into t2 values (3, 300)").unwrap();
+    }
+
+    // Regression test: get_tables used to resolve the joined-in relation
+    // from `qtable.relation` (the BASE table) instead of `j.relation`
+    // (the actual table named after JOIN) — so every join silently
+    // self-joined the base table against itself instead of the table it
+    // actually named, and any reference to the real second table (e.g.
+    // its own ON-clause column) failed with "table not found".
+    #[test]
+    fn test_inner_join_matches_against_the_actual_joined_table() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c
+            .create_statement("select * from t1 join t2 on t1.id = t2.id")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(columns, vec!["id", "name", "id", "val"]);
+        assert_eq!(
+            rows,
+            vec![vec![
+                ValueItem::Integer(2),
+                ValueItem::Str(("bob".into(), 20)),
+                ValueItem::Integer(2),
+                ValueItem::Integer(200),
+            ]]
+        );
+    }
+
+    // Regression test: SELECT *, qualified column references, WHERE,
+    // and GROUP BY all resolved column names against the top-level FROM
+    // table list only, never descending into a table's nested `.joins`
+    // — so a joined table's columns were invisible everywhere except
+    // the ON-clause's own private 2-table resolution list. Fixed via
+    // QueryVisitor::flatten_tables.
+    #[test]
+    fn test_qualified_column_from_the_joined_table_resolves() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c
+            .create_statement("select t1.name, t2.val from t1 join t2 on t1.id = t2.id")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(columns, vec!["name", "val"]);
+        assert_eq!(
+            rows,
+            vec![vec![ValueItem::Str(("bob".into(), 20)), ValueItem::Integer(200)]]
+        );
+    }
+
+    #[test]
+    fn test_ambiguous_column_across_joined_tables_is_rejected() {
+        let c = conn();
+        setup(&c);
+        let err = run(&c, "select id from t1 join t2 on t1.id = t2.id").unwrap_err();
+        assert!(matches!(err, SchemaError::AmbiguousFieldError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_where_clause_can_reference_a_joined_column() {
+        let c = conn();
+        setup(&c);
+        run(&c, "insert into t1 values (3, 'carol')").unwrap();
+        run(&c, "insert into t2 values (1, 50)").unwrap();
+        let mut stmt = c
+            .create_statement("select t1.id from t1 join t2 on t1.id = t2.id where t2.val > 100")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, mut rows) = take_streaming_result(&mut stmt, 0);
+        rows.sort();
+        // id=1 has val=50 (excluded); id=2 has val=200 and id=3 has
+        // val=300 (both > 100).
+        assert_eq!(rows, vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]);
+    }
+
+    #[test]
+    fn test_order_by_a_joined_column_sorts_the_projected_output_correctly() {
+        let c = conn();
+        setup(&c);
+        run(&c, "insert into t1 values (3, 'carol')").unwrap();
+        run(&c, "insert into t2 values (1, 999)").unwrap();
+        // SELECT list only has 2 columns (t1.id, t2.val), but ORDER BY's
+        // raw FROM-clause position for t2.val would be 3 (t1 has 2
+        // columns) — resolving against that raw position instead of the
+        // projected output's own field list used to index a 2-element
+        // row with index 3 and panic.
+        let mut stmt = c
+            .create_statement(
+                "select t1.id, t2.val from t1 join t2 on t1.id = t2.id order by t2.val",
+            )
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(
+            rows,
+            vec![
+                vec![ValueItem::Integer(2), ValueItem::Integer(200)],
+                vec![ValueItem::Integer(3), ValueItem::Integer(300)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(999)],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_left_join_emits_unmatched_left_rows_with_right_nulls() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c
+            .create_statement("select * from t1 left join t2 on t1.id = t2.id")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, mut rows) = take_streaming_result(&mut stmt, 0);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    ValueItem::Integer(1),
+                    ValueItem::Str(("alice".into(), 20)),
+                    ValueItem::Null,
+                    ValueItem::Null,
+                ],
+                vec![
+                    ValueItem::Integer(2),
+                    ValueItem::Str(("bob".into(), 20)),
+                    ValueItem::Integer(2),
+                    ValueItem::Integer(200),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_right_join_emits_unmatched_right_rows_with_left_nulls() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c
+            .create_statement("select * from t1 right join t2 on t1.id = t2.id")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, mut rows) = take_streaming_result(&mut stmt, 0);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                vec![ValueItem::Null, ValueItem::Null, ValueItem::Integer(3), ValueItem::Integer(300)],
+                vec![
+                    ValueItem::Integer(2),
+                    ValueItem::Str(("bob".into(), 20)),
+                    ValueItem::Integer(2),
+                    ValueItem::Integer(200),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_full_join_emits_unmatched_rows_from_both_sides() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c
+            .create_statement("select * from t1 full join t2 on t1.id = t2.id")
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(rows.len(), 3, "{rows:?}");
+    }
+
+    #[test]
+    fn test_missing_on_clause_is_rejected_for_a_non_cross_join() {
+        let c = conn();
+        setup(&c);
+        let err = run(&c, "select * from t1 join t2").unwrap_err();
+        assert!(matches!(err, SchemaError::UserError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn test_using_clause_is_rejected_as_unsupported() {
+        let c = conn();
+        setup(&c);
+        let err = run(&c, "select * from t1 join t2 using (id)").unwrap_err();
+        assert!(matches!(err, SchemaError::UnsupportedFeature(_)), "{err:?}");
+    }
+
+    // KNOWN BUG, not yet fixed: JoinSource::new calls equi_join_fields
+    // on the ON expression unconditionally, before checking join_type —
+    // but a CROSS JOIN's on_expr is EvalExpr::None (there is no ON
+    // clause), which equi_join_fields has no case for, so every CROSS
+    // JOIN fails outright instead of falling through to the
+    // JoinType::Cross => UnionJoin branch that already exists right
+    // below it.
+    #[test]
+    // Regression test: JoinSource::new used to call equi_join_fields
+    // unconditionally, even for CROSS JOIN (whose on_expr is
+    // EvalExpr::None — there's no ON clause) — equi_join_fields has no
+    // case for that, so every CROSS JOIN failed outright before ever
+    // reaching the JoinType::Cross => UnionJoin branch right below it.
+    #[test]
+    fn test_cross_join_produces_the_full_cross_product() {
+        let c = conn();
+        setup(&c);
+        let mut stmt = c.create_statement("select * from t1 cross join t2").unwrap();
+        stmt.execute().unwrap();
+        let (_columns, mut rows) = take_streaming_result(&mut stmt, 0);
+        rows.sort();
+        assert_eq!(rows.len(), 4, "2 t1 rows * 2 t2 rows = 4: {rows:?}");
+    }
+
+    // Regression test: chaining a second JOIN onto the same base table
+    // used to build two INDEPENDENT JoinSources (t1⋈t2 and t1⋈t3) and
+    // cross-product them via UnionJoin, instead of folding them into a
+    // proper left-deep join chain. That didn't just produce the wrong
+    // row count — flatten_tables' logical column numbering (t1, t2, t3
+    // concatenated) didn't match the actual physical row (t1++t2, then
+    // ANOTHER independent t1++t3), so projection read the wrong
+    // physical column outright (confirmed via direct repro: t3.extra,
+    // an integer column, came back holding t1.name's string value).
+    // Fixed by folding chained joins into (t1⋈t2)⋈t3 (handle_select)
+    // and resolving each join's ON clause against every table already
+    // joined so far, not just [base, this relation] (get_tables) — the
+    // second join's `t1.id = t3.id` needs `t1`'s position relative to
+    // the FULL (t1, t2, t3) resolution list to match the running
+    // left-deep side's actual field width at that point.
+    #[test]
+    fn test_three_way_join_produces_correct_data() {
+        let c = conn();
+        setup(&c);
+        run(&c, "create table t3 (id integer not null, extra integer, primary key(id))").unwrap();
+        run(&c, "insert into t3 values (2, 7000)").unwrap();
+        run(&c, "insert into t3 values (3, 8000)").unwrap();
+        let mut stmt = c
+            .create_statement(
+                "select t1.id, t1.name, t2.val, t3.extra from t1 join t2 on t1.id = t2.id join \
+                 t3 on t1.id = t3.id",
+            )
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(
+            rows,
+            vec![vec![
+                ValueItem::Integer(2),
+                ValueItem::Str(("bob".into(), 20)),
+                ValueItem::Integer(200),
+                ValueItem::Integer(7000),
+            ]]
+        );
+    }
+
+    // A third join whose ON clause references the FIRST joined table
+    // (t2), not the base table (t1) — exercises resolving against the
+    // full running chain rather than just [base, this-relation].
+    #[test]
+    fn test_three_way_join_where_the_last_on_clause_references_the_middle_table() {
+        let c = conn();
+        setup(&c);
+        run(&c, "create table t3 (id integer not null, extra integer, primary key(id))").unwrap();
+        run(&c, "insert into t3 values (200, 7777)").unwrap();
+        let mut stmt = c
+            .create_statement(
+                "select t3.extra from t1 join t2 on t1.id = t2.id join t3 on t2.val = t3.id",
+            )
+            .unwrap();
+        stmt.execute().unwrap();
+        let (_columns, rows) = take_streaming_result(&mut stmt, 0);
+        assert_eq!(rows, vec![vec![ValueItem::Integer(7777)]]);
+    }
 }

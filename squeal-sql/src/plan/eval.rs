@@ -25,6 +25,7 @@ pub(crate) struct ExprWrapper<'a, F: DBFile + 'static> {
 
 #[derive(Debug, Clone)]
 pub enum EvalExpr {
+    None,
     Literal(ValueItem),
     // A flat offset into UnionJoin's single combined row (see its own
     // extend_from_slice loop) — not a (table_id, field_id) pair. Every
@@ -65,7 +66,7 @@ impl EvalExpr {
                 v.extend_from_slice(&rhs.get_non_agg_fields());
                 v
             }
-            Self::Literal(_) => {
+            Self::Literal(_) | Self::None => {
                 vec![]
             }
             Self::Value(u) => {
@@ -90,12 +91,10 @@ impl EvalExpr {
                 v.extend_from_slice(&rhs.get_funcs());
                 v
             }
-            Self::Literal(_) | Self::Value(_) => {
-                vec![]
-            }
             Self::Function(f) => {
                 vec![f]
             }
+            _ => vec![],
         }
     }
     pub(crate) fn eval(&self, data: &[IndexKey], _index: usize) -> Result<ValueItem, SchemaError> {
@@ -117,6 +116,7 @@ impl EvalExpr {
             // its stored FuncArgs against `data`/`_index` to produce
             // them yet.
             Self::Function(obj) => &obj.eval(data)?,
+            Self::None => &ValueItem::Null,
         };
         Ok(v.clone())
     }

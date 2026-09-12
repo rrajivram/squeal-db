@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
 use sql_parser::expr::BinaryOp;
 use store::{
@@ -18,6 +18,7 @@ pub(crate) enum JoinType {
     Left,
     Right,
     Full,
+    Cross,
 }
 
 /// A comma-joined FROM clause (`FROM a, b, c`), i.e. a full cross join
@@ -42,7 +43,8 @@ pub(crate) struct UnionJoin {
 pub(crate) struct JoinSource<F: DBFile + 'static> {
     fields: Arc<[ProjectableField]>,
     join_type: JoinType,
-    hashed: HashedSource<F>,
+    source: Box<dyn Source>,
+    _phantom: PhantomData<F>,
 }
 
 impl<F: DBFile + 'static> JoinSource<F> {
@@ -62,22 +64,33 @@ impl<F: DBFile + 'static> JoinSource<F> {
                 .chain(right_source.fields().iter().cloned())
                 .collect::<Vec<_>>(),
         );
-        let left_field_count = left_source.fields().len();
-        let (left_fields, right_fields) =
-            equi_join_fields(&on_expr, left_field_count).map_err(SchemaError::UserError)?;
-        let hashed = HashedSource::new(
-            left_source,
-            right_source,
-            db,
-            mem,
-            &left_fields,
-            &right_fields,
-            join_type,
-        )?;
+        // CROSS JOIN has no ON clause at all (on_expr is EvalExpr::None
+        // — see get_tables) — equi_join_fields has no case for that and
+        // would reject it outright, so it must never be called for this
+        // join type. Every other type genuinely needs the equi-join
+        // field positions to build its HashedSource.
+        let source: Box<dyn Source> = match join_type {
+            JoinType::Cross => Box::new(UnionJoin::new(vec![left_source, right_source])?),
+            _ => {
+                let left_field_count = left_source.fields().len();
+                let (left_fields, right_fields) =
+                    equi_join_fields(&on_expr, left_field_count).map_err(SchemaError::UserError)?;
+                Box::new(HashedSource::new(
+                    left_source,
+                    right_source,
+                    db,
+                    mem,
+                    &left_fields,
+                    &right_fields,
+                    join_type,
+                )?)
+            }
+        };
         Ok(Self {
             fields,
             join_type,
-            hashed,
+            source,
+            _phantom: PhantomData,
         })
     }
 }
@@ -162,11 +175,11 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        self.hashed.next()
+        self.source.next()
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
-        self.hashed.reset()
+        self.source.reset()
     }
 }
 
@@ -268,7 +281,7 @@ impl<F: DBFile + 'static> Debug for JoinSource<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Join")
             .field("type", &self.join_type)
-            .field("hashed", &self.hashed)
+            .field("hashed", &self.source)
             .finish()
     }
 }
