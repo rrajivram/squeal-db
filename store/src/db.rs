@@ -23,6 +23,7 @@ use crate::logger::scan_log;
 use crate::logger::write_log_header;
 use crate::memfile::MemFile;
 use crate::page::Page;
+use crate::page::PageId;
 use crate::run::Run;
 use crate::table::Table;
 use crate::table::TableIdType;
@@ -338,8 +339,72 @@ where
             checkpoint_gate: RwLock::new(()),
         };
         sf.load_system_tables()?;
+        // STORE_AUDIT.md T16: reconcile the just-loaded (possibly stale)
+        // free list against what's actually reachable, before replay can
+        // hand out any of it. Must run after load_system_tables (needs
+        // `self.tables` populated to walk them) but before load_logs
+        // (replay's own insert_if_needed/alloc_page calls must never see a
+        // free list that still lists a live page as available).
+        sf.reconcile_free_list()?;
         sf.load_logs()?;
         Ok(Arc::new(sf))
+    }
+
+    // STORE_AUDIT.md T16: the persisted free list is only ever written at
+    // checkpoint/close (write_system_tables) — a transaction that takes a
+    // page from it, writes, and commits (with the commit's own redo record
+    // durable) between checkpoints leaves the ON-DISK free list stale: it
+    // still lists that now-live page as free. On a crash-and-reopen with no
+    // intervening checkpoint, the stale list would let a LATER allocation
+    // hand that same page out again, silently overwriting committed data
+    // that replay already restored (or is about to). A page reachable from
+    // any live table's own structure is, by definition, not actually free
+    // regardless of what a stale snapshot claims — remove it from the
+    // loaded free list unconditionally.
+    fn reconcile_free_list(&self) -> Result<(), StoreError> {
+        let mut reachable: HashSet<PageId> = HashSet::new();
+        // The three system pages (catalog/generator/free-list) are never
+        // meant to be freed at all, but cost nothing to guard here too.
+        reachable.insert(SYSTEM_TABLE_PAGE.into());
+        reachable.insert(GENERATOR_TABLE_PAGE.into());
+        reachable.insert(FREE_PAGE_TABLE_PAGE.into());
+        for table in self.tables.read().values() {
+            reachable.extend(table.all_index_page_ids()?);
+            // Raw next_page-following, not the overflow-skipping
+            // data_chain_next: a page's own next_page field points INTO
+            // its overflow chain when it has one (data_chain_next exists
+            // specifically to skip past that to the next sibling data
+            // page) — so following it directly, page by page, visits
+            // every physically linked page, overflow continuations
+            // included, exactly like BPlusTree::free_page_chain's own
+            // (destructive) walk already does for drop_table.
+            //
+            // Reads via read_page_header (raw header only), not get_page
+            // (full content decode): an overflow *continuation* page's data
+            // region is only a valid, decodable Page when reassembled
+            // starting from its chain's primary (HAS_OVERFLOW) page — see
+            // buffer::read_page. Calling get_page directly on a middle
+            // page (IS_OVERFLOW, not HAS_OVERFLOW) tries to decode a raw
+            // mid-stream byte chunk as a standalone tuple page, which
+            // fails (or worse, silently "succeeds" on garbage). This walk
+            // only needs next_page, which the header alone carries safely
+            // for every page in the chain, continuations included.
+            let mut cur = table.table.first_data_page;
+            loop {
+                if !reachable.insert(cur) {
+                    break; // cycle guard; should be unreachable on sound data
+                }
+                let next = self.buffer.read_page_header(cur)?.next_page();
+                if !next.is_valid_next_page() {
+                    break;
+                }
+                cur = next;
+            }
+        }
+        let mut free_pages = self.buffer.get_free_pages();
+        free_pages.retain(|p| !reachable.contains(p));
+        self.buffer.set_free_pages(free_pages);
+        Ok(())
     }
 
     pub fn get_generator(self: &Arc<Self>) -> Arc<Generator> {
@@ -6500,4 +6565,61 @@ mod tests {
         );
     }
 
+    // STORE_AUDIT.md T16: the persisted free list is only ever written at
+    // checkpoint/close — a transaction that takes a page from it, writes,
+    // and commits (its own page flushed some other way, e.g. ordinary
+    // eviction, and its redo record durable) between checkpoints leaves
+    // the ON-DISK free list stale: it still lists that now-live page as
+    // free. On reopen with no intervening checkpoint, the stale list would
+    // let a later allocation hand that same page out again, silently
+    // clobbering committed data replay already restored.
+    //
+    // Constructed directly at the byte level (per this finding's own
+    // design doc) rather than trying to engineer the exact "flushed via
+    // eviction but never checkpointed" timing: writes a free-list page
+    // that wrongly lists `first_data_page` (a real, definitely-reachable
+    // page) as free, exactly the state a stale checkpoint snapshot would
+    // produce, and checks reconciliation removes it on open.
+    #[test]
+    fn test_audit_t16_reopen_reconciles_the_free_list_against_reachable_pages() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        wait_for_durable_logs(&db, 2);
+
+        let table = db.table_by_id(tid).unwrap();
+        let reachable_page = table.table.first_data_page;
+
+        // Directly write a free-list page that wrongly claims a real,
+        // reachable page is free — simulates a checkpoint snapshot taken
+        // before that page was ever allocated, now stale relative to
+        // committed reality.
+        let page = crate::page::Page::new_pinned(db.header.page_size);
+        page.add_tuple(Tuple::new(
+            0,
+            &postcard::to_allocvec(&vec![reachable_page]).unwrap(),
+        ))
+        .unwrap();
+        db.buffer
+            .write_page(crate::constant::FREE_PAGE_TABLE_PAGE.into(), &page)
+            .unwrap();
+        // Sync the header's page_count (never touched since Db::create) to
+        // the live value WITHOUT truncating the log — see this helper's
+        // own comment. Without this, open_using's freshly-cloned header
+        // still says whatever page_count was at table creation, well
+        // under FIRST_USER_PAGE for a from-scratch test db, and
+        // load_system_tables refuses to even start.
+        sync_header_without_truncating_logs(&db);
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
+        assert!(
+            !db2.buffer.get_free_pages().contains(&reachable_page),
+            "a page reachable from a live table's own structure must never be left on \
+             the free list after open, regardless of what a stale persisted snapshot \
+             claims — otherwise a later allocation could hand it out again and clobber \
+             committed data"
+        );
+    }
 }

@@ -539,7 +539,7 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   Full `store` suite: 399 passed, 0 failed (398 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
 
-## Phase 4 — T3 FIXED; T5/T16/S1/T17 in progress
+## Phase 4 — T3/T5/T16 FIXED; S1/T17 in progress
 
 Design doc: `PHASE4_CHECKPOINT_DESIGN.md`. **Decision confirmed with the user**: T3 uses the
 audit's simpler *quiesced checkpoint* design (checkpoint blocks new transactions and waits for
@@ -625,8 +625,54 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   `buffer.checkpoint()` just flushed. Full write-up in `PHASE4_CHECKPOINT_DESIGN.md`.
   Full `store` suite: 402 passed, 0 failed (401 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
-- [ ] **T16** — free list / page count only persisted at checkpoint; crash recovery can
-  double-allocate a page still holding committed data.
+- [t-green] **T16** — FIXED. The free list is only ever persisted at checkpoint/close
+  (`write_system_tables`) — a transaction that takes a page off it, writes, and commits between
+  checkpoints leaves the ON-DISK free list stale: it still lists that now-live page as free. On
+  a crash-and-reopen with no intervening checkpoint, the stale list would let a later allocation
+  hand that same page out again, silently clobbering committed data replay already restored (or
+  is about to). Fixed with `Db::reconcile_free_list`, called right after `load_system_tables`
+  (needs `self.tables` populated) and before `load_logs` (replay's own `alloc_page` calls must
+  never see a free list that still lists a live page as available): builds the set of every page
+  reachable from a live table's own structure — the 3 system pages, every table's index pages
+  (`all_index_page_ids`), and a raw `next_page`-following walk from each table's `first_data_page`
+  — and strips any of them off the loaded free list unconditionally, regardless of what the stale
+  snapshot claims.
+  The data-chain walk deliberately does NOT use the overflow-skipping `data_chain_next`/
+  `overflow_terminator` pair: those exist so a page's *content* survives a shrink while its
+  overflow chain collapses, by returning only the real next *sibling* page. Reconciliation needs
+  the opposite — every physically linked page marked reachable, overflow continuations included
+  — which a plain "follow next_page until invalid" walk already gives, exactly like
+  `PageBuffer::free_page_chain`'s own (destructive) walk for `drop_table`.
+  Caught a second, real bug while building this: the walk's first version read each page via
+  `get_page` (full content decode) to pull out `next_page`. That's unsafe for an overflow
+  *continuation* page — its on-disk data region is only a valid, decodable `Page` when
+  reassembled starting from its chain's primary (`HAS_OVERFLOW`) page (see `buffer::read_page`);
+  calling `get_page` directly on a middle page (`IS_OVERFLOW`, not `HAS_OVERFLOW`) tries to
+  decode a raw mid-stream byte chunk as a standalone tuple page, which reliably throws
+  `SerializationError(SerdeDeCustom)` (confirmed by instrumenting the walk: it failed exactly at
+  the first continuation page of a shrunk overflow object). This surfaced as 7 unrelated-looking
+  failures in the full suite (`test_checkpoint_with_large_overflow_object`,
+  `test_free_pages_do_not_accumulate_across_multiple_close_reopen_cycles`,
+  `test_freed_overflow_pages_persist_across_close_reopen`, `test_large_object_full_lifecycle_all_ops`,
+  `test_large_objects_persist_across_close_reopen`,
+  `test_reopened_db_reuses_freed_pages_before_growing_page_count`,
+  `test_reused_freed_overflow_page_is_safe_to_write_fresh_data_into`) — every one that opens a
+  db containing an overflow object. Fixed by switching the walk to `read_page_header` (raw
+  header-only read, newly made `pub(crate)`; same pattern `overflow_terminator` already uses) —
+  it only needs `next_page`, which the header alone carries safely for every page in the chain,
+  continuations included, with no content decode at all.
+  (Note: this suggests `PageBuffer::free_page_chain` itself may have the identical latent bug —
+  it also calls `get_page` while walking into overflow continuation pages for `drop_table` — but
+  its own existing tests don't reopen the db mid-chain and apparently don't trip it. Not fixed
+  here (out of scope for T16); worth folding into **T17**'s drop_table investigation, which
+  already touches this same code path.)
+  Test: `test_audit_t16_reopen_reconciles_the_free_list_against_reachable_pages` — writes a
+  free-list page directly at the byte level claiming a real, reachable page (a table's
+  `first_data_page`) is free (the state a stale checkpoint snapshot would produce), crash-reopens,
+  asserts reconciliation removed it. Confirmed meaningful: reliably red with the `retain` call
+  temporarily replaced with a no-op, reliably green restored.
+  Full `store` suite: 403 passed, 0 failed (402 baseline + this test, including the 7 overflow
+  tests above). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 - [ ] **S1** — no format version, no header checksum, no header validation.
 - [ ] **T17** — `drop_table` frees pages in-flight operations may still hold; not logged either.
 

@@ -483,7 +483,7 @@ where
         self.write_page(page_id, &p)
     }
 
-    fn read_page_header(&self, page_num: PageId) -> Result<PageHeader, StoreError> {
+    pub(crate) fn read_page_header(&self, page_num: PageId) -> Result<PageHeader, StoreError> {
         let num = u64::from(page_num);
         let page_size = self.header.page_size;
         let page_count = self.page_count.load(std::sync::atomic::Ordering::Relaxed);
