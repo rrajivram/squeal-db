@@ -496,27 +496,51 @@ where
             }
         }
 
-        // --- Pass 2: redo — every record for a COMMITTED txn ---
-        for (txn, ops) in &by_txn {
+        // --- Pass 2: redo — every record for a COMMITTED txn, in the log's
+        // own (LSN-ascending) order.
+        //
+        // Deliberately iterates `scanned.records` directly, NOT `by_txn`
+        // (a HashMap grouping each transaction's own records together,
+        // built above for Pass 3's benefit): a HashMap's iteration order
+        // across DIFFERENT keys is randomized per-process, so replaying
+        // "one committed transaction's records, then the next" in
+        // HashMap-key order can replay two DIFFERENT committed
+        // transactions' operations on the SAME row out of their original
+        // order. Concretely (the exact bug this fixes, caught by
+        // test_replay_handles_mixed_add_mod_del_across_committed_and_abandoned_txns
+        // failing intermittently — passing or failing depending on that
+        // run's random hash seed): row 2 is inserted by committed txn C,
+        // then removed by committed txn D. If D's group happened to be
+        // visited before C's, replay ran remove(row2) — a no-op, row 2
+        // isn't there yet — then insert_if_needed(row2) from C's own
+        // group, resurrecting a row that was correctly, committedly
+        // removed. Iterating the flat, already-LSN-ordered record list
+        // instead preserves the true order operations happened in,
+        // regardless of which transactions logged them.
+        for record in &scanned.records {
+            let txn = match &record.operation {
+                Operation::Add { txn, .. }
+                | Operation::Mod { txn, .. }
+                | Operation::Del { txn, .. } => txn,
+                _ => continue,
+            };
             if !committed.contains(txn) {
                 continue;
             }
-            for record in ops {
-                match &record.operation {
-                    Operation::Add { post, .. } => {
-                        self.table_by_id(post.table_id)?
-                            .insert_if_needed(&post.tuple, txn.clone())?;
-                    }
-                    Operation::Mod { post, .. } => {
-                        self.table_by_id(post.table_id)?
-                            .update_if_needed(post.tuple.clone())?;
-                    }
-                    Operation::Del { pre, .. } => {
-                        self.table_by_id(pre.table_id)?
-                            .remove(pre.tuple.id.clone())?;
-                    }
-                    _ => {}
+            match &record.operation {
+                Operation::Add { post, .. } => {
+                    self.table_by_id(post.table_id)?
+                        .insert_if_needed(&post.tuple, txn.clone())?;
                 }
+                Operation::Mod { post, .. } => {
+                    self.table_by_id(post.table_id)?
+                        .update_if_needed(post.tuple.clone())?;
+                }
+                Operation::Del { pre, .. } => {
+                    self.table_by_id(pre.table_id)?
+                        .remove(pre.tuple.id.clone())?;
+                }
+                _ => {}
             }
         }
 

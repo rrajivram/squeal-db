@@ -245,7 +245,7 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   red test now would mean immediately also deciding how to handle that existing test — closer
   to starting the fix than just pinning the bug. Left for the fix step itself.
 
-## Phase 2 — T10 FIXED; T4/S2 staged as a separate follow-up
+## Phase 2 — ALL FIXED (T10, T4, S2)
 
 - [t-green] **T10** — FIXED. Root cause confirmed via `grep -rn "UndoId"` across `store/src`:
   `Logger::log_undo` minted `UndoId(id.len() as u16)` (`id.len()` being the transaction's own
@@ -357,6 +357,28 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
     tests — confirmed by exact count across two independent runs). `squeal-sql --lib`: 346
     passed, 0 failed (unaffected aside from `Database::close`'s return-type ripple and one stale
     comment). Whole workspace (`cargo build --workspace --tests`) builds clean.
+  - **Follow-up correctness fix (found after the fact, in a later session, not caught by the
+    "396 passed" run above)**: `process_log`'s Pass 2 (redo) grouped records by transaction into
+    `by_txn: HashMap<TransactionId, Vec<&LogRecord>>` and iterated THAT map to decide replay
+    order — but a `HashMap`'s iteration order across different keys is randomized per-process
+    (Rust's default `RandomState`, reseeded each process start), so which of two DIFFERENT
+    committed transactions' records replayed first was effectively a coin flip each run. Found
+    because `test_replay_handles_mixed_add_mod_del_across_committed_and_abandoned_txns` — a
+    pre-existing test — failed 5 of 6 standalone reruns despite being part of the "396 passed"
+    commit: row 2 is inserted by committed txn C then removed by committed txn D; whenever D's
+    group happened to be visited before C's, replay ran `remove(row2)` (a no-op — row 2 isn't
+    there yet) and only then `insert_if_needed(row2)` from C's group — resurrecting a row that
+    was correctly, committedly removed. Fixed by having Pass 2 iterate `scanned.records`
+    directly (already in true LSN/log order from the scan) instead of `by_txn`, checking
+    `committed.contains(txn)` per record inline — `by_txn` is still built and used, unchanged,
+    for Pass 3 (undo), where it's safe: two *different* uncommitted transactions can never have
+    written the same row (write-conflict detection guarantees only one owner at a time while
+    uncommitted), so cross-transaction order doesn't matter there, only within one transaction's
+    own op list — which was already correctly built in scan order and already relied on
+    `update_if_txn`/`remove_if_txn`'s own order-tolerant checks (established during Phase 1's
+    T13 work). Confirmed fixed, not just less likely: 20/20 standalone reruns green after the
+    fix (was 1/6 before), plus two full-suite runs (fresh process each time, so a different
+    random hash seed) both at 396 passed, 0 failed. `squeal-sql --lib`: 346 passed, 0 failed.
 - [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance; T4's WAL
   unification incidentally also gets this down to one fsync per batch, but it was never
   separately benchmarked as a goal of this pass.)*
