@@ -5993,4 +5993,68 @@ mod tests {
             "row 1 always exists (only ever updated, never removed) — a concurrent find() must              never observe it as missing, even mid-relocation"
         );
     }
+
+    // T10: UndoId is minted as `id.len() as u16`, where `id.len()` is the
+    // transaction's own TOTAL undo-op count so far across every row it
+    // touches (not per-row) — this wraps at 65,536 ops, not just saturates
+    // or errors. A wrapped id then silently resolves, via
+    // `Logger::find_undo_tuple`'s `v.get(undo_id.0 as usize)`, to whatever
+    // op happens to sit at that (much lower) index in the transaction's
+    // op list — if that index belongs to a DIFFERENT row, the walk hands
+    // back that other row's pre-image entirely.
+    //
+    // The audit's own suggested repro — one row, updated 70,000+ times,
+    // then rolled back — turns out NOT to exercise this (confirmed by
+    // running it against the unfixed code below: it passes). Two reasons,
+    // both traced directly: (1) rollback (`Db::revert_txn_writes`) replays
+    // the raw undo `Vec<Operation>` directly and never goes through
+    // `UndoId`/`find_undo_tuple` at all; (2) `update()`'s `build` resolves
+    // every one of a transaction's own repeated updates to the SAME row
+    // via `find_last_committed`, which always walks straight past the
+    // txn's own in-flight chain to the true committed ancestor — so every
+    // entry logged for repeated updates to one row has IDENTICAL content
+    // regardless of index, and even a wrong slot within that row's own
+    // entries is indistinguishable. The bug's actually-observable
+    // consequence is the other one the audit names: a concurrent MVCC read
+    // (`Db::find_visible_to`) walking a wrapped `undo_id` into a
+    // DIFFERENT row's undo entry. Reproduced below by giving row 1 (not
+    // the row under test) the low slot the wraparound aliases into.
+    #[test]
+    fn test_audit_t10_a_wrapped_undo_id_must_not_alias_a_different_rows_undo_entry() {
+        // Sized so the LAST of row 2's updates is pushed at absolute undo
+        // slot 65,536 — whose UndoId (minted from the txn's running op
+        // count, truncated to u16) wraps to 0, aliasing row 1's slot.
+        const NUM_ROW2_UPDATES: u64 = 65_536;
+
+        let (db, tid) = make_db_with_table();
+
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"row1_original"), &t0).unwrap();
+        db.insert(tid, row(2, b"row2_original"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let t1 = db.begin().unwrap();
+        // Occupies undo slot 0 in t1's op list.
+        db.update(tid, row(1, b"row1_touched"), &t1).unwrap();
+        // 65,536 updates to a DIFFERENT row: the last one lands at
+        // absolute slot 65,536, which wraps to 0 and aliases row 1's slot
+        // above instead of row 2's own true committed ancestor.
+        for i in 0..NUM_ROW2_UPDATES {
+            let data = format!("row2_v{i}");
+            db.update(tid, row(2, data.as_bytes()), &t1).unwrap();
+        }
+
+        // t1 never commits, so it's invisible to any other reader — this
+        // forces find()'s undo-chain walk instead of a read-your-own-writes
+        // shortcut.
+        let reader = db.begin().unwrap();
+        let visible = db.find(tid, id(2), &reader).unwrap().unwrap();
+        assert_eq!(
+            visible.id,
+            id(2),
+            "a lookup for row 2 resolved to a DIFFERENT row's identity — a wrapped UndoId \
+             aliased row 1's undo slot instead of walking to row 2's own committed ancestor"
+        );
+        assert_eq!(visible.data.to_vec(), b"row2_original");
+    }
 }

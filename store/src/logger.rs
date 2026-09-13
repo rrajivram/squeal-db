@@ -83,7 +83,7 @@ impl LsnClock {
 pub struct LsnId(pub(crate) u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Eq, Hash, Serialize, Deserialize)]
-pub struct UndoId(pub(crate) u16);
+pub struct UndoId(pub(crate) u64);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) enum MsgType {
@@ -207,7 +207,7 @@ impl Logger {
                     .and_modify(|v| v.push(op.clone()))
                     .or_insert(vec![op.clone()]);
                 MsgType::Undo(UndoOperation {
-                    undo_id: Some(UndoId(id.len() as u16)),
+                    undo_id: Some(UndoId(id.len() as u64)),
                     operation: op.clone(),
                 })
             }
@@ -597,7 +597,7 @@ fn redo_log_runner(
 
 impl From<usize> for UndoId {
     fn from(value: usize) -> Self {
-        Self(value as u16)
+        Self(value as u64)
     }
 }
 

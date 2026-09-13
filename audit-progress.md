@@ -14,16 +14,18 @@ Performance findings (P1-P10) are deferred entirely — no tests written yet; re
 actually implementing Phase 6/7 of the fix plan, since a benchmark written before the fix mostly
 just documents current (slow) behavior rather than proving anything.
 
-**Current status: Phase 1 is DONE.** All 12 in-scope findings (T8, T9, T6, T12, T14, S3, S4, S5,
-S6, S7 — S7 counted once, covering both its prefix and Ord sub-issues) are fixed and `[t-green]`.
-Full `store` suite: **380 passed, 0 failed** (`cargo test -p store --lib -- --test-threads=1`).
-`squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean. One test
+**Current status: Phase 1 is DONE; Phase 2's T10 is DONE (T4+S2 staged, not yet started).** All
+12 Phase 1 findings (T8, T9, T6, T12, T14, S3, S4, S5, S6, S7 — S7 counted once, covering both its
+prefix and Ord sub-issues) plus Phase 2's T10 are fixed and `[t-green]`. Full `store` suite:
+**381 passed, 0 failed** (`cargo test -p store --lib -- --test-threads=1`). `squeal-sql --lib`:
+346 passed, 0 failed. Whole workspace builds clean. One test
 (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) is a known
 pre-existing, unrelated flaky/timing-sensitive test (confirmed via repeated standalone runs
 during T12's work) — not part of this audit's scope. 3 sub-findings deliberately have no test
 (T7, S7's `u64::MAX` sentinel, S7's `Eq`-capacity question) — see their own entries for why; not
-blocking, since nothing regressed them. Phases 2-7 (everything beyond Phase 1) remain untouched,
-catalogued below as `[ ]`.
+blocking, since nothing regressed them. T4+S2 (the rest of Phase 2 — single WAL redesign) remain
+staged, not started, per the user's decision to scope T10 as a standalone fix first. Phases 3-7
+remain untouched, catalogued below as `[ ]`.
 
 ## Phase 1 — ALL FIXED
 
@@ -242,12 +244,49 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   red test now would mean immediately also deciding how to handle that existing test — closer
   to starting the fix than just pinning the bug. Left for the fix step itself.
 
-## Not started (later phases, per the fix plan)
+## Phase 2 — T10 FIXED; T4/S2 staged as a separate follow-up
 
-### Phase 2 — single WAL, framed + checksummed, pre+post images
+- [t-green] **T10** — FIXED. Root cause confirmed via `grep -rn "UndoId"` across `store/src`:
+  `Logger::log_undo` minted `UndoId(id.len() as u16)` (`id.len()` being the transaction's own
+  TOTAL undo-op count so far, across every row it touches, not per-row) — wraps at 65,536 ops,
+  not saturates or errors. `Logger::next_undo_id`/`impl From<usize> for UndoId` did the identical
+  `as u16` truncation. A wrapped id then silently resolved, via `find_undo_tuple`'s
+  `v.get(undo_id.0 as usize)`, to whatever op happens to sit at that (much lower) index in the
+  SAME transaction's op list — if that index belongs to a DIFFERENT row, the walk hands back that
+  other row's pre-image entirely. Fixed by widening `UndoId`'s inner type from `u16` to `u64`
+  (not the audit's stated minimum of `u32` — chosen because the later T4+S2 redesign will very
+  likely make the undo pointer *be* the record's own `LsnId`, already `u64`, avoiding a second
+  width change later) across all three call sites in `store/src/logger.rs`
+  (`UndoId(pub(crate) u64)`, `log_undo`'s `UndoId(id.len() as u64)`,
+  `From<usize>`'s `Self(value as u64)`). `find_undo_tuple`'s `undo_id.0 as usize` cast needed no
+  change (widening `u64`→`usize` is lossless on any real target). `bplustree.rs`'s
+  `MAX_ENTRY_BYTES` comment needed no change either — it already accounts for `Option<UndoId>` as
+  1 byte on the assumption it's `None` for index entries, which postcard's `None` discriminant is
+  regardless of the inner type's width.
+  Test: `test_audit_t10_a_wrapped_undo_id_must_not_alias_a_different_rows_undo_entry`. IMPORTANT
+  process note — the audit's own suggested repro ("70,000 updates of one row in one transaction,
+  then rolled back") was tried FIRST and confirmed to NOT reproduce anything (it passed cleanly
+  against the unfixed `u16` code). Traced why, directly, before redesigning the test: (1)
+  `Db::rollback`'s `revert_txn_writes` replays the raw undo `Vec<Operation>` directly and never
+  goes through `UndoId`/`find_undo_tuple` at all, so a rollback-shaped test can't touch this bug
+  by construction; (2) `Db::update`'s `build` resolves every one of a transaction's own repeated
+  updates to the SAME row via `find_last_committed`, which always walks straight past the txn's
+  own in-flight chain to the true committed ancestor — so every undo entry logged for repeated
+  updates to one row has IDENTICAL content regardless of index, making even a genuinely wrong
+  slot within that row's own entries indistinguishable. Rebuilt the test around the audit's
+  OTHER named consequence instead — a concurrent MVCC read (`Db::find_visible_to`) walking a
+  wrapped `undo_id` into a different row's undo entry — by giving a second row (touched once,
+  first) the low slot the wraparound aliases into, then driving 65,536 updates against the row
+  under test so its last update's minted id wraps to that same low slot. Confirmed red first
+  (failed with `left: Int(1), right: Int(2)` — row 2's lookup resolved to row 1's identity) against
+  the unfixed `u16` code, then green after the widen. Full `store` suite: 381 passed (380 baseline
+  + this test), 0 failed, 0 regressions (`cargo test -p store --lib -- --test-threads=1`).
+  `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace (`cargo build --workspace --tests`)
+  builds clean.
 - [ ] **T4** — redo and undo are two independently-synced files; commit point isn't atomic.
-- [ ] **S2** — log records have no framing/checksum; a torn tail makes the DB unopenable.
-- [ ] **T10** — undo ids are `u16`; >65,535 writes in one txn corrupts its own undo chain.
+  Staged as a separate, later design/implementation effort (see below) — not part of this pass.
+- [ ] **S2** — log records have no framing/checksum; a torn tail makes the DB unopenable. Staged
+  alongside T4 (shares its root fix: a single, framed, checksummed WAL) — not part of this pass.
 - [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance)*
 - [ ] **P8** — three clones of every pre-image per operation. *(deferred — performance)*
 
