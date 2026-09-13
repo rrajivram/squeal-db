@@ -784,26 +784,49 @@ fn log_runner(
     log_header_bytes: Vec<u8>,
 ) -> Result<(), StoreError> {
     let mut file = file;
+    // STORE_AUDIT.md P10: whether the PREVIOUS batch actually had more than
+    // one record in it — i.e. whether there was real concurrent load to
+    // batch last time around. `LOG_BATCH_LINGER` exists purely to give
+    // concurrent senders a window to join one fsync; paying it after an
+    // isolated write (nothing else in flight) is pure added latency with
+    // no batching benefit. Once T1 makes `commit()` actually wait on
+    // durability, this linger is no longer a hidden cost — it's directly
+    // visible as commit latency, so it's worth skipping when there's
+    // nothing to gain from it. Starts true (linger on the very first
+    // batch): with no history yet, behave exactly as before until there's
+    // real evidence one way or the other.
+    let mut last_batch_had_concurrency = true;
     loop {
         // Block for the first message, then linger briefly for more to
         // accumulate into the same batch (see LOG_BATCH_LINGER's own
         // comment) — stopping at the first timeout, not retrying the full
         // linger window MAX_LOG_BATCH times, so an isolated single message
-        // only ever pays one linger's worth of extra latency.
+        // only ever pays one linger's worth of extra latency. Skipped
+        // entirely (a non-blocking try_recv instead) when the previous
+        // batch was NOT itself evidence of concurrent load — see
+        // last_batch_had_concurrency's own comment above.
         let first = recv
             .recv()
             .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         let mut batch: Vec<u8> = Vec::new();
+        let mut batch_record_count = 0usize;
         let mut highest_lsn: Option<LsnId> = None;
         let mut special: Option<LogMsg> = None;
         let mut pending = Some(first);
         for _ in 0..MAX_LOG_BATCH {
             let msg = match pending.take() {
                 Some(m) => m,
-                None => match recv.recv_timeout(LOG_BATCH_LINGER) {
-                    Ok(m) => m,
-                    Err(_) => break,
-                },
+                None => {
+                    let next = if last_batch_had_concurrency {
+                        recv.recv_timeout(LOG_BATCH_LINGER).ok()
+                    } else {
+                        recv.try_recv().ok()
+                    };
+                    match next {
+                        Some(m) => m,
+                        None => break,
+                    }
+                }
             };
             match msg {
                 LogMsg::ShutDown | LogMsg::Checkpoint(_) => {
@@ -820,9 +843,11 @@ fn log_runner(
                         _ => rec.lsn,
                     });
                     batch.extend_from_slice(&frame_record(&to_allocvec(&rec)?));
+                    batch_record_count += 1;
                 }
             }
         }
+        last_batch_had_concurrency = batch_record_count > 1;
         if !batch.is_empty() {
             file.seek(SeekFrom::End(0))?;
             file.write_all(&batch)?;
@@ -956,6 +981,47 @@ mod tests {
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_new(op).is_ok());
         assert!(logger.shutdown().is_ok());
+    }
+
+    // STORE_AUDIT.md P10: the group-commit linger existed purely to give a
+    // concurrent sender a window to join the same fsync — paying it after
+    // an isolated write (nothing else in flight) is pure added latency
+    // with zero batching benefit, and since T1 makes commit() actually
+    // wait on durability, this linger is now directly visible as commit
+    // latency rather than a hidden background cost.
+    #[test]
+    fn test_audit_p10_an_isolated_write_skips_the_group_commit_linger() {
+        let mut logger = Logger::new();
+        logger.set_db(MemFile::new(), Vec::new()).unwrap();
+
+        // First write: log_runner starts assuming concurrency (see
+        // last_batch_had_concurrency's own comment in log_runner) so this
+        // one still pays the linger — nothing to compare against yet
+        // either way, this just establishes "the previous batch had
+        // exactly one record" for the second write below.
+        let lsn1 = logger
+            .log_new(Operation::new_commit(TransactionId::from(1)))
+            .unwrap();
+        logger.wait_until_durable(lsn1);
+
+        // Second write, with nothing else in flight: since the first batch
+        // had exactly one record (no concurrency), this one should skip
+        // the linger entirely instead of paying the full
+        // super::LOG_BATCH_LINGER unconditionally.
+        let start = std::time::Instant::now();
+        let lsn2 = logger
+            .log_new(Operation::new_commit(TransactionId::from(2)))
+            .unwrap();
+        logger.wait_until_durable(lsn2);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < super::LOG_BATCH_LINGER,
+            "an isolated write (no concurrent sender) should skip the group-commit \
+             linger entirely once the previous batch showed no concurrency, not pay \
+             the full {:?} every time — took {:?}",
+            super::LOG_BATCH_LINGER,
+            elapsed
+        );
     }
 
     #[test]

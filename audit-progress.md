@@ -14,19 +14,26 @@ Performance findings (P1-P10) are deferred entirely — no tests written yet; re
 actually implementing Phase 6/7 of the fix plan, since a benchmark written before the fix mostly
 just documents current (slow) behavior rather than proving anything.
 
-**Current status: Phase 1 is DONE; Phase 2 (T10, T4, S2) is DONE.** All 12 Phase 1 findings (T8,
-T9, T6, T12, T14, S3, S4, S5, S6, S7 — S7 counted once, covering both its prefix and Ord
-sub-issues) plus Phase 2's T10/T4/S2 are fixed and `[t-green]`. T4+S2 shipped together as one WAL
+**Current status: Phases 1, 2, and 3 are DONE.** All 12 Phase 1 findings (T8, T9, T6, T12, T14,
+S3, S4, S5, S6, S7 — S7 counted once, covering both its prefix and Ord sub-issues), Phase 2's
+T10/T4/S2, and Phase 3's T2/T1/P10 are fixed and `[t-green]`. T4+S2 shipped together as one WAL
 redesign (single framed/checksummed log file, `LogHeader` mismatch detection, `UndoId` retired in
-favor of LSN-keyed lookups) — full design in `T4_S2_WAL_DESIGN.md`, implementation notes in that
-doc's §14. `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean. One test
-(`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) is a known
-pre-existing, unrelated flaky/timing-sensitive test (confirmed via repeated standalone runs
+favor of LSN-keyed lookups) — full design in `T4_S2_WAL_DESIGN.md`. T2/T1/P10 design in
+`T2_T1_P10_DURABILITY_DESIGN.md`; T2 fixed the actual root cause (pages stamped from the flush
+watermark instead of their own operation's lsn), T1 added a real durability-wait to `commit()`
+(catching a cold-start-sentinel bug in the process), P10 made the group-commit linger adaptive.
+Also caught and fixed, mid-Phase-3, a genuine pre-existing bug unrelated to any single finding: a
+nondeterministic (HashMap-iteration-order-dependent) replay ordering bug in `process_log`'s redo
+pass, found by re-verifying Phase 2's own "396 passed" claim after a session boundary and
+noticing a test failed 5/6 standalone reruns despite being part of that green commit — see the
+`process_log` note further down and commit `b9c1437`.
+`squeal-sql --lib`: 346 passed, 0 failed throughout. Whole workspace builds clean throughout. One
+test (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) is a
+known pre-existing, unrelated flaky/timing-sensitive test (confirmed via repeated standalone runs
 during T12's work) — not part of this audit's scope. 3 sub-findings deliberately have no test
 (T7, S7's `u64::MAX` sentinel, S7's `Eq`-capacity question) — see their own entries for why; not
-blocking, since nothing regressed them. Full `store` suite after T4+S2: **396 passed, 0 failed**.
-Phases 3-7
-remain untouched, catalogued below as `[ ]`.
+blocking, since nothing regressed them. Full `store` suite after Phase 3: **399 passed, 0
+failed**. Phases 4-7 remain untouched, catalogued below as `[ ]`.
 
 ## Phase 1 — ALL FIXED
 
@@ -394,7 +401,7 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   (`TransactionId` is `Arc`-backed internally, `Tuple.data` is `Arc<[u8]>`) already make that
   one remaining clone cheap (mostly refcount bumps, not deep copies).
 
-## Phase 3 — T2 and T1 FIXED; P10 in progress
+## Phase 3 — ALL FIXED (T2, T1, P10)
 
 Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
 
@@ -504,7 +511,33 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   `wait_until_durable` call: failed 5/5 runs (0 records found instead of 2). Green after
   restoring it: 5/5 clean runs. Full `store` suite: 398 passed, 0 failed (397 baseline + this
   test). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
-- [ ] **P10** — group-commit linger is paid by every isolated write. *(deferred — performance)*
+- [t-green] **P10** — FIXED. `log_runner`'s `LOG_BATCH_LINGER` (200us) was charged after the
+  first message of every batch, even with nothing else in flight — pure added latency with zero
+  batching benefit for an isolated write, and (since T1 now makes `commit()` actually wait on
+  durability) directly visible as commit latency rather than a hidden background cost. Fixed
+  with adaptive linger: a `last_batch_had_concurrency` flag (local to the runner loop, no shared
+  state needed — it's a single thread), set from whether the PREVIOUS batch actually contained
+  more than one record. When true, the "look for more" step lingers exactly as before
+  (`recv_timeout(LOG_BATCH_LINGER)`); when false, it polls non-blocking instead
+  (`try_recv()`), so an isolated write's batch closes immediately rather than waiting out the
+  full window. Starts `true` (linger on the very first batch, matching the original behavior
+  until there's real evidence either way). Note: "more than one record in a batch" isn't
+  purely a proxy for *cross-thread* concurrency — a single transaction's own back-to-back
+  `log()` calls (e.g. an Add followed shortly by its Commit) can also land in one batch — but
+  that's a feature, not a noise source: it correctly keeps batching a busy single transaction's
+  own rapid writes too, which is exactly the group-commit spirit.
+  Test: `test_audit_p10_an_isolated_write_skips_the_group_commit_linger` — a first, throwaway
+  write establishes "previous batch had exactly one record," then a second, isolated write's
+  wall-clock latency (log + `wait_until_durable`) is asserted to land under `LOG_BATCH_LINGER`
+  itself, using `MemFile` so `do_sync` cost doesn't dominate the measurement. Confirmed
+  meaningful, not just passing by construction: reliably red (3/3) with the adaptive check
+  temporarily reverted to the old unconditional `recv_timeout`, reliably green (20/20) restored.
+  This is a magnitude-based (performance) test, not a strict boolean correctness check like the
+  rest of Phase 3 — flagged as such per the design doc's own caveat; one earlier one-off failure
+  immediately after a fresh `cargo build` (before the 20-run confirmation) is noted rather than
+  hidden, most likely transient system load right after compilation, not a real flake rate.
+  Full `store` suite: 399 passed, 0 failed (398 baseline + this test). `squeal-sql --lib`: 346
+  passed, 0 failed. Whole workspace builds clean.
 
 ### Phase 4 — fuzzy checkpoint + header discipline
 - [ ] **T3** — `checkpoint()` with an active transaction turns uncommitted writes into
