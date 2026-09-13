@@ -123,6 +123,16 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`); all 3
   confirmed pre-existing flaky/timing-sensitive tests, not caused by this fix — each passes
   reliably (3/3) run standalone.
+  **Update (Phase 4, T17)**: this test's original reproduction (dropping the transaction's own
+  table mid-flight to make `revert_txn_writes` fail with `TableNotFound`) stopped failing once
+  T17 made `revert_undo_ops` treat a since-dropped table as "nothing to revert" instead of an
+  error — rollback now succeeds outright in that scenario rather than falling into this fix's
+  `aborting`-fallback path. Strictly better (a full resolution instead of one T12's own fallback
+  would retry from `aborting` forever and never actually succeed, since the table is gone for
+  good) — not a regression in this fix, whose fallback is untouched and still covers every OTHER
+  way `revert_txn_writes` can fail. Test renamed to
+  `test_audit_t12_rollback_of_a_transaction_whose_table_was_dropped_mid_flight_now_succeeds_cleanly`
+  and its assertions flipped to match; see T17's own write-up below.
 - [t-green] **T14** — FIXED, but the real root cause turned out to be different from (and
   narrower than) the audit's own diagnosis. `LIKELY` in the audit, `CONFIRMED` empirically first
   (real threads, no artificial delay: ~1140-4067 false "missing" reads per 20,000 iterations).
@@ -539,7 +549,7 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   Full `store` suite: 399 passed, 0 failed (398 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
 
-## Phase 4 — T3/T5/T16/S1 FIXED; T17 in progress
+## Phase 4 — ALL FIXED (T3, T5, T16, S1, T17)
 
 Design doc: `PHASE4_CHECKPOINT_DESIGN.md`. **Decision confirmed with the user**: T3 uses the
 audit's simpler *quiesced checkpoint* design (checkpoint blocks new transactions and waits for
@@ -715,10 +725,60 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   commented out, reliably green restored.
   Full `store` suite: 406 passed, 0 failed (403 baseline + these 3 tests). `squeal-sql --lib`:
   346 passed, 0 failed. Whole workspace builds clean.
-- [ ] **T17** — `drop_table` frees pages in-flight operations may still hold; not logged either.
-  Also now flagged (see T16's own write-up above): `PageBuffer::free_page_chain` may share
-  T16's exact "get_page on a mid-chain overflow continuation page" decode hazard — worth
-  checking as part of this investigation, since T17 already touches the same code path.
+- [t-green] **T17** — FIXED, two independent halves.
+  **Locking half**: `drop_table` removed a table and freed its pages with nothing stopping an
+  `insert`/`update`/`remove`/`find` already in flight against that same table (looked up before
+  `drop_table` started) from continuing to touch those exact page ids after they'd been handed
+  back to the free list and potentially reused by an unrelated allocation. Fixed with a
+  `table_locks: RwLock<HashMap<TableIdType, Arc<RwLock<()>>>>` on `Db` (parking_lot's `arc_lock`
+  feature enabled to get an owned, 'static read guard back from a helper function). New
+  `table_by_id_guarded` acquires a table's read guard BEFORE looking it up and returns both —
+  callers bind the guard to a local variable for their whole operation, not just the lookup —
+  and replaces the bare `table_by_id` call at the top of `insert`/`update`/`remove`/`find` (all
+  four already looked the table up exactly once, as their very first substantive step, making
+  this a drop-in swap with no other change to their bodies). `drop_table` takes the same table's
+  WRITE guard — acquired before ever touching `self.tables` or freeing a page — so it can only
+  proceed once every already-in-flight guarded operation against that id has finished, and blocks
+  any new one from starting until it's done. Deliberately scoped to those four operations, not
+  `table_scan`'s longer-lived `TableCursor` — matches the audit's own framing that the current
+  squeal-sql usage (dropping a just-created, not-yet-published table after a failed CREATE TABLE)
+  can't already have a live scan against it; a long-lived scan racing a drop is deferred, the same
+  class of limitation as T3's long-reader caveat.
+  Test: `test_audit_t17_drop_table_waits_for_an_in_flight_operation` — holds a table's read guard
+  on one thread (standing in for an in-flight operation, via `table_by_id_guarded` directly),
+  confirms `drop_table` on another thread is still blocked after 50ms (`JoinHandle::is_finished`),
+  then releases and confirms both complete — mirrors
+  `test_audit_t3_checkpoint_waits_for_a_still_active_transaction`'s own shape. Confirmed
+  meaningful: reliably blocks with the guard acquisition live, reliably completes immediately
+  (assertion fails as expected) with it temporarily replaced by a no-op.
+  **Logging half**: `drop_table` doesn't log anything to the WAL (only `write_system_tables`,
+  which persists the catalog but not the log) — so a crash between `drop_table` and the next
+  checkpoint left the log still holding redo/undo records naming a table id the catalog no
+  longer has. Before this fix, `process_log`'s redo pass (and `revert_undo_ops`, shared by replay
+  and live rollback) propagated `table_by_id`'s `TableNotFound` with `?`, failing `Db::open`
+  entirely — a table drop should never make an otherwise sound database unopenable. Fixed with
+  `table_by_id_or_dropped`, used at all five call sites (redo's `Add`/`Mod`/`Del` in
+  `process_log`, and undo's `Add`/`Del`/`Mod` in `revert_undo_ops`): treats `TableNotFound` as
+  "nothing to do" rather than an error, since a record's target table being gone is, by
+  definition, the state replay is converging toward either way — no new logged `Operation`
+  variant needed to reach that outcome, contrary to this section's original sketch.
+  Test: `test_audit_t17_replay_survives_log_records_for_a_table_dropped_before_the_next_checkpoint`
+  — inserts, commits, drops the table, flushes via `PageBuffer::checkpoint` (not `Db::checkpoint`,
+  so the log is NOT truncated — reproduces the exact "dropped but not yet checkpointed" crash
+  window), crash-reopens, and asserts open succeeds with the table staying gone. Confirmed
+  meaningful: reliably fails `Db::open` with the fix's call sites reverted to bare `table_by_id`,
+  reliably succeeds restored.
+  **Side effect on a Phase 1 test**: `revert_undo_ops` no longer erroring on a dropped table means
+  `test_audit_t12_...` (T12's own reproduction, which dropped the transaction's table mid-flight
+  specifically to make rollback fail) now sees rollback succeed instead — updated and renamed;
+  see T12's own entry above for the full reasoning.
+  Also checked while touching this code: `PageBuffer::free_page_chain` (used by `drop_table`
+  itself to walk and free the data chain) shares T16's `get_page`-on-a-mid-chain-overflow-page
+  decode hazard in principle, but `drop_table`'s own existing tests don't reopen the db mid-chain
+  and don't trip it — left as-is, out of scope for this pass; flagging again here since T16's
+  write-up already noted it.
+  Full `store` suite: 408 passed, 0 failed (406 baseline + 2 new tests; T12's renamed test doesn't
+  change the count). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 
 ### Phase 5 — logical timestamps, slimmer tuples
 - [ ] **T11** — wall-clock (`SystemTime`) timestamps are the ordering primitive for isolation

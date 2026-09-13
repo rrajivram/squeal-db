@@ -38,6 +38,8 @@ use crate::txn::TransactionManager;
 use log::LevelFilter;
 use log::info;
 use memmap::MmapOptions;
+use parking_lot::ArcRwLockReadGuard;
+use parking_lot::RawRwLock;
 use parking_lot::RwLock;
 use portable_atomic::AtomicU128;
 use postcard::from_bytes;
@@ -287,6 +289,25 @@ pub struct Db<F: DBFile + 'static> {
     // in either transaction set and (see TransactionManager::is_committed)
     // concludes it must have committed.
     checkpoint_gate: RwLock<()>,
+    // STORE_AUDIT.md T17: drop_table frees a table's pages back to the free
+    // list while some other in-flight insert/update/remove/find against
+    // that same table may still be reading/writing through those exact
+    // page ids (obtained via its own earlier table_by_id call, before
+    // drop_table ran) — those pages can be reused by an unrelated
+    // allocation while the in-flight operation is still mid-use of them.
+    // One lock per table id, created lazily: ordinary operations take the
+    // read side for their whole call (see table_by_id_guarded) so the set
+    // of in-flight operations against a given table can only shrink once
+    // drop_table takes that table's write side; drop_table only removes
+    // the table from `tables` and frees its pages after acquiring it,
+    // guaranteeing no in-flight operation is (or can start) touching those
+    // pages concurrently. Scoped to insert/update/remove/find only, not
+    // table_scan's longer-lived TableCursor — matches the audit's own
+    // framing that the current squeal-sql usage (dropping a just-created,
+    // not-yet-published table after a failed CREATE TABLE) can't already
+    // have a live scan against it; a long-lived scan racing a drop is the
+    // same class of deferred limitation as T3's long-reader caveat.
+    table_locks: RwLock<HashMap<TableIdType, Arc<RwLock<()>>>>,
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -438,6 +459,7 @@ where
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
             checkpoint_gate: RwLock::new(()),
+            table_locks: RwLock::new(HashMap::new()),
         };
         sf.load_system_tables()?;
         // STORE_AUDIT.md T16: reconcile the just-loaded (possibly stale)
@@ -776,16 +798,19 @@ where
             }
             match &record.operation {
                 Operation::Add { post, .. } => {
-                    self.table_by_id(post.table_id)?
-                        .insert_if_needed(&post.tuple, txn.clone())?;
+                    if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
+                        table.insert_if_needed(&post.tuple, txn.clone())?;
+                    }
                 }
                 Operation::Mod { post, .. } => {
-                    self.table_by_id(post.table_id)?
-                        .update_if_needed(post.tuple.clone())?;
+                    if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
+                        table.update_if_needed(post.tuple.clone())?;
+                    }
                 }
                 Operation::Del { pre, .. } => {
-                    self.table_by_id(pre.table_id)?
-                        .remove(pre.tuple.id.clone())?;
+                    if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
+                        table.remove(pre.tuple.id.clone())?;
+                    }
                 }
                 _ => {}
             }
@@ -1108,12 +1133,21 @@ where
         for o in ops {
             match o {
                 Operation::Add { post, .. } => {
-                    let table = self.table_by_id(post.table_id)?;
-                    retry_on_contention(|| table.remove_if_txn(post.tuple.id.clone(), id))?;
+                    // STORE_AUDIT.md T17: table_by_id_or_dropped, not
+                    // table_by_id — the table this op targeted may have
+                    // been dropped since (replay, or a live rollback
+                    // racing a drop_table between this txn's own write and
+                    // its abort/rollback). Nothing to revert against a
+                    // table that no longer exists; that IS the converged
+                    // state either way.
+                    if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
+                        retry_on_contention(|| table.remove_if_txn(post.tuple.id.clone(), id))?;
+                    }
                 }
                 Operation::Del { pre, .. } => {
-                    let table = self.table_by_id(pre.table_id)?;
-                    retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
+                    if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
+                        retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
+                    }
                 }
                 // pre: None is a "redo-only" Mod (see Operation::Mod's own
                 // doc comment) — the own-insert-then-update chain, where
@@ -1121,8 +1155,9 @@ where
                 // the row entirely. Reverting a real pre-image here too
                 // would re-materialize a row the Add's revert just removed.
                 Operation::Mod { pre: Some(pre), .. } => {
-                    let table = self.table_by_id(pre.table_id)?;
-                    retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
+                    if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
+                        retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
+                    }
                 }
                 Operation::Mod { pre: None, .. } => {}
                 _ => {}
@@ -1173,6 +1208,63 @@ where
             .ok_or_else(|| StoreError::TableNotFound(id.to_string()))
     }
 
+    // STORE_AUDIT.md T17: a redo/undo record can legitimately name a table
+    // that no longer exists — drop_table between the record's own commit
+    // and the next checkpoint, followed by a crash before the log is
+    // truncated. The table being gone is, by definition, the state replay
+    // is converging toward either way (the record's effect on a
+    // now-nonexistent table can't matter), so this is treated as "nothing
+    // to do", not a recovery failure. Used by both process_log's redo/undo
+    // passes and revert_undo_ops (also reachable from live rollback, if a
+    // transaction's own table is dropped out from under it after one of
+    // its writes already returned but before the transaction ends).
+    fn table_by_id_or_dropped(
+        &self,
+        id: TableIdType,
+    ) -> Result<Option<Arc<BPlusTree<F>>>, StoreError> {
+        match self.table_by_id(id) {
+            Ok(table) => Ok(Some(table)),
+            Err(StoreError::TableNotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    // STORE_AUDIT.md T17: lazily gets-or-creates the per-table lock used to
+    // keep drop_table from freeing a table's pages while an in-flight
+    // operation is still using them. A short-lived write lock on
+    // `table_locks` itself only guards inserting the entry (once per table,
+    // ever) — never held while anyone waits on the per-table lock it
+    // returns.
+    fn table_guard(&self, id: TableIdType) -> Arc<RwLock<()>> {
+        if let Some(lock) = self.table_locks.read().get(&id) {
+            return lock.clone();
+        }
+        self.table_locks
+            .write()
+            .entry(id)
+            .or_insert_with(|| Arc::new(RwLock::new(())))
+            .clone()
+    }
+
+    // STORE_AUDIT.md T17: insert/update/remove/find's replacement for a
+    // bare table_by_id call — acquires the table's read guard BEFORE
+    // looking the table up, so if the lookup succeeds, drop_table cannot
+    // be concurrently mid-flight against this same id (it takes the write
+    // side, see drop_table, before ever removing the table or freeing a
+    // page), and cannot start until every guard returned here for this id
+    // is dropped. Callers must hold the returned guard for their whole
+    // operation, not just the lookup — binding it to a local variable (not
+    // `_`) for the rest of the calling function's body is what actually
+    // provides the protection.
+    fn table_by_id_guarded(
+        &self,
+        id: TableIdType,
+    ) -> Result<(Arc<BPlusTree<F>>, ArcRwLockReadGuard<RawRwLock, ()>), StoreError> {
+        let guard = self.table_guard(id).read_arc();
+        let table = self.table_by_id(id)?;
+        Ok((table, guard))
+    }
+
     pub fn table_id_by_name<S: AsRef<str>>(
         &self,
         name: S,
@@ -1201,9 +1293,10 @@ where
         // value afterward (log, not log_new, which would mint a DIFFERENT
         // one) is what makes the writer's flush gate actually correct.
         let lsn = self.logger.next_lsn();
-        let page_id = self
-            .table_by_id(id)?
-            .insert_at_lsn(tuple.clone(), tx_id.clone(), lsn)?;
+        // STORE_AUDIT.md T17: guard held for the whole call, not just this
+        // lookup — see table_by_id_guarded's own comment.
+        let (table, _table_guard) = self.table_by_id_guarded(id)?;
+        let page_id = table.insert_at_lsn(tuple.clone(), tx_id.clone(), lsn)?;
         let op = Operation::Add {
             txn: tx_id,
             post: Record::new(id, tuple, Some(page_id)),
@@ -1219,7 +1312,8 @@ where
         txn: &Transaction,
     ) -> Result<Option<Tuple>, StoreError> {
         let txn_id = txn.id();
-        let table = self.table_by_id(tid)?;
+        // STORE_AUDIT.md T17: guard held for the whole call.
+        let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
             let visible = self
@@ -1247,7 +1341,8 @@ where
     ) -> Result<(), StoreError> {
         let txn = txn_id.id();
         self.require_active(&txn)?;
-        let table = self.table_by_id(tid)?;
+        // STORE_AUDIT.md T17: guard held for the whole call.
+        let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let id = new_tuple.id.clone();
         // build/before_write both run under table.update_checked's own
         // page lock, atomically with the physical write — see that
@@ -1335,7 +1430,8 @@ where
     ) -> Result<Tuple, StoreError> {
         let txn = txn_id.id();
         self.require_active(&txn)?;
-        let table = self.table_by_id(tid)?;
+        // STORE_AUDIT.md T17: guard held for the whole call.
+        let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let build = |current: &Tuple| {
             self.check_write_conflict(current, &txn)?;
             // STORE_AUDIT.md T9 — see update()'s matching comment: a row
@@ -1810,28 +1906,38 @@ where
     /// tracked by a `Transaction`'s undo log, so there's no `&Transaction`
     /// parameter and nothing here can be rolled back once called.
     ///
-    /// Not safe against a concurrent operation already in flight against
-    /// this table: this only removes it from the name/id registry and
-    /// frees its pages — anything that already holds its own reference
-    /// (obtained before this call) keeps working against pages that are
-    /// now back on the free list and may be reused underneath it. Callers
-    /// are responsible for knowing nothing else is using the table (e.g.
-    /// squeal-sql's own use — cleaning up a table's own just-created,
-    /// not-yet-published indices after a failed CREATE TABLE — holds,
-    /// since nothing else can have discovered them yet).
+    /// STORE_AUDIT.md T17: blocks until every insert/update/remove/find
+    /// currently in flight against this table (i.e. that already looked it
+    /// up via `table_by_id_guarded` before this call started) has
+    /// finished, and blocks any new one from starting until this whole
+    /// call completes — see `table_locks`' own doc comment. This makes it
+    /// safe against exactly those four operations; it is NOT safe against
+    /// a live `table_scan` cursor obtained before this call, since a
+    /// `TableCursor` can be held far longer than one call and isn't
+    /// guarded the same way (deferred, like T3's long-reader caveat — the
+    /// audit's own text notes the current squeal-sql usage, dropping a
+    /// just-created, not-yet-published table after a failed CREATE TABLE,
+    /// can't already have a live scan against it).
     pub fn drop_table<S: AsRef<str>>(&self, name: S) -> Result<(), StoreError> {
         let name = name.as_ref();
-        let table = {
-            let mut tables = self.tables.write();
-            let id = tables
-                .values()
-                .find(|t| t.table.name == name)
-                .map(|t| t.id())
-                .ok_or_else(|| StoreError::TableNotFound(name.to_string()))?;
-            // Always Some: id was just read from this same map under the
-            // same held write lock.
-            tables.remove(&id).unwrap()
-        };
+        let id = self
+            .tables
+            .read()
+            .values()
+            .find(|t| t.table.name == name)
+            .map(|t| t.id())
+            .ok_or_else(|| StoreError::TableNotFound(name.to_string()))?;
+        let _table_guard = self.table_guard(id).write_arc();
+        // Re-resolved (not reused from the id above) under the same guard
+        // that now excludes every in-flight reader/writer: if a racing
+        // drop_table for this same name already won, this table is gone
+        // and we report TableNotFound cleanly instead of panicking on a
+        // stale id.
+        let table = self
+            .tables
+            .write()
+            .remove(&id)
+            .ok_or_else(|| StoreError::TableNotFound(name.to_string()))?;
         for page_id in table.all_index_page_ids()? {
             let record_size = self.buffer.get_page(page_id)?.record_size();
             self.buffer.reset_and_free_page(page_id, record_size)?;
@@ -1954,6 +2060,7 @@ where
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
             checkpoint_gate: RwLock::new(()),
+            table_locks: RwLock::new(HashMap::new()),
         })
     }
 
@@ -6312,12 +6419,30 @@ mod tests {
     // run — so if the revert itself fails partway through, nothing
     // re-arms anything: the id is left in `active` forever (permanent
     // WriteConflicts on its rows, permanently pinning every later
-    // reader's snapshot, per T7). Reproduced here without needing a
-    // fault-injecting DBFile at all: dropping the table an in-flight
-    // transaction's undo ops reference makes revert_txn_writes fail with
-    // TableNotFound the moment it tries to resolve that table.
+    // reader's snapshot, per T7). `Db::rollback_by_id` guards against this
+    // generally: any `revert_txn_writes` failure moves the transaction to
+    // `aborting` (via `tx_mgr.abort`) instead of leaving it stranded in
+    // `active`.
+    //
+    // This test's ORIGINAL reproduction (still described by its name) used
+    // dropping the transaction's own table mid-flight to make
+    // revert_txn_writes fail with TableNotFound. STORE_AUDIT.md T17
+    // deliberately closed exactly that failure mode — revert_undo_ops now
+    // treats a since-dropped table as "nothing to revert" (a table that no
+    // longer exists can't have a row to restore either way) instead of
+    // propagating the error — so rollback here now succeeds outright
+    // rather than failing into T12's aborting-fallback path. That's a
+    // strictly better outcome (a full, immediate resolution instead of a
+    // permanently-retried-but-never-succeeding one — the table is gone
+    // forever, so T12's own fallback would otherwise retry this exact
+    // revert from `aborting` on every future `begin()`, forever, and never
+    // succeed). T12's fallback itself is unchanged and still in place for
+    // every OTHER way revert_txn_writes can fail (e.g. get_undo_operations
+    // itself failing, or a genuine contention timeout) — this specific
+    // scenario just no longer exercises it.
     #[test]
-    fn test_audit_t12_a_failed_rollback_must_not_leave_the_transaction_stuck_active_forever() {
+    fn test_audit_t12_rollback_of_a_transaction_whose_table_was_dropped_mid_flight_now_succeeds_cleanly()
+     {
         let (db, tid) = make_db_with_table();
         let t0 = db.begin().unwrap();
         db.insert(tid, row(1, b"v0"), &t0).unwrap();
@@ -6331,15 +6456,14 @@ mod tests {
 
         let result = db.rollback(t1);
         assert!(
-            result.is_err(),
-            "rollback should fail here — its table is gone mid-flight: {result:?}"
+            result.is_ok(),
+            "STORE_AUDIT.md T17: rollback must succeed here — its table is gone, so there's \
+             nothing left to revert, not a failure: {result:?}"
         );
 
         assert!(
             !db.tx_mgr.is_transaction_active(&t1_id),
-            "a transaction whose rollback failed partway through must not be left stuck in \
-             `active` forever — it should move to a recoverable state (e.g. `aborting`, so \
-             drain_aborting can retry it later)"
+            "a transaction whose rollback completed must not still be active"
         );
     }
 
@@ -6796,6 +6920,86 @@ mod tests {
             matches!(result, Err(StoreError::HeaderCorruption(_))),
             "expected HeaderCorruption, got {:?}",
             result.err()
+        );
+    }
+
+    // STORE_AUDIT.md T17: drop_table used to remove a table and free its
+    // pages with nothing stopping an insert/update/remove/find already in
+    // flight against that same table (looked up before drop_table started)
+    // from continuing to touch those exact page ids after they'd been
+    // handed back to the free list and potentially reused. Reproduces the
+    // "in flight" window directly via table_by_id_guarded (the same guard
+    // insert/update/remove/find now hold for their whole call) rather than
+    // trying to time a race against real page I/O — mirrors
+    // test_audit_t3_checkpoint_waits_for_a_still_active_transaction's own
+    // "spawn, wait on a barrier, assert the other side is still blocked"
+    // shape.
+    #[test]
+    fn test_audit_t17_drop_table_waits_for_an_in_flight_operation() {
+        let (db, tid) = make_db_with_table();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db_h = db.clone();
+        let started_h = started.clone();
+        let release_h = release.clone();
+        let holder = thread::spawn(move || {
+            let (_table, _guard) = db_h.table_by_id_guarded(tid).unwrap();
+            started_h.wait();
+            while !release_h.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        started.wait();
+        let db_d = db.clone();
+        let dropper = thread::spawn(move || db_d.drop_table("rows"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !dropper.is_finished(),
+            "drop_table must wait for an in-flight insert/update/remove/find to finish \
+             before freeing the table's pages"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        holder.join().unwrap();
+        dropper.join().unwrap().unwrap();
+    }
+
+    // STORE_AUDIT.md T17 (logging half): drop_table doesn't log anything to
+    // the WAL, only write_system_tables — so a crash between drop_table
+    // and the next checkpoint leaves the log still holding redo/undo
+    // records for a table id the catalog no longer has, e.g. this test's
+    // own insert+commit for "rows". Before the fix, process_log's redo
+    // pass propagated table_by_id's TableNotFound with `?`, failing
+    // Db::open entirely — a table drop should never make an otherwise
+    // sound database unopenable. Flushes via PageBuffer::checkpoint (not
+    // Db::checkpoint), matching sync_header_without_truncating_logs's own
+    // trick, so the catalog's removal is durable but the log is not
+    // truncated — reproducing the exact "dropped but not yet checkpointed"
+    // crash window.
+    #[test]
+    fn test_audit_t17_replay_survives_log_records_for_a_table_dropped_before_the_next_checkpoint()
+     {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        wait_for_durable_logs(&db, 2);
+
+        db.drop_table("rows").unwrap();
+        // Flushes the now-table-less system catalog page (PageBuffer::
+        // checkpoint) and syncs the header's page_count — never touched by
+        // an ordinary drop_table, only Db::checkpoint/close — WITHOUT
+        // truncating the log (see this helper's own comment; T16's own
+        // test needed the same fix for the same reason).
+        sync_header_without_truncating_logs(&db);
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
+        assert!(
+            db2.table_id_by_name("rows").unwrap().is_none(),
+            "the dropped table must stay gone after replay, not resurrect or fail open"
         );
     }
 }
