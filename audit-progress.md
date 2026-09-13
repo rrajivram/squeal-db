@@ -394,7 +394,7 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   (`TransactionId` is `Arc`-backed internally, `Tuple.data` is `Arc<[u8]>`) already make that
   one remaining clone cheap (mostly refcount bumps, not deep copies).
 
-## Phase 3 — T2 FIXED; T1/P10 in progress
+## Phase 3 — T2 and T1 FIXED; P10 in progress
 
 Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
 
@@ -462,7 +462,48 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   plus the updated pending-write-cap test — both pass. Full `store` suite: 397 passed, 0
   failed (396 baseline + this test), confirmed after the pending-write-cap fix. `squeal-sql
   --lib`: 346 passed, 0 failed. Whole workspace builds clean.
-- [ ] **T1** — `commit()` returns before the commit record is actually durable (fsynced).
+- [t-green] **T1** — FIXED. `Db::commit` logged its `Operation::Commit` record via `Logger::log_new`
+  — a plain channel send that returns as soon as the log runner thread merely accepts the
+  message, not once it's actually batched, written, and `do_sync`'d. Fixed by adding a
+  durability-completion signal to `LsnClock`: a `Mutex<()>`/`Condvar` pair (`durable_mutex`/
+  `durable_condvar`) alongside the existing `last_written` watermark — `mark_written` now
+  notifies under the mutex after storing (standard pairing, no missed-wakeup window between a
+  waiter's check and its wait call), and a new `wait_until_durable(lsn)` blocks (timeout-bounded
+  `wait_timeout` in a loop, so even a hypothetical missed notify just costs one extra 50ms
+  iteration, never a permanent hang) until `last_written() >= lsn`. `Db::commit` captures the
+  lsn its Commit record was logged under and calls `Logger::wait_until_durable` on it — but
+  deliberately at the very END of `commit()`, right before returning, not immediately after
+  logging as the audit's own recommendation literally suggests ("`Db::commit` blocks on it
+  before `tx_mgr.commit`"). Blocking that early would reopen the exact race STORE_AUDIT.md T14
+  already closed: `tx_mgr.commit`/the tombstone-reclaim decision need to run promptly so
+  `is_committed(id)` flips true and undo/reclaim bookkeeping resolves quickly, unaffected by
+  however long a real fsync takes — delaying those would leave a concurrent walker unable to
+  tell "committed" from "not yet" for the whole wait, not just a few instructions. Only this
+  function's own return to ITS OWN caller is delayed; every other thread still observes the
+  commit immediately, exactly as before. Group commit is fully preserved: the wait blocks on
+  the SAME per-batch watermark the runner already advances once per batch, so N concurrent
+  committers waiting on lsns within one batch all wake from the same `notify_all` — nothing
+  changes about how often the runner actually syncs.
+  A real, second bug caught by the test during implementation (not by inspection): the FIRST
+  version of `wait_until_durable` used a bare `last_written() >= lsn` check — but
+  `last_written` starts at the `u64::MAX` cold-start sentinel ("nothing tracked yet"), which is
+  deliberately `>= ` any real lsn so a freshly-dirtied page's flush gate doesn't defer forever
+  waiting for a watermark that hasn't started moving (see T2's own `Page::set_dirty` comment).
+  That's correct for gating a page flush but exactly backwards here — the sentinel means
+  nothing is durable yet, the opposite of what a bare `>=` concludes — so the first version
+  returned instantly on every commit without ever actually waiting. Fixed with a dedicated
+  `is_durable(lsn)` check (`w != u64::MAX && w >= lsn.0`) instead of reusing the existing
+  `last_written()`/`PartialOrd<LsnId>` comparison.
+  Test: `test_audit_t1_commit_does_not_return_before_its_own_record_is_durable` — no fake/slow
+  `DBFile` needed: the log runner deliberately lingers up to `LOG_BATCH_LINGER` (200us) after a
+  batch's first message hoping more arrive to share the sync, so even with `MemFile`'s
+  effectively-instant `do_sync` there's a real, near-guaranteed window right after `commit()`
+  returns during which the record isn't durable yet — checking the raw log-buffer record count
+  with NO polling (unlike `wait_for_durable_logs`, which exists specifically because this isn't
+  normally guaranteed) is enough to observe it. Confirmed red by temporarily disabling the
+  `wait_until_durable` call: failed 5/5 runs (0 records found instead of 2). Green after
+  restoring it: 5/5 clean runs. Full `store` suite: 398 passed, 0 failed (397 baseline + this
+  test). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 - [ ] **P10** — group-commit linger is paid by every isolated write. *(deferred — performance)*
 
 ### Phase 4 — fuzzy checkpoint + header discipline

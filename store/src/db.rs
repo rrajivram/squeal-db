@@ -639,7 +639,12 @@ where
         // the caller's state from the DB's (a committed remove the caller thought
         // had failed).
         let op = Operation::Commit(id.clone(), timestamp());
-        self.logger.log_new(op)?;
+        // STORE_AUDIT.md T1: captured so this function can wait on it being
+        // durable before returning — see the wait_until_durable call at the
+        // very end of this function for why it happens THERE, not here
+        // (immediately, matching the audit's own suggested ordering would
+        // reopen the exact race STORE_AUDIT.md T14 already closed).
+        let commit_lsn = self.logger.log_new(op)?;
         // Mark committed BEFORE deciding whether id's undo trail can be
         // dropped now or must wait — not after. STORE_AUDIT.md T14
         // follow-up: with the old ordering (decide-then-commit), there was
@@ -719,6 +724,22 @@ where
                     .map(|r| (waiters.clone(), id.clone(), r)),
             );
         }
+        // STORE_AUDIT.md T1: don't tell the caller this commit succeeded
+        // until its own Commit record is actually durable (fsynced), not
+        // just queued for the log runner. Deliberately last, not right
+        // after logging: is_committed(id) must flip true (via tx_mgr.commit
+        // above) and the tombstone-reclaim decision must happen promptly,
+        // unaffected by however long this wait takes — delaying THOSE would
+        // reopen the exact race STORE_AUDIT.md T14 already closed (a
+        // concurrent walker could observe id as neither committed nor
+        // aborting for the whole duration of a real fsync instead of a few
+        // instructions). Only this function's own return to ITS caller
+        // waits; every other thread sees id as committed immediately, same
+        // as before this fix. Group commit is preserved: this blocks on the
+        // SAME per-batch watermark the log runner already advances, so
+        // concurrent committers waiting on lsns in one batch all wake
+        // together, not one fsync per commit.
+        self.logger.wait_until_durable(commit_lsn);
         Ok(())
     }
 
@@ -6229,6 +6250,37 @@ mod tests {
              not the stale watermark from before this insert began — otherwise the writer \
              thread's flush gate (page.lsn < last_written) is already satisfied by the \
              watermark alone, and could flush this page before its own redo record is durable"
+        );
+    }
+
+    // STORE_AUDIT.md T1: Db::commit logged its Commit record via log_new,
+    // a plain channel send that returns as soon as the log runner thread
+    // has merely accepted the message — not once it's actually written and
+    // fsynced. The runner also deliberately lingers up to LOG_BATCH_LINGER
+    // (200us) after the first message of a batch, hoping more arrive to
+    // batch under the same sync (see its own comment) — so even with
+    // MemFile's effectively-instant do_sync, there's a real, near-
+    // guaranteed window right after commit() returns during which the
+    // runner hasn't even started processing this record yet.
+    //
+    // No fake/slow DBFile needed to observe this: checking the record
+    // count in the underlying log buffer IMMEDIATELY after commit()
+    // returns (no polling — see wait_for_durable_logs, which exists
+    // precisely because this ISN'T normally guaranteed) is enough. Without
+    // the fix, this reliably fails (the record often isn't there yet);
+    // with the fix, it's true synchronously by construction.
+    #[test]
+    fn test_audit_t1_commit_does_not_return_before_its_own_record_is_durable() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(
+            count_log_records(&db.log_file),
+            2, // Add + Commit
+            "commit() must not return until its own commit record (and everything logged \
+             earlier in this transaction) is actually durable, not just queued for the log \
+             runner thread"
         );
     }
 }

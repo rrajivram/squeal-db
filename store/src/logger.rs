@@ -37,6 +37,20 @@ pub(crate) struct LsnClock {
     /// so freshly created pages (stamped from it) are written promptly until the
     /// first redo record lands and pulls the watermark down to a real value.
     last_written: AtomicU64,
+    // STORE_AUDIT.md T1: lets a caller (Db::commit) block until a specific
+    // lsn has actually become durable, instead of returning as soon as its
+    // record is merely queued. `last_written` above is the source of truth
+    // ("has it happened yet") — this pair exists purely so a waiter can
+    // sleep instead of spin-polling that atomic, and be woken promptly when
+    // it changes. `Mutex<()>` guards nothing on its own; the atomic is
+    // still what's actually checked. See `wait_until_durable`/`mark_written`
+    // for the standard mutex+condvar pairing this relies on for correctness
+    // (no missed-wakeup window between checking the atomic and starting to
+    // wait) and why the wait loop is timeout-bounded regardless (belt and
+    // suspenders — even a hypothetical missed notify just costs one extra
+    // loop iteration, never a permanent hang).
+    durable_mutex: std::sync::Mutex<()>,
+    durable_condvar: std::sync::Condvar,
 }
 
 impl Default for LsnClock {
@@ -44,6 +58,8 @@ impl Default for LsnClock {
         Self {
             counter: AtomicU64::new(0),
             last_written: AtomicU64::new(u64::MAX),
+            durable_mutex: std::sync::Mutex::new(()),
+            durable_condvar: std::sync::Condvar::new(),
         }
     }
 }
@@ -60,10 +76,65 @@ impl LsnClock {
         LsnId(self.last_written.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Advance the watermark as the log runner persists records.
+    /// Advance the watermark as the log runner persists records. Holds
+    /// `durable_mutex` around the store (not just around the notify) —
+    /// this is the standard mutex+condvar pairing: a waiter always checks
+    /// the atomic and starts waiting while holding the SAME mutex (see
+    /// `wait_until_durable`), so this store can never land in the narrow
+    /// window between a waiter's check and its wait call, which is
+    /// precisely the window a plain unlocked notify_all could miss.
     pub(crate) fn mark_written(&self, lsn: LsnId) {
+        let _guard = self.durable_mutex.lock().unwrap();
         self.last_written
             .store(lsn.0, std::sync::atomic::Ordering::Relaxed);
+        self.durable_condvar.notify_all();
+    }
+
+    /// STORE_AUDIT.md T1: blocks until `lsn` is durable (i.e. until some
+    /// `mark_written` call reports a value >= `lsn`), so `Db::commit` can
+    /// actually wait for its own commit record to be fsynced instead of
+    /// returning as soon as it's merely queued for the log runner. Group
+    /// commit is preserved exactly as-is: this only waits on the SAME
+    /// `last_written` watermark the runner already advances once per
+    /// batch, so N concurrent committers waiting on lsns within one batch
+    /// all wake from the SAME `notify_all` — nothing here changes how
+    /// often the runner actually syncs.
+    ///
+    /// Timeout-bounded (`wait_timeout` in a loop, not a plain `wait`) as a
+    /// second, independent safety net beyond the mutex+condvar pairing
+    /// itself: even a hypothetical missed wakeup just costs one extra
+    /// 50ms loop iteration before rechecking, never a permanent hang.
+    pub(crate) fn wait_until_durable(&self, lsn: LsnId) {
+        if self.is_durable(lsn) {
+            return;
+        }
+        let mut guard = self.durable_mutex.lock().unwrap();
+        while !self.is_durable(lsn) {
+            let (g, _timeout) = self
+                .durable_condvar
+                .wait_timeout(guard, Duration::from_millis(50))
+                .unwrap();
+            guard = g;
+        }
+    }
+
+    // `last_written() >= lsn` alone is wrong here: last_written starts at
+    // the u64::MAX cold-start sentinel ("nothing tracked yet"), which is
+    // deliberately >= any real lsn so a freshly-dirtied page's flush gate
+    // (see Page::set_dirty's own comment) doesn't defer forever waiting
+    // for a watermark that hasn't started moving yet. That's the right
+    // call for gating a page flush (nothing to protect it FROM yet, so
+    // let it through) but the wrong one here — the sentinel means no
+    // `mark_written` has ever actually run, i.e. nothing is durable, the
+    // exact opposite of what `>=` would otherwise conclude. Confirmed via
+    // a real failure, not just reasoning: an early version of this method
+    // used the bare `last_written() >= lsn` comparison and
+    // `test_audit_t1_commit_does_not_return_before_its_own_record_is_durable`
+    // failed with 0 records found — wait_until_durable returned instantly,
+    // never actually waiting, on the very first commit of a fresh Db.
+    fn is_durable(&self, lsn: LsnId) -> bool {
+        let w = self.last_written.load(std::sync::atomic::Ordering::Relaxed);
+        w != u64::MAX && w >= lsn.0
     }
 
     /// Ensure `next_lsn()` never mints a value <= `lsn`. Used by replay
@@ -444,6 +515,8 @@ impl Logger {
             clock: Arc::new(LsnClock {
                 counter: AtomicU64::new(lsn.0 + 1),
                 last_written: AtomicU64::new(u64::MAX),
+                durable_mutex: std::sync::Mutex::new(()),
+                durable_condvar: std::sync::Condvar::new(),
             }),
             ..Default::default()
         }
@@ -496,6 +569,15 @@ impl Logger {
     /// instead of one.
     pub(crate) fn next_lsn(&self) -> LsnId {
         self.clock.next_lsn()
+    }
+
+    /// STORE_AUDIT.md T1: blocks until `lsn` is durable — see
+    /// `LsnClock::wait_until_durable`'s own comment. `Db::commit` calls this
+    /// on the lsn its own Commit record was logged under, right before
+    /// finishing the commit, so a caller is never told a commit succeeded
+    /// before it's actually fsynced.
+    pub(crate) fn wait_until_durable(&self, lsn: LsnId) {
+        self.clock.wait_until_durable(lsn)
     }
 
     /// Records `op` under the given (already-minted — see `next_lsn`) lsn:
