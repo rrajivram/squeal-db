@@ -284,9 +284,12 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace (`cargo build --workspace --tests`)
   builds clean.
 - [ ] **T4** — redo and undo are two independently-synced files; commit point isn't atomic.
-  Staged as a separate, later design/implementation effort (see below) — not part of this pass.
-- [ ] **S2** — log records have no framing/checksum; a torn tail makes the DB unopenable. Staged
-  alongside T4 (shares its root fix: a single, framed, checksummed WAL) — not part of this pass.
+  Design done — see `T4_S2_WAL_DESIGN.md` (one framed/checksummed WAL, one runner thread, LSN
+  becomes the undo pointer, three-pass recovery, fault-injecting `DBFile` test wrapper, exact
+  blast radius). Implementation not started.
+- [ ] **S2** — log records have no framing/checksum; a torn tail makes the DB unopenable. Shares
+  T4's design doc (`T4_S2_WAL_DESIGN.md`, §2's record-framing/recovery-scan rule) — implementation
+  not started.
 - [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance)*
 - [ ] **P8** — three clones of every pre-image per operation. *(deferred — performance)*
 
