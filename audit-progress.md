@@ -539,7 +539,7 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   Full `store` suite: 399 passed, 0 failed (398 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
 
-## Phase 4 — T3/T5/T16 FIXED; S1/T17 in progress
+## Phase 4 — T3/T5/T16/S1 FIXED; T17 in progress
 
 Design doc: `PHASE4_CHECKPOINT_DESIGN.md`. **Decision confirmed with the user**: T3 uses the
 audit's simpler *quiesced checkpoint* design (checkpoint blocks new transactions and waits for
@@ -673,8 +673,52 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   temporarily replaced with a no-op, reliably green restored.
   Full `store` suite: 403 passed, 0 failed (402 baseline + this test, including the 7 overflow
   tests above). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
-- [ ] **S1** — no format version, no header checksum, no header validation.
+- [t-green] **S1** — FIXED (scoped — see decision below). The main file's header had no
+  format version, no checksum, and no validation of `page_size`/`first_page_offset` — a
+  corrupted or foreign header decoded (or failed to decode) however postcard happened to
+  interpret the bytes, with a bogus `page_size` able to drive every later page-offset
+  calculation instead of being refused up front with a clear cause.
+  **Scope decision**: implemented `format_version: u32` + `header_checksum: u32` (fnv1a_32
+  over every other field, the same hash already reused for page/WAL checksums) + validation
+  of `page_size` (power of two, `[4 KiB, 1 MiB]`) and `first_page_offset` (`>=` the header's
+  own footprint) on open — NOT the audit's fuller double-buffered-alternating-header-slots
+  recommendation. T5's `write_header_synced` already closes the specific "torn header write"
+  race double-buffering primarily exists to survive, so the double-slot mechanism would be
+  belt-and-suspenders on top of that, not something closing a live bug; deferred, not
+  forgotten (noted here, not silently dropped).
+  `Header::seal()` computes and stores the checksum right before a write; called at all three
+  write sites (`create_core_db`, `Db::checkpoint`, `Db::close`) plus the `sync_header_without_
+  truncating_logs` test helper. `Header::validate()` runs once in `open_using_with_limits`,
+  right after the existing magic check, before the header is trusted for anything else.
+  New `StoreError::HeaderCorruption(String)` for all three failure modes (bad format_version,
+  checksum mismatch, invalid `page_size`/`first_page_offset`) — mirrors `LogHeaderMismatch`'s
+  existing shape for the WAL header.
+  Caught two real breaks while wiring this up: `squeal-sql`'s `From<StoreError> for
+  SchemaError` matched on `StoreError` exhaustively, so the new variant was a compile error
+  there — added alongside `LogCorruption`/`LogHeaderMismatch` in the internal-error bucket.
+  And two `store`-internal test helpers (`buffer::tests::make_header_bytes`,
+  `tables::bplustree::tests::make_header`) hand-built raw header bytes matching the OLD field
+  layout exactly, so decoding via `from_bytes::<Header>` started failing with
+  `DeserializeUnexpectedEnd` (62 failures, all in `bplustree`'s test module, once the two new
+  fields were added) — fixed by extending both byte-built layouts with a placeholder
+  `format_version`/`header_checksum` (neither path ever calls `Header::validate`, so the
+  checksum value there is inert).
+  Tests: `test_audit_s1_open_rejects_a_corrupted_header_checksum`,
+  `test_audit_s1_open_rejects_an_invalid_page_size`,
+  `test_audit_s1_open_rejects_a_first_page_offset_smaller_than_the_header_itself` — each
+  round-trips the real on-disk header through `Header` itself (decode, mutate one field,
+  re-encode) via a shared `tamper_header` helper rather than hand-computing byte offsets, so
+  they don't depend on the header's exact wire layout. Confirmed meaningful: all three
+  reliably red (each failing a different way — `None` where `HeaderCorruption` was expected,
+  a `LogHeaderMismatch` from the page_size change reaching the WAL-pairing check instead, and
+  a raw `DeserializeUnexpectedEnd` from the truncated offset) with `validate()`'s call site
+  commented out, reliably green restored.
+  Full `store` suite: 406 passed, 0 failed (403 baseline + these 3 tests). `squeal-sql --lib`:
+  346 passed, 0 failed. Whole workspace builds clean.
 - [ ] **T17** — `drop_table` frees pages in-flight operations may still hold; not logged either.
+  Also now flagged (see T16's own write-up above): `PageBuffer::free_page_chain` may share
+  T16's exact "get_page on a mid-chain overflow continuation page" decode hazard — worth
+  checking as part of this investigation, since T17 already touches the same code path.
 
 ### Phase 5 — logical timestamps, slimmer tuples
 - [ ] **T11** — wall-clock (`SystemTime`) timestamps are the ordering primitive for isolation

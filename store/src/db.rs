@@ -136,9 +136,23 @@ impl<T> DBFile for T where
 {
 }
 
+// STORE_AUDIT.md S1: format_version + header_checksum, plus validation of
+// page_size/first_page_offset on open (see Header::validate). Scoped to
+// exactly this per the design doc's own decision — NOT the audit's fuller
+// double-buffered-alternating-header-slots recommendation, since T5's
+// write_header_synced already closes the specific "torn header write"
+// race that double-buffering primarily exists to survive; the double-slot
+// mechanism would be belt-and-suspenders on top of that, not something
+// closing a live bug, so it's deferred (see audit-progress.md).
+const HEADER_FORMAT_VERSION: u32 = 1;
+const MIN_PAGE_SIZE: DBSizeType = 4 * 1024;
+const MAX_PAGE_SIZE: DBSizeType = 1024 * 1024;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Header {
     magic: [u8; 2],
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) format_version: u32,
     #[serde(with = "postcard::fixint::le")]
     pub(crate) first_page_offset: DBSizeType,
     #[serde(with = "postcard::fixint::le")]
@@ -146,6 +160,86 @@ pub(crate) struct Header {
     #[serde(with = "postcard::fixint::le")]
     pub(crate) page_size: DBSizeType,
     pub(crate) last_checkpoint: u128,
+    // Always the last field: computed over every OTHER field's bytes (see
+    // checksum_input) and patched in via seal() right before a write —
+    // never meaningful to read until seal() has run.
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) header_checksum: u32,
+}
+
+impl Header {
+    // Explicit field-by-field bytes rather than serializing `self` with the
+    // checksum zeroed out: avoids the chicken-and-egg of "the checksum's
+    // own on-wire width could in principle change based on its value" that
+    // a whole-struct-minus-one-field approach would have to worry about
+    // (moot today since every field uses fixint's fixed width, but this
+    // way it's true by construction, not by coincidence of the current
+    // field types).
+    fn checksum_input(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(32);
+        v.extend_from_slice(&self.magic);
+        v.extend_from_slice(&self.format_version.to_le_bytes());
+        v.extend_from_slice(&self.first_page_offset.to_le_bytes());
+        v.extend_from_slice(&self.page_count.to_le_bytes());
+        v.extend_from_slice(&self.page_size.to_le_bytes());
+        v.extend_from_slice(&self.last_checkpoint.to_le_bytes());
+        v
+    }
+
+    pub(crate) fn compute_checksum(&self) -> u32 {
+        crate::page::fnv1a_32(&self.checksum_input())
+    }
+
+    // Must be called right before every write of a Header to disk — every
+    // write site (create_core_db, Db::checkpoint, Db::close) mutates
+    // page_count/last_checkpoint and then calls this before handing the
+    // header to write_header/write_header_synced, so the persisted
+    // checksum always matches the persisted fields.
+    pub(crate) fn seal(&mut self) {
+        self.header_checksum = self.compute_checksum();
+    }
+
+    // Called once, right after magic is checked, before this Header is
+    // trusted for anything else (page_size drives every subsequent I/O
+    // offset calculation, so a corrupt value here must be caught before
+    // it can drive a huge or misaligned read/write downstream).
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.format_version != HEADER_FORMAT_VERSION {
+            return Err(StoreError::HeaderCorruption(format!(
+                "unsupported header format_version {} (expected {})",
+                self.format_version, HEADER_FORMAT_VERSION
+            )));
+        }
+        let expected = self.compute_checksum();
+        if self.header_checksum != expected {
+            return Err(StoreError::HeaderCorruption(format!(
+                "header checksum mismatch: stored {}, computed {}",
+                self.header_checksum, expected
+            )));
+        }
+        if !self.page_size.is_power_of_two()
+            || self.page_size < MIN_PAGE_SIZE
+            || self.page_size > MAX_PAGE_SIZE
+        {
+            return Err(StoreError::HeaderCorruption(format!(
+                "invalid page_size {} (must be a power of two in [{}, {}])",
+                self.page_size, MIN_PAGE_SIZE, MAX_PAGE_SIZE
+            )));
+        }
+        // size_of::<Header>() is already how every write site sizes the
+        // zero-padded on-disk header slot (see BufMsg::WriteHeader's
+        // handling) and how open_using_with_limits sizes its initial read
+        // — reusing it here as the "must be at least this big" floor keeps
+        // this check consistent with what the rest of the header I/O code
+        // already treats as the header's footprint.
+        if self.first_page_offset < size_of::<Header>() as DBSizeType {
+            return Err(StoreError::HeaderCorruption(format!(
+                "first_page_offset {} is smaller than the header itself",
+                self.first_page_offset
+            )));
+        }
+        Ok(())
+    }
 }
 
 // Every constructor (create*/open*) returns Arc<Db<F>>, never a bare Db<F>:
@@ -270,10 +364,17 @@ where
         let mut file = file;
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut bytes)?;
-        let header = Arc::new(from_bytes::<Header>(&bytes)?);
+        let header = from_bytes::<Header>(&bytes)?;
         if header.magic != MAGIC {
             return Err(StoreError::FileError);
         }
+        // STORE_AUDIT.md S1: format_version/checksum/page_size/
+        // first_page_offset validation — before this, a corrupted or
+        // foreign header decoded (or failed to decode) however postcard
+        // happened to interpret the bytes, with nothing catching a bogus
+        // page_size before it drove every later page-offset calculation.
+        header.validate()?;
+        let header = Arc::new(header);
         let mut log_file = log_file;
         // T4_S2_WAL_DESIGN.md §2: validated BEFORE any lock is taken, so a
         // wrongly-paired log file (wrong database, wrong WAL version, wrong
@@ -468,6 +569,7 @@ where
         } = db;
         drop(tables);
         let buffer = Arc::into_inner(buffer).unwrap();
+        hdr.seal();
         buffer.write_header(hdr)?;
         buffer.shutdown()?;
         // Unwrapping here as the expectation is there is only this thread accessing logger
@@ -534,6 +636,7 @@ where
         // being truncated could truncate first, leaving a stale header
         // (wrong page_count/last_checkpoint) paired with an already-empty
         // log on reopen.
+        hdr.seal();
         self.buffer.write_header_synced(hdr)?;
         self.logger.checkpoint(ts)?;
         self.last_checkpoint
@@ -1805,13 +1908,16 @@ where
         let mut log_file = F::open(log_file, lf_name)?;
         f.do_lock()?;
         log_file.do_lock()?;
-        let header = Header {
+        let mut header = Header {
             magic: MAGIC,
+            format_version: HEADER_FORMAT_VERSION,
             first_page_offset: ZERO_PAGE_SIZE,
             page_count: 0,
             page_size,
             last_checkpoint: timestamp(),
+            header_checksum: 0,
         };
+        header.seal();
         let bytes = to_allocvec(&header)?;
         f.write_all(&bytes)?;
         // T4_S2_WAL_DESIGN.md §2: written synchronously right alongside the
@@ -2131,6 +2237,7 @@ mod tests {
     {
         let mut hdr = (*db.header).clone();
         hdr.page_count = db.page_count();
+        hdr.seal();
         db.buffer.write_header(hdr).unwrap();
         db.buffer.checkpoint().unwrap();
     }
@@ -6620,6 +6727,75 @@ mod tests {
              the free list after open, regardless of what a stale persisted snapshot \
              claims — otherwise a later allocation could hand it out again and clobber \
              committed data"
+        );
+    }
+
+    // STORE_AUDIT.md S1: the main file's header had no format version, no
+    // checksum, and no validation of page_size/first_page_offset before
+    // this — a corrupted or foreign header decoded (or failed to decode)
+    // however postcard happened to interpret the bytes, with a bogus
+    // page_size able to drive every later page-offset calculation instead
+    // of being refused up front. All three tests round-trip the real
+    // on-disk header through Header itself (decode, mutate one field,
+    // re-encode) rather than hand-computing byte offsets, so they don't
+    // depend on the header's exact wire layout.
+    fn tamper_header(f: &MemFile, mutate: impl FnOnce(&mut Header)) {
+        let mut buf = vec![0u8; 128];
+        f.pread(&mut buf, 0).unwrap();
+        let mut hdr: Header = postcard::from_bytes(&buf).unwrap();
+        mutate(&mut hdr);
+        let bytes = postcard::to_allocvec(&hdr).unwrap();
+        f.pwrite(&bytes, 0).unwrap();
+    }
+
+    #[test]
+    fn test_audit_s1_open_rejects_a_corrupted_header_checksum() {
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        // Flip the stored checksum without touching anything else (or
+        // resealing) — an otherwise byte-for-byte-valid header whose
+        // checksum simply no longer matches, exactly what bit rot or a
+        // torn write would produce.
+        tamper_header(&f, |hdr| hdr.header_checksum ^= 0xFFFF_FFFF);
+        let result = TestDB::open_using("txn_test.db", f, l);
+        assert!(
+            matches!(result, Err(StoreError::HeaderCorruption(_))),
+            "expected HeaderCorruption, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_audit_s1_open_rejects_an_invalid_page_size() {
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        // Resealed after mutating, so the checksum check passes and only
+        // the page_size validation is what's actually under test here.
+        tamper_header(&f, |hdr| {
+            hdr.page_size = 12345; // not a power of two
+            hdr.seal();
+        });
+        let result = TestDB::open_using("txn_test.db", f, l);
+        assert!(
+            matches!(result, Err(StoreError::HeaderCorruption(_))),
+            "expected HeaderCorruption, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_audit_s1_open_rejects_a_first_page_offset_smaller_than_the_header_itself() {
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        tamper_header(&f, |hdr| {
+            hdr.first_page_offset = 4;
+            hdr.seal();
+        });
+        let result = TestDB::open_using("txn_test.db", f, l);
+        assert!(
+            matches!(result, Err(StoreError::HeaderCorruption(_))),
+            "expected HeaderCorruption, got {:?}",
+            result.err()
         );
     }
 }

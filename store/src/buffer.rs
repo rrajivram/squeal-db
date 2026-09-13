@@ -1630,10 +1630,14 @@ mod tests {
     // this is byte-identical to what a full Header serialization produces).
     fn make_header_bytes(first_page_offset: u64, page_count: u64, page_size: u64) -> Vec<u8> {
         let mut v = vec![0x53u8, 0x65]; // MAGIC
+        v.extend_from_slice(&1u32.to_le_bytes()); // format_version (STORE_AUDIT.md S1)
         v.extend_from_slice(&first_page_offset.to_le_bytes());
         v.extend_from_slice(&page_count.to_le_bytes());
         v.extend_from_slice(&page_size.to_le_bytes());
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap()); // last_checkpoint
+        // header_checksum (STORE_AUDIT.md S1) — this path never runs
+        // Header::validate, so a placeholder is fine.
+        v.extend_from_slice(&0u32.to_le_bytes());
         v
     }
 

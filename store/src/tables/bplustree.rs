@@ -1616,6 +1616,7 @@ mod tests {
 
     fn make_header(page_size: u64) -> Arc<Header> {
         let mut v = vec![0x53u8, 0x65];
+        v.extend_from_slice(&1u32.to_le_bytes()); // format_version (STORE_AUDIT.md S1)
         v.extend_from_slice(&0u64.to_le_bytes()); // first_page_offset
         v.extend_from_slice(&FIRST_USER_PAGE.to_le_bytes()); // page_count
         v.extend_from_slice(&page_size.to_le_bytes());
@@ -1623,6 +1624,10 @@ mod tests {
         // encodes it — append its own to_allocvec output (see the identical
         // fix/comment in buffer.rs's make_header_bytes).
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap());
+        // header_checksum (STORE_AUDIT.md S1) — never validated on this
+        // direct PageBuffer-construction path (only Db::open_using calls
+        // Header::validate), so a placeholder value is fine here.
+        v.extend_from_slice(&0u32.to_le_bytes());
         Arc::new(from_bytes::<Header>(&v).unwrap())
     }
 

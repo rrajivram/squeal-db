@@ -121,6 +121,14 @@ pub enum StoreError {
     // Real, mid-file corruption; recovery refuses to guess past it.
     #[error("WAL corruption: {0}")]
     LogCorruption(String),
+    // STORE_AUDIT.md S1: the main file's own header had no format version,
+    // no checksum, and no validation of page_size/first_page_offset before
+    // this — a corrupted or foreign header decoded (or failed to decode)
+    // in whatever way postcard happened to produce, with a bogus page_size
+    // potentially driving a huge allocation downstream instead of being
+    // refused up front with a clear cause.
+    #[error("Header corruption: {0}")]
+    HeaderCorruption(String),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {
