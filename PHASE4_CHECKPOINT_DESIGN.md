@@ -97,13 +97,21 @@ calls this instead of the current `write_header`, and only calls `logger.checkpo
 whole file, which covers the header too (same-channel FIFO ordering already guarantees the
 header write is processed before the shutdown message that syncs).
 
-**Page count derivation**: the audit's recommendation (derive `page_count` from file length on
-open, `(len - first_page_offset) / page_size`, rather than trusting the header field) removes
-a whole class of "header says fewer pages than actually exist" failures cheaply — worth doing
-alongside the header-sync fix since it touches the same code path (`Db::open_using`/
-`create_core_db`'s header handling). Keep the header's own `page_count` field for now (S1
-still needs it for format-validation purposes and it's harmless to keep writing) but stop
-*trusting* it as the source of truth for how many pages exist.
+**Page count derivation — tried, reverted, do not retry without re-reading this note.** The
+audit's recommendation (derive `page_count` from file length on open instead of trusting the
+header field) was implemented and immediately caught its own failure: `write_locked_page`
+deliberately does NOT write pages to disk on every mutation — it only updates the cache,
+deferring the actual write until eviction, checkpoint, or shutdown (see its own doc comment).
+Outside of a checkpoint/close boundary, the main file's length reflects whichever pages
+happened to be evicted so far — sparse and out of allocation order, not "every page up to the
+highest one in use". A file-length-derived count let replay route through a page that was
+never actually flushed (all-zero bytes, no node-type flag set), panicking — worse than the bug
+it was meant to fix, since the original stale-but-honest header count at least never claimed a
+page existed before it was durable. Reverted; `page_count` stays sourced from the header. The
+specific race T5 actually describes (a stale header paired with an already-truncated log) is
+fully closed by the header-sync fix above on its own: by the time a header is ever paired with
+an empty log, `write_header_synced` already guarantees it reflects everything
+`buffer.checkpoint()` just flushed.
 
 ### Test
 

@@ -590,8 +590,41 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   temporarily disabled, reliably green (3/3) restored. Full `store` suite: 401 passed, 0 failed
   (399 baseline + these 2 tests). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace
   builds clean.
-- [ ] **T5** — checkpoint sequence isn't crash-ordered; log truncation can precede the header
-  write, and the header is never synced.
+- [t-green] **T5** — FIXED (partially — see scope note). `PageBuffer::write_header` was
+  fire-and-forget (a plain channel send, no reply, no fsync) — `Db::checkpoint` truncated the
+  log right after calling it with no guarantee the header write had even been dequeued, let
+  alone durably written. A crash in that window could leave a stale on-disk header (wrong
+  `page_count`/`last_checkpoint`) paired with an already-empty log. Fixed with
+  `PageBuffer::write_header_synced` (a `bounded(1)`-reply-channel variant, mirroring
+  `checkpoint()`'s own existing pattern) that `pwrite`'s and `do_sync`'s the header before
+  replying; `Db::checkpoint` now calls it (blocking) instead of the fire-and-forget version,
+  and only truncates the log (`logger.checkpoint`) after it returns `Ok`. `Db::close` keeps
+  using the plain fire-and-forget `write_header` — its own `buffer.shutdown()` call right after
+  already flushes and syncs the whole file, and same-channel FIFO order already guarantees the
+  header write is processed first.
+  Test: `test_audit_t5_checkpoint_header_write_is_durable_before_returning` — checks the
+  on-disk header bytes match the just-checkpointed `page_count` with NO polling (mirroring T1's
+  own no-polling pattern) right after `checkpoint()` returns; if it merely queued the write,
+  this would be flaky/failing rather than reliably true. Confirmed meaningful: reliably red
+  (5/5) with `write_header_synced` temporarily reverted to plain `write_header`, reliably green
+  (5/5) restored.
+  **Scope note — tried and reverted**: the audit's OTHER T5 recommendation (derive
+  `page_count` on open from the main file's actual length instead of trusting the header
+  field) was implemented and immediately caught a worse bug of its own: `write_locked_page`
+  deliberately does NOT write pages to disk on every mutation — it only updates the cache,
+  deferring the real write until eviction, checkpoint, or shutdown. Outside a checkpoint/close
+  boundary the file's length reflects whichever pages happened to be evicted so far — sparse
+  and out of order, not "every page up to the highest one allocated". A file-length-derived
+  count let replay route through a page that was never actually flushed (all-zero bytes, no
+  node-type flag set), panicking with "Unknown page PageId(3)" during a red-test run — strictly
+  worse than the original bug, since the stale-but-honest header count at least never claimed a
+  page existed before it was durable. Reverted; `page_count` stays sourced from the header. Not
+  a gap: the specific race T5 actually describes (a stale header paired with an
+  already-truncated log) is fully closed by `write_header_synced` alone — by the time a header
+  is ever paired with an empty log, it's already guaranteed to reflect everything
+  `buffer.checkpoint()` just flushed. Full write-up in `PHASE4_CHECKPOINT_DESIGN.md`.
+  Full `store` suite: 402 passed, 0 failed (401 baseline + this test). `squeal-sql --lib`: 346
+  passed, 0 failed. Whole workspace builds clean.
 - [ ] **T16** — free list / page count only persisted at checkpoint; crash recovery can
   double-allocate a page still holding committed data.
 - [ ] **S1** — no format version, no header checksum, no header validation.

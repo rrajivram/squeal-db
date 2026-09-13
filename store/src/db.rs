@@ -282,6 +282,29 @@ where
         file.do_lock()?;
         log_file.do_lock()?;
         let gens = Arc::new(Generator::new());
+        // STORE_AUDIT.md T5 follow-up: the audit's own recommendation
+        // ("derive page_count from file length instead of trusting the
+        // header") was tried and reverted — it's unsound for THIS engine's
+        // architecture, not just a rounding detail. write_locked_page
+        // deliberately does NOT write pages to disk on every mutation; it
+        // only updates the cache, deferring the actual write until
+        // eviction, checkpoint, or shutdown (see its own doc comment). So
+        // outside of a checkpoint/close boundary, the main file's length
+        // reflects whichever pages happened to be evicted so far — sparse
+        // and out of allocation order, not "every page up to the highest
+        // one in use". Confirmed via a real failure, not just reasoning: a
+        // file-length-derived page_count let replay route through a page
+        // that was never actually flushed (all-zero bytes, no LEAF_NODE/
+        // INNER_NODE flag set), panicking with "Unknown page PageId(3)" —
+        // worse than the bug it was meant to fix, since the ORIGINAL
+        // (stale-but-honest) header count at least never claimed a page
+        // existed before it was actually durable. The specific race T5
+        // describes (a stale header paired with an already-truncated log)
+        // is closed by write_header_synced above instead: the header is
+        // now guaranteed durable, with a page_count that accounts for
+        // everything buffer.checkpoint() just flushed, before anything
+        // truncates the log — so by the time a header is ever paired with
+        // an empty log, it's already correct, not stale.
         let page_count = Arc::new(AtomicU64::new(header.page_count));
         let nm = Self::setup_needed_modules(
             header.clone(),
@@ -6446,4 +6469,35 @@ mod tests {
              finish — it must still be there, not discarded"
         );
     }
+
+    // STORE_AUDIT.md T5: PageBuffer::write_header was fire-and-forget (a
+    // plain channel send, no reply, no fsync) — Db::checkpoint truncated
+    // the log right after calling it with no guarantee the header write had
+    // even been dequeued yet, let alone durably written. A crash in that
+    // window could leave a stale on-disk header (wrong page_count/
+    // last_checkpoint) paired with an already-empty log. Fixed via
+    // write_header_synced (a reply-channel variant that pwrite's AND
+    // fsyncs before replying) — checked here with NO polling, mirroring
+    // T1's own count_log_records-no-polling pattern: if checkpoint()
+    // returned without the header actually being durable, this would be
+    // flaky/failing rather than reliably true.
+    #[test]
+    fn test_audit_t5_checkpoint_header_write_is_durable_before_returning() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let page_count_before = db.page_count();
+        db.checkpoint().unwrap();
+
+        let bytes = db.file.data();
+        let on_disk: Header = from_bytes(&bytes[..size_of::<Header>()]).unwrap();
+        assert_eq!(
+            on_disk.page_count, page_count_before,
+            "checkpoint() must not return until the header it just wrote is actually \
+             durable on disk, not merely queued for the buffer's writer thread"
+        );
+    }
+
 }
