@@ -8,7 +8,7 @@ use crate::{
     buffer::{PageBuffer, WritePageHandle},
     db::{DBFile, DBSizeType, retry_on_contention},
     error::StoreError,
-    logger::Logger,
+    logger::{LsnId, Logger},
     page::{Page, PageId},
     table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple},
@@ -223,7 +223,31 @@ where
         }
     }
 
+    // STORE_AUDIT.md T2: thin wrapper over insert_at_lsn for callers with no
+    // operation-level lsn to give it (i.e. everything except Db::insert,
+    // which mints one up front — see insert_at_lsn's own comment). Mints
+    // its own here so pages this write touches still end up correctly
+    // stamped (never a stale watermark), just not tied to any redo record
+    // an external caller will actually log.
     pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<PageId, StoreError> {
+        self.insert_at_lsn(tuple, txn, self.logger.next_lsn())
+    }
+
+    /// Like `insert`, but takes the operation's redo lsn explicitly instead
+    /// of minting its own — used by `Db::insert`, which mints the lsn
+    /// *before* calling this (so the pages this write touches are stamped
+    /// with the SAME lsn `Db::insert` then logs the record under), closing
+    /// STORE_AUDIT.md T2: a page must never be stamped with the flush
+    /// watermark at dirty-time (see `Page::set_dirty`'s own caveat), only
+    /// with the lsn of the operation that dirtied it, or the writer's flush
+    /// gate can be satisfied before this operation's own redo record is
+    /// even logged.
+    pub(crate) fn insert_at_lsn(
+        &self,
+        tuple: Tuple,
+        txn: TransactionId,
+        lsn: LsnId,
+    ) -> Result<PageId, StoreError> {
         let tuple_id = tuple.id.clone();
         // Write the data row, then insert its index entry. If the index insert
         // fails (e.g. DuplicateKey, or lock contention), the data-page write we
@@ -232,8 +256,8 @@ where
         // rollback can't clean it up and a later retry/re-insert leaves the same
         // key's data on multiple pages. Making the whole insert atomic here is
         // exactly "a failed insert rolls back its own partial work".
-        let data_page_id = self.write_data(&tuple)?;
-        let res = self.insert_index(tuple_id.clone(), data_page_id, txn);
+        let data_page_id = self.write_data(&tuple, lsn)?;
+        let res = self.insert_index(tuple_id.clone(), data_page_id, txn, lsn);
         if res.is_err() {
             // Undo the data-page write so a failed index insert leaves no
             // orphaned row. Retry on LockContentionError: this cleanup is
@@ -273,6 +297,7 @@ where
         tuple_id: DBIdType,
         data_page_id: PageId,
         txn: TransactionId,
+        lsn: LsnId,
     ) -> Result<PageId, StoreError> {
         let id_tuple = Tuple::new_with(
             tuple_id,
@@ -300,7 +325,7 @@ where
             // insert_recursive holds the root lock the root may already be split.
             let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
             if handle.page.count()? == self.table.nodes_per_page - 1 {
-                self.split_root_page(handle, txn.clone(), &id_tuple.id)?;
+                self.split_root_page(handle, txn.clone(), &id_tuple.id, lsn)?;
             } else {
                 drop(handle);
             }
@@ -309,6 +334,7 @@ where
                 txn.clone(),
                 self.table.first_index_page,
                 None,
+                lsn,
             ) {
                 Err(StoreError::PageCapacityError) if retries < 16 => {
                     retries += 1;
@@ -342,12 +368,12 @@ where
         }
     }
 
-    fn write_data(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
+    fn write_data(&self, tuple: &Tuple, lsn: LsnId) -> Result<PageId, StoreError> {
         let mut data_page_id = PageId::from(self.last_data_page.load(Ordering::Relaxed));
         loop {
             let handle = self.buffer.get_page_mut(data_page_id)?;
             if handle.page.can_store(tuple) {
-                self.write_page(handle, tuple.clone())?;
+                self.write_page(handle, tuple.clone(), lsn)?;
                 return Ok(data_page_id);
             }
             let next = self.buffer.data_chain_next(&handle.page, data_page_id)?;
@@ -388,7 +414,16 @@ where
         self.buffer.get_page(page_id)?.get(id)
     }
 
+    // STORE_AUDIT.md T2: mints its own lsn to stamp the pages this write
+    // touches (see insert's matching comment on why that's still needed
+    // even for a caller with no redo record of its own to tie it to). Only
+    // Db::update_checked_with_retry needs an externally-supplied lsn (see
+    // update_checked, called directly since it's the only pub(crate) —
+    // never test-called from outside this module — entry point); nothing
+    // calls this plain `update` with one of its own, so unlike `insert`
+    // there's no separate `update_at_lsn` split.
     pub fn update(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
+        let lsn = self.logger.next_lsn();
         let id = tuple.id.clone();
         let pid = self
             .find_page(id.clone(), self.table.first_index_page)?
@@ -417,7 +452,7 @@ where
                 <= header.usable_data_size();
         if fits_in_place {
             let old = h.page.replace_tuple(&id, tuple)?;
-            self.buffer.write_locked_page(h)?;
+            self.buffer.write_locked_page_with_lsn(h, lsn)?;
             Ok(old)
         } else {
             // Doesn't fit alongside its siblings: relocate instead of
@@ -429,7 +464,7 @@ where
                 .page
                 .get(id.clone())?
                 .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-            self.relocate_tuple(h, pid, id, tuple)?;
+            self.relocate_tuple(h, pid, id, tuple, lsn)?;
             Ok(old)
         }
     }
@@ -472,6 +507,7 @@ where
         pid: PageId,
         id: DBIdType,
         tuple: Tuple,
+        lsn: LsnId,
     ) -> Result<(), StoreError> {
         drop(h);
         // Write side of relocation_lock (see find()'s own comment): held
@@ -482,7 +518,7 @@ where
             .relocation_lock
             .write()
             .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
-        match self.write_data(&tuple) {
+        match self.write_data(&tuple, lsn) {
             Ok(new_page_id) => {
                 debug_assert_ne!(
                     new_page_id, pid,
@@ -497,21 +533,22 @@ where
                         txn.clone(),
                         self.table.first_index_page,
                         None,
+                        lsn,
                     )
                 })?;
                 retry_on_contention(|| {
                     let h = self.buffer.get_page_mut(pid)?;
                     h.page.remove_tuple(id.clone())?;
-                    self.buffer.write_locked_page(h)
+                    self.buffer.write_locked_page_with_lsn(h, lsn)
                 })
             }
             Err(StoreError::DuplicateKey(dup_id)) if dup_id == id => {
                 retry_on_contention(|| {
                     let h = self.buffer.get_page_mut(pid)?;
                     h.page.remove_tuple(id.clone())?;
-                    self.buffer.write_locked_page(h)
+                    self.buffer.write_locked_page_with_lsn(h, lsn)
                 })?;
-                let new_page_id = self.write_data(&tuple)?;
+                let new_page_id = self.write_data(&tuple, lsn)?;
                 if new_page_id != pid {
                     let txn = tuple.txn_id.clone().unwrap_or_default();
                     retry_on_contention(|| {
@@ -521,6 +558,7 @@ where
                             txn.clone(),
                             self.table.first_index_page,
                             None,
+                            lsn,
                         )
                     })?;
                 }
@@ -554,12 +592,22 @@ where
     /// logging belongs, preserving the existing invariant that the log
     /// record must exist before a concurrent reader can observe the new
     /// tuple's undo_id (see the plain `update`'s own callers for why that
-    /// ordering matters).
+    /// ordering matters). Returns the `LsnId` it logged the record under —
+    /// STORE_AUDIT.md T2: the exact lsn used to stamp the page(s) this
+    /// write physically touches below must be the SAME one `before_write`
+    /// just logged the record under, not a separately-minted value, or the
+    /// writer's flush gate has nothing correct to compare against. Callers
+    /// (`Db::update`/`Db::remove`) can't hand that lsn in ahead of time the
+    /// way `Db::insert` does — which lsn applies (a freshly minted one, or
+    /// none at all for the own-fresh-insert special case) depends on
+    /// `current`, which `build` only sees once it runs under this method's
+    /// own lock — so it flows back out through `before_write`'s return
+    /// instead.
     pub(crate) fn update_checked(
         &self,
         id: DBIdType,
         build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
-        before_write: impl Fn(&Tuple, &Tuple) -> Result<(), StoreError>,
+        before_write: impl Fn(&Tuple, &Tuple) -> Result<LsnId, StoreError>,
     ) -> Result<Tuple, StoreError> {
         let pid = self
             .find_page(id.clone(), self.table.first_index_page)?
@@ -570,7 +618,7 @@ where
             .get(id.clone())?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
         let (pre_image, tuple) = build(&current)?;
-        before_write(&pre_image, &tuple)?;
+        let lsn = before_write(&pre_image, &tuple)?;
 
         // From here down, identical to update() — see its own comments on
         // why the fits-in-place check exists, and relocate_tuple's own doc
@@ -582,10 +630,10 @@ where
                 <= header.usable_data_size();
         if fits_in_place {
             let old = h.page.replace_tuple(&id, tuple)?;
-            self.buffer.write_locked_page(h)?;
+            self.buffer.write_locked_page_with_lsn(h, lsn)?;
             Ok(old)
         } else {
-            self.relocate_tuple(h, pid, id, tuple)?;
+            self.relocate_tuple(h, pid, id, tuple, lsn)?;
             Ok(current)
         }
     }
@@ -989,6 +1037,7 @@ where
         txn: TransactionId,
         start: PageId,
         parent: Option<WritePageHandle>,
+        lsn: LsnId,
     ) -> Result<(), StoreError> {
         let handle = self.buffer.get_page_mut(start)?;
         drop(parent);
@@ -1003,6 +1052,7 @@ where
                             txn,
                             page_num,
                             Some(handle),
+                            lsn,
                         );
                     } else {
                         panic!("Expected Inner. Found leaf! {:?}", row.id);
@@ -1013,7 +1063,7 @@ where
                 }
             }
             if let Some(child) = last_child {
-                return self.update_index_entry(id, new_page_id, txn, child, Some(handle));
+                return self.update_index_entry(id, new_page_id, txn, child, Some(handle), lsn);
             }
             Ok(())
         } else {
@@ -1024,7 +1074,7 @@ where
                 None,
             );
             handle.page.replace_tuple(&id, new_entry)?;
-            self.buffer.write_locked_page(handle)?;
+            self.buffer.write_locked_page_with_lsn(handle, lsn)?;
             Ok(())
         }
     }
@@ -1035,6 +1085,7 @@ where
         txn_id: TransactionId,
         start: PageId,
         parent: Option<WritePageHandle>,
+        lsn: LsnId,
     ) -> Result<PageId, StoreError> {
         let mut handle = self.buffer.get_page_mut(start)?;
         // Hand-over-hand (crabbing): now that we hold this node's lock, release
@@ -1061,8 +1112,8 @@ where
                     // lock and no-ops if some other thread already split it
                     // first, so this is safe even if the race resolves a
                     // different way than assumed here.
-                    self.split_root_page(handle, txn_id.clone(), &tuple.id)?;
-                    return self.insert_recursive(tuple, txn_id, start, None);
+                    self.split_root_page(handle, txn_id.clone(), &tuple.id, lsn)?;
+                    return self.insert_recursive(tuple, txn_id, start, None, lsn);
                 }
                 // This used to be reachable: a non-root leaf could be
                 // concurrently filled to capacity in the window between
@@ -1086,7 +1137,7 @@ where
                 && handle.page.can_store(&tuple)
             {
                 let id = handle.page_num;
-                self.write_page(handle, tuple)?;
+                self.write_page(handle, tuple, lsn)?;
                 Ok(id)
             } else if let Some(max) = handle.page.record_size() {
                 // A tuple that will never fit this page's fixed per-entry
@@ -1152,7 +1203,7 @@ where
             }
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
-                match self.split_if_needed(p, &tuple)? {
+                match self.split_if_needed(p, &tuple, lsn)? {
                     SplitOutcome::Split(separator, sibling) => {
                         let page = Arc::make_mut(&mut handle.page);
                         // `p` kept the smaller half (keys < separator); the larger half
@@ -1188,8 +1239,8 @@ where
                         // pre-split version), so without this write-back the
                         // updated routing entries are silently dropped when
                         // `handle` goes out of scope, corrupting the index.
-                        self.buffer.write_locked_page(handle)?;
-                        self.insert_recursive(tuple, txn_id, target, Some(child))
+                        self.buffer.write_locked_page_with_lsn(handle, lsn)?;
+                        self.insert_recursive(tuple, txn_id, target, Some(child), lsn)
                     }
                     SplitOutcome::NoSplitNeeded(child) => {
                         // `child` is `p`'s own lock, held continuously since
@@ -1206,7 +1257,7 @@ where
                         // the recursive call) is the same hand-over-hand
                         // order, just made explicit.
                         drop(handle);
-                        self.insert_recursive(tuple, txn_id, p, Some(child))
+                        self.insert_recursive(tuple, txn_id, p, Some(child), lsn)
                     }
                 }
             } else {
@@ -1217,13 +1268,18 @@ where
         }
     }
 
-    fn split_if_needed(&self, page_id: PageId, tuple: &Tuple) -> Result<SplitOutcome, StoreError> {
+    fn split_if_needed(
+        &self,
+        page_id: PageId,
+        tuple: &Tuple,
+        lsn: LsnId,
+    ) -> Result<SplitOutcome, StoreError> {
         let handle = self.buffer.get_page_mut(page_id)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
                 panic!("Trying to split root in the wrong place");
             } else {
-                let (separator, sibling) = self.split_non_root_page(handle, &tuple.id)?;
+                let (separator, sibling) = self.split_non_root_page(handle, &tuple.id, lsn)?;
                 Ok(SplitOutcome::Split(separator, sibling))
             }
         } else {
@@ -1322,6 +1378,7 @@ where
         &self,
         handle: WritePageHandle,
         incoming_id: &DBIdType,
+        lsn: LsnId,
     ) -> Result<(DBIdType, PageId), StoreError> {
         let mut current_handle = handle;
         let values = current_handle.page.iter().collect::<Vec<_>>();
@@ -1399,8 +1456,8 @@ where
         new_vals
             .iter()
             .try_for_each(|t| new_page.add_tuple(t.clone()))?;
-        self.buffer.write_locked_page(current_handle)?;
-        self.buffer.write_locked_page(new_handle)?;
+        self.buffer.write_locked_page_with_lsn(current_handle, lsn)?;
+        self.buffer.write_locked_page_with_lsn(new_handle, lsn)?;
         Ok((separator_id, new_page_id))
     }
 
@@ -1410,6 +1467,7 @@ where
         left_page: PageId,
         right_page: PageId,
         txn_id: TransactionId,
+        lsn: LsnId,
     ) -> Result<(), StoreError> {
         let mut handle = self.buffer.get_page_mut(self.table.first_index_page)?;
         // Mutate flags and data together on the COW copy. Flipping LEAF→INNER on
@@ -1436,7 +1494,7 @@ where
         );
         page.add_tuple(new_t)?;
         page.add_tuple(end_t)?;
-        self.buffer.write_locked_page(handle)?;
+        self.buffer.write_locked_page_with_lsn(handle, lsn)?;
         Ok(())
     }
 
@@ -1445,6 +1503,7 @@ where
         handle: WritePageHandle,
         txn_id: TransactionId,
         incoming_id: &DBIdType,
+        lsn: LsnId,
     ) -> Result<(), StoreError> {
         // insert()'s caller decides whether to call this based on an
         // *unlocked* read of the root's count — by the time we actually hold
@@ -1515,15 +1574,15 @@ where
         right_vals
             .iter()
             .try_for_each(|t| right_page.add_tuple(t.clone()))?;
-        self.buffer.write_locked_page(left_handle)?;
-        self.buffer.write_locked_page(right_handle)?;
-        self.update_root_page(separator_id, left_page_id, right_page_id, txn_id)?;
+        self.buffer.write_locked_page_with_lsn(left_handle, lsn)?;
+        self.buffer.write_locked_page_with_lsn(right_handle, lsn)?;
+        self.update_root_page(separator_id, left_page_id, right_page_id, txn_id, lsn)?;
         Ok(())
     }
 
-    fn write_page(&self, handle: WritePageHandle, tuple: Tuple) -> Result<(), StoreError> {
+    fn write_page(&self, handle: WritePageHandle, tuple: Tuple, lsn: LsnId) -> Result<(), StoreError> {
         handle.page.add_tuple(tuple)?;
-        self.buffer.write_locked_page(handle)?;
+        self.buffer.write_locked_page_with_lsn(handle, lsn)?;
         Ok(())
     }
 }

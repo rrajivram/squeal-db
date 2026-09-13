@@ -459,6 +459,41 @@ impl Page {
         Ok(())
     }
 
+    // STORE_AUDIT.md T2: set_dirty above stamps a page from the CURRENT
+    // flush watermark ("whatever's already durable"), which is correct
+    // only for a mutation that has no operation-level redo record of its
+    // own (e.g. page allocation/formatting during table creation) — there
+    // is nothing else to stamp it with. But for a mutation that IS part of
+    // a logged Db-level operation (insert/update/remove), the watermark at
+    // dirty time is stale: that operation's own redo LSN hasn't been
+    // minted yet (set_dirty runs from inside the physical page write,
+    // which happens before the caller logs the record). A page left
+    // stamped with the stale watermark can satisfy the writer's flush gate
+    // (`page.lsn <= last_written`) as soon as ANY later, unrelated record
+    // becomes durable — flushing this page before its own change's redo
+    // record is durable, or even logged.
+    //
+    // Callers that DO have an operation-level LSN (threaded down from
+    // Db::insert/update/remove, which mint it via Logger::next_lsn BEFORE
+    // mutating — see those callers' own comments) call this right before
+    // the page is published to the buffer cache (PageBuffer::
+    // write_locked_page_with_lsn), overriding set_dirty's watermark stamp
+    // with the correct value while still under the page's exclusive lock,
+    // so nothing ever observes the wrong one.
+    //
+    // Monotonic (keeps the higher of the two), not a blind overwrite: a
+    // page touched more than once in one critical section (e.g. a split
+    // writing to both a page and its new sibling under the same operation)
+    // must end up stamped with the HIGHEST lsn of anything it currently
+    // holds, never a lower one that would let it flush too early.
+    pub(crate) fn stamp_lsn_at_least(&self, lsn: LsnId) -> Result<(), StoreError> {
+        let mut current = self.lsn.write()?;
+        if lsn.0 > current.0 {
+            *current = lsn;
+        }
+        Ok(())
+    }
+
     /// Adopt a page into a database's WAL clock. Called by the PageBuffer for
     /// every page it creates or loads, before the page is mutated; `set_dirty`
     /// then stamps from this clock, and copy-on-write clones inherit it.

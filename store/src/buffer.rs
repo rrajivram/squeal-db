@@ -16,7 +16,7 @@ use crate::{
     constant::timestamp,
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
-    logger::LsnClock,
+    logger::{LsnClock, LsnId},
     page::{PAGE_MAGIC, PAGE_OVERHEAD, Page, PageHeader, PageId, fnv1a_32},
     pages::content::PageContentRegistry,
     utils::shardedpq::ShardedPQ,
@@ -248,6 +248,25 @@ where
     // durability boundary to begin with — they're not fsynced except at
     // checkpoint/shutdown; the redo log already is, on every commit, and
     // is what a page write is recoverable *from* on an unclean reopen.
+    // STORE_AUDIT.md T2: use this instead of write_locked_page whenever the
+    // write is part of a logged Db-level operation (insert/update/remove) —
+    // i.e. whenever the caller minted an lsn via Logger::next_lsn for this
+    // operation before mutating. Stamps the page with that lsn (see
+    // Page::stamp_lsn_at_least's own comment for why this must override,
+    // not follow, set_dirty's watermark-based stamp) while still under the
+    // page's exclusive lock, then publishes it exactly like
+    // write_locked_page. Plain write_locked_page stays correct as-is for
+    // mutations with no operation-level lsn to give it (e.g. page
+    // allocation/formatting during table creation).
+    pub(crate) fn write_locked_page_with_lsn(
+        &self,
+        handle: WritePageHandle,
+        lsn: LsnId,
+    ) -> Result<(), StoreError> {
+        handle.page.stamp_lsn_at_least(lsn)?;
+        self.write_locked_page(handle)
+    }
+
     pub(crate) fn write_locked_page(&self, handle: WritePageHandle) -> Result<(), StoreError> {
         // Use the handle's existing Arc directly rather than converting to &Page
         // and back. The Arc identity must be preserved: the same allocation goes
@@ -1106,7 +1125,14 @@ fn writer<F: DBFile>(
         // pass keeps it bounded to just the pages whose redo isn't durable yet.
         let mut i = 0;
         while i < pending.len() {
-            if pending[i].page.is_pinned() || pending[i].page.lsn_id()? < clock.last_written() {
+            if pending[i].page.is_pinned()
+                // STORE_AUDIT.md T2: `<=`, not `<`. Now that a page is
+                // correctly stamped with the exact lsn of the operation
+                // that dirtied it (see Page::stamp_lsn_at_least), a page
+                // whose lsn exactly EQUALS the current watermark has its
+                // protecting redo record already durable — safe to flush
+                // now, not stuck waiting for something strictly newer.
+                || pending[i].page.lsn_id()? <= clock.last_written() {
                 match write_page(
                     pending[i].page_num,
                     &pending[i].page,
@@ -1233,7 +1259,9 @@ fn writer<F: DBFile>(
                 // shutdown in vector order, so without this a stale entry for a
                 // repeatedly-mutated page could flush last and clobber it.
                 pending.retain(|m| m.page_num != msg.page_num);
-                if msg.page.is_pinned() || msg.page.lsn_id()? < clock.last_written() {
+                // STORE_AUDIT.md T2: `<=`, not `<` — see the matching gate
+                // above (pending's own drain loop) for why.
+                if msg.page.is_pinned() || msg.page.lsn_id()? <= clock.last_written() {
                     match write_page(
                         msg.page_num,
                         &msg.page,
@@ -1838,11 +1866,22 @@ mod tests {
         // doc comment), so it no longer feeds `pending` on every call the
         // way this test needs to exercise the writer's own backpressure/
         // deadlock-avoidance logic.
+        //
+        // STORE_AUDIT.md T2: stamps the page at 101 (strictly above the
+        // 100 watermark set above), not just set_dirty's own watermark
+        // stamp — the writer's flush gate is now `<=`, not `<` (a page
+        // whose own lsn exactly equals the watermark is genuinely durable
+        // and correctly flushes right away), so simply calling
+        // set_dirty(true) here (which would stamp exactly 100, matching
+        // the watermark) would satisfy the gate immediately and never
+        // actually defer into `pending` at all — defeating this test's own
+        // setup. stamp_lsn_at_least(101) mimics a real not-yet-logged
+        // operation the way Db::insert/update/remove now do.
         fn dirty_and_send(buf: &PageBuffer<MemFile>, page_num: crate::page::PageId) {
             let mut handle = buf.get_page_mut(page_num).unwrap();
-            std::sync::Arc::make_mut(&mut handle.page)
-                .set_dirty(true)
-                .unwrap();
+            let page = std::sync::Arc::make_mut(&mut handle.page);
+            page.set_dirty(true).unwrap();
+            page.stamp_lsn_at_least(LsnId(101)).unwrap();
             let page = handle.page.clone();
             buf.write_tx
                 .send(BufMsg::WritePage(WriteMsg {
@@ -1853,9 +1892,9 @@ mod tests {
                 .unwrap();
         }
 
-        // These fill `pending` exactly to capacity (both stamped at 100,
-        // which never satisfies "< last_written" until it advances) —
-        // sends here must not block.
+        // These fill `pending` exactly to capacity (both stamped at 101,
+        // which never satisfies "<= last_written" (100) until it advances)
+        // — sends here must not block.
         for i in 0..MAX_PENDING as u64 {
             dirty_and_send(&buf, i.into());
         }
@@ -1880,8 +1919,8 @@ mod tests {
             "sends beyond the cap should block until pending drains, but finished immediately"
         );
 
-        // Advance the watermark: everything stamped at 100 now satisfies
-        // "100 < 101". The writer's per-iteration drain (unconditional, not
+        // Advance the watermark: everything stamped at 101 now satisfies
+        // "101 <= 101". The writer's per-iteration drain (unconditional, not
         // gated on receiving a new message) picks this up on its own,
         // draining `pending` and reopening the gate — unblocking the sender.
         clock.mark_written(LsnId(101));

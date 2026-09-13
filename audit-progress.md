@@ -379,14 +379,89 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
     T13 work). Confirmed fixed, not just less likely: 20/20 standalone reruns green after the
     fix (was 1/6 before), plus two full-suite runs (fresh process each time, so a different
     random hash seed) both at 396 passed, 0 failed. `squeal-sql --lib`: 346 passed, 0 failed.
-- [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance; T4's WAL
-  unification incidentally also gets this down to one fsync per batch, but it was never
-  separately benchmarked as a goal of this pass.)*
-- [ ] **P8** — three clones of every pre-image per operation. *(deferred — performance)*
+- [t-green] **P1** — effectively FIXED as a structural consequence of T4, verified by reading
+  `logger::log_runner` directly: one WAL file, one runner thread, one `do_sync()` call per
+  batch — down from two (one per the old separate undo/redo files). No separate code change
+  or dedicated benchmark; noted here since the audit calls it out as a distinct finding, and
+  because verifying it mattered before deciding Phase 3 + perf fixes needed any NEW work here.
+- [t-green] **P8** — effectively FIXED as a structural consequence of T4, verified by reading
+  `Logger::log` directly: one `op.clone()` (into the in-memory `records` map, needed so a
+  later rollback/MVCC walk can find it) plus one MOVE (not clone) of the original `op` into the
+  channel message — down from the audit's counted three (a `.clone()` into the vec, a second
+  `.clone()` into the message, plus the caller's own), since the old separate redo+undo
+  logging calls are gone. Not literally the audit's suggested `Arc<Record>` shared reference,
+  but the SAME outcome (one clone total) via a simpler mechanism, and `Operation`'s own fields
+  (`TransactionId` is `Arc`-backed internally, `Tuple.data` is `Arc<[u8]>`) already make that
+  one remaining clone cheap (mostly refcount bumps, not deep copies).
 
-### Phase 3 — page-LSN gating + durable commit
-- [ ] **T2** — pages are flushed gated on the wrong LSN; a page can reach disk before its own
-  redo record.
+## Phase 3 — T2 FIXED; T1/P10 in progress
+
+Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
+
+- [t-green] **T2** — FIXED. Root cause confirmed in code, not just from the audit:
+  `Page::set_dirty(true)` stamped a freshly-dirtied page's `lsn` field from
+  `clock.last_written()` — the CURRENT flush watermark ("whatever's already durable") — not
+  from the redo lsn of the mutation dirtying it right now, because that lsn didn't exist yet:
+  `Db::insert` called `table.insert(...)` (mutates + dirties the page) BEFORE
+  `self.logger.log_new(op)` (mints the lsn and logs the record); same shape in
+  `update`/`remove`. The writer thread's flush gate was `page.lsn < clock.last_written()` —
+  satisfied by a stale watermark stamp as soon as ANY later, unrelated record became durable,
+  flushing a page before its own change's redo record was even logged.
+  Reproduced with a test needing NO timing/concurrency/fault-injection at all: advance the
+  watermark to a known value via an unrelated, already-durable prior write, then check whether
+  a NEW insert's page ends up stamped with something `<=` that old watermark (proving it got
+  the stale value — a fresh lsn, minted after the warmup already committed, could only ever be
+  strictly greater). Confirmed red first.
+  Fixed by: (1) minting the lsn BEFORE mutating — `Db::insert`/`Db::update`/`Db::remove` call
+  `Logger::next_lsn()` (already existed, previously only used for `pre_lsn` stamping) ahead of
+  the physical write, then log the record under that SAME lsn via `Logger::log` (not
+  `log_new`, which would mint a different one); (2) `Page::stamp_lsn_at_least(lsn)` — a new,
+  monotonic (`max(current, lsn)`) stamp, called by a new `PageBuffer::write_locked_page_with_lsn`
+  right before a page is published to the cache, overriding `set_dirty`'s watermark stamp with
+  the correct value while still under the page's exclusive lock; (3) threading `lsn: LsnId`
+  through every `BPlusTree` write path that can reach a `write_locked_page` call
+  (`insert_at_lsn`, `write_data`, `insert_index`, `insert_recursive`, `split_if_needed`,
+  `split_non_root_page`, `update_root_page`, `split_root_page`, `write_page`,
+  `update_checked`, `relocate_tuple`, `update_index_entry`) — a monotonic stamp handles a page
+  touched twice in one operation (e.g. a split writing to both a page and its new sibling)
+  correctly regardless of write order; (4) the writer's flush gate becomes `<=`, not `<` — once
+  `page.lsn` correctly equals the exact lsn it needs durable, a page whose lsn exactly equals
+  the watermark is safe to flush now, not stuck waiting for something strictly newer.
+  `table.remove`/`remove_index_entry` needed NO changes: `Db::remove` never calls them for a
+  live, first-logged operation (it tombstones via `update_checked`, already covered) — they're
+  only reached by `commit()`'s best-effort post-commit tombstone reclaim (already
+  best-effort/replayable, per T6) and by crash-recovery replay (already past the durability
+  boundary), neither of which needs fresh redo-durability protection.
+  Blast-radius control: `insert`/`update`/`update_checked` (and the `before_write` closures
+  `Db::update`/`Db::remove` pass into it) needed a genuinely new design, not just a bolted-on
+  parameter — `update_checked`'s conditional lsn-minting decision (own-fresh-insert vs. a real
+  ancestor) only resolves INSIDE `build`, which runs under `update_checked`'s own lock, so the
+  lsn can't be handed in ahead of time the way `Db::insert` does. Solved by changing
+  `before_write`'s return type from `Result<(), StoreError>` to `Result<LsnId, StoreError>` —
+  it already computed the correct lsn internally for logging; `update_checked` now captures
+  that same return value and uses it for stamping instead of taking a separate parameter.
+  `insert`/`update` themselves (the plain, non-`Db`-facing public API, still used directly by
+  ~62 existing `bplustree.rs` unit tests) kept their EXACT original signatures — `insert` is a
+  thin wrapper over the new `pub(crate) insert_at_lsn` that mints its own lsn when no caller
+  supplies one; `update` mints its own inline (nothing needed an `update_at_lsn` split, since
+  only `Db::update_checked_with_retry` — not the plain path — needed an externally-supplied
+  lsn). Verified safe for those 62 tests before relying on it: their own `make_buffer`/
+  `make_logger` test helpers wire up two entirely INDEPENDENT `LsnClock`s (a pre-existing test
+  fixture quirk, not something this fix introduced), so a self-minted lsn from `BPlusTree`'s
+  own logger never interacts with the buffer's flush-gating clock in a way that could stall a
+  page — confirmed via a `cargo build` with zero signature-mismatch errors, not just
+  assumption.
+  One pre-existing test needed updating to match the corrected (now stricter) semantics:
+  `test_pending_write_cap_blocks_then_drains_without_deadlock` stamped its test pages via plain
+  `set_dirty(true)` (landing exactly ON the watermark) specifically because the OLD `<` gate
+  treated "exactly on the watermark" as "not yet durable" — with the fix, that's now genuinely
+  durable and flushes immediately, so the test's own `pending`-queue setup no longer filled to
+  capacity as intended. Fixed by stamping explicitly one above the watermark via
+  `stamp_lsn_at_least`, matching how a real not-yet-logged operation is stamped now.
+  Tests: `test_audit_t2_a_page_is_stamped_with_its_own_operations_lsn_not_a_stale_watermark`
+  plus the updated pending-write-cap test — both pass. Full `store` suite: 397 passed, 0
+  failed (396 baseline + this test), confirmed after the pending-write-cap fix. `squeal-sql
+  --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 - [ ] **T1** — `commit()` returns before the commit record is actually durable (fsynced).
 - [ ] **P10** — group-commit linger is paid by every isolated write. *(deferred — performance)*
 

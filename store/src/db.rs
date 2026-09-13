@@ -918,12 +918,20 @@ where
         self.require_active(&tx_id)?;
         let mut tuple = tuple;
         tuple.set_txn_id(tx_id.clone());
-        let page_id = self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
+        // STORE_AUDIT.md T2: mint the lsn BEFORE mutating, not after — see
+        // BPlusTree::insert_at_lsn's own comment. The page(s) this write
+        // touches get stamped with this exact lsn; logging under the same
+        // value afterward (log, not log_new, which would mint a DIFFERENT
+        // one) is what makes the writer's flush gate actually correct.
+        let lsn = self.logger.next_lsn();
+        let page_id = self
+            .table_by_id(id)?
+            .insert_at_lsn(tuple.clone(), tx_id.clone(), lsn)?;
         let op = Operation::Add {
             txn: tx_id,
             post: Record::new(id, tuple, Some(page_id)),
         };
-        self.logger.log_new(op)?;
+        self.logger.log(lsn, op)?;
         Ok(())
     }
 
@@ -1036,7 +1044,7 @@ where
                 post: Record::new(tid, updated.clone(), None),
             };
             self.logger.log(lsn, op)?;
-            Ok(())
+            Ok(lsn)
         };
         self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)?;
         Ok(())
@@ -1114,7 +1122,7 @@ where
                 pre: Record::new(tid, old_tuple.clone(), None),
             };
             self.logger.log(lsn, op)?;
-            Ok(())
+            Ok(lsn)
         };
         self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)
     }
@@ -1135,7 +1143,7 @@ where
         id: DBIdType,
         txn: &TransactionId,
         build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
-        before_write: impl Fn(&Tuple, &Tuple) -> Result<(), StoreError>,
+        before_write: impl Fn(&Tuple, &Tuple) -> Result<LsnId, StoreError>,
     ) -> Result<Tuple, StoreError> {
         let result = match table.update_checked(id.clone(), &build, &before_write) {
             Err(StoreError::WriteConflict(_)) => {
@@ -6176,5 +6184,51 @@ mod tests {
              aliased row 1's undo slot instead of walking to row 2's own committed ancestor"
         );
         assert_eq!(visible.data.to_vec(), b"row2_original");
+    }
+
+    // STORE_AUDIT.md T2: Page::set_dirty stamps a freshly-dirtied page's own
+    // `lsn` field from `clock.last_written()` — the CURRENT flush watermark
+    // ("whatever's already durable") — not from the redo LSN of the
+    // mutation dirtying it right now. That LSN doesn't exist yet at dirty
+    // time: Db::insert calls table.insert() (which mutates + dirties the
+    // page) BEFORE self.logger.log_new(op) (which mints the LSN and logs
+    // the record). The writer thread's flush gate is `page.lsn <
+    // clock.last_written()` — "flush once anything newer than this page's
+    // stamped LSN is durable" — so a page stamped with a STALE watermark
+    // can satisfy that gate (and get flushed) before its own change's redo
+    // record has even been logged, let alone synced.
+    //
+    // Reproduced here without any timing/concurrency/fault-injection:
+    // advance the watermark to a known value via an unrelated, already-
+    // durable prior write, then check whether a NEW insert's page ends up
+    // stamped with something <= that old watermark (proving it got the
+    // stale value) or something strictly greater (proving it got a fresh
+    // LSN of its own, which — since LSNs only increase and this op's LSN
+    // is minted after the warmup already committed — could only happen if
+    // the page was correctly stamped with ITS OWN operation's LSN).
+    #[test]
+    fn test_audit_t2_a_page_is_stamped_with_its_own_operations_lsn_not_a_stale_watermark() {
+        let (db, tid) = make_db_with_table();
+
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"warmup"), &t0).unwrap();
+        db.commit(t0).unwrap();
+        // Add + Commit = 2 records; wait for both to actually land so the
+        // watermark below reflects a real, already-durable value rather
+        // than racing the async log runner.
+        wait_for_durable_logs(&db, 2);
+        let watermark_before = db.logger.clock().last_written();
+
+        let table = db.table_by_id(tid).unwrap();
+        let t1 = db.begin().unwrap();
+        let page_id = table.insert(row(2, b"v2"), t1.id()).unwrap();
+        let page = db.buffer.get_page(page_id).unwrap();
+        assert!(
+            page.lsn_id().unwrap() > watermark_before,
+            "the page must be stamped with THIS operation's own (not yet durable) redo lsn, \
+             not the stale watermark from before this insert began — otherwise the writer \
+             thread's flush gate (page.lsn < last_written) is already satisfied by the \
+             watermark alone, and could flush this page before its own redo record is durable"
+        );
     }
 }
