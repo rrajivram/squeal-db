@@ -99,18 +99,35 @@ header write is processed before the shutdown message that syncs).
 
 **Page count derivation — tried, reverted, do not retry without re-reading this note.** The
 audit's recommendation (derive `page_count` from file length on open instead of trusting the
-header field) was implemented and immediately caught its own failure: `write_locked_page`
-deliberately does NOT write pages to disk on every mutation — it only updates the cache,
-deferring the actual write until eviction, checkpoint, or shutdown (see its own doc comment).
-Outside of a checkpoint/close boundary, the main file's length reflects whichever pages
-happened to be evicted so far — sparse and out of allocation order, not "every page up to the
-highest one in use". A file-length-derived count let replay route through a page that was
-never actually flushed (all-zero bytes, no node-type flag set), panicking — worse than the bug
-it was meant to fix, since the original stale-but-honest header count at least never claimed a
-page existed before it was durable. Reverted; `page_count` stays sourced from the header. The
-specific race T5 actually describes (a stale header paired with an already-truncated log) is
-fully closed by the header-sync fix above on its own: by the time a header is ever paired with
-an empty log, `write_header_synced` already guarantees it reflects everything
+header field) was implemented and immediately caught its own failure, panicking with "Unknown
+page PageId(3)" — worse than the bug it was meant to fix.
+
+**Correction, found during a later re-investigation**: the FIRST version of this note blamed
+`write_locked_page`'s general deferral ("the file's length reflects whichever pages happened to
+be evicted so far — sparse and out of allocation order"). That's imprecise — a *new* page's own
+initial write is always synchronous and eager (`alloc_page` → `init_page` → `write_page`, a
+completely different, direct-to-`self_file` path from `write_locked_page`), so file length DOES
+reliably track how many page slots have ever been carved out, contiguously, in allocation
+order. The real, narrower mechanism: some call sites — concretely `BPlusTree::new`, setting up
+a table's first index page — allocate a page synchronously as a generic, unflagged placeholder
+(`Page::new_data`, `alloc_page(false)`) and then *separately* build its real, intended content
+(`Page::new_indexed` with `LEAF_NODE` set) and write *that* via the deferred, cache-only
+`write_locked_page`. A crash-clone taken before that second write ever got flushed (no
+eviction/checkpoint/shutdown yet) leaves the page's on-disk bytes as the generic placeholder —
+neither `LEAF_NODE` nor `INNER_NODE` flagged. The panic actually came from
+`BPlusTree::insert_recursive`'s `panic!("Unknown page {:?}", start)` (a content/flag mismatch on
+an in-bounds page), not from `PageBuffer::get_page`'s bounds check (worded "Invalid page
+number") — confirming the page genuinely existed (file length was right about that); its
+*content* just hadn't caught up. A file-length-derived `page_count` makes replay treat "this
+slot exists" as license to read and use it; the header-derived count avoids the failure only as
+a side effect, by keeping such pages out of the visible set until a checkpoint has actually
+flushed everything.
+
+Reverted; `page_count` stays sourced from the header — same decision as before, just for this
+more precise reason, not a general claim that file length is unreliable. Not a live gap either
+way: the specific race T5 actually describes (a stale header paired with an already-truncated
+log) is fully closed by the header-sync fix above on its own: by the time a header is ever
+paired with an empty log, `write_header_synced` already guarantees it reflects everything
 `buffer.checkpoint()` just flushed.
 
 ### Test

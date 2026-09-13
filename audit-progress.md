@@ -620,19 +620,33 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   (5/5) restored.
   **Scope note — tried and reverted**: the audit's OTHER T5 recommendation (derive
   `page_count` on open from the main file's actual length instead of trusting the header
-  field) was implemented and immediately caught a worse bug of its own: `write_locked_page`
-  deliberately does NOT write pages to disk on every mutation — it only updates the cache,
-  deferring the real write until eviction, checkpoint, or shutdown. Outside a checkpoint/close
-  boundary the file's length reflects whichever pages happened to be evicted so far — sparse
-  and out of order, not "every page up to the highest one allocated". A file-length-derived
-  count let replay route through a page that was never actually flushed (all-zero bytes, no
-  node-type flag set), panicking with "Unknown page PageId(3)" during a red-test run — strictly
-  worse than the original bug, since the stale-but-honest header count at least never claimed a
-  page existed before it was durable. Reverted; `page_count` stays sourced from the header. Not
-  a gap: the specific race T5 actually describes (a stale header paired with an
-  already-truncated log) is fully closed by `write_header_synced` alone — by the time a header
-  is ever paired with an empty log, it's already guaranteed to reflect everything
-  `buffer.checkpoint()` just flushed. Full write-up in `PHASE4_CHECKPOINT_DESIGN.md`.
+  field) was implemented and immediately caught a worse bug of its own, panicking with
+  "Unknown page PageId(3)" during a red-test run.
+  **Correction (found during a later re-investigation prompted by a fair challenge to the
+  original explanation below)**: the original write-up here claimed the file's length is
+  generally "sparse and out of order" because `write_locked_page` defers real writes —
+  true as far as it goes, but NOT actually why this specific failure happened, and stated too
+  broadly. A *new* page's own initial content is always written synchronously
+  (`alloc_page`/`init_page`/`write_page`, not `write_locked_page`) — file length reliably
+  tracks how many page slots have ever been carved out. The real, narrower hazard: several call
+  sites (concretely `BPlusTree::new`, constructing a table's first index page) allocate a page
+  synchronously as a generic, unflagged placeholder (`Page::new_data`, flags `NONE`) and then
+  *separately* construct its real, intended content (`Page::new_indexed` with `LEAF_NODE` set)
+  and write *that* via the deferred, cache-only `write_locked_page` — which may not reach disk
+  until eviction/checkpoint/shutdown. A crash-clone taken before any of those had a chance to
+  run left page 3's on-disk bytes as the generic placeholder — neither `LEAF_NODE` nor
+  `INNER_NODE` flagged — which is `BPlusTree::insert_recursive`'s own
+  `panic!("Unknown page {:?}", start)`, not a bounds/existence rejection from `get_page` (that
+  error is worded differently: "Invalid page number"). So: the page genuinely existed (file
+  length was right about that) — its *content* just hadn't caught up yet. A file-length-derived
+  `page_count` makes replay treat "this slot exists" as license to read and use it; the
+  header-derived count avoids that only as a side effect, by keeping such pages out of the
+  visible set until a checkpoint has actually flushed everything. Reverted; `page_count` stays
+  sourced from the header, but for this more precise reason, not the original blanket "sparse
+  file" framing. Not a live gap either way: the specific race T5 actually describes (a stale
+  header paired with an already-truncated log) is fully closed by `write_header_synced` alone —
+  by the time a header is ever paired with an empty log, it's already guaranteed to reflect
+  everything `buffer.checkpoint()` just flushed. Full write-up in `PHASE4_CHECKPOINT_DESIGN.md`.
   Full `store` suite: 402 passed, 0 failed (401 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
 - [t-green] **T16** — FIXED. The free list is only ever persisted at checkpoint/close
