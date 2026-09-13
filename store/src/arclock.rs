@@ -3,12 +3,13 @@ use std::{
     fmt::Debug,
     hash::Hash,
     ops::Deref,
-    sync::{Arc, RwLock},
+    sync::Arc,
     thread::{self, ThreadId, current},
     time::{Duration, Instant},
 };
 
 use log::trace;
+use parking_lot::RwLock;
 
 //pub type ArcLockGuard = Arc<u16>;
 pub struct ArcLockGuard<T: Sized + Clone + Debug> {
@@ -108,7 +109,7 @@ where
     pub fn lock(self: &Arc<Self>, val: T, _timeout: u64) -> Option<ArcLockGuard<T>> {
         let timeout = Duration::from_secs(60).as_micros() as u64;
         let now = Instant::now();
-        let mut map = self.locks.write().unwrap();
+        let mut map = self.locks.write();
         trace!(
             "Thread:{:?} : write lock on {:?} after {} usecs.",
             thread::current().id(),
@@ -174,7 +175,7 @@ where
             // Needs the write lock (not just read): deciding "it's free" and
             // claiming it must be atomic, or two waiters could both observe
             // count == 1 and both think they won.
-            let mut map = self.locks.write().unwrap();
+            let mut map = self.locks.write();
             // Treat a missing entry (e.g. removed by cleanup() racing with
             // this poll) the same as "free", instead of unwrapping into a
             // panic.
@@ -196,7 +197,7 @@ where
     }
 
     pub fn cleanup(&self) {
-        let mut map = self.locks.write().unwrap();
+        let mut map = self.locks.write();
         let unused = map
             .iter()
             .filter(|&(_, v)| v.lock_count() == 1)
@@ -224,7 +225,7 @@ where
     T: Debug + Clone,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Locks: {}", self.locks.read().unwrap().len())?;
+        write!(f, "Locks: {}", self.locks.read().len())?;
         Ok(())
     }
 }
@@ -251,6 +252,38 @@ mod arclock_tests {
         drop(l2);
         assert_eq!(l1.as_ref().unwrap().lock_count(), 2);
         drop(l1);
+    }
+
+    // STORE_AUDIT.md S8: `locks` used to be a std::sync::RwLock, which
+    // poisons permanently on any panic while held — an unrelated bug
+    // elsewhere (in a completely different call that happened to be
+    // holding this same lock at the wrong moment) would turn every FUTURE
+    // ArcLock::lock/cleanup/Debug call across the whole process into a
+    // panic too, since each one .unwrap()s the lock result. For a page
+    // lock registry backing every page in the database, one unrelated
+    // panic anywhere would have taken down every other page's locking
+    // entirely. Reproduced directly against the internal `locks` field
+    // (same-file access) rather than trying to engineer a panic inside
+    // ArcLock's own methods.
+    #[test]
+    fn test_arclock_remains_usable_after_a_panic_while_its_internal_lock_was_held() {
+        let lock = ArcLock::new();
+        let l = lock.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = l.locks.write();
+            panic!("simulated bug elsewhere, unrelated to ArcLock itself");
+        }));
+        assert!(result.is_err(), "sanity: the panic above must actually unwind");
+
+        // With a poisoning std::sync::RwLock, this next call would itself
+        // panic (on the .unwrap() inside ArcLock::lock) instead of
+        // returning normally.
+        let guard = lock.lock(42, 0);
+        assert!(
+            guard.is_some(),
+            "ArcLock must remain fully usable after an unrelated panic merely held \
+             (not corrupted) its internal lock"
+        );
     }
 
     // Reentrant many times on the same thread should never block.
@@ -343,20 +376,20 @@ mod arclock_tests {
         let l1 = lock.lock(1, 0).unwrap();
         let l2 = lock.lock(2, 0).unwrap();
         let l3 = lock.lock(3, 0).unwrap();
-        assert_eq!(lock.locks.read().unwrap().len(), 3);
+        assert_eq!(lock.locks.read().len(), 3);
         lock.cleanup();
-        assert_eq!(lock.locks.read().unwrap().len(), 3);
+        assert_eq!(lock.locks.read().len(), 3);
         drop(l1);
         drop(l2);
         lock.cleanup();
-        assert_eq!(lock.locks.read().unwrap().len(), 1);
+        assert_eq!(lock.locks.read().len(), 1);
         // A different thread is blocked by l3.
         let tlock = lock.clone();
         let blocked = thread::spawn(move || tlock.lock(3, 500)).join().unwrap();
         assert!(blocked.is_none());
         drop(l3);
         lock.cleanup();
-        assert_eq!(lock.locks.read().unwrap().len(), 0);
+        assert_eq!(lock.locks.read().len(), 0);
     }
 
     // ArcLock::lock() never updates the map entry's recorded thread_id once a

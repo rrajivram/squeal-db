@@ -742,6 +742,12 @@ where
         let mut committed: HashSet<TransactionId> = HashSet::new();
         let mut by_txn: HashMap<TransactionId, Vec<&LogRecord>> = HashMap::new();
         let mut max_lsn: Option<u64> = None;
+        // STORE_AUDIT.md T11: highest ts seen across every TransactionId
+        // this log mentions — used below to reconcile the ts sequence
+        // against the log, not just whatever was persisted as of the last
+        // checkpoint. See TransactionManager::advance_ts_past's own
+        // comment.
+        let mut max_ts: u128 = 0;
         for record in &scanned.records {
             max_lsn = Some(match max_lsn {
                 Some(m) if m >= record.lsn.0 => m,
@@ -751,9 +757,11 @@ where
                 Operation::Add { txn, .. }
                 | Operation::Mod { txn, .. }
                 | Operation::Del { txn, .. } => {
+                    max_ts = max_ts.max(txn.ts());
                     by_txn.entry(txn.clone()).or_default().push(record);
                 }
                 Operation::Commit(t, _ts) => {
+                    max_ts = max_ts.max(t.ts());
                     committed.insert(t.clone());
                 }
                 // Dropped the old code's separate `rollback` HashSet here —
@@ -761,9 +769,12 @@ where
                 // never actually consulted afterward in either one. "not in
                 // `committed`" below already covers an explicit rollback
                 // exactly the same as a never-committed abandoned txn.
-                Operation::Rollback(_, _) => {}
+                Operation::Rollback(t, _ts) => {
+                    max_ts = max_ts.max(t.ts());
+                }
             }
         }
+        self.tx_mgr.advance_ts_past(max_ts)?;
 
         // --- Pass 2: redo — every record for a COMMITTED txn, in the log's
         // own (LSN-ascending) order.
@@ -1317,7 +1328,7 @@ where
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
             let visible = self
-                .find_visible_to(&tuple, &txn_id)
+                .find_visible_to(&tuple, &txn_id)?
                 .map(|t| t.into_owned());
             // A committed tombstone means the key was removed — it must be
             // invisible even if its physical row hasn't been reclaimed yet.
@@ -1377,7 +1388,7 @@ where
             // readers can walk the undo chain back to a value that's
             // actually visible.
             let old_tuple = self
-                .find_last_committed(current)
+                .find_last_committed(current)?
                 .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
                 .into_owned();
             let mut updated = old_tuple.clone();
@@ -1451,7 +1462,7 @@ where
             // flag) and concurrent readers see it instead of the in-flight
             // tombstone.
             let old_tuple = self
-                .find_last_committed(current)
+                .find_last_committed(current)?
                 .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
                 .into_owned();
             let mut tombstoned = old_tuple.clone();
@@ -1613,10 +1624,10 @@ where
         &self,
         tuple: &'a Tuple,
         is_visible: impl Fn(&TransactionId) -> bool,
-    ) -> Visibility<'a> {
+    ) -> Result<Visibility<'a>, StoreError> {
         if let Some(txn) = tuple.txn_id.clone() {
             if is_visible(&txn) {
-                Visibility::Found(Cow::Borrowed(tuple))
+                Ok(Visibility::Found(Cow::Borrowed(tuple)))
             } else {
                 let mut tuple = tuple.clone();
                 loop {
@@ -1626,7 +1637,7 @@ where
                     // the same as a missing undo record below — see
                     // Visibility's own doc comment.
                     let Some(pre_lsn) = tuple.pre_lsn else {
-                        return Visibility::NoAncestor;
+                        return Ok(Visibility::NoAncestor);
                     };
 
                     // Tolerate a missing record: an aborting txn's undo can
@@ -1634,7 +1645,7 @@ where
                     // can't walk further, treat the row as ambiguous rather than
                     // panicking or silently asserting it has no ancestor.
                     let Some(op) = self.logger.find_record(pre_lsn) else {
-                        return Visibility::MissingUndoRecord;
+                        return Ok(Visibility::MissingUndoRecord);
                     };
                     let next_tuple = match op {
                         Operation::Add { post, .. } => post.tuple,
@@ -1645,23 +1656,31 @@ where
                         // what a pre_lsn points at — defensive fallback,
                         // matching the old code's leniency (it mapped every
                         // Add/Del/Mod to a tuple unconditionally).
-                        _ => return Visibility::MissingUndoRecord,
+                        _ => return Ok(Visibility::MissingUndoRecord),
                     };
                     let Some(next_txn) = next_tuple.txn_id.clone() else {
-                        return Visibility::NoAncestor;
+                        return Ok(Visibility::NoAncestor);
                     };
                     if is_visible(&next_txn) {
                         // next_tuple is the visible ancestor we walked back
                         // to — return it, not the in-flight `tuple` we started
                         // from (which belongs to a not-yet-visible txn and must
                         // stay invisible to other readers).
-                        return Visibility::Found(Cow::Owned(next_tuple));
+                        return Ok(Visibility::Found(Cow::Owned(next_tuple)));
                     }
                     tuple = next_tuple;
                 }
             }
         } else {
-            panic!("Tuple does NOT have txn! {:?}", tuple.id);
+            // STORE_AUDIT.md S8: every real insert/update/remove always
+            // sets txn_id — this used to be `panic!`, which for an
+            // embedded library is a process crash for the host. A
+            // corrupted or hand-crafted on-disk file could easily produce
+            // a tuple missing it; surface that as a typed error instead.
+            Err(StoreError::Corruption(format!(
+                "tuple {:?} has no txn_id",
+                tuple.id
+            )))
         }
     }
 
@@ -1719,7 +1738,10 @@ where
     // internally by update()/remove() to resolve the current pre-image for
     // undo-log construction once check_write_conflict has already
     // confirmed the row's current writer is safe to build on top of.
-    pub(crate) fn find_last_committed<'a>(&self, tuple: &'a Tuple) -> Option<Cow<'a, Tuple>> {
+    pub(crate) fn find_last_committed<'a>(
+        &self,
+        tuple: &'a Tuple,
+    ) -> Result<Option<Cow<'a, Tuple>>, StoreError> {
         // Visible iff the writer COMMITTED — i.e. it is neither still active
         // nor aborting-with-unreverted-writes. A dropped/aborted txn stays
         // in `aborting` and is therefore correctly invisible here even
@@ -1727,9 +1749,9 @@ where
         // (unlike find_visible_to) there's no meaningful difference between
         // NoAncestor and MissingUndoRecord to preserve — either way, no
         // committed version was found.
-        match self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn)) {
-            Visibility::Found(t) => Some(t),
-            Visibility::NoAncestor | Visibility::MissingUndoRecord => None,
+        match self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn))? {
+            Visibility::Found(t) => Ok(Some(t)),
+            Visibility::NoAncestor | Visibility::MissingUndoRecord => Ok(None),
         }
     }
 
@@ -1771,7 +1793,7 @@ where
         &self,
         tuple: &'a Tuple,
         reader: &TransactionId,
-    ) -> Option<Cow<'a, Tuple>> {
+    ) -> Result<Option<Cow<'a, Tuple>>, StoreError> {
         // Cloned once up front rather than held as a lock guard for the
         // whole (potentially multi-hop) undo-chain walk below. Full
         // TransactionId (id + ts), not just the numeric id — see
@@ -1788,8 +1810,8 @@ where
                 || (self.tx_mgr.is_committed(txn)
                     && txn.ts() < reader_ts
                     && !reader_snapshot.contains(txn))
-        }) {
-            Visibility::Found(t) => Some(t),
+        })? {
+            Visibility::Found(t) => Ok(Some(t)),
             // A genuine dead end — this version has no ancestor at all, so
             // there is nothing to fall back to. Critically, this is also
             // exactly what a phantom row looks like: a fresh INSERT by a
@@ -1802,7 +1824,7 @@ where
             // `reader` anyway. Confirmed via direct repro before this
             // distinction existed (see store's db.rs test
             // test_find_does_not_see_a_row_inserted_and_committed_by_another_txn_after_this_txn_began).
-            Visibility::NoAncestor => None,
+            Visibility::NoAncestor => Ok(None),
             // Unlike NoAncestor, an ancestor genuinely existed here — we
             // just lost track of it (a discarded undo record). Falling
             // back to the latest committed version instead of hiding a row
@@ -7000,6 +7022,134 @@ mod tests {
         assert!(
             db2.table_id_by_name("rows").unwrap().is_none(),
             "the dropped table must stay gone after replay, not resurrect or fail open"
+        );
+    }
+
+    // STORE_AUDIT.md T15: recovery's `insert_if_needed`/`update_if_needed`
+    // use an "exists ⇒ already applied" heuristic instead of a real
+    // per-page LSN idempotence check. The audit's own text argues this is
+    // safe given T1+T2 hold (a page can never become durable before its
+    // own record does, and commit() never returns before its own record
+    // is durable — see each fix's own writeup) — the specific bad
+    // ordering that would break the heuristic ("txn B's page flush is
+    // durable but txn A's own commit record, which B's data logically
+    // depends on, is not") cannot happen: the WAL is a single, physically
+    // sequential file, so a later record can never be durable while an
+    // earlier one in the same append stream is not. This test reproduces
+    // the audit's own concrete, "should already work" scenario directly:
+    // A inserts K, commits, checkpoints (durable). B then updates K,
+    // commits — logged, but crashes before its own page write is ever
+    // flushed to the main file (still just sitting on the durable log).
+    // Replay must still converge on B's value: A's Add is skipped (the
+    // key already exists, on the checkpointed page), B's Mod is applied
+    // via update_if_needed (the on-page data doesn't match B's post-image,
+    // so it's not a no-op). No fix expected here — this exists to turn
+    // the audit's "should be fine, verify once T4 lands" into a real,
+    // permanent regression test instead of an unverified assumption.
+    #[test]
+    fn test_audit_t15_replay_applies_a_committed_update_whose_own_page_flush_never_landed() {
+        let (db, tid) = make_db_with_table();
+
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t0).unwrap();
+        db.commit(t0).unwrap();
+        db.checkpoint().unwrap();
+        // Second checkpoint's own synchronous reply is queued strictly
+        // after the first one's fire-and-forget header write (same
+        // channel, FIFO) — see test_replay_recovers_a_write_whose_page_
+        // flush_never_reached_the_main_file's identical use of this.
+        db.checkpoint().unwrap();
+        let stale_main_file_bytes = db.file.data();
+
+        let t1 = db.begin().unwrap();
+        db.update(tid, row(1, b"v2"), &t1).unwrap();
+        db.commit(t1).unwrap();
+
+        // Only txn B's (post-checkpoint) records are in the log at all —
+        // checkpoint truncated everything from A above.
+        wait_for_durable_logs(&db, 2);
+        let (_, log_file) = crash_clone(&db);
+
+        // A "crashed" main file built from the pre-B snapshot — B's page
+        // write never reached it, only the log knows B happened.
+        let crashed_file = MemFile::new();
+        crashed_file.pwrite(&stale_main_file_bytes, 0).unwrap();
+
+        let db2 = TestDB::open_using("txn_test.db", crashed_file, log_file).unwrap();
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"v2",
+            "replay must apply B's committed update even though its own page flush \
+             never reached the main file — only A's (older) flush did"
+        );
+    }
+
+    // STORE_AUDIT.md T11: the persisted ts generator snapshot is only
+    // written by write_system_tables (checkpoint/close/table-creation),
+    // same staleness risk the numeric transaction-id sequence already has
+    // — so it alone isn't enough to guarantee a new session's ts()
+    // sequence starts above every ts a PRIOR session ever used. Db::
+    // process_log additionally reconciles it against every ts seen while
+    // scanning the (un-truncated) log itself. This test forces exactly
+    // the gap that closes: the on-disk generator snapshot is frozen at
+    // table-creation time (before the transaction below ever began), and
+    // ONLY the log — not checkpointed away — knows that transaction's own
+    // ts. A fresh transaction after reopen must still be ordered after it.
+    #[test]
+    fn test_audit_t11_reopen_advances_ts_past_everything_seen_in_the_log_not_just_the_persisted_value()
+     {
+        let (db, tid) = make_db_with_table();
+
+        let t = db.begin().unwrap();
+        let a_ts = t.id().ts();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        wait_for_durable_logs(&db, 2);
+
+        // Syncs page_count only (needed for load_system_tables to accept
+        // the reopened header) — deliberately not a real checkpoint or
+        // write_system_tables call, so the on-disk generator snapshot
+        // stays exactly as it was at table-creation time, before the
+        // transaction above ever began.
+        sync_header_without_truncating_logs(&db);
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
+        let t2 = db2.begin().unwrap();
+        assert!(
+            t2.id().ts() > a_ts,
+            "a transaction begun after reopen must be ordered after every transaction \
+             from the prior session, even one the persisted generator snapshot never \
+             saw — got {} which must exceed {}",
+            t2.id().ts(),
+            a_ts
+        );
+    }
+
+    // STORE_AUDIT.md S8: resolve_visible panicked outright on a tuple with
+    // no txn_id — every real Db::insert/update/remove always sets one, but
+    // a corrupted or hand-crafted on-disk file could easily contain a
+    // tuple that doesn't, and for an embedded library a panic is a process
+    // crash for the host, not a recoverable error. Writes such a tuple
+    // through the real production write path (BPlusTree::insert_at_lsn
+    // directly, bypassing Db::insert — which is the one place that always
+    // calls tuple.set_txn_id first) rather than raw byte surgery, so this
+    // is exactly the shape a genuinely corrupted database would produce.
+    #[test]
+    fn test_audit_s8_find_returns_a_typed_error_for_a_tuple_missing_its_txn_id() {
+        let (db, tid) = make_db_with_table();
+        let table = db.table_by_id(tid).unwrap();
+        let lsn = db.logger.next_lsn();
+        table
+            .insert_at_lsn(Tuple::new(1, b"corrupt"), TransactionId::from(1), lsn)
+            .unwrap();
+
+        let t = db.begin().unwrap();
+        let result = db.find(tid, id(1), &t);
+        assert!(
+            matches!(result, Err(StoreError::Corruption(_))),
+            "expected StoreError::Corruption, got {result:?}"
         );
     }
 }

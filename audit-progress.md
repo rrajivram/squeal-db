@@ -795,9 +795,55 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   change the count). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 
 ### Phase 5 — logical timestamps, slimmer tuples
-- [ ] **T11** — wall-clock (`SystemTime`) timestamps are the ordering primitive for isolation
-  and conflict detection; not monotonic, can panic pre-1970, can invert conflict detection on a
-  backward clock step.
+- [t-green] **T11** — FIXED. `TransactionId::ts()` was real wall-clock time (`SystemTime::now()`,
+  at construction) — not monotonic (NTP step, VM migration pause, manual clock change), so a
+  transaction that truly began LATER could get a SMALLER `ts()` than one that began earlier,
+  silently breaking both `check_write_conflict`'s `writer.ts() >= txn.ts()` and
+  `find_visible_to`'s `txn.ts() < reader_ts`. `TransactionInner::eq`'s own `(id, ts)` identity
+  check was also affected: `ts`'s whole reason for existing there is standing in for "definitely
+  a different transaction" across a reopen, which a non-monotonic source can't reliably promise.
+  Fixed by minting `ts` from a new per-Db `Generator` sequence (`__system.transactions.ts`)
+  instead of `timestamp()` — `TransactionManager::create_transaction` mints it via `gen_key`
+  inside the exact same `active_transactions.write()` critical section that already orders
+  snapshot registration (preserving that existing, carefully-reasoned invariant — see the
+  method's own comment), so `ts()` is now monotonic by construction, immune to anything the OS
+  clock does. `TransactionId::new` now takes `ts` explicitly rather than minting it internally;
+  `Default`/`From<u64>` (test/placeholder-only, never on the real path) keep calling
+  `timestamp()`.
+  The persisted generator value alone has the same staleness risk the numeric id sequence
+  already has (only refreshed at checkpoint/close/table-creation) — closed with a new
+  `Generator::advance_past`/`TransactionManager::advance_ts_past`, called from `Db::process_log`
+  after scanning every record's embedded `TransactionId` (`Add`/`Mod`/`Del`/`Commit`/`Rollback`)
+  for the highest `ts` seen, raising the sequence past it (never lowering). Together, "persisted
+  value as of the last checkpoint" and "everything logged since" span the full history, matching
+  the audit's own recommended seeding formula.
+  Tests: `test_successive_transaction_timestamps_are_a_monotonic_counter_not_wall_clock_deltas`
+  (txn.rs) — a real, deterministic proxy for "still wall-clock-derived" vs. "a true logical
+  sequence", since two consecutive `SystemTime::now()` calls essentially never differ by exactly
+  1 nanosecond in practice (confirmed: failed with a ~90,000ns gap against the old code) while a
+  counter's `+1` is exact by construction — a literal backward-clock-step repro isn't safely or
+  portably forceable in a unit test (no clock-injection seam; actually moving the OS clock would
+  be flaky and affect the whole process), so this proxy is the rigorous alternative. Plus
+  `test_audit_t11_reopen_advances_ts_past_everything_seen_in_the_log_not_just_the_persisted_value`
+  (db.rs) — freezes the on-disk generator snapshot at table-creation time (before a real
+  transaction ever begins), crash-reopens with that transaction only reflected in the
+  un-truncated log, and confirms a fresh post-reopen transaction is still ordered after it.
+  Confirmed meaningful: both reliably red with, respectively, the `gen_key` mint reverted and
+  `advance_ts_past`'s call site disabled; reliably green restored.
+  Full `store` suite: 414 passed, 0 failed (411 baseline + 3 `advance_past` tests in
+  `generator.rs` + these 2). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds
+  clean.
+  Also verified (piggybacking on this pass, no separate fix needed): **T15** — recovery's
+  `insert_if_needed`/`update_if_needed` "exists ⇒ already applied" heuristic instead of a real
+  per-page-LSN idempotence check. The audit's own text argues this is safe given T1+T2 hold (a
+  page can never become durable before its own record does; `commit()` never returns before its
+  own record is durable) — the WAL is a single, physically sequential file, so the specific bad
+  ordering that would break the heuristic can't happen. Added
+  `test_audit_t15_replay_applies_a_committed_update_whose_own_page_flush_never_landed` (db.rs) as
+  a permanent regression test for the audit's own "should already work" scenario (committed
+  insert, checkpointed; committed update, page flush never reaches the main file before a crash;
+  replay must still converge on the update) rather than leaving it an unverified assumption. It
+  passed immediately, with no code change — confirming, not fixing.
 - [ ] **P4** — every row and index entry carries a 128-bit timestamp. *(deferred — performance)*
 - [ ] **P7** — per-row visibility check clones the reader's whole snapshot set.
   *(deferred — performance)*
@@ -820,13 +866,72 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   *(deferred — performance)*
 
 ### Not yet slotted into a phase by the audit itself
-- [ ] **T15** — recovery doesn't replay `Add`/`Mod` for a committed txn whose page write was
-  superseded. Edge case; audit notes it's naturally resolved once T4's page-LSN idempotence
-  check exists — verify once T4 lands, no separate fix needed.
-- [ ] **S8** — panics as control flow (11 `panic!`s in `bplustree.rs`, `std::sync::RwLock`
-  poisoning turns one panic into permanent failure of that page/lock). Recommend doing the
-  `parking_lot` swap *before* Phase 1's testing work, since a poisoned lock from an unrelated
-  panic could cause misleading cross-test failures during fault-injection testing later.
+- [t-green] **T15** — see Phase 5's T11 entry above (verified alongside it; no separate fix
+  needed).
+- [t-green] **S8** — FIXED, three independent parts.
+  **`ArcLock`'s poisoning**: `locks: RwLock<HashMap<...>>` was `std::sync::RwLock`, which
+  poisons permanently on any panic while held — an unrelated bug elsewhere merely holding this
+  lock at the wrong moment would turn every FUTURE `ArcLock::lock`/`cleanup`/`Debug` call across
+  the whole process into a panic too (each one `.unwrap()`s the lock result), taking down every
+  other page's locking along with it. Swapped for `parking_lot::RwLock` (no poisoning; already a
+  dependency), dropping the now-unneeded `.unwrap()`s. Test:
+  `test_arclock_remains_usable_after_a_panic_while_its_internal_lock_was_held` — panics inside a
+  `catch_unwind` while directly holding the internal `locks` field's write lock (same-file
+  access), then confirms `ArcLock::lock` still works afterward. Confirmed meaningful: reliably
+  panics with `PoisonError` before the swap, reliably succeeds after.
+  **`Page`'s poisoning**: `inner`/`lsn` were also `std::sync::RwLock` — several accessors
+  (`has_overflow`, `get_next_page`, `high_key`, etc.) are infallible-looking (return a bare
+  value, not a `Result`) and `.unwrap()` the lock result directly, so an unrelated panic
+  mid-read/write on any ONE page would make that specific page permanently unusable for the rest
+  of the process. Same `parking_lot::RwLock` swap; every `.read()?`/`.write()?`/`.read().unwrap()`
+  call site adjusted (no function signatures changed — several `Result`-returning methods are
+  now vacuously infallible in practice, which is fine). Test:
+  `page_test_remains_usable_after_a_panic_while_its_internal_lock_was_held` — identical shape to
+  `ArcLock`'s, against `Page::inner`. Confirmed meaningful the same way.
+  **`resolve_visible`'s panic on a tuple with no `txn_id`**: every real `insert`/`update`/`remove`
+  always sets one, but a corrupted or hand-crafted on-disk file could easily produce a tuple that
+  doesn't — for an embedded library, a panic on read is a process crash for the host. New
+  `StoreError::Corruption(String)`; `resolve_visible`/`find_last_committed`/`find_visible_to` now
+  return `Result<_, StoreError>` instead of a bare `Visibility`/`Option`, propagated through their
+  four callers (`Db::find`, `update`/`remove`'s `build` closures, `TableCursor`/`RangeCursor` in
+  `cursor.rs`). Test: `test_audit_s8_find_returns_a_typed_error_for_a_tuple_missing_its_txn_id` —
+  writes such a tuple through the real production path (`BPlusTree::insert_at_lsn` directly,
+  bypassing `Db::insert`, the one place that always calls `set_txn_id`), confirms `db.find`
+  returns `Corruption` instead of panicking. Confirmed meaningful: reliably panicked
+  (`"Tuple does NOT have txn!"`) before, reliably returns the typed error after.
+  **`bplustree.rs`'s 12 production `panic!`s** (audit said 11; grew slightly since) on tree-shape
+  invariants — every real write path keeps a page's `INNER_NODE`/`LEAF_NODE` flag in sync with
+  its actual content, but a corrupted or hand-crafted file could easily disagree, and the audit's
+  own framing is specifically that this is reachable that way, not just theoretically. Split into
+  two categories: 7 are genuine content/flag mismatches (`route_to_leaf`, `resolve_index_entry`,
+  `find_page`, `remove_index_entry`, `update_index_entry`, `insert_recursive` ×2 — "expected
+  inner, found leaf", "unknown page" i.e. neither flag set, "inner page has no routing entries")
+  → `StoreError::Corruption`; 4 are internal locking/call-site-discipline assertions, not
+  on-disk-data problems (`insert_recursive`'s "non-root leaf unexpectedly at capacity" and
+  "count == nodes, or too big" ×2, `split_if_needed`'s "trying to split root in the wrong place")
+  → `StoreError::UnknownError`, since calling these "corruption" would misattribute a runtime/
+  concurrency bug to bad data. All 12 already sat inside functions returning `Result`, so every
+  conversion was a same-signature `panic!` → `return Err(...)` swap, no caller changes needed.
+  (The remaining `panic!`s in this file are all inside `#[cfg(test)]`, legitimate test
+  assertions, out of scope.)
+  Test: `test_audit_s8_find_returns_corruption_error_for_an_inner_page_holding_a_leaf_entry`
+  (bplustree.rs) — directly replaces a tree's root page with an `INNER_NODE`-flagged page holding
+  a `Node::Leaf` entry (the `Node` enum is private to this module, so this lives in bplustree.rs's
+  own test module, not db.rs), confirms `find()` returns `Corruption` instead of panicking. This
+  is representative, not exhaustive: the other 6 content/flag-mismatch panics share the identical
+  pattern and were converted the same way, verified via the full suite rather than one red test
+  each; the 4 locking/call-site-invariant panics are currently-unreachable defensive assertions
+  under correct locking discipline (by design) and aren't something a test can force without
+  deliberately breaking the locking code first, so no red test exists for those specifically —
+  they were converted mechanically and the full suite confirms no regression. Confirmed
+  meaningful for the one test that exists: reliably panicked before, reliably returns `Corruption`
+  after.
+  Full `store` suite: 418 passed, 0 failed (414 baseline + these 4 new tests). `squeal-sql --lib`:
+  346 passed, 0 failed (also fixed a non-exhaustive `StoreError` match there, same as
+  `HeaderCorruption` needed in S1). Whole workspace builds clean.
+  Not in scope for this pass (per the audit's own S8 text, a separate finding): `ArcLock`'s
+  hardcoded 60s wait / unhonored timeout parameter (P2/S9), and `retry_on_contention`'s own
+  behavior — this pass only closed the *poisoning* risk, not the timeout-handling one.
 
 ## Test infrastructure (Phase 0, build as needed)
 

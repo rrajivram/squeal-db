@@ -58,6 +58,14 @@ pub(crate) struct TransactionData {
 }
 
 const TXN_GENERATOR_NANE: &str = "__system.transactions";
+// STORE_AUDIT.md T11: a separate named sequence (not reusing
+// TXN_GENERATOR_NANE's own counter) for the ts ordering primitive —
+// see TransactionId::ts's own doc comment for why this exists and what
+// it replaced. Kept as its own Generator entry rather than a bespoke
+// AtomicU64 field so it rides along for free on the exact same
+// persistence path (write_system_tables/load_system_tables, generic
+// over every named generator) the numeric id sequence already uses.
+const TXN_TS_GENERATOR_NAME: &str = "__system.transactions.ts";
 
 #[derive(Debug)]
 pub(crate) struct TransactionManager {
@@ -143,12 +151,35 @@ static TX_COUNTER: AtomicU64 = AtomicU64::new(0);
 impl TransactionManager {
     pub(crate) fn new(gens: Arc<Generator>, last_id: TransactionId) -> Result<Self, StoreError> {
         gens.create_generator(TXN_GENERATOR_NANE, Some(last_id.0.id))?;
+        // STORE_AUDIT.md T11: starts at 1, not 0 — 0 is Default's/for_test's
+        // usual placeholder value elsewhere, and this way a fresh db's very
+        // first ts() is never ambiguous with "never initialized". Reopening
+        // an existing db restores the real persisted value over this via
+        // load_system_tables's generic Generator::set_values (same path
+        // TXN_GENERATOR_NANE's own value takes) — see advance_ts_past for
+        // the additional log-scan-based reconciliation that also runs on
+        // open, closing the gap for anything logged since the last
+        // checkpoint.
+        gens.create_generator(TXN_TS_GENERATOR_NAME, Some(1))?;
         Ok(Self {
             gens,
             active_transactions: RwLock::new(HashSet::new()),
             aborting_transactions: RwLock::new(HashSet::new()),
             transaction_data: RwLock::new(HashMap::new()),
         })
+    }
+
+    // STORE_AUDIT.md T11: reconciles this Db's ts sequence against the
+    // highest ts value Db::process_log observed while scanning the log
+    // (every TransactionId embedded in a redo/undo record or a Commit/
+    // Rollback marker) — called once, during replay. See `TransactionId::
+    // ts`'s own doc comment for why the persisted generator value alone
+    // (restored by load_system_tables, stale as of the last checkpoint)
+    // isn't enough on its own. Never lowers the sequence, only raises it
+    // if the log revealed a higher value than whatever was persisted.
+    pub(crate) fn advance_ts_past(&self, max_seen: u128) -> Result<(), StoreError> {
+        let min_next = max_seen.saturating_add(1).min(u64::MAX as u128) as u64;
+        self.gens.advance_past(TXN_TS_GENERATOR_NAME, min_next)
     }
 
     pub(crate) fn active_count(&self) -> usize {
@@ -181,24 +212,32 @@ impl TransactionManager {
         //      gap where a second transaction beginning in between could
         //      read the same "before I was added" snapshot as the first —
         //      each absent from the other's snapshot.
-        //   2. Even after fixing (1), TransactionId::new() (which stamps
-        //      ts() from timestamp()) used to run BEFORE this lock was
-        //      acquired — so which thread's write-lock acquisition
-        //      actually went first (and therefore whose snapshot saw
-        //      whom) could disagree with which thread's ts() was
-        //      numerically smaller, since OS scheduling can reorder "call
-        //      timestamp()" independently of "acquire the lock". That
-        //      breaks check_write_conflict's fallback `writer.ts() >=
-        //      txn.ts()` test — it needs ts() ordering to always agree
-        //      with snapshot-registration ordering, which is only
-        //      guaranteed if both happen under the same lock.
-        // Stamping ts() here, while holding the write lock, makes both
-        // properties hold by construction: only one thread's
-        // create_transaction body ever runs at a time, so whichever one
-        // acquires the lock first necessarily stamps the smaller ts() too.
+        //   2. Even after fixing (1), stamping ts() used to run BEFORE
+        //      this lock was acquired — so which thread's write-lock
+        //      acquisition actually went first (and therefore whose
+        //      snapshot saw whom) could disagree with which thread's
+        //      ts() was numerically smaller, since OS scheduling can
+        //      reorder "read the ts source" independently of "acquire
+        //      the lock". That breaks check_write_conflict's fallback
+        //      `writer.ts() >= txn.ts()` test — it needs ts() ordering to
+        //      always agree with snapshot-registration ordering, which is
+        //      only guaranteed if both happen under the same lock.
+        // STORE_AUDIT.md T11: minting ts() here via gen_key (a per-Db
+        // logical counter) rather than the old timestamp() (wall-clock)
+        // additionally guarantees ts() itself can never go backward
+        // between two calls, regardless of what the OS clock does — the
+        // ordering bug the two numbered points above describe was about
+        // ts() disagreeing with LOCK ordering; a non-monotonic wall clock
+        // could ALSO make ts() disagree with TRUE chronological order
+        // even with perfect lock discipline. Both are closed the same
+        // way: ts() is now just "the next value of a sequence this exact
+        // critical section hands out one at a time", so it's monotonic
+        // with respect to real time by construction, not by assumption
+        // about the clock.
         let (txn, snapshot) = {
             let mut active = self.active_transactions.write();
-            let txn = TransactionId::new(id);
+            let ts = self.gens.gen_key(TXN_TS_GENERATOR_NAME)? as u128;
+            let txn = TransactionId::new(id, ts);
             let snapshot = active.iter().cloned().collect::<HashSet<_>>();
             active.insert(txn.clone());
             (txn, snapshot)
@@ -332,39 +371,62 @@ impl TransactionManager {
 }
 
 impl TransactionId {
-    pub fn new(id: u64) -> Self {
-        Self(Arc::new(TransactionInner {
-            id,
-            ts: timestamp(),
-        }))
+    // STORE_AUDIT.md T11: takes `ts` explicitly rather than minting it
+    // internally (it used to call `timestamp()` here) — the one real
+    // caller, TransactionManager::create_transaction, must mint it from
+    // its own per-Db logical sequence, under the exact lock that also
+    // orders snapshot registration (see that method's own comment for
+    // why). Every OTHER caller of this type (Default, From<u64>, tests)
+    // has no such sequence to draw from and isn't part of the real
+    // ordering-sensitive path, so they keep using `timestamp()` as a
+    // placeholder — fine for identity/uniqueness purposes, just never
+    // used for the isolation/conflict-detection ordering `ts()` backs.
+    pub fn new(id: u64, ts: u128) -> Self {
+        Self(Arc::new(TransactionInner { id, ts }))
     }
 
     // Test-only: builds a TransactionId with an explicit, caller-chosen
-    // `ts` instead of a fresh `timestamp()` call — needed to deterministically
-    // construct two distinct transactions with a colliding `ts` (real
-    // wall-clock collisions are rare and impossible to force from outside
-    // this module, since TransactionInner's fields are private to it).
-    // Used by db.rs's own tests to pin down check_write_conflict's
-    // tie-breaking behavior.
+    // `ts` — needed to deterministically construct two distinct
+    // transactions with a colliding (or specifically ordered) `ts` for
+    // testing check_write_conflict/find_visible_to's own comparison
+    // logic in isolation. Identical to `new` now that `new` also takes an
+    // explicit `ts` (STORE_AUDIT.md T11) — kept as a separate, `#[cfg(test)]`
+    // name since callers reach for it specifically to signal "this is a
+    // synthetic id built to pin down comparison logic, not a real
+    // transaction", not because the implementation differs.
     #[cfg(test)]
     pub(crate) fn for_test(id: u64, ts: u128) -> Self {
         Self(Arc::new(TransactionInner { id, ts }))
     }
 
-    /// The transaction's creation timestamp — used to order two
-    /// transactions by which began first. Deliberately `ts`, not the
-    /// numeric `id`: the id generator's persisted sequence isn't guaranteed
-    /// to have caught up to the true high-water mark right after a reopen
-    /// (it's only refreshed at checkpoint/close/table-creation, not on
-    /// every transaction), so comparing raw ids across a reopen boundary
-    /// can be wrong — confirmed via replay tests failing when
-    /// snapshot-isolation visibility first used raw_id() ordering instead
-    /// of this. `ts` has no such dependency: it's real wall-clock time
-    /// (`timestamp()`, at construction), so a transaction from a prior
-    /// session is always chronologically before any transaction in a later
-    /// one, regardless of what the id generator happens to resume from.
-    /// Used by `Db::find_visible_to` to determine whether a writer began
-    /// before or after a given reader.
+    /// The transaction's ordering primitive — used to decide which of two
+    /// transactions began first (`check_write_conflict`'s `writer.ts() >=
+    /// txn.ts()`, `find_visible_to`'s `txn.ts() < reader_ts`).
+    ///
+    /// STORE_AUDIT.md T11: this used to be real wall-clock time
+    /// (`SystemTime::now()`, at construction). `SystemTime` is not
+    /// monotonic — an NTP step, VM migration pause, or manual clock change
+    /// can make it run backward — which could make a transaction that
+    /// truly began LATER get a SMALLER `ts()` than one that began earlier,
+    /// silently breaking both checks above (a reader could see a writer's
+    /// row that hadn't logically happened yet from the reader's own
+    /// perspective, or a write conflict could go undetected). Replaced
+    /// with a per-Db logical counter (`TransactionManager::
+    /// create_transaction` mints it via `Generator::gen_key` on a
+    /// dedicated sequence) — monotonic by construction, immune to
+    /// anything the OS clock does. Deliberately still not the numeric
+    /// `id`: the id generator's own persisted sequence isn't guaranteed to
+    /// have caught up to the true high-water mark right after a reopen
+    /// (only refreshed at checkpoint/close/table-creation, not on every
+    /// transaction), so comparing raw ids across a reopen boundary can be
+    /// wrong. `ts`'s own sequence has the same staleness risk on its
+    /// persisted value alone, which is why `Db::process_log` additionally
+    /// reconciles it against every ts seen while replaying the log (see
+    /// `TransactionManager::advance_ts_past`) — together, "persisted value
+    /// as of the last checkpoint" and "everything logged since" span the
+    /// full history, so a transaction from a prior session is always
+    /// ordered before any transaction in a later one, regardless of what
+    /// either generator happens to resume from.
     pub(crate) fn ts(&self) -> u128 {
         self.0.ts
     }
@@ -553,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_txn_new_sets_id() {
-        let t = TransactionId::new(5);
+        let t = TransactionId::new(5, 1);
         assert_eq!(t.0.id, 5);
     }
 
@@ -607,6 +669,41 @@ mod tests {
     fn test_txn_from_u64_sets_id() {
         let t = TransactionId::from(77u64);
         assert_eq!(t.0.id, 77);
+    }
+
+    // STORE_AUDIT.md T11: ts() is the ordering primitive check_write_conflict
+    // and find_visible_to use to decide which of two transactions began
+    // first. Before this fix it was minted from SystemTime::now() — not
+    // monotonic (NTP steps, VM migration, manual changes), so two
+    // transactions created in true chronological order could still get
+    // ts() values in the WRONG order, silently breaking both checks. A
+    // real backward clock step can't be safely or portably forced inside
+    // a unit test (there's no clock-injection seam, and actually moving
+    // the OS clock would be flaky and would affect the whole test
+    // process) — but the underlying defect is directly, deterministically
+    // observable without one: consecutive REAL ts() values minted via
+    // create_transaction must differ by exactly 1 once they come from a
+    // per-Db logical counter. A wall-clock source can never guarantee
+    // that (the gap between two SystemTime::now() calls is whatever the
+    // OS clock and surrounding code happen to take — routinely thousands
+    // of nanoseconds, never reliably exactly 1), so this is a direct,
+    // reliable proxy for "still wall-clock-derived" vs. "a true logical
+    // sequence" — and incidentally proves monotonicity is now guaranteed
+    // by construction (a counter can't go backward) rather than by
+    // assumption about the OS clock.
+    #[test]
+    fn test_successive_transaction_timestamps_are_a_monotonic_counter_not_wall_clock_deltas() {
+        let mgr = make_mgr();
+        let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        let t3 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
+        assert_eq!(
+            t2.ts(),
+            t1.ts() + 1,
+            "ts() must advance by exactly one logical tick per transaction, not by an \
+             arbitrary wall-clock delta"
+        );
+        assert_eq!(t3.ts(), t2.ts() + 1);
     }
 
     // --- Transaction guard tests ---

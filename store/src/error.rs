@@ -129,6 +129,15 @@ pub enum StoreError {
     // refused up front with a clear cause.
     #[error("Header corruption: {0}")]
     HeaderCorruption(String),
+    // STORE_AUDIT.md S8: a structural invariant a well-formed tuple/page
+    // must uphold turned out false — e.g. a tuple with no txn_id, which
+    // every real insert/update/remove always sets. Every real writer
+    // guarantees this, but a corrupted or hand-crafted on-disk file
+    // easily could not; for an embedded library a panic on read is a
+    // process crash for the host, so this is surfaced as a typed error
+    // instead.
+    #[error("Data corruption: {0}")]
+    Corruption(String),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

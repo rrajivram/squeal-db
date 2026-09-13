@@ -3,10 +3,11 @@
  * if HAS_Overflow is set, next_page will point to continuation. This contunation logic is fully handled by PageBuffer
  */
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicBool, AtomicU16},
 };
 
+use parking_lot::RwLock;
 use portable_atomic::AtomicU128;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
@@ -364,7 +365,7 @@ impl Page {
             page_data_size: self.page_data_size,
             page_used_size: inner.page_used_size,
             record_size: self.record_size,
-            lsn: *self.lsn.read().unwrap(),
+            lsn: *self.lsn.read(),
             flags,
             high_key: inner.high_key.clone(),
             content_kind: self.content_kind,
@@ -379,7 +380,7 @@ impl Page {
     }
 
     pub(crate) fn header(&self) -> PageHeader {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         self.header_from_inner(&inner)
     }
 
@@ -388,7 +389,7 @@ impl Page {
     }
 
     pub(crate) fn lsn_id(&self) -> Result<LsnId, StoreError> {
-        Ok(*self.lsn.read()?)
+        Ok(*self.lsn.read())
     }
 
     pub(crate) fn is_pinned(&self) -> bool {
@@ -400,15 +401,15 @@ impl Page {
     }
 
     pub(crate) fn has_overflow(&self) -> bool {
-        self.inner.read().unwrap().has_overflow
+        self.inner.read().has_overflow
     }
 
     pub(crate) fn set_overflow(&self, of: bool) {
-        self.inner.write().unwrap().has_overflow = of;
+        self.inner.write().has_overflow = of;
     }
 
     pub(crate) fn get_next_page(&self) -> PageId {
-        PageId(self.inner.read().unwrap().next_page)
+        PageId(self.inner.read().next_page)
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -416,7 +417,7 @@ impl Page {
     }
 
     pub(crate) fn set_next_page(&self, next_page: PageId) -> Result<(), StoreError> {
-        self.inner.write().unwrap().next_page = next_page.0;
+        self.inner.write().next_page = next_page.0;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -424,11 +425,11 @@ impl Page {
     // B-link tree high key — see PageHeader's own comment. `None` means
     // unbounded.
     pub(crate) fn high_key(&self) -> Option<DBIdType> {
-        self.inner.read().unwrap().high_key.clone()
+        self.inner.read().high_key.clone()
     }
 
     pub(crate) fn set_high_key(&self, high_key: Option<DBIdType>) -> Result<(), StoreError> {
-        self.inner.write().unwrap().high_key = high_key;
+        self.inner.write().high_key = high_key;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -453,7 +454,7 @@ impl Page {
                 // meantime, that stale write then clobbers the new occupant on
                 // the shutdown flush. Stamp low so a cold-dirtied page is written
                 // promptly instead of forever-deferred.
-                *self.lsn.write()? = if w.0 == u64::MAX { LsnId(0) } else { w };
+                *self.lsn.write() = if w.0 == u64::MAX { LsnId(0) } else { w };
             }
         }
         Ok(())
@@ -487,7 +488,7 @@ impl Page {
     // must end up stamped with the HIGHEST lsn of anything it currently
     // holds, never a lower one that would let it flush too early.
     pub(crate) fn stamp_lsn_at_least(&self, lsn: LsnId) -> Result<(), StoreError> {
-        let mut current = self.lsn.write()?;
+        let mut current = self.lsn.write();
         if lsn.0 > current.0 {
             *current = lsn;
         }
@@ -503,7 +504,7 @@ impl Page {
 
     pub(crate) fn clear(&self) -> Result<(), StoreError> {
         {
-            let mut inner = self.inner.write()?;
+            let mut inner = self.inner.write();
             inner.data.clear()?;
             inner.page_used_size = 0;
         }
@@ -516,7 +517,6 @@ impl Page {
             data: self
                 .inner
                 .read()
-                .unwrap()
                 .data
                 .values()
                 .unwrap_or_default()
@@ -549,7 +549,7 @@ impl Page {
         // chain. This keeps overflow off the common path: ordinary pages fill to
         // capacity and link to the next data page instead of every near-full
         // page spilling into (and rewriting) an overflow chain on each write.
-        let used = self.inner.read().unwrap().page_used_size;
+        let used = self.inner.read().page_used_size;
         used == 0 || used + tuple.size() <= self.usable_data_size()
     }
 
@@ -581,7 +581,7 @@ impl Page {
         }
         let sz = tuple.size();
         {
-            let mut inner = self.inner.write()?;
+            let mut inner = self.inner.write();
             inner.data.add(tuple)?;
             inner.page_used_size += sz;
         }
@@ -591,7 +591,7 @@ impl Page {
 
     pub(crate) fn remove_tuple(&self, id: DBIdType) -> Result<Tuple, StoreError> {
         let old = {
-            let mut inner = self.inner.write()?;
+            let mut inner = self.inner.write();
             let old = inner.data.remove(id)?;
             // checked_sub: an underflow here would wrap page_used_size to
             // ~u64::MAX, which then drives handle_large_page_size to allocate
@@ -617,7 +617,7 @@ impl Page {
     pub(crate) fn replace_tuple(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         let new_size = tuple.size();
         let old = {
-            let mut inner = self.inner.write()?;
+            let mut inner = self.inner.write();
             let old = inner.data.replace(id, tuple)?;
             let old_size = old.size();
             inner.page_used_size = inner.page_used_size.checked_sub(old_size).ok_or_else(|| {
@@ -634,7 +634,7 @@ impl Page {
     }
 
     pub(crate) fn count(&self) -> Result<usize, StoreError> {
-        self.inner.read()?.data.count()
+        self.inner.read().data.count()
     }
 
     pub(crate) fn written(&self) {
@@ -651,11 +651,11 @@ impl Page {
     }
 
     pub(crate) fn contains(&self, id: DBIdType) -> Result<bool, StoreError> {
-        self.inner.read()?.data.contains(&id)
+        self.inner.read().data.contains(&id)
     }
 
     pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
-        self.inner.read()?.data.get(&id)
+        self.inner.read().data.get(&id)
     }
 
     // The one atomic read anything that needs *both* a header and the raw
@@ -668,7 +668,7 @@ impl Page {
     // write_page act on a header from one moment and data from another.
     // One lock acquisition here closes that the rest of the way.
     pub(crate) fn to_bytes_snapshot(&self) -> (PageHeader, Vec<u8>) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         let mut header = self.header_from_inner(&inner);
         let mut data = inner.data.to_bytes().unwrap_or_default();
         if data.len() < self.page_data_size as usize {
@@ -886,7 +886,7 @@ impl From<Page> for PageDto {
         // into_inner(), not read(): value is owned here, so there's no other
         // referent that could still hold the lock — this is a plain field
         // access, not a real lock acquisition.
-        let inner = value.inner.into_inner().unwrap();
+        let inner = value.inner.into_inner();
         // Recombine has_overflow (from `inner`) with the other, still-atomic
         // flag bits into the one on-disk `u16` — the inverse of from_bytes/
         // From<PageDto>'s split.
@@ -902,7 +902,7 @@ impl From<Page> for PageDto {
             page_data_size: value.page_data_size,
             page_used_size: inner.page_used_size,
             record_size: value.record_size,
-            lsn: *value.lsn.read().unwrap(),
+            lsn: *value.lsn.read(),
             flags,
             high_key: inner.high_key,
             content_kind: value.content_kind,
@@ -921,7 +921,7 @@ impl Clone for Page {
         // Ordinary in-place mutation of an already-shared Arc<Page> goes
         // through add_tuple/remove_tuple/replace_tuple's own locking instead
         // of this Clone impl — see their own comments.
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read();
         Self {
             inner: RwLock::new(PageInner {
                 data: inner.data.deep_clone(),
@@ -935,7 +935,7 @@ impl Clone for Page {
             record_size: self.record_size,
             content_kind: self.content_kind,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
-            lsn: RwLock::new(*self.lsn.read().unwrap()),
+            lsn: RwLock::new(*self.lsn.read()),
             lsn_clock: self.lsn_clock.clone(),
             accessed: AtomicU128::new(self.accessed.load(std::sync::atomic::Ordering::Relaxed)),
             written: AtomicU128::new(self.written.load(std::sync::atomic::Ordering::Relaxed)),
@@ -946,8 +946,8 @@ impl Clone for Page {
 
 impl PartialEq for Page {
     fn eq(&self, rhs: &Self) -> bool {
-        let inner = self.inner.read().unwrap();
-        let rhs_inner = rhs.inner.read().unwrap();
+        let inner = self.inner.read();
+        let rhs_inner = rhs.inner.read();
         inner.page_used_size == rhs_inner.page_used_size
             && inner.has_overflow == rhs_inner.has_overflow
             && inner.next_page == rhs_inner.next_page
@@ -1035,6 +1035,30 @@ mod tests {
         ));
         assert!(p.is_dirty());
         assert!(p.can_store(&Tuple::new(3, b"abcd")));
+    }
+
+    // STORE_AUDIT.md S8: `Page::inner`/`lsn` used to be std::sync::RwLock,
+    // which poisons permanently on any panic while held. Many accessors
+    // (has_overflow, get_next_page, high_key, etc.) are infallible-looking
+    // (return a bare value, not a Result) and `.unwrap()` the lock result
+    // directly — so ANY unrelated panic on ANY thread that happened to be
+    // mid-read/write on THIS one page's lock would turn that single page
+    // permanently unusable (every future accessor call on it panics too),
+    // for the rest of the process, with no way to recover it. Reproduced
+    // directly against the internal `inner` field (same-file access)
+    // rather than trying to engineer a panic inside Page's own methods.
+    #[test]
+    fn page_test_remains_usable_after_a_panic_while_its_internal_lock_was_held() {
+        let p = Page::new_data(2000);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = p.inner.write();
+            panic!("simulated bug elsewhere, unrelated to Page itself");
+        }));
+        assert!(result.is_err(), "sanity: the panic above must actually unwind");
+
+        // With a poisoning std::sync::RwLock, this would itself panic (on
+        // the .unwrap() inside has_overflow) instead of returning normally.
+        let _ = p.has_overflow();
     }
 
     #[test]

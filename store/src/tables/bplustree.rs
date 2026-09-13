@@ -876,7 +876,16 @@ where
                         matched_child = Some(page_num);
                         break;
                     } else {
-                        panic!("Expected Inner. Found leaf ! {:?}", row.id);
+                        // STORE_AUDIT.md S8: this page's own INNER_NODE
+                        // flag disagrees with this entry's actual content
+                        // — every real write path keeps these in sync, so
+                        // this can only mean a corrupted or hand-crafted
+                        // on-disk file. A panic here would be a process
+                        // crash for the host; surface it as a typed error.
+                        return Err(StoreError::Corruption(format!(
+                            "expected an inner routing entry, found a leaf entry at {:?}",
+                            row.id
+                        )));
                     }
                 }
                 let node = from_bytes::<Node>(&row.data)?;
@@ -953,7 +962,14 @@ where
     pub(crate) fn resolve_index_entry(&self, entry: &Tuple) -> Result<Option<Tuple>, StoreError> {
         match from_bytes::<Node>(&entry.data)? {
             Node::Leaf(data_page_id) => self.buffer.get_page(data_page_id)?.get(entry.id.clone()),
-            Node::Inner(_) => panic!("Expected leaf entry, found inner! {:?}", entry.id),
+            // STORE_AUDIT.md S8: see route_to_leaf's identical comment —
+            // a leaf page holding an inner routing entry instead of a
+            // real leaf pointer is corrupted on-disk data, not a
+            // reachable outcome of any real write path.
+            Node::Inner(_) => Err(StoreError::Corruption(format!(
+                "expected a leaf entry, found an inner routing entry at {:?}",
+                entry.id
+            ))),
         }
     }
 
@@ -965,9 +981,13 @@ where
                 let id = from_bytes::<Node>(&t.data);
                 match id {
                     Ok(Node::Leaf(page_id)) => Some(Ok(page_id)),
-                    Ok(Node::Inner(_)) => {
-                        panic!("Expected leaf, found inner! {:?}", t.id)
-                    }
+                    // STORE_AUDIT.md S8: see route_to_leaf's identical
+                    // comment on why this is corrupted data, not a
+                    // reachable outcome of any real write path.
+                    Ok(Node::Inner(_)) => Some(Err(StoreError::Corruption(format!(
+                        "expected a leaf entry, found an inner routing entry at {:?}",
+                        t.id
+                    )))),
                     Err(e) => Some(Err(StoreError::from(e))),
                 }
             })
@@ -996,7 +1016,12 @@ where
                     if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
                         return self.remove_index_entry(id, page_num, Some(handle));
                     } else {
-                        panic!("Expected Inner. Found leaf! {:?}", row.id);
+                        // STORE_AUDIT.md S8: see route_to_leaf's identical
+                        // comment.
+                        return Err(StoreError::Corruption(format!(
+                            "expected an inner routing entry, found a leaf entry at {:?}",
+                            row.id
+                        )));
                     }
                 }
                 if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
@@ -1055,7 +1080,12 @@ where
                             lsn,
                         );
                     } else {
-                        panic!("Expected Inner. Found leaf! {:?}", row.id);
+                        // STORE_AUDIT.md S8: see route_to_leaf's identical
+                        // comment.
+                        return Err(StoreError::Corruption(format!(
+                            "expected an inner routing entry, found a leaf entry at {:?}",
+                            row.id
+                        )));
                     }
                 }
                 if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
@@ -1127,12 +1157,19 @@ where
                 // (every non-root descent holds this page's lock
                 // continuously from its own capacity check) has been
                 // broken somewhere new.
-                panic!(
+                // STORE_AUDIT.md S8: an internal locking-discipline
+                // invariant, not corrupted on-disk data — if it ever
+                // fires it's a real bug elsewhere in this file, not
+                // something a caller can recover from by retrying. Still
+                // surfaced as a typed error rather than a panic: for an
+                // embedded library, a panic here is a process crash for
+                // the host regardless of the root cause.
+                return Err(StoreError::UnknownError(format!(
                     "non-root leaf {:?} unexpectedly at capacity on arrival — the \
                      continuous-lock invariant split_if_needed relies on must have \
                      been violated",
                     start
-                );
+                )));
             } else if handle.page.count()? < self.table.nodes_per_page
                 && handle.page.can_store(&tuple)
             {
@@ -1151,22 +1188,33 @@ where
                 if tuple.size() as usize > max {
                     Err(StoreError::TupleTooLarge(tuple.size(), max))
                 } else {
-                    panic!(
+                    // STORE_AUDIT.md S8: an internal invariant (this leaf
+                    // should have matched one of the branches above), not
+                    // corrupted on-disk data — see the non-root-leaf-at-
+                    // capacity comment above for the same reasoning.
+                    Err(StoreError::UnknownError(format!(
                         "count == nodes {}, or too big {}",
-                        handle.page.count().unwrap(),
+                        handle.page.count()?,
                         tuple.size()
-                    );
+                    )))
                 }
             } else {
-                panic!(
+                Err(StoreError::UnknownError(format!(
                     "count == nodes {}, or too big {}",
-                    handle.page.count().unwrap(),
+                    handle.page.count()?,
                     tuple.size()
-                );
+                )))
             }
         } else if handle.page.is_flag_set(INNER_NODE) {
             if handle.page.count()? == 0 {
-                panic!("Inner Page cannot be empty {:?}", handle.page_num);
+                // STORE_AUDIT.md S8: an INNER_NODE page is never created
+                // empty by any real write path (see this comment's
+                // original wording) — a corrupted or hand-crafted
+                // on-disk file could easily produce one.
+                return Err(StoreError::Corruption(format!(
+                    "inner page {:?} has no routing entries",
+                    handle.page_num
+                )));
             }
             // If this node is already at capacity, a child split would need to
             // add a separator here — but there's no room. Return early so the
@@ -1261,10 +1309,23 @@ where
                     }
                 }
             } else {
-                panic!("Expected inner - found leaf : {:?}", start);
+                // STORE_AUDIT.md S8: see route_to_leaf's identical
+                // comment — this node's own governing routing entry
+                // disagrees with its INNER_NODE flag.
+                Err(StoreError::Corruption(format!(
+                    "expected an inner routing entry, found a leaf entry at {:?}",
+                    start
+                )))
             }
         } else {
-            panic!("Unknown page {:?}", start);
+            // STORE_AUDIT.md S8: a page flagged neither LEAF_NODE nor
+            // INNER_NODE — every real write path sets exactly one of the
+            // two (see BPlusTree::new/split_root_page/etc.), so this can
+            // only mean a corrupted or hand-crafted on-disk file.
+            Err(StoreError::Corruption(format!(
+                "page {:?} is flagged neither a leaf nor an inner node",
+                start
+            )))
         }
     }
 
@@ -1277,7 +1338,16 @@ where
         let handle = self.buffer.get_page_mut(page_id)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
-                panic!("Trying to split root in the wrong place");
+                // STORE_AUDIT.md S8: a caller-discipline invariant (the
+                // root is always split via split_root_page, from
+                // insert_recursive, before ever reaching here) — not
+                // corrupted on-disk data. See the non-root-leaf-at-
+                // capacity comment in insert_recursive for the same
+                // reasoning on why this is still a typed error, not a
+                // panic.
+                Err(StoreError::UnknownError(
+                    "Trying to split root in the wrong place".into(),
+                ))
             } else {
                 let (separator, sibling) = self.split_non_root_page(handle, &tuple.id, lsn)?;
                 Ok(SplitOutcome::Split(separator, sibling))
@@ -1651,7 +1721,7 @@ mod tests {
 
     fn make_txn_mgr() -> Arc<TransactionManager> {
         let generator = Arc::new(Generator::new());
-        TransactionManager::new(generator, TransactionId::new(0))
+        TransactionManager::new(generator, TransactionId::new(0, 1))
             .unwrap()
             .into()
     }
@@ -1680,7 +1750,7 @@ mod tests {
     }
 
     fn txn() -> TransactionId {
-        TransactionId::new(1)
+        TransactionId::new(1, 1)
     }
 
     // update()/remove() log an undo record keyed off the *stored* tuple's own
@@ -2458,7 +2528,7 @@ mod tests {
         for iteration in 0..ITERATIONS {
             let tree = make_tree(BIG);
             for i in 0..PREPOPULATE {
-                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i))
+                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i, 1))
                     .unwrap();
             }
             let tree = Arc::new(tree);
@@ -2477,7 +2547,7 @@ mod tests {
                         barrier.wait();
                         tree.insert(
                             Tuple::new(id, format!("v{id}").as_bytes()),
-                            TransactionId::new(id),
+                            TransactionId::new(id, 1),
                         )
                     })
                 })
@@ -2688,7 +2758,7 @@ mod tests {
         for i in 0u64..400 {
             tree.insert(
                 Tuple::new(i, format!("v{i}").as_bytes()),
-                TransactionId::new(i),
+                TransactionId::new(i, 1),
             )
             .unwrap();
         }
@@ -2910,5 +2980,48 @@ mod tests {
             }
             other => panic!("expected TupleTooLarge, got {other:?}"),
         }
+    }
+
+    // STORE_AUDIT.md S8: route_to_leaf/find_page/resolve_index_entry/
+    // remove_index_entry/update_index_entry/insert_recursive all panic
+    // when a page's own INNER_NODE/LEAF_NODE flag disagrees with what an
+    // entry (or the page itself) actually contains — e.g. an INNER_NODE
+    // page holding a Node::Leaf entry where a Node::Inner routing pointer
+    // was expected. Every real write path keeps these in sync by
+    // construction, but a corrupted or hand-crafted on-disk file could
+    // easily disagree, and for an embedded library a panic there is a
+    // process crash for the host. Reproduces one representative case
+    // (route_to_leaf, reached via the public find()) by directly replacing
+    // the root page's content with exactly that mismatch — the other
+    // panics in this file share the identical pattern (flag says one
+    // node type, content says another) and were converted the same way,
+    // verified by the full suite rather than one red test each.
+    #[test]
+    fn test_audit_s8_find_returns_corruption_error_for_an_inner_page_holding_a_leaf_entry() {
+        let page_size = 4096;
+        let tree = make_tree(page_size);
+
+        let mut corrupt_root = Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize);
+        corrupt_root.set_clock(tree.buffer.clock());
+        corrupt_root.set_page_flags(INNER_NODE).unwrap();
+        corrupt_root
+            .add_tuple(Tuple::new_with(
+                DBIdType::Int(100),
+                &postcard::to_allocvec(&Node::Leaf(tree.table.first_data_page)).unwrap(),
+                None,
+                None,
+            ))
+            .unwrap();
+        let mut handle = tree.buffer.get_page_mut(tree.table.first_index_page).unwrap();
+        handle.page = Arc::new(corrupt_root);
+        tree.buffer.write_locked_page(handle).unwrap();
+
+        // 1 < 100, so find() routes into the corrupt entry expecting
+        // Node::Inner and finds Node::Leaf instead.
+        let result = tree.find(DBIdType::Int(1));
+        assert!(
+            matches!(result, Err(StoreError::Corruption(_))),
+            "expected StoreError::Corruption, got {result:?}"
+        );
     }
 }

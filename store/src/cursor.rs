@@ -224,7 +224,7 @@ where
                     let Some(tuple) = table.resolve_index_entry(&entry)? else {
                         continue;
                     };
-                    match self.db.find_visible_to(&tuple, &reader) {
+                    match self.db.find_visible_to(&tuple, &reader)? {
                         Some(committed) if !committed.is_tombstoned() => {
                             return Ok(Some(committed.into_owned()));
                         }
@@ -271,7 +271,7 @@ where
         let reader = self.transaction.id();
         loop {
             match self.next_tuple()? {
-                Some(t) => match self.db.find_visible_to(&t, &reader) {
+                Some(t) => match self.db.find_visible_to(&t, &reader)? {
                     Some(committed) if !committed.is_tombstoned() => {
                         return Ok(Some(committed.into_owned()));
                     }

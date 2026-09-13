@@ -39,6 +39,26 @@ impl Generator {
         Ok(())
     }
 
+    // STORE_AUDIT.md T11: raises a named generator's stored value to at
+    // least `min_value`, never lowering it — used to reconcile an
+    // in-memory sequence against a value recovered by scanning the log,
+    // which can be higher than whatever was last persisted (generators
+    // are only flushed to disk at checkpoint/close/table-creation, not on
+    // every mint).
+    pub(crate) fn advance_past<S: AsRef<str>>(
+        &self,
+        name: S,
+        min_value: DBSizeType,
+    ) -> Result<(), StoreError> {
+        let name = name.as_ref().to_string();
+        self.gens
+            .read()?
+            .get(&name)
+            .ok_or(StoreError::MissingKey(name))?
+            .fetch_max(min_value, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
     pub fn gen_key<S: AsRef<str>>(&self, name: S) -> Result<DBSizeType, StoreError> {
         let name = name.as_ref().to_string();
         Ok(self
@@ -134,5 +154,31 @@ mod tests {
         assert_eq!(a, 100);
         let a = g.gen_key("test2").unwrap();
         assert_eq!(a, 500);
+    }
+
+    #[test]
+    fn test_advance_past_raises_the_value_when_min_value_is_higher() {
+        let g = Generator::new();
+        g.create_generator("test", Some(5)).unwrap();
+        g.advance_past("test", 100).unwrap();
+        assert_eq!(g.gen_key("test").unwrap(), 100);
+    }
+
+    #[test]
+    fn test_advance_past_never_lowers_the_value() {
+        let g = Generator::new();
+        g.create_generator("test", Some(100)).unwrap();
+        g.advance_past("test", 5).unwrap();
+        assert_eq!(
+            g.gen_key("test").unwrap(),
+            100,
+            "advance_past must never lower an already-higher value"
+        );
+    }
+
+    #[test]
+    fn test_advance_past_missing_name_is_an_error() {
+        let g = Generator::new();
+        assert!(g.advance_past("nope", 1).is_err());
     }
 }

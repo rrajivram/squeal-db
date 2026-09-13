@@ -116,6 +116,7 @@ impl From<StoreError> for SchemaError {
             | StoreError::LogHeaderMismatch(_)
             | StoreError::LogCorruption(_)
             | StoreError::HeaderCorruption(_)
+            | StoreError::Corruption(_)
             | StoreError::LockContentionError => Self::InternalError(value),
             // Not internal — "this value is too big to fit in its
             // declared size" (a VARCHAR/BLOB literal longer than the
