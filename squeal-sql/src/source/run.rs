@@ -39,10 +39,10 @@ where
         // like TableSource's real-table case, since a temp table has no
         // ALTER TABLE, so there's only ever one schema version to decode
         // against.
-        Ok(self
-            .cursor
+        self.cursor
             .next()?
-            .map(|tuple| IndexKey::from_bytes(tuple.data())))
+            .map(|tuple| Ok(IndexKey::from_bytes(tuple.data())?))
+            .transpose()
     }
 
     fn fields(&self) -> Arc<[ProjectableField]> {

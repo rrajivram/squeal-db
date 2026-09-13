@@ -194,7 +194,7 @@ impl<'de> Visitor<'de> for VersionedRowVisitor {
             .ok_or_else(|| de::Error::invalid_length(1, &self))?;
         Ok(VersionedRow {
             version,
-            values: IndexKey::from_bytes(&bytes),
+            values: IndexKey::from_bytes(&bytes).map_err(de::Error::custom)?,
         })
     }
 }

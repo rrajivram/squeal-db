@@ -112,6 +112,7 @@ impl From<StoreError> for SchemaError {
             | StoreError::InvalidPageMagic(_)
             | StoreError::PageChecksumMismatch(_)
             | StoreError::RunPageIndexOutOfRange(_, _)
+            | StoreError::TruncatedValueItem(_)
             | StoreError::LockContentionError => Self::InternalError(value),
             // Not internal — "this value is too big to fit in its
             // declared size" (a VARCHAR/BLOB literal longer than the
@@ -131,6 +132,7 @@ impl From<StoreError> for SchemaError {
             StoreError::TransactionAlreadyFinished => Self::TransactionAlreadyFinished,
             StoreError::TableNameInvalid(_, _)
             | StoreError::TableNotFound(_)
+            | StoreError::ReservedTableName(_)
             | StoreError::DuplicateName(_) => Self::BadTableName(value.to_string()),
         }
     }

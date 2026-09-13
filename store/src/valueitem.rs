@@ -103,8 +103,19 @@ impl IndexKey {
         bytes
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let count = u64::from_le_bytes(bytes[0..size_of::<u64>()].try_into().unwrap()) as usize;
+    // STORE_AUDIT.md S3: bounds-checked instead of a raw slice index /
+    // `try_into().unwrap()` on the leading count prefix — this hand-rolled
+    // format decodes bytes read straight off disk, so truncated/malformed
+    // input must surface as an `Err`, not a panic.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        let count_bytes = bytes.get(0..size_of::<u64>()).ok_or_else(|| {
+            StoreError::TruncatedValueItem(format!(
+                "need {} byte(s) for the field-count prefix, buffer is {} byte(s)",
+                size_of::<u64>(),
+                bytes.len()
+            ))
+        })?;
+        let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
         let mut index = size_of::<u64>();
         let mut data = vec![];
         for _ in 0..count {
@@ -112,12 +123,23 @@ impl IndexKey {
             // it was handed (bytes[index..]), not absolute — it must be
             // added to the running offset, not replace it, or every field
             // after the first is read starting mid-way through the
-            // previous one instead of where it actually begins.
-            let (v, i) = ValueItem::from_bytes_many(&bytes[index..]);
-            index += i;
+            // previous one instead of where it actually begins. `index` is
+            // fetched via `get` (not a raw `bytes[index..]` slice), since a
+            // prior field's declared-but-truncated length can otherwise
+            // push it clean past `bytes.len()`, which would itself panic
+            // (slice start index out of range) before from_bytes_many ever
+            // gets a chance to report it as an ordinary Err.
+            let rest = bytes.get(index..).ok_or_else(|| {
+                StoreError::TruncatedValueItem(format!(
+                    "offset {index} past end of buffer ({} byte(s))",
+                    bytes.len()
+                ))
+            })?;
+            let (v, i) = ValueItem::from_bytes_many(rest)?;
+            index = index.saturating_add(i);
             data.push(v);
         }
-        Self::new_from(&data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap())
+        Ok(Self::new_from(&data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap()))
     }
 
     /// Combines each field's own hash with an FNV-1a-style XOR+multiply
@@ -304,66 +326,82 @@ impl ValueItem {
         }
     }
 
-    pub(super) fn from_bytes_single(bytes: &[u8]) -> ValueItem {
-        Self::from_bytes_many(bytes).0
+    pub(super) fn from_bytes_single(bytes: &[u8]) -> Result<ValueItem, StoreError> {
+        Self::from_bytes_many(bytes).map(|(v, _)| v)
     }
 
-    pub(super) fn from_bytes_many(bytes: &[u8]) -> (ValueItem, usize) {
+    // STORE_AUDIT.md S3: every extraction below is bounds-checked (`take`)
+    // instead of a raw slice index / `try_into().unwrap()` — this hand-
+    // rolled format decodes bytes read straight off disk, so a truncated
+    // or corrupted buffer must surface as an `Err`, not a panic (which,
+    // per S8, would poison the page lock this runs under on the hot read
+    // path).
+    pub(super) fn from_bytes_many(bytes: &[u8]) -> Result<(ValueItem, usize), StoreError> {
+        fn take<'a>(bytes: &'a [u8], index: usize, len: usize) -> Result<&'a [u8], StoreError> {
+            let end = index.checked_add(len).ok_or_else(|| {
+                StoreError::TruncatedValueItem(format!("offset {index} + {len} overflows"))
+            })?;
+            bytes.get(index..end).ok_or_else(|| {
+                StoreError::TruncatedValueItem(format!(
+                    "need {len} byte(s) at offset {index}, buffer is {} byte(s)",
+                    bytes.len()
+                ))
+            })
+        }
         let mut index = 0usize;
-        let vtype = bytes[index];
+        let vtype = *bytes
+            .first()
+            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
         index += 1;
         let val = match vtype {
             0 => ValueItem::Null,
             5 => {
-                let v =
-                    i64::from_le_bytes(bytes[index..index + size_of::<i64>()].try_into().unwrap());
+                let v = i64::from_le_bytes(take(bytes, index, size_of::<i64>())?.try_into().unwrap());
                 index += size_of::<i64>();
                 ValueItem::Integer(v)
             }
             10 => {
-                let v =
-                    f64::from_le_bytes(bytes[index..index + size_of::<f64>()].try_into().unwrap());
+                let v = f64::from_le_bytes(take(bytes, index, size_of::<f64>())?.try_into().unwrap());
                 index += size_of::<f64>();
                 ValueItem::Double(v)
             }
             15 => {
-                let v =
-                    u64::from_le_bytes(bytes[index..index + size_of::<i64>()].try_into().unwrap());
+                let v = u64::from_le_bytes(take(bytes, index, size_of::<u64>())?.try_into().unwrap());
                 index += size_of::<u64>();
                 ValueItem::Datetime(v)
             }
             20 => {
                 let len =
-                    u32::from_le_bytes(bytes[index..index + size_of::<u32>()].try_into().unwrap());
+                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
                 index += size_of::<u32>();
-                let real_len =
-                    u32::from_le_bytes(bytes[index..index + size_of::<u32>()].try_into().unwrap())
-                        as usize;
+                let real_len = u32::from_le_bytes(
+                    take(bytes, index, size_of::<u32>())?.try_into().unwrap(),
+                ) as usize;
                 index += size_of::<u32>();
-                let str =
-                    String::from_utf8(bytes[index..index + real_len].to_vec()).unwrap_or_default();
+                let str = String::from_utf8(take(bytes, index, real_len)?.to_vec())
+                    .unwrap_or_default();
                 // to_bytes() pads the content out to `len` bytes when the
                 // real content is shorter than the reserved capacity — skip
                 // that padding too, not just the real content, or the next
                 // value in the buffer is misread starting mid-padding.
-                index += real_len.max(len as usize);
+                index = index.saturating_add(real_len.max(len as usize));
                 ValueItem::Str((str, len))
             }
             25 => {
                 let len =
-                    u32::from_le_bytes(bytes[index..index + size_of::<u32>()].try_into().unwrap());
+                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
                 index += size_of::<u32>();
-                let real_len =
-                    u32::from_le_bytes(bytes[index..index + size_of::<u32>()].try_into().unwrap())
-                        as usize;
+                let real_len = u32::from_le_bytes(
+                    take(bytes, index, size_of::<u32>())?.try_into().unwrap(),
+                ) as usize;
                 index += size_of::<u32>();
-                let arc = Arc::from(&bytes[index..index + real_len]);
+                let arc = Arc::from(take(bytes, index, real_len)?);
                 // See the Str case above: skip trailing padding too.
-                index += real_len.max(len as usize);
+                index = index.saturating_add(real_len.max(len as usize));
                 ValueItem::Blob((arc, len))
             }
             30 => {
-                let v = bytes[index] != 0;
+                let v = take(bytes, index, size_of::<u8>())?[0] != 0;
                 index += size_of::<u8>();
                 ValueItem::Boolean(v)
             }
@@ -372,7 +410,7 @@ impl ValueItem {
                 ValueItem::Null
             }
         };
-        (val, index)
+        Ok((val, index))
     }
 
     fn discriminant(&self) -> u8 {
@@ -419,27 +457,49 @@ impl PartialOrd for ValueItem {
     }
 }
 
+impl ValueItem {
+    // STORE_AUDIT.md S7: fixed, total (if otherwise arbitrary) rank across
+    // variants, used by Ord::cmp only when comparing two DIFFERENT
+    // variants. Store has no schema to prevent a Rec key's fields from
+    // differing in type between rows (or a range scan over mixed-type
+    // data), so Ord must be a genuine total order over every possible
+    // pair — not "every same-type pair, plus a panic for anything else".
+    // Null ranks lowest (unchanged from the old special-casing); the rest
+    // is an arbitrary but fixed and documented order.
+    fn type_rank(&self) -> u8 {
+        match self {
+            ValueItem::Null => 0,
+            ValueItem::Boolean(_) => 1,
+            ValueItem::Integer(_) => 2,
+            ValueItem::Double(_) => 3,
+            ValueItem::Datetime(_) => 4,
+            ValueItem::Str(_) => 5,
+            ValueItem::Blob(_) => 6,
+        }
+    }
+}
+
 impl Ord for ValueItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        if *self == ValueItem::Null && *other == ValueItem::Null {
-            return std::cmp::Ordering::Equal;
-        }
         match (self, other) {
             (ValueItem::Integer(a), ValueItem::Integer(b)) => a.cmp(b),
             (ValueItem::Double(a), ValueItem::Double(b)) => a.total_cmp(b),
             (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.cmp(b),
             (ValueItem::Str(a), ValueItem::Str(b)) => a.0.cmp(&b.0),
             (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a.cmp(b),
-            (ValueItem::Blob(_), _) => panic!("Blobs cannot be compared."),
-
-            (_, ValueItem::Null) => std::cmp::Ordering::Greater,
-            (ValueItem::Integer(_), _) => panic!("Invalid comparison. I"),
-            (ValueItem::Double(_), _) => panic!("Invalid comparison. F "),
-            (ValueItem::Datetime(_), _) => panic!("Invalid comparison. D"),
-            (ValueItem::Str(_), _) => panic!("Invalid comparison. S"),
-            (ValueItem::Boolean(_), _) => panic!("Invalid comparison. B"),
-
-            (ValueItem::Null, _) => std::cmp::Ordering::Less,
+            // Content-based, like Str above — the u32 alongside the bytes
+            // is reserved on-disk capacity, not part of the logical value
+            // (see PartialEq's own handling of this same distinction).
+            (ValueItem::Blob(a), ValueItem::Blob(b)) => a.0.cmp(&b.0),
+            (ValueItem::Null, ValueItem::Null) => Ordering::Equal,
+            // Different variants: fall back to the fixed type rank instead
+            // of panicking — see type_rank's own comment. Subsumes the old
+            // Null-vs-anything special cases (Null's rank is lowest) and
+            // makes every pair, in either order, agree with each other
+            // (a.cmp(&b) == b.cmp(&a).reverse()) — the old code's Null
+            // handling didn't (Blob.cmp(&Null) panicked, but
+            // Null.cmp(&Blob) didn't).
+            _ => self.type_rank().cmp(&other.type_rank()),
         }
     }
 }
@@ -465,6 +525,7 @@ impl Eq for ValueItem {}
 
 #[cfg(test)]
 mod valueitem_tests {
+    use std::cmp::Ordering;
     use std::sync::Arc;
 
     use crate::valueitem::ValueItem;
@@ -559,16 +620,19 @@ mod valueitem_tests {
         assert!(ValueItem::Boolean(true) > ValueItem::Null);
     }
 
+    // STORE_AUDIT.md S7: mixed-type comparisons used to panic; now they
+    // fall back to a fixed type rank (see ValueItem::type_rank) instead,
+    // and agree with each other regardless of argument order.
     #[test]
-    #[should_panic(expected = "Invalid comparison. B")]
-    fn test_partial_ord_boolean_vs_integer_panics() {
-        let _ = ValueItem::Boolean(true).partial_cmp(&ValueItem::Integer(1));
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid comparison. I")]
-    fn test_partial_ord_integer_vs_boolean_panics() {
-        let _ = ValueItem::Integer(1).partial_cmp(&ValueItem::Boolean(true));
+    fn test_partial_ord_boolean_vs_integer_uses_type_rank() {
+        assert_eq!(
+            ValueItem::Boolean(true).partial_cmp(&ValueItem::Integer(1)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            ValueItem::Integer(1).partial_cmp(&ValueItem::Boolean(true)),
+            Some(Ordering::Greater)
+        );
     }
 
     // The u32 alongside the String/blob data is a reserved on-disk capacity
@@ -614,54 +678,49 @@ mod valueitem_tests {
         assert_ne!(a, c, "differing reserved capacity makes them !=, like Str");
     }
 
+    // STORE_AUDIT.md S7: Blob is now genuinely comparable — same-variant
+    // Blob-vs-Blob compares content (like Str), and Blob-vs-anything-else
+    // falls back to the fixed type rank, same as any other mixed-type pair.
     #[test]
-    #[should_panic(expected = "Blobs cannot be compared")]
-    fn test_partial_ord_blob_vs_blob_panics() {
+    fn test_partial_ord_blob_vs_blob_compares_content() {
+        let a = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
         let b = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
-        let _ = b.partial_cmp(&b.clone());
+        assert_eq!(a.partial_cmp(&b), Some(Ordering::Equal));
+        let c = ValueItem::Blob((Arc::from(&b"y"[..]), 1));
+        assert_eq!(a.partial_cmp(&c), Some(Ordering::Less));
     }
 
     #[test]
-    #[should_panic(expected = "Blobs cannot be compared")]
-    fn test_partial_ord_blob_vs_integer_panics() {
-        let b = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
-        let _ = b.partial_cmp(&ValueItem::Integer(1));
-    }
-
-    // Blob is checked before the `(_, Null)` catch-all, so Blob-vs-Null
-    // panics from the Blob side...
-    #[test]
-    #[should_panic(expected = "Blobs cannot be compared")]
-    fn test_partial_ord_blob_vs_null_panics() {
-        let b = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
-        let _ = b.partial_cmp(&ValueItem::Null);
-    }
-
-    // ...but the same comparison with the operands swapped does NOT panic:
-    // Null (as the left side) falls through to the final `(Null, _) =>
-    // Less` arm before a Blob-specific case is ever checked on that side.
-    // A real asymmetry — `a.partial_cmp(&b)` and `b.partial_cmp(&a)` are
-    // not mirror images of each other for (Null, Blob) — documented so a
-    // future caller doesn't assume partial_cmp is order-independent here.
-    #[test]
-    fn test_partial_ord_null_vs_blob_does_not_panic_but_blob_vs_null_does() {
+    fn test_partial_ord_blob_vs_integer_uses_type_rank() {
         let b = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
         assert_eq!(
-            ValueItem::Null.partial_cmp(&b),
-            Some(std::cmp::Ordering::Less)
+            b.partial_cmp(&ValueItem::Integer(1)),
+            Some(Ordering::Greater)
         );
+        assert_eq!(ValueItem::Integer(1).partial_cmp(&b), Some(Ordering::Less));
+    }
+
+    // Previously a real asymmetry: Blob-vs-Null panicked from the Blob
+    // side but not from the Null side (Null had its own special-cased
+    // catch-all checked before any Blob-specific arm). Both directions
+    // now agree, like every other mixed-type pair.
+    #[test]
+    fn test_partial_ord_null_vs_blob_is_symmetric() {
+        let b = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
+        assert_eq!(ValueItem::Null.partial_cmp(&b), Some(Ordering::Less));
+        assert_eq!(b.partial_cmp(&ValueItem::Null), Some(Ordering::Greater));
     }
 
     #[test]
-    #[should_panic(expected = "Invalid comparison. I")]
-    fn test_partial_ord_integer_vs_str_panics() {
-        let _ = ValueItem::Integer(1).partial_cmp(&ValueItem::Str(("x".into(), 1)));
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid comparison. S")]
-    fn test_partial_ord_str_vs_integer_panics() {
-        let _ = ValueItem::Str(("x".into(), 1)).partial_cmp(&ValueItem::Integer(1));
+    fn test_partial_ord_integer_vs_str_uses_type_rank() {
+        assert_eq!(
+            ValueItem::Integer(1).partial_cmp(&ValueItem::Str(("x".into(), 1))),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            ValueItem::Str(("x".into(), 1)).partial_cmp(&ValueItem::Integer(1)),
+            Some(Ordering::Greater)
+        );
     }
 
     #[test]
@@ -722,29 +781,29 @@ mod valueitem_tests {
     fn test_valueitem_serialize() {
         let ivalue = ValueItem::Integer(123456);
         let ibytes = ivalue.to_bytes();
-        assert_eq!(ivalue, ValueItem::from_bytes_single(&ibytes));
+        assert_eq!(ivalue, ValueItem::from_bytes_single(&ibytes).unwrap());
         let fvalue = ValueItem::Double(123456.5678);
         let fbytes = fvalue.to_bytes();
-        assert_eq!(fvalue, ValueItem::from_bytes_single(&fbytes));
+        assert_eq!(fvalue, ValueItem::from_bytes_single(&fbytes).unwrap());
         let dvalue = ValueItem::Datetime(1234567);
         let dbytes = dvalue.to_bytes();
-        assert_eq!(dvalue, ValueItem::from_bytes_single(&dbytes));
+        assert_eq!(dvalue, ValueItem::from_bytes_single(&dbytes).unwrap());
         let svalue = ValueItem::Str(("Hello, World".to_owned(), 20));
         let sbytes = svalue.to_bytes();
-        assert_eq!(svalue, ValueItem::from_bytes_single(&sbytes));
+        assert_eq!(svalue, ValueItem::from_bytes_single(&sbytes).unwrap());
         let bvalue = ValueItem::Blob((Arc::new([b'A'; 545]), 545));
         let bbytes = bvalue.to_bytes();
-        assert_eq!(bvalue, ValueItem::from_bytes_single(&bbytes));
+        assert_eq!(bvalue, ValueItem::from_bytes_single(&bbytes).unwrap());
         let nvalue = ValueItem::Null;
         let nbytes = nvalue.to_bytes();
-        assert_eq!(nvalue, ValueItem::from_bytes_single(&nbytes));
+        assert_eq!(nvalue, ValueItem::from_bytes_single(&nbytes).unwrap());
         for bvalue in [ValueItem::Boolean(true), ValueItem::Boolean(false)] {
             let bbytes = bvalue.to_bytes();
-            assert_eq!(bvalue, ValueItem::from_bytes_single(&bbytes));
+            assert_eq!(bvalue, ValueItem::from_bytes_single(&bbytes).unwrap());
         }
 
         let junk = vec![b'A'; 10];
-        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk));
+        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk).unwrap());
     }
 
     #[test]
@@ -763,7 +822,7 @@ mod valueitem_tests {
             let bytes = v.to_bytes();
             assert_eq!(
                 v,
-                ValueItem::from_bytes_single(&bytes),
+                ValueItem::from_bytes_single(&bytes).unwrap(),
                 "roundtrip failed for {v:?}"
             );
         }
@@ -773,7 +832,7 @@ mod valueitem_tests {
         for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -0.0] {
             let v = ValueItem::Double(f);
             let bytes = v.to_bytes();
-            match ValueItem::from_bytes_single(&bytes) {
+            match ValueItem::from_bytes_single(&bytes).unwrap() {
                 ValueItem::Double(got) => {
                     assert_eq!(
                         got.to_bits(),
@@ -794,11 +853,11 @@ mod valueitem_tests {
     fn test_serialize_content_longer_than_reserved_capacity_single_value() {
         let s = ValueItem::Str(("this is way more than five bytes".into(), 5));
         let bytes = s.to_bytes();
-        assert_eq!(s, ValueItem::from_bytes_single(&bytes));
+        assert_eq!(s, ValueItem::from_bytes_single(&bytes).unwrap());
 
         let b = ValueItem::Blob((Arc::from(&b"this is way more than five bytes"[..]), 5));
         let bytes = b.to_bytes();
-        assert_eq!(b, ValueItem::from_bytes_single(&bytes));
+        assert_eq!(b, ValueItem::from_bytes_single(&bytes).unwrap());
     }
 
     #[test]
@@ -810,9 +869,9 @@ mod valueitem_tests {
         let mut bytes = a.to_bytes();
         bytes.extend(b.to_bytes());
 
-        let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes);
+        let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes).unwrap();
         assert_eq!(parsed_a, a);
-        let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]);
+        let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]).unwrap();
         assert_eq!(
             parsed_b, b,
             "second value must be recovered after the first's real index"
@@ -835,9 +894,9 @@ mod valueitem_tests {
             let mut bytes = a.to_bytes();
             bytes.extend(b.to_bytes());
 
-            let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes);
+            let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes).unwrap();
             assert_eq!(parsed_a, a);
-            let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]);
+            let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]).unwrap();
             assert_eq!(
                 parsed_b, b,
                 "index after reading {a:?} must skip its full width, not just the tag byte"
@@ -860,9 +919,9 @@ mod valueitem_tests {
         let mut bytes = a.to_bytes();
         bytes.extend(b.to_bytes());
 
-        let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes);
+        let (parsed_a, idx) = ValueItem::from_bytes_many(&bytes).unwrap();
         assert_eq!(parsed_a, a);
-        let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]);
+        let (parsed_b, _) = ValueItem::from_bytes_many(&bytes[idx..]).unwrap();
         assert_eq!(
             parsed_b, b,
             "index returned by from_bytes_many must skip padding bytes, not just the real \
@@ -979,7 +1038,7 @@ mod valueitem_tests {
         // 15/20/25); from_bytes_many's fallback logs and returns Null
         // instead of panicking on malformed/corrupt input.
         let junk = vec![b'A'; 10];
-        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk));
+        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk).unwrap());
     }
 }
 
@@ -1052,7 +1111,7 @@ mod indexkey_tests {
         let k = IndexKey::new_from(&[]).unwrap();
         let bytes = k.to_bytes();
         assert_eq!(bytes.len(), 8, "empty key is just the 8-byte zero count");
-        assert_eq!(k, IndexKey::from_bytes(&bytes));
+        assert_eq!(k, IndexKey::from_bytes(&bytes).unwrap());
     }
 
     #[test]
@@ -1061,7 +1120,7 @@ mod indexkey_tests {
         let bytes = k.to_bytes();
         assert_eq!(
             k,
-            IndexKey::from_bytes(&bytes),
+            IndexKey::from_bytes(&bytes).unwrap(),
             "a single-field (non-empty) key must round-trip through to_bytes/from_bytes"
         );
     }
@@ -1076,7 +1135,7 @@ mod indexkey_tests {
         ])
         .unwrap();
         let bytes = k.to_bytes();
-        assert_eq!(k, IndexKey::from_bytes(&bytes));
+        assert_eq!(k, IndexKey::from_bytes(&bytes).unwrap());
     }
 
     // Same as above, but the Str field reserves more capacity than it
@@ -1093,7 +1152,7 @@ mod indexkey_tests {
         ])
         .unwrap();
         let bytes = k.to_bytes();
-        assert_eq!(k, IndexKey::from_bytes(&bytes));
+        assert_eq!(k, IndexKey::from_bytes(&bytes).unwrap());
     }
 
     // IndexKey::size() sums each field's own size() but never accounts for
@@ -1219,16 +1278,53 @@ mod indexkey_tests {
 
     // --- Blob fields and ordering ---
 
-    // ValueItem::Blob's PartialOrd always panics (see valueitem_tests), so
-    // any IndexKey containing a Blob field can never be ordered against
-    // another key, even one holding an identical Blob. Worth knowing
-    // before allowing Blob-typed columns into a multi-key index that will
-    // ever need range queries or B+-tree ordering.
+    // STORE_AUDIT.md S7: ValueItem::Blob's PartialOrd used to always
+    // panic, so any IndexKey containing a Blob field could never be
+    // ordered against another key, even one holding an identical Blob.
+    // Now compares content, like Str.
     #[test]
-    #[should_panic(expected = "Blobs cannot be compared")]
-    fn test_partial_ord_panics_when_a_field_is_blob() {
+    fn test_partial_ord_compares_content_when_a_field_is_blob() {
         let a = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]).unwrap();
         let b = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"x"[..]), 1))]).unwrap();
-        let _ = a.partial_cmp(&b);
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
+        let c = IndexKey::new_from(&[ValueItem::Blob((Arc::from(&b"y"[..]), 1))]).unwrap();
+        assert_eq!(a.partial_cmp(&c), Some(std::cmp::Ordering::Less));
+    }
+
+    // STORE_AUDIT.md S3: the hand-rolled key parser panics on truncated/
+    // malformed input instead of returning an error — a real risk since
+    // these bytes come straight off disk. Wrapped in catch_unwind rather
+    // than asserted directly: the eventual fix will very likely change
+    // these functions' signatures to return Result, and this assertion
+    // (no panic occurs) stays meaningful and compiling either way, unlike
+    // a call site that assumes one particular future signature.
+    //
+    // This is exactly the kind of panic S8 warns about happening under a
+    // page lock (poisoning it); IndexKey::from_bytes/from_bytes_many are
+    // called while decoding page content on the hot read path.
+    #[test]
+    fn test_audit_s3_from_bytes_does_not_panic_on_a_truncated_length_prefix() {
+        // Not even enough bytes for the leading u64 field-count prefix.
+        let result = std::panic::catch_unwind(|| IndexKey::from_bytes(&[1, 2, 3]));
+        assert!(
+            result.is_ok(),
+            "IndexKey::from_bytes must not panic on truncated input, only report an error"
+        );
+    }
+
+    #[test]
+    fn test_audit_s3_from_bytes_many_does_not_panic_on_a_truncated_string_field() {
+        // vtype=20 (Str), followed by a `len`/`real_len` pair claiming 100
+        // bytes of content that were never actually written.
+        let mut bytes = vec![20u8];
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // len
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // real_len
+        // No content bytes at all follow.
+        let result = std::panic::catch_unwind(|| ValueItem::from_bytes_many(&bytes));
+        assert!(
+            result.is_ok(),
+            "ValueItem::from_bytes_many must not panic on a length prefix that overruns the \
+             buffer, only report an error"
+        );
     }
 }

@@ -4,6 +4,7 @@ use crate::constant::FIRST_USER_PAGE;
 use crate::constant::FREE_PAGE_TABLE_PAGE;
 use crate::constant::GENERATOR_TABLE_PAGE;
 use crate::constant::MAX_TABLE_NAME_LEN;
+use crate::constant::RESERVED_TABLE_NAME_PREFIX;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::constant::timestamp;
@@ -160,6 +161,19 @@ pub struct Db<F: DBFile + 'static> {
     tx_mgr: Arc<TransactionManager>,
     buffer: Arc<PageBuffer<F>>,
     last_checkpoint: AtomicU128, // Store the actual checkopint so it can be mutated
+    // STORE_AUDIT.md T6: physical tombstone reclamation must not run while
+    // some OTHER still-active transaction's snapshot predates this commit —
+    // otherwise that reader's find() hits a genuinely absent row instead of
+    // falling back through find_visible_to to the pre-delete version, since
+    // there's no physical tuple left to start that walk from. Mirrors
+    // Logger's pending_undo_discards/discard_or_defer_undo pattern exactly,
+    // just for the tree-level reclaim step instead of the in-memory undo
+    // trail (which is a separate concern already handled correctly).
+    // TransactionId here is the remover's own id — NOT derivable from
+    // Record::tuple, which (for a Del undo record) holds the PRE-image
+    // (whoever owned the row before this remove), not the remover. Must be
+    // carried explicitly.
+    pending_tombstone_reclaims: RwLock<Vec<(HashSet<TransactionId>, TransactionId, Record)>>,
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -277,6 +291,7 @@ where
             logger: nm.logger,
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
+            pending_tombstone_reclaims: RwLock::new(Vec::new()),
         };
         sf.load_system_tables()?;
         sf.load_logs()?;
@@ -574,6 +589,11 @@ where
         // no-op when nothing is pending.
         self.logger
             .drain_ready_undo_discards(&self.tx_mgr.get_active_transactions()?);
+        // Same opportunistic-cleanup pattern for tombstones commit() had to
+        // defer reclaiming (see the waiters comment there and
+        // pending_tombstone_reclaims's own doc comment) because some
+        // reader's snapshot might still have needed the pre-delete version.
+        self.drain_ready_tombstone_reclaims(&self.tx_mgr.get_active_transactions()?);
         if self.redo_file.get_metadata()?.len > 16 * 1024 * 1024
             || self.undo_file.get_metadata()?.len > 16 * 1024 * 1024
         {
@@ -618,15 +638,48 @@ where
         let op = Operation::Commit(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
+        // Mark committed BEFORE deciding whether id's undo trail can be
+        // dropped now or must wait — not after. STORE_AUDIT.md T14
+        // follow-up: with the old ordering (decide-then-commit), there was
+        // a window, between "no one else is active, discard the undo trail
+        // now" and tx_mgr.commit actually flipping id to committed, where a
+        // concurrent walker's is_committed(id) check still said false (so
+        // it tried to walk PAST id for a pre-image) but id's undo trail was
+        // ALREADY gone (so the walk hit MissingUndoRecord) — and, critically,
+        // find_visible_to's own fallback for that case (find_last_committed)
+        // re-walks the exact same, already-discarded chain and hits the
+        // identical dead end, so it doesn't rescue this specific case the
+        // way it rescues the one its own comment describes. CONFIRMED via
+        // direct concurrent repro: a fresh reader beginning and finding a
+        // row immediately after a racing commit landed exactly in this
+        // window, incorrectly reporting a committed, existing row as
+        // missing. Committing first closes the window: by the time any
+        // walker could see id's undo trail discarded, is_committed(id) is
+        // already true, so it never needs to walk past id at all.
+        //
+        // Safe to reorder: still_active's computation (get_active_transactions,
+        // then explicitly removing id) doesn't depend on whether tx_mgr.commit
+        // has already removed id from the active set — the result is
+        // identical either way.
+        self.tx_mgr.commit(id.clone())?;
         // Decide whether id's undo trail can be dropped now or must wait for
         // every currently-active transaction that might have it in its own
-        // snapshot to finish first — see Logger::discard_or_defer_undo. Must
-        // capture the active set (excluding id itself, which is about to
-        // leave it on the very next line) before tx_mgr.commit changes it.
+        // snapshot to finish first — see Logger::discard_or_defer_undo.
         let mut still_active = self.tx_mgr.get_active_transactions()?;
         still_active.remove(&id);
+        // STORE_AUDIT.md T6: any transaction still active at this exact
+        // commit point might have begun (captured its snapshot) before this
+        // delete, and find_visible_to's fallback for such a reader depends
+        // on a physical tuple still being present in the tree to walk the
+        // undo chain from. Physically reclaiming it now — like the old
+        // unconditional loop below did — pulls that tuple out from under
+        // any such reader, so find() sees a flat "gone" instead of falling
+        // back to the pre-delete version. Gate physical reclaim on the same
+        // waiter set discard_or_defer_undo already computes for exactly
+        // this reason, just for the tree-level row instead of the in-memory
+        // undo trail.
+        let waiters = still_active.clone();
         self.logger.discard_or_defer_undo(id.clone(), still_active);
-        self.tx_mgr.commit(id.clone())?;
 
         // Best-effort tombstone reclamation. Errors here do not un-commit the
         // transaction: find() already treats a committed tombstone as absent,
@@ -648,7 +701,27 @@ where
         // later pass to retry it. Retrying the whole find+remove sequence is
         // safe to repeat: find is a pure read, and remove (since the earlier
         // fix) tolerates the data already being gone from a prior attempt.
-        #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
+        //
+        // If some other transaction is still active right now, it might
+        // still need the pre-delete version (see the waiters comment
+        // above) — defer physical reclaim for those records instead of
+        // running it immediately; drain_ready_tombstone_reclaims (called
+        // opportunistically from begin(), alongside the equivalent undo-
+        // trail drain) finishes the job once every such waiter is gone.
+        if waiters.is_empty() {
+            self.reclaim_tombstones(del_records, id.clone());
+        } else {
+            self.pending_tombstone_reclaims.write().extend(
+                del_records
+                    .into_iter()
+                    .map(|r| (waiters.clone(), id.clone(), r)),
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
+    fn reclaim_tombstones(&self, del_records: Vec<Record>, id: TransactionId) {
         for r in del_records {
             if let Ok(table) = self.table_by_id(r.table_id) {
                 let _ = retry_on_contention(|| {
@@ -661,7 +734,39 @@ where
                 });
             }
         }
-        Ok(())
+    }
+
+    /// Opportunistic maintenance for tombstone reclaims deferred by
+    /// commit() (see the waiters comment there and
+    /// `pending_tombstone_reclaims`'s own doc comment) — called alongside
+    /// drain_aborting/drain_ready_undo_discards, e.g. at Db::begin(). For
+    /// each deferred record, drops from its waiter set any transaction
+    /// that's since finished (no longer in `currently_active`); once a
+    /// record's waiter set is empty — nothing that could still need the
+    /// pre-delete version remains active — it's actually reclaimed.
+    fn drain_ready_tombstone_reclaims(&self, currently_active: &HashSet<TransactionId>) {
+        let mut pending = self.pending_tombstone_reclaims.write();
+        if pending.is_empty() {
+            return;
+        }
+        let mut still_pending = Vec::with_capacity(pending.len());
+        let mut ready: HashMap<TransactionId, Vec<Record>> = HashMap::new();
+        for (waiters, owner, record) in pending.drain(..) {
+            let remaining: HashSet<TransactionId> = waiters
+                .into_iter()
+                .filter(|w| currently_active.contains(w))
+                .collect();
+            if remaining.is_empty() {
+                ready.entry(owner).or_default().push(record);
+            } else {
+                still_pending.push((remaining, owner, record));
+            }
+        }
+        *pending = still_pending;
+        drop(pending);
+        for (id, records) in ready {
+            self.reclaim_tombstones(records, id);
+        }
     }
 
     pub fn rollback(&self, txn: Transaction) -> Result<(), StoreError> {
@@ -688,7 +793,21 @@ where
         // other thread can observe or reclaim this txn mid-revert. Only once the
         // writes are physically undone do we retire it from the active set.
         // Revert BEFORE the Rollback marker, which discards the undo records.
-        self.revert_txn_writes(id)?;
+        //
+        // STORE_AUDIT.md T12: if revert_txn_writes fails partway (e.g. a
+        // table one of its undo ops targets was dropped mid-flight), the
+        // old code just propagated the error via `?` here, leaving `id`
+        // stuck in `active` forever — invisible to everyone, but with no
+        // path back to a resolved state, since drain_aborting only ever
+        // scans `aborting`. Move it there instead of leaving it stranded:
+        // revert_aborted (via drain_aborting, run opportunistically from
+        // begin()) retries the exact same conditional, tolerant reverts
+        // later, which succeeds once whatever failed stops failing (or is
+        // a permanent no-op if the row's already gone some other way).
+        if let Err(e) = self.revert_txn_writes(id) {
+            self.tx_mgr.abort(id.clone())?;
+            return Err(e);
+        }
         let op = Operation::Rollback(id.clone(), timestamp());
         self.logger.log_redo(op.clone())?;
         self.logger.log_undo(op)?;
@@ -838,6 +957,26 @@ where
         // a separate find()-then-update() pair used to leave open).
         let build = |current: &Tuple| {
             self.check_write_conflict(current, &txn)?;
+            // STORE_AUDIT.md T9: a row this SAME transaction inserted has
+            // no *committed* ancestor at all (undo_id is None from the
+            // insert onward — see Tuple::set_undo_id's own callers), so
+            // find_last_committed below would otherwise return None and
+            // this whole call would incorrectly fail with KeyNotFound.
+            // There is nothing to resolve here, and nothing new needs
+            // logging either: keep undo_id at None (so a LATER own-update
+            // in the same chain is recognized the same way, and so
+            // concurrent readers' find_visible_to still correctly treats
+            // this row as having no ancestor — i.e. not existing yet, per
+            // its own phantom-insert protection) and just revise the data
+            // in place. The original insert's own undo entry
+            // (Operation::Add) already fully reverts this row (by
+            // removing it) on rollback; before_write below skips logging
+            // a second, redundant undo record for exactly this reason.
+            if current.txn_id.as_ref() == Some(&txn) && current.undo_id.is_none() {
+                let mut updated = current.clone();
+                updated.set_data(&new_tuple.data);
+                return Ok((current.clone(), updated));
+            }
             // old_tuple is the pre-update, already-committed version. It's
             // kept (with its original txn_id) as the undo record's content,
             // so a rollback restores the exact prior state and concurrent
@@ -861,9 +1000,17 @@ where
         // None where the code expects Some).
         let before_write = |old_tuple: &Tuple, updated: &Tuple| {
             let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone(), None));
-            let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple.clone(), None));
             self.logger.log_redo(redo_op)?;
-            self.logger.log_undo(undo_op)?;
+            // See build's own comment: revising this transaction's own
+            // fresh insert needs no separate undo record — its undo_id
+            // stays None, and the original Add's undo entry already
+            // covers full rollback (removal). Unlike remove()'s tombstone
+            // counterpart, nothing at commit time keys off a Mod undo
+            // record's presence, so it's safe to skip outright here.
+            if updated.undo_id.is_some() {
+                let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple.clone(), None));
+                self.logger.log_undo(undo_op)?;
+            }
             Ok(())
         };
         self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)?;
@@ -881,6 +1028,18 @@ where
         let table = self.table_by_id(tid)?;
         let build = |current: &Tuple| {
             self.check_write_conflict(current, &txn)?;
+            // STORE_AUDIT.md T9 — see update()'s matching comment: a row
+            // this SAME transaction inserted has no committed ancestor at
+            // all, so find_last_committed below would otherwise fail with
+            // KeyNotFound. Tombstone it in place, keeping undo_id at None;
+            // the original insert's own undo entry already fully reverts
+            // this row (by removing it) on rollback, so before_write skips
+            // logging a second, redundant undo record.
+            if current.txn_id.as_ref() == Some(&txn) && current.undo_id.is_none() {
+                let mut tombstoned = current.clone();
+                tombstoned.tombstone();
+                return Ok((current.clone(), tombstoned));
+            }
             // old_tuple is the pre-remove, already-committed (non-tombstoned)
             // version, kept as the undo record's content so a rollback
             // restores the row exactly (including clearing the tombstone
@@ -899,10 +1058,26 @@ where
         // Same ordering requirement as update(): log undo/redo before the
         // tombstoned tuple becomes visible in the tree, so a concurrent
         // reader can never observe an undo_id that doesn't resolve yet.
+        //
+        // Unlike update()'s Mod undo record, this Del undo record is always
+        // logged, even for the own-fresh-insert case above where
+        // `tombstoned.undo_id` stays None: Db::commit's tombstone-reclaim
+        // pass finds rows to physically clean up (and their index entries)
+        // by scanning the undo log specifically for Operation::Del records
+        // (see del_records there), not by inspecting undo_id. Skipping it
+        // here left an own-insert-then-remove-then-commit tombstone's index
+        // entry permanently orphaned, causing a real, permanent DuplicateKey
+        // on any later insert of the same key (STORE_AUDIT.md T9 follow-up).
+        // Replaying this Del's undo on rollback (restoring `old_tuple`,
+        // still owned by `txn`) is safe regardless of order relative to the
+        // original insert's own Add-undo, which removes the row outright —
+        // whichever runs second finds the row already in the state it
+        // expects or already gone, both tolerated by update_if_txn /
+        // remove_if_txn.
         let before_write = |old_tuple: &Tuple, tombstoned: &Tuple| {
             let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone(), None));
-            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple.clone(), None));
             self.logger.log_redo(redo_op)?;
+            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple.clone(), None));
             self.logger.log_undo(undo_op)?;
             Ok(())
         };
@@ -1267,7 +1442,33 @@ where
             tables.insert(id, Arc::new(table));
             id
         };
-        self.write_system_tables()?;
+        // STORE_AUDIT.md S6: the system catalog (page 0) is a single
+        // fixed-size page — write_system_tables can fail with
+        // PageCapacityError once enough tables exist that their combined
+        // metadata no longer fits. Before this rollback, that failure left
+        // the new table fully registered in memory (table_id_by_name found
+        // it, the generator entry existed) despite create_table itself
+        // returning Err — and since it stayed in `self.tables`, every
+        // LATER write_system_tables call (including checkpoint's own) hit
+        // the exact same PageCapacityError trying to serialize it too,
+        // permanently breaking checkpoint() on this otherwise-fine
+        // database. Roll back every step above on failure —
+        // deregister the generator, drop it from `tables`, and free the
+        // pages BPlusTree::new already allocated for it — so a rejected
+        // create_table leaves the database exactly as if it had never been
+        // called.
+        if let Err(e) = self.write_system_tables() {
+            let table = self.tables.write().remove(&table_id);
+            self.generator.remove_generator(&name)?;
+            if let Some(table) = table {
+                for page_id in table.all_index_page_ids()? {
+                    let record_size = self.buffer.get_page(page_id)?.record_size();
+                    self.buffer.reset_and_free_page(page_id, record_size)?;
+                }
+                self.buffer.free_page_chain(table.table.first_data_page)?;
+            }
+            return Err(e);
+        }
         Ok(table_id)
     }
 
@@ -1356,20 +1557,30 @@ where
     ) -> Result<Self, StoreError> {
         let uf_name = name.to_string() + ".undo";
         let rf_name = name.to_string() + ".redo";
+        // STORE_AUDIT.md S4: create(true) opens-or-creates, so Db::create
+        // on an already-existing path silently reopened it, then
+        // unconditionally overwrote its header with page_count=0 and
+        // started handing out pages from scratch — destroying any
+        // existing data at that path with no warning at all.
+        // create_new(true) instead fails with an AlreadyExists io error if
+        // any of the three files is already there, matching create()'s
+        // documented contract of making a brand new database. Db::open
+        // (the "load an existing database" entry point) is unaffected — it
+        // has its own, separate file-opening path.
         let f = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .clone();
         let mut f = F::open(f, &name)?;
         let undo_file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .clone();
         let undo_file = F::open(undo_file, uf_name)?;
         let redo_file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .read(true)
             .write(true)
             .clone();
@@ -1414,12 +1625,16 @@ where
             logger: nm.logger,
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
+            pending_tombstone_reclaims: RwLock::new(Vec::new()),
         })
     }
 
     fn validate_table_name(&self, name: &String) -> Result<(), StoreError> {
         if name.len() > MAX_TABLE_NAME_LEN {
             return Err(StoreError::TableNameInvalid(MAX_TABLE_NAME_LEN, name.len()));
+        }
+        if name.starts_with(RESERVED_TABLE_NAME_PREFIX) {
+            return Err(StoreError::ReservedTableName(name.to_string()));
         }
         let tables = self.tables.read();
         let present = tables
@@ -1503,6 +1718,27 @@ where
     pub fn delete<S: AsRef<str>>(name: S) -> Result<(), StoreError> {
         let uf_name = name.as_ref().to_string() + ".undo";
         let rf_name = name.as_ref().to_string() + ".redo";
+        // STORE_AUDIT.md S5: locking is otherwise only ever checked on the
+        // way IN (create/open take an exclusive advisory lock) — delete()
+        // never checked it at all, so it could unlink a live, in-use
+        // database's files out from under whatever process/handle still
+        // has it open. delete() has no existing file handle of its own (a
+        // static, path-based API), so it opens each file fresh and
+        // attempts the same exclusive, non-blocking lock create()/open()
+        // use: succeeding means no one else holds it, safe to drop
+        // immediately and proceed; failing means some other open handle
+        // owns it right now. A path that doesn't exist yet fails this
+        // open with NotFound, same as remove_file below would have — not
+        // a new failure mode, just surfaced one step earlier.
+        for path in [name.as_ref(), uf_name.as_str(), rf_name.as_str()] {
+            let opts = OpenOptions::new().read(true).write(true).clone();
+            let f = F::open(opts, path)?;
+            f.do_lock().map_err(|_| {
+                StoreError::UnknownError(format!(
+                    "refusing to delete {path}: still open/locked elsewhere"
+                ))
+            })?;
+        }
         remove_file(name.as_ref())?;
         remove_file(uf_name)?;
         remove_file(rf_name)?;
@@ -1589,6 +1825,7 @@ mod tests {
         table::TableIdType,
         tuple::{DBIdType, Tuple},
         txn::{ConflictPolicy, TransactionId},
+        valueitem::ValueItem,
     };
     use postcard::take_from_bytes;
     use std::fs::File;
@@ -1982,6 +2219,10 @@ mod tests {
         // generator removal itself persisted, not just the table list.
         db2.create_table("rows".to_string()).unwrap();
 
+        // STORE_AUDIT.md S5: delete() now refuses to remove a still-locked
+        // database — db2 (and the file handles close() handed off to it)
+        // must actually be gone first, or this cleanup silently no-ops.
+        drop(db2);
         FileDB::delete(&db_name).unwrap_or_default();
     }
 
@@ -4509,6 +4750,11 @@ mod tests {
         let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
         assert_eq!(db2.get_tables().unwrap().len(), 1);
 
+        // STORE_AUDIT.md S5: delete() now refuses to remove a still-locked
+        // database — both handles must actually be gone first, or this
+        // cleanup silently no-ops.
+        drop(db2);
+        drop(db);
         FileDB::delete(&db_name).unwrap_or_default();
     }
 
@@ -4544,6 +4790,11 @@ mod tests {
         }
         drop(t);
 
+        // STORE_AUDIT.md S5: delete() now refuses to remove a still-locked
+        // database — both handles must actually be gone first, or this
+        // cleanup silently no-ops.
+        drop(db2);
+        drop(db);
         FileDB::delete(&db_name).unwrap_or_default();
     }
 
@@ -4585,6 +4836,12 @@ mod tests {
         }
         drop(t);
 
+        // STORE_AUDIT.md S5: delete() now refuses to remove a still-locked
+        // database — all three handles must actually be gone first, or
+        // this cleanup silently no-ops.
+        drop(db3);
+        drop(db2);
+        drop(db);
         FileDB::delete(&db_name).unwrap_or_default();
     }
 
@@ -5337,6 +5594,403 @@ mod tests {
         assert_eq!(
             resurrections, 0,
             "{resurrections} keys resurrected across {ROUNDS} rounds"
+        );
+    }
+
+    // ── STORE_AUDIT.md Phase 1 findings ─────────────────────────────────────
+
+    // T8: Transaction derives Clone, and abort() doesn't check the id is
+    // currently active before moving it to `aborting` — so dropping a
+    // CLONE of an already-committed Transaction guard triggers
+    // Drop::drop's default rollback, which silently reverts a
+    // committed write. Reproduction straight from STORE_AUDIT.md.
+    #[test]
+    fn test_audit_t8_abort_refuses_to_move_an_already_finished_transaction_into_aborting() {
+        // The ORIGINAL reproduction (clone a committed Transaction guard,
+        // drop the clone, watch Drop's default rollback revert the
+        // committed write) is no longer expressible at all now that
+        // Transaction isn't Clone — that in itself is the fix for that
+        // exact path, verified by this file compiling without it. This
+        // test covers the second, independent half of T8's fix: hardening
+        // abort() itself so an already-finished id can never be
+        // re-processed as if it were still live, which also protects the
+        // AbortOnConflict path (see ConflictPolicy) that relies on
+        // "moving an id into aborting twice is harmless" reasoning — true
+        // only once this guard exists.
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        let t0_id = t0.id();
+        db.insert(tid, row(1, b"v0"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let result = db.tx_mgr.abort(t0_id);
+        assert!(
+            result.is_err(),
+            "abort() must refuse to move an already-finished (committed) transaction into \
+             `aborting`: {result:?}"
+        );
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0",
+            "the committed row must be unaffected regardless"
+        );
+    }
+
+    // T9: a transaction can't update or delete a row it inserted itself —
+    // find_last_committed insists on a *committed* ancestor, but a fresh
+    // own-insert has none (undo_id is None from the start).
+    #[test]
+    fn test_audit_t9_a_transaction_can_update_a_row_it_inserted_itself() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        let result = db.update(tid, row(1, b"v1"), &t);
+        assert!(
+            result.is_ok(),
+            "updating a row inserted earlier in the SAME transaction must succeed: {result:?}"
+        );
+        db.commit(t).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v1"
+        );
+    }
+
+    #[test]
+    fn test_audit_t9_a_transaction_can_remove_a_row_it_inserted_itself() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        let result = db.remove(tid, id(1), &t);
+        assert!(
+            result.is_ok(),
+            "removing a row inserted earlier in the SAME transaction must succeed: {result:?}"
+        );
+        db.commit(t).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert!(db.find(tid, id(1), &reader).unwrap().is_none());
+    }
+
+    // Per STORE_AUDIT.md T9's own recommended test list: insert then
+    // update in one transaction, then ROLL BACK, must make the row look
+    // like it never existed — not restore some intermediate value.
+    #[test]
+    fn test_audit_t9_rollback_after_insert_then_update_leaves_no_trace_of_the_row() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.update(tid, row(1, b"v1"), &t).unwrap();
+        db.rollback(t).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert!(
+            db.find(tid, id(1), &reader).unwrap().is_none(),
+            "rolling back insert-then-update must leave the row looking like it never existed"
+        );
+    }
+
+    // Mirror case: insert then remove in one transaction, then commit —
+    // the row must simply not exist, with no leftover tombstone artifact
+    // tripping up a later insert of the same key.
+    #[test]
+    fn test_audit_t9_insert_then_remove_then_commit_allows_reinserting_the_same_key() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.remove(tid, id(1), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let t2 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v2"), &t2).unwrap();
+        db.commit(t2).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v2"
+        );
+    }
+
+    // T13: undo replay applies operations forward, not reverse. Harmless
+    // today only because find_last_committed always resolves a pre-image
+    // to the true committed ancestor regardless of chain position — but
+    // TWO updates to an EXISTING committed row within one transaction
+    // build a real two-hop undo chain (v0 -> v1 -> v2), and rolling back
+    // must restore v0 (the original), not v1 (an intermediate value a
+    // forward replay would stop at).
+    #[test]
+    fn test_audit_t13_rollback_after_two_updates_in_one_txn_restores_the_original_not_an_intermediate_value()
+     {
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let t1 = db.begin().unwrap();
+        db.update(tid, row(1, b"v1"), &t1).unwrap();
+        db.update(tid, row(1, b"v2"), &t1).unwrap();
+        db.rollback(t1).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0",
+            "rollback must restore the ORIGINAL pre-transaction value, not an intermediate one"
+        );
+    }
+
+    // T6: reads are not snapshot-isolated against a committed DELETE —
+    // commit's tombstone reclaim is a physical removal, not deferred like
+    // undo discard, so a reader with an already-open snapshot loses a row
+    // it could see a moment ago.
+    #[test]
+    fn test_audit_t6_a_reader_snapshot_survives_a_concurrent_committed_delete() {
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0"
+        );
+
+        let t1 = db.begin().unwrap();
+        db.remove(tid, id(1), &t1).unwrap();
+        db.commit(t1).unwrap();
+
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0",
+            "a transaction's own snapshot must still see a row that was deleted and committed \
+             by someone else after it began"
+        );
+    }
+
+    // STORE_AUDIT.md S4: Db::create on an existing path rewrites the
+    // header with page_count=0 and starts overwriting old pages — no
+    // create_new/truncate/exists-check at all. Needs the real File
+    // backend: MemFile::open always returns a brand new, unshared buffer
+    // regardless of "path", so it can't reproduce a same-path collision.
+    #[test]
+    fn test_audit_s4_create_on_an_existing_path_does_not_silently_destroy_it() {
+        let db_name = temp_db_path("audit_s4_create_existing");
+        FileDB::delete(&db_name).unwrap_or_default();
+
+        let db = FileDB::create(&db_name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"precious"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.close().unwrap();
+
+        let result = FileDB::create(&db_name);
+        assert!(
+            result.is_err(),
+            "Db::create on an already-existing path must fail, not silently truncate it back \
+             to an empty database"
+        );
+
+        FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    // STORE_AUDIT.md S5: Db::delete unlinks all three files with no lock
+    // check at all, so a second process (or, as tested here, a second
+    // file description in the same process — flock is per-open-file-
+    // description, not per-process, so this is a faithful repro without
+    // needing real multi-process orchestration) can delete a database
+    // that's still open and in active use.
+    #[test]
+    fn test_audit_s5_delete_refuses_to_remove_a_locked_live_database() {
+        let db_name = temp_db_path("audit_s5_delete_locked");
+        FileDB::delete(&db_name).unwrap_or_default();
+
+        let db = FileDB::create(&db_name).unwrap(); // holds an flock on all 3 files
+
+        let result = FileDB::delete(&db_name);
+        assert!(
+            result.is_err(),
+            "delete must refuse to remove a database that's still open/locked elsewhere"
+        );
+
+        drop(db);
+        FileDB::delete(&db_name).unwrap_or_default();
+    }
+
+    // STORE_AUDIT.md S6: the catalog (system table page) has a hard
+    // capacity — create_table inserts into the in-memory `tables` map
+    // BEFORE persisting, so once the catalog page is full, the failing
+    // call leaves a table that's visible in memory (table_id_by_name
+    // finds it) but was never actually persisted — and every later
+    // checkpoint()/close() fails forever after, since they keep trying
+    // to persist a catalog that no longer fits.
+    #[test]
+    fn test_audit_s6_create_table_fails_cleanly_once_the_catalog_page_is_full() {
+        let db = TestDB::create("audit_s6_catalog_full.db").unwrap();
+        let mut failed_name = None;
+        for i in 0..1000 {
+            let name = format!("table_number_{i:05}");
+            if db.create_table(name.clone()).is_err() {
+                failed_name = Some(name);
+                break;
+            }
+        }
+        let failed_name = failed_name
+            .expect("expected create_table to eventually fail once the catalog page is full");
+
+        assert!(
+            db.table_id_by_name(&failed_name).unwrap().is_none(),
+            "a table whose create_table call FAILED must not be left half-created in memory"
+        );
+        assert!(
+            db.checkpoint().is_ok(),
+            "checkpoint must still succeed after a cleanly-rejected create_table, not fail \
+             forever afterward"
+        );
+    }
+
+    // STORE_AUDIT.md S7 (part 1): validate_table_name only checks length
+    // and exact-duplicate — nothing reserves the WHOLE `__system.`
+    // namespace, only the specific internal names that happen to already
+    // exist collide by accident. A name that doesn't happen to collide
+    // with any actual internal generator succeeds today.
+    #[test]
+    fn test_audit_s7_the_system_prefix_is_reserved_as_a_whole_namespace() {
+        let db = TestDB::create("audit_s7_system_prefix.db").unwrap();
+        let result = db.create_table("__system.not_actually_used_anywhere".to_string());
+        assert!(
+            result.is_err(),
+            "the entire __system. prefix must be reserved, not just the specific names \
+             already in use internally"
+        );
+    }
+
+    // STORE_AUDIT.md S7 (part 2): ValueItem::Ord panics on any mixed-type
+    // comparison (and on Blob at all) — a Rec key whose field types
+    // differ from an existing key in the same tree (store has no schema
+    // to prevent this) panics inside route_to_leaf, under a page lock.
+    // Wrapped in catch_unwind rather than asserted directly, matching S3:
+    // the eventual fix (a type-rank ordering) doesn't lock in what
+    // specific Ordering comes back, only that comparing never panics.
+    #[test]
+    fn test_audit_s7_value_item_ord_does_not_panic_on_mixed_types() {
+        let result = std::panic::catch_unwind(|| {
+            ValueItem::Integer(1).cmp(&ValueItem::Str(("x".into(), 1)))
+        });
+        assert!(
+            result.is_ok(),
+            "comparing two ValueItems of different types must never panic"
+        );
+    }
+
+    #[test]
+    fn test_audit_s7_value_item_ord_does_not_panic_on_blob() {
+        let a = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
+        let b = ValueItem::Blob((Arc::from(&b"y"[..]), 1));
+        let result = std::panic::catch_unwind(|| a.cmp(&b));
+        assert!(result.is_ok(), "comparing two Blob ValueItems must never panic");
+    }
+
+    // STORE_AUDIT.md T12: into_id() disarms Transaction::drop's default
+    // rollback unconditionally, before revert_txn_writes has actually
+    // run — so if the revert itself fails partway through, nothing
+    // re-arms anything: the id is left in `active` forever (permanent
+    // WriteConflicts on its rows, permanently pinning every later
+    // reader's snapshot, per T7). Reproduced here without needing a
+    // fault-injecting DBFile at all: dropping the table an in-flight
+    // transaction's undo ops reference makes revert_txn_writes fail with
+    // TableNotFound the moment it tries to resolve that table.
+    #[test]
+    fn test_audit_t12_a_failed_rollback_must_not_leave_the_transaction_stuck_active_forever() {
+        let (db, tid) = make_db_with_table();
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t0).unwrap();
+        db.commit(t0).unwrap();
+
+        let t1 = db.begin().unwrap();
+        let t1_id = t1.id();
+        db.update(tid, row(1, b"v1"), &t1).unwrap();
+
+        db.drop_table("rows").unwrap();
+
+        let result = db.rollback(t1);
+        assert!(
+            result.is_err(),
+            "rollback should fail here — its table is gone mid-flight: {result:?}"
+        );
+
+        assert!(
+            !db.tx_mgr.is_transaction_active(&t1_id),
+            "a transaction whose rollback failed partway through must not be left stuck in \
+             `active` forever — it should move to a recoverable state (e.g. `aborting`, so \
+             drain_aborting can retry it later)"
+        );
+    }
+
+    // STORE_AUDIT.md T14: row relocation on update (BPlusTree::
+    // update_checked's "doesn't fit alongside its siblings" branch)
+    // removes the tuple from its old page, releases that page's lock,
+    // writes the new copy elsewhere, and ONLY THEN repoints the index —
+    // three separate lock acquisitions, not one atomic step. A find()
+    // landing in the gap between "removed from old page" and "index
+    // repointed" resolves the STALE index entry, finds nothing on the
+    // (now tuple-less) old page, and reports a committed, existing key
+    // as missing. CONFIRMED empirically before writing this (real
+    // threads, no artificial delay): ~1140 false "missing" reads out of
+    // 20,000 iterations on a first run.
+    #[test]
+    fn test_audit_t14_concurrent_find_never_observes_a_committed_row_as_missing_during_relocation()
+     {
+        let db = TestDB::create_with_page_size("audit_t14_probe.db", 1024).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+
+        let t0 = db.begin().unwrap();
+        db.insert(tid, row(1, &[0u8; 50]), &t0).unwrap();
+        db.insert(tid, row(2, &[0u8; 50]), &t0).unwrap(); // shares row 1's page
+        db.commit(t0).unwrap();
+
+        const ITERS: usize = 20_000;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let missing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let db_w = db.clone();
+        let stop_w = stop.clone();
+        let writer = thread::spawn(move || {
+            let mut big = true;
+            for _ in 0..ITERS {
+                let data = if big { vec![7u8; 800] } else { vec![7u8; 50] };
+                big = !big;
+                let t = db_w.begin().unwrap();
+                let _ = db_w.update(tid, row(1, &data), &t);
+                let _ = db_w.commit(t);
+            }
+            stop_w.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let db_r = db.clone();
+        let missing_r = missing.clone();
+        let reader = thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let t = db_r.begin().unwrap();
+                if db_r.find(tid, id(1), &t).unwrap().is_none() {
+                    missing_r.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(
+            missing.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "row 1 always exists (only ever updated, never removed) — a concurrent find() must              never observe it as missing, even mid-relocation"
         );
     }
 }

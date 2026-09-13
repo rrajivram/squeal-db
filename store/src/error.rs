@@ -56,6 +56,12 @@ pub enum StoreError {
     TransactionAlreadyFinished,
     #[error("Table name max length is {0}, got {1}")]
     TableNameInvalid(usize, usize),
+    // STORE_AUDIT.md S7: the whole `__system.` namespace is reserved for
+    // internal tables, not just the specific names currently in use —
+    // rejected regardless of whether this particular name happens to
+    // collide with a real internal table today.
+    #[error("Table name {0} uses the reserved __system. prefix")]
+    ReservedTableName(String),
     #[error("Unknown error {0}")]
     UnknownError(String),
     #[error("Duplicate table name {0}")]
@@ -94,6 +100,12 @@ pub enum StoreError {
     // but the data didn't: truncation, a torn write, or on-disk bit rot.
     #[error("Page {0:?} failed its checksum — data is corrupted")]
     PageChecksumMismatch(crate::page::PageId),
+    // STORE_AUDIT.md S3: IndexKey::from_bytes/ValueItem::from_bytes_many
+    // hand-parse their own byte format (not through postcard), so a
+    // truncated or malformed buffer — read straight off disk — used to
+    // panic on an out-of-bounds slice index instead of surfacing as data.
+    #[error("Truncated or malformed value item bytes: {0}")]
+    TruncatedValueItem(String),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

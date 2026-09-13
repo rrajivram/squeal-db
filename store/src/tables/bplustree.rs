@@ -74,6 +74,23 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // why a plain Relaxed store (not a CAS/fetch_max) is fine even though
     // concurrent writers can race to extend the chain — see write_data.
     last_data_page: AtomicU64,
+    // STORE_AUDIT.md T14: find()'s "read the index, then read the data page
+    // it points to" is two separate lock acquisitions, not one atomic step
+    // — see find()'s and relocate_tuple's own comments. A concurrent
+    // relocation landing entirely between those two reads could make
+    // find() observe a page the row had *already* moved off of, reporting
+    // a still-existing, committed row as missing. Retrying find()'s lookup
+    // once against a fresh index read narrows the window a lot but can't
+    // close it (a tight enough writer can still race two lookups in a
+    // row) — confirmed empirically: retrying cut a ~1140-4067-per-20,000
+    // failure rate to ~150-200, not zero. This lock makes the two truly
+    // mutually exclusive instead: find() holds the read side across its
+    // whole index-then-data lookup; relocate_tuple holds the write side
+    // across its whole write-then-repoint-then-remove sequence. Global to
+    // the table (not per-id) — coarser than necessary, but correctness,
+    // not throughput, is Phase 1's goal here (see STORE_AUDIT.md's P-item
+    // performance findings, deliberately deferred).
+    relocation_lock: std::sync::RwLock<()>,
 }
 
 impl<F: DBFile> BPlusTree<F>
@@ -144,6 +161,7 @@ where
             txn_mgr,
             logger,
             last_data_page: AtomicU64::new(first_data_page.into()),
+            relocation_lock: std::sync::RwLock::new(()),
         })
     }
 
@@ -163,6 +181,7 @@ where
             txn_mgr,
             logger,
             last_data_page: AtomicU64::new(tail.into()),
+            relocation_lock: std::sync::RwLock::new(()),
         })
     }
 
@@ -345,11 +364,28 @@ where
     }
 
     pub fn find(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self
-            .find_page(id.clone(), self.table.first_index_page)?
-            .map(|p| self.buffer.get_page(p).and_then(|p| p.get(id)))
-            .transpose()?
-            .flatten())
+        // STORE_AUDIT.md T14: reading the index (find_page) and then the
+        // data page it points to are two separate lock acquisitions, not
+        // one atomic step. Holding relocation_lock's read side across both
+        // makes them atomic with respect to relocate_tuple (which holds
+        // the write side across its whole write-then-repoint-then-remove
+        // sequence): either this runs fully before a given relocation (and
+        // sees the old page, which still has the row) or fully after (and
+        // sees the new index entry and the new page) — never astride it,
+        // which is what let a concurrent find() land on a page the row had
+        // *already* moved off of and report a still-existing, committed
+        // row as missing. A single retry-on-miss against a fresh index
+        // read (an earlier attempt at this fix) narrowed the window a lot
+        // but couldn't close it — confirmed empirically: it cut a
+        // ~1140-4067-per-20,000 failure rate to ~150-200, not zero.
+        let _guard = self
+            .relocation_lock
+            .read()
+            .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
+        let Some(page_id) = self.find_page(id.clone(), self.table.first_index_page)? else {
+            return Ok(None);
+        };
+        self.buffer.get_page(page_id)?.get(id)
     }
 
     pub fn update(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
@@ -385,14 +421,74 @@ where
             Ok(old)
         } else {
             // Doesn't fit alongside its siblings: relocate instead of
-            // exceeding capacity. Remove from the current page (freeing its
-            // slot), place via the same capacity-aware logic insert() uses
-            // (which may still land back on this same, now-lighter page),
-            // then repoint the index entry if it landed somewhere else.
-            let old = h.page.remove_tuple(id.clone())?;
-            self.buffer.write_locked_page(h)?;
-            let new_page_id = self.write_data(&tuple)?;
-            if new_page_id != pid {
+            // exceeding capacity. See relocate_tuple's own doc comment for
+            // why the old copy isn't removed until after the new one is
+            // written and the index (if needed) repointed — STORE_AUDIT.md
+            // T14.
+            let old = h
+                .page
+                .get(id.clone())?
+                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
+            self.relocate_tuple(h, pid, id, tuple)?;
+            Ok(old)
+        }
+    }
+
+    // STORE_AUDIT.md T14: relocates `tuple` off page `pid` (which no longer
+    // has room for it) to wherever write_data lands, repointing the index
+    // if that's a different page, and only THEN removing the stale copy
+    // left behind on `pid`.
+    //
+    // The old ordering (remove from `pid` first, write elsewhere, then
+    // repoint the index) left a window — between the remove and the index
+    // repoint — where the index still pointed at `pid` after the tuple was
+    // already gone from it. A concurrent find() landing in that gap
+    // resolved the (unchanged) index to a page that genuinely didn't have
+    // the row anymore, and reported a still-existing, committed key as
+    // missing. CONFIRMED via direct concurrent repro (real threads, no
+    // artificial delay) before this fix: ~1140-4067 false "missing" reads
+    // per 20,000 iterations across runs.
+    //
+    // Writing the new copy and repointing the index *before* removing the
+    // old one closes that gap: at every point a concurrent find() can
+    // observe, the index points at a page that actually has the row —
+    // either still `pid` (old copy, not yet superseded) or the new page
+    // (new copy, already written). Never neither.
+    //
+    // `h` (the caller's already-held lock on `pid`) is dropped before
+    // write_data runs: nothing's been mutated on it yet (the caller only
+    // ever *read* the old tuple through it), and write_data must be free
+    // to walk to (and lock) other pages — including, in a small/young
+    // table, potentially `pid` itself. If it does land back on `pid`, the
+    // still-present old copy makes write_data's own add_tuple fail with
+    // DuplicateKey rather than corrupt the page; that specific case needs
+    // no index repoint anyway (the index already points at `pid`), so it
+    // falls back to a plain, fully serialized remove-then-add, safe
+    // because nothing outside this row's own owning transaction can be
+    // racing this id (see Db::check_write_conflict).
+    fn relocate_tuple(
+        &self,
+        h: WritePageHandle,
+        pid: PageId,
+        id: DBIdType,
+        tuple: Tuple,
+    ) -> Result<(), StoreError> {
+        drop(h);
+        // Write side of relocation_lock (see find()'s own comment): held
+        // across this whole write-then-repoint-then-remove sequence so a
+        // concurrent find()'s index-then-data lookup always lands fully
+        // before or fully after this relocation, never astride it.
+        let _guard = self
+            .relocation_lock
+            .write()
+            .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
+        match self.write_data(&tuple) {
+            Ok(new_page_id) => {
+                debug_assert_ne!(
+                    new_page_id, pid,
+                    "write_data landing back on pid while pid's old copy of \
+                     id is still present should have hit DuplicateKey instead"
+                );
                 let txn = tuple.txn_id.clone().unwrap_or_default();
                 retry_on_contention(|| {
                     self.update_index_entry(
@@ -403,8 +499,34 @@ where
                         None,
                     )
                 })?;
+                retry_on_contention(|| {
+                    let h = self.buffer.get_page_mut(pid)?;
+                    h.page.remove_tuple(id.clone())?;
+                    self.buffer.write_locked_page(h)
+                })
             }
-            Ok(old)
+            Err(StoreError::DuplicateKey(dup_id)) if dup_id == id => {
+                retry_on_contention(|| {
+                    let h = self.buffer.get_page_mut(pid)?;
+                    h.page.remove_tuple(id.clone())?;
+                    self.buffer.write_locked_page(h)
+                })?;
+                let new_page_id = self.write_data(&tuple)?;
+                if new_page_id != pid {
+                    let txn = tuple.txn_id.clone().unwrap_or_default();
+                    retry_on_contention(|| {
+                        self.update_index_entry(
+                            id.clone(),
+                            new_page_id,
+                            txn.clone(),
+                            self.table.first_index_page,
+                            None,
+                        )
+                    })?;
+                }
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -451,8 +573,8 @@ where
         before_write(&pre_image, &tuple)?;
 
         // From here down, identical to update() — see its own comments on
-        // why the fits-in-place check exists and what the relocation
-        // branch does.
+        // why the fits-in-place check exists, and relocate_tuple's own doc
+        // comment for what the relocation branch does (STORE_AUDIT.md T14).
         let header = h.page.header();
         let old_size = current.size();
         let fits_in_place = h.page.count()? <= 1
@@ -463,22 +585,8 @@ where
             self.buffer.write_locked_page(h)?;
             Ok(old)
         } else {
-            let old = h.page.remove_tuple(id.clone())?;
-            self.buffer.write_locked_page(h)?;
-            let new_page_id = self.write_data(&tuple)?;
-            if new_page_id != pid {
-                let txn = tuple.txn_id.clone().unwrap_or_default();
-                retry_on_contention(|| {
-                    self.update_index_entry(
-                        id.clone(),
-                        new_page_id,
-                        txn.clone(),
-                        self.table.first_index_page,
-                        None,
-                    )
-                })?;
-            }
-            Ok(old)
+            self.relocate_tuple(h, pid, id, tuple)?;
+            Ok(current)
         }
     }
 

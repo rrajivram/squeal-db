@@ -79,7 +79,13 @@ pub(crate) struct TransactionManager {
 ///
 /// Rolls back automatically when dropped if `commit()` was never called. Use
 /// `id()` to get the raw `TransactionId` for passing to lower-level operations.
-#[derive(Clone)]
+///
+/// Deliberately NOT `Clone` (see STORE_AUDIT.md T8): a clone dropped after
+/// the original committed used to trigger Drop's default rollback,
+/// silently reverting a committed write. `TransactionId` (via `id()`)
+/// stays freely cloneable for that purpose — it's a bare identifier with
+/// no ownership over the transaction's lifecycle, so cloning and dropping
+/// it has no effect on anything.
 pub struct Transaction {
     id: Option<TransactionId>,
     mgr: Arc<TransactionManager>,
@@ -259,11 +265,20 @@ impl TransactionManager {
     /// done separately by `Db` (which has table access), which then calls
     /// `abort_complete`. Callers without table access (Transaction::drop) can
     /// only get this far; the revert is drained by the next Db operation.
+    // STORE_AUDIT.md T8 (second half): refuses to move `txn` into
+    // `aborting` unless it's currently `active`. Independent hardening
+    // alongside removing `Clone` from `Transaction` — this is the
+    // invariant that actually matters (an already-finished transaction
+    // must never be re-processed as if it were still live), and it also
+    // guards the AbortOnConflict path, which relies on "moving an id into
+    // aborting twice is harmless" reasoning that only holds while nothing
+    // else has already finished it.
     pub(crate) fn abort(&self, txn: TransactionId) -> Result<(), StoreError> {
         let mut active = self.active_transactions.write();
-        let mut aborting = self.aborting_transactions.write();
-        active.remove(&txn);
-        aborting.insert(txn);
+        if !active.remove(&txn) {
+            return Err(StoreError::TransactionAlreadyFinished);
+        }
+        self.aborting_transactions.write().insert(txn);
         Ok(())
     }
 
