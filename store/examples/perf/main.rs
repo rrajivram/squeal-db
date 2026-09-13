@@ -227,11 +227,11 @@ where
     report_duration("checkpoint", t0.elapsed());
 
     let t0 = Instant::now();
-    let (f, u, r) = db.close().unwrap();
+    let (f, l) = db.close().unwrap();
     report_duration("close", t0.elapsed());
 
     let t0 = Instant::now();
-    let db: Arc<Db<F>> = Db::open_using(db_name, f, u, r).unwrap();
+    let db: Arc<Db<F>> = Db::open_using(db_name, f, l).unwrap();
     report_duration("reopen (open_using)", t0.elapsed());
     drop(db);
 
