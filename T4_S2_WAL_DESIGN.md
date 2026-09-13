@@ -23,7 +23,73 @@ made yet. Backward compatibility with existing on-disk databases is explicitly N
   `Db::open` outright. There is no way today to tell "the last record is incomplete, drop it and
   open anyway" apart from "the file is genuinely corrupted, refuse to open."
 
-## 2. On-disk record framing
+## 2. Log file header (mismatch detection)
+
+Small addition on top of the original sketch: the log file's first bytes are a fixed-size
+`LogHeader`, written once when the log file is created and never rewritten with different
+content afterward (only re-written verbatim after a checkpoint truncate — see below). This is
+what lets `Db::open` refuse cleanly if the WAL sitting next to a database file doesn't actually
+belong to it — e.g. someone restores a log file from a different backup generation, a different
+database entirely, or a build with an incompatible WAL format — instead of either failing deep
+inside recovery with a confusing decode error, or (worse) silently replaying operations that
+assume a different page layout.
+
+```rust
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+struct LogHeader {
+    magic: [u8; 4],                              // LOG_MAGIC, distinct from the main file's own 2-byte MAGIC
+    #[serde(with = "postcard::fixint::le")]
+    version: u16,                                  // WAL format version — bump on any incompatible framing/Operation change
+    #[serde(with = "postcard::fixint::le")]
+    page_size: DBSizeType,                        // must equal the paired main file's Header.page_size
+}
+
+const LOG_MAGIC: [u8; 4] = [0x53, 0x71, 0x57, 0x4c]; // "SqWL" — deliberately a different length AND
+                                                       // value from the main file's `MAGIC`, so the two
+                                                       // file kinds can never be mistaken for each other
+const CURRENT_LOG_VERSION: u16 = 1;
+```
+
+Every numeric field uses `postcard::fixint::le`, same as `Header` (`store/src/db.rs:134-144`)
+already does — so, exactly like `Header`, `LogHeader`'s postcard-encoded size equals
+`size_of::<LogHeader>()`, and reading it is the same `vec![0u8; size_of::<LogHeader>()]` +
+`read_exact` + `from_bytes` pattern `open_using` already uses for the main file's header
+(`store/src/db.rs:252-259`).
+
+- **Written**: `create_core_db` (`store/src/db.rs:1553+`) writes `LogHeader{ magic: LOG_MAGIC,
+  version: CURRENT_LOG_VERSION, page_size }` to the freshly `create_new`'d log file immediately
+  after opening it — mirroring exactly how it already writes the main file's `Header` via
+  `f.write_all(&bytes)?` right after that file's own `create_new`, before `setup_needed_modules`
+  spawns anything. `page_size` here is the same value already passed into `create_core_db` for
+  the main `Header`, so there's no new input to thread through, just one more serialize+write.
+- **Validated**: `open_using`/`open_using_with_limits` (`store/src/db.rs:234-299`), right after
+  the existing main-file magic check (`if header.magic != MAGIC { return Err(...) }`,
+  `store/src/db.rs:257-259`) and before any `do_lock()` call — read the log file's `LogHeader`
+  the same way, then check, in order: `magic == LOG_MAGIC`, `version == CURRENT_LOG_VERSION`
+  (exact match, not `<=` — a version this build doesn't recognize is exactly the "don't guess"
+  case S1's own future header-versioning work will want to reuse this reasoning for), then
+  `page_size == header.page_size` (the main file's, just read). Any mismatch returns a new
+  `StoreError::LogHeaderMismatch` variant whose message names which field disagreed and both
+  values — checking all three unconditionally before failing (not stopping at the first
+  mismatch) makes for a more useful error message if more than one is wrong at once. Failing
+  here, before any lock is taken, means a wrongly-paired log file is rejected with zero side
+  effects — nothing gets locked, nothing gets recovered against it.
+- **Recovery scanning** (§8) begins at byte offset `size_of::<LogHeader>()`, not byte 0 — the
+  header itself is never mistaken for a framed record.
+- **Checkpoint's truncate must not erase the header.** Today, `Checkpoint` truncates a log file
+  to zero bytes unconditionally (`Opener::truncate` — `MemFile`/`File`/`NamedMemFile` all
+  implement it as "set length to 0", `store/src/memfile.rs:73-76,102-105`). Under this design
+  that would also delete the `LogHeader`, so the NEXT append (after this checkpoint) would land
+  at byte 0 with no header in front of it, and the NEXT `Db::open` would read zeroed/absent
+  header bytes and reject the file. Fix: `log_runner` (§6) is given a copy of the exact
+  `LogHeader` bytes it should own (computed once, either freshly written by `create_core_db` or
+  re-derived from the just-validated on-disk header in `open_using` — byte-identical either
+  way), and on `Checkpoint`, immediately after `file.truncate()?`, does
+  `file.write_all(&header_bytes)?` before returning to the batching loop. `Db::close`
+  (`store/src/db.rs:339-392`) goes through the identical `logger.checkpoint(ts)` call
+  (`store/src/db.rs:389`), so this is the ONE place that needs the fix, not two.
+
+## 3. On-disk record framing
 
 Each persisted record (everything except the in-memory-only `ShutDown`/`Checkpoint` control
 messages, which never reach disk today and won't under this design either) is framed as:
@@ -42,10 +108,12 @@ messages, which never reach disk today and won't under this design either) is fr
 - One batch write (`file.write_all(&batch)`) may contain several framed records back to back,
   exactly as today's batching already concatenates several `to_allocvec` blobs — framing changes
   what's inside `batch`, not the batching/fsync structure around it.
+- The very first framed record in the file starts right after `LogHeader` (§2), not at byte 0.
 
 ### Recovery scan rule (this is S2's actual fix)
 
-Scanning forward from the start of the file, at each position:
+Scanning forward from the start of the RECORD region (i.e. from `size_of::<LogHeader>()`, after
+§2's header has already been read and validated separately), at each position:
 
 1. If fewer than 8 bytes remain → **torn tail at the frame header**. Stop scanning; everything
    before this position is the durable prefix. Not an error.
@@ -75,7 +143,7 @@ subsequent appends (new writes after a recovering session opens the DB) then sta
 end, not after any torn/corrupt trailing garbage — so the file's own O.S.-reported length can stay
 untouched by recovery.
 
-## 3. Unified `Operation` (combined pre/post images)
+## 4. Unified `Operation` (combined pre/post images)
 
 Replaces the current split (`Operation::Add/Del/Mod` carrying ONE `Record`, with redo getting
 the post-image and undo getting the pre-image via two separate log calls):
@@ -105,7 +173,7 @@ One call site per operation now: `Db::insert`/`update`/`remove`/`rollback_by_id`
 `self.logger.log(op)` ONCE (replacing today's paired `log_redo`+`log_undo`), which returns the
 single `LsnId` this operation was assigned.
 
-## 4. `LogRecord` / `LogMsg` (replaces `RedoOperation`/`UndoOperation`/`MsgType`)
+## 5. `LogRecord` / `LogMsg` (replaces `RedoOperation`/`UndoOperation`/`MsgType`)
 
 ```rust
 struct LogRecord {
@@ -125,25 +193,27 @@ enum LogMsg {
 in-memory control signals to the runner thread, exactly as `MsgType::ShutDown`/`Checkpoint` are
 today (never appear in `batch`, per `undo_log_runner`/`redo_log_runner`'s existing `match`).
 
-## 5. One runner thread, one channel
+## 6. One runner thread, one channel
 
-`Logger::set_db` (`store/src/logger.rs:160`) takes ONE `file: impl DBFile` instead of
+`Logger::set_db` (`store/src/logger.rs:160`) takes ONE `file: impl DBFile` (plus the
+`log_header_bytes: Vec<u8>` from §2 — needed for the post-checkpoint-truncate rewrite) instead of
 `(undo_file, redo_file)`, creates ONE `bounded(LOG_CHANNEL_CAPACITY)` channel, and spawns ONE
-`log_runner(file, rx, clock)` thread — replacing `undo_log_runner`+`redo_log_runner`. `log_runner`
-is `redo_log_runner`'s existing batching/linger loop (`store/src/logger.rs:538-596`) almost
-unchanged: same `MAX_LOG_BATCH`/`LOG_BATCH_LINGER` batching, same "write the batch, one fsync,
-then `mark_written(highest_lsn)`" structure — just framing each `LogRecord` into the batch buffer
-(`len`+`crc32`+bytes) instead of `to_allocvec`-ing it bare, and matching on `LogMsg` instead of
-`MsgType`.
+`log_runner(file, rx, clock, log_header_bytes)` thread — replacing `undo_log_runner`+
+`redo_log_runner`. `log_runner` is `redo_log_runner`'s existing batching/linger loop
+(`store/src/logger.rs:538-596`) almost unchanged: same `MAX_LOG_BATCH`/`LOG_BATCH_LINGER`
+batching, same "write the batch, one fsync, then `mark_written(highest_lsn)`" structure — just
+framing each `LogRecord` into the batch buffer (`len`+`crc32`+bytes) instead of `to_allocvec`-ing
+it bare, matching on `LogMsg` instead of `MsgType`, and — the one new step — on `Checkpoint`,
+writing `log_header_bytes` back immediately after `file.truncate()?` (§2).
 
 This incidentally fixes the other half of T4 (independently-synced files ⇒ commit not atomic):
 one file, one thread, one `fsync` per batch — a batch either lands completely or the crash caught
-it mid-`write_all`, handled by the torn-tail rule in §2. There is no longer a "redo landed, undo
+it mid-`write_all`, handled by the torn-tail rule in §3. There is no longer a "redo landed, undo
 didn't" state to reach, because there's only one artifact.
 
 `Logger::shutdown`/`checkpoint` each send exactly one `ShutDown`/`Checkpoint(ts)` instead of two.
 
-## 6. Undo pointer becomes the record's own LSN — retiring `UndoId`
+## 7. Undo pointer becomes the record's own LSN — retiring `UndoId`
 
 This is what makes T10's fix (widening `UndoId` to `u64`, already committed) obsolete rather than
 just safe: once every record has a real LSN, `Tuple`'s back-pointer to its own pre-image can just
@@ -189,13 +259,17 @@ a future change made pre-images "immediately preceding version" instead of "true
 ancestor" — flagging that coupling explicitly here so it isn't silently reintroduced as a latent
 bug if that semantic ever changes. Keep forward order; it's simpler and already proven correct.
 
-## 7. Recovery: three passes, one file
+## 8. Recovery: three passes, one file
 
 Replaces `Db::load_logs`/`process_redo`/`process_undo` (`store/src/db.rs:424-562`) with one
 `process_log(buffer)`, reading the ONE log file (mmap'd for `File`, `.data()` for `MemFile`,
 exactly as today's dual read does) and running:
 
-1. **Analysis** — single forward scan (applying §2's torn-tail/corruption rule as it goes),
+0. **Skip the header** — `process_log` is handed `&buffer[size_of::<LogHeader>()..]`; the header
+   itself was already read and validated separately, before locking, per §2 (so a mismatched
+   header never even reaches this function).
+
+1. **Analysis** — single forward scan (applying §3's torn-tail/corruption rule as it goes),
    building:
    - `committed: HashSet<TransactionId>` (saw a `Commit` record for this txn)
    - `by_txn: HashMap<TransactionId, Vec<(LsnId, Operation)>>` (every `Add`/`Mod`/`Del`, in scan
@@ -224,7 +298,7 @@ exactly as today's dual read does) and running:
    without error, unchanged.
 
 3. **Undo** — for every txn NOT in `committed`, replay its `by_txn` ops in forward LSN order
-   (§6's decision) via the existing `revert_undo_ops` (`store/src/db.rs:829-844`), unchanged in
+   (§7's decision) via the existing `revert_undo_ops` (`store/src/db.rs:829-844`), unchanged in
    shape — it already takes `&Vec<Operation>` and a `&TransactionId`, just now sourced from one
    unified `by_txn` map instead of two separately-decoded files agreeing (or not) on which
    records existed.
@@ -234,22 +308,27 @@ exactly as today's dual read does) and running:
 (today this only happens inside `process_redo`, so an empty redo file with a non-empty undo file
 would silently skip clock seeding; moot with one file, since there's only one scan to seed from).
 
-## 8. `Db<F>` / file-layout changes
+## 9. `Db<F>` / file-layout changes
 
 - `Db<F>` (`store/src/db.rs:151-177`): `undo_file`/`redo_file` fields collapse to one
   `log_file: F`.
 - `create_core_db` (`store/src/db.rs:1553+`): opens ONE file (suggest `name + ".wal"`) instead of
   `.undo`/`.redo` — one `create_new`/`do_lock`/`do_clone` instead of two, same S4/S5 semantics
-  (exclusive create, exclusive lock) just applied once.
+  (exclusive create, exclusive lock) just applied once, PLUS writes the `LogHeader` (§2)
+  synchronously right after creating it, same as the main `Header`.
 - `open_using`/`open_using_with_limits` (`store/src/db.rs:234-299`): take one `log_file: F`
-  parameter instead of two, one `do_lock`/`do_clone`.
+  parameter instead of two; read+validate its `LogHeader` (§2) right after the main file's own
+  magic check and before any `do_lock()` call, returning the new `StoreError::LogHeaderMismatch`
+  on disagreement; then one `do_lock`/`do_clone` instead of two.
 - `close` (`store/src/db.rs:339-392`): returns `(F, F)` (main file + log file) instead of
   `(F, F, F)`.
-- `checkpoint`/`Logger::checkpoint`: unchanged in spirit (§5) — one truncate instead of two,
-  removing the (latent, never-observed-failing-but-real) risk of the two runner threads
-  truncating their respective files at very slightly different moments under load.
+- `checkpoint`/`Logger::checkpoint`: unchanged in spirit (§6) — one truncate instead of two (now
+  immediately followed by the header rewrite, §2), removing the (latent, never-observed-failing-
+  but-real) risk of the two runner threads truncating their respective files at very slightly
+  different moments under load.
+- New `StoreError` variants: `LogHeaderMismatch` (§2) and `LogCorruption` (§3).
 
-## 9. Test infrastructure needed (Phase 0 item, build before writing T4/S2's own tests)
+## 10. Test infrastructure needed (Phase 0 item, build before writing T4/S2's own tests)
 
 A fault-injecting `DBFile` wrapper, per `audit-progress.md`'s existing Phase 0 note — needed to
 actually exercise "crash mid-write" for S2's torn-tail path and T4's atomicity claim, not just
@@ -281,18 +360,25 @@ schedule before delegating; everything else (`read`, `seek`, `do_sync`, `do_lock
 reset it, so a test can take a "crash clone" (mirroring the existing `crash_clone` helper) that
 still carries whatever fault was injected up to that point.
 
-## 10. Blast radius (concrete, from the current tree)
+Also usable directly (no new fault variant needed) for §2's header-mismatch tests: construct a
+log file whose first `size_of::<LogHeader>()` bytes were written by hand with a different
+`page_size`/`version`/`magic` than the paired main file expects, then assert `Db::open_using`
+returns `StoreError::LogHeaderMismatch` rather than proceeding into recovery.
+
+## 11. Blast radius (concrete, from the current tree)
 
 - `store/src/logger.rs` — the whole redo/undo split: `MsgType`/`RedoOperation`/`UndoOperation` →
   `LogMsg`/`LogRecord`; `Operation` gains combined pre/post variants; `undo_log_runner`+
-  `redo_log_runner` → one `log_runner`; `UndoId` type deleted; `Logger`'s `undo_txns` field →
-  `records`+`by_txn`; `next_undo_id`/`find_undo_tuple` retired in favor of LSN-keyed lookups;
-  `log_redo`+`log_undo` → one `log`.
-- `store/src/db.rs` — `Db` struct's `undo_file`/`redo_file` → `log_file`; `create_core_db`,
-  `open_using`/`open_using_with_limits`, `close`, `checkpoint`, `setup_needed_modules`
-  (`Logger::set_db` call site); `load_logs`/`process_redo`/`process_undo` → one `process_log`;
-  `insert`/`update`/`remove`/`rollback_by_id`'s logging call sites (one `log()` call each instead
-  of paired `log_redo`+`log_undo`); new `StoreError::LogCorruption` variant.
+  `redo_log_runner` → one `log_runner` (now also carrying `log_header_bytes` for the post-
+  truncate rewrite); `UndoId` type deleted; `Logger`'s `undo_txns` field → `records`+`by_txn`;
+  `next_undo_id`/`find_undo_tuple` retired in favor of LSN-keyed lookups; `log_redo`+`log_undo`
+  → one `log`; new `LogHeader`/`LOG_MAGIC`/`CURRENT_LOG_VERSION`.
+- `store/src/db.rs` — `Db` struct's `undo_file`/`redo_file` → `log_file`; `create_core_db`
+  (writes `LogHeader`), `open_using`/`open_using_with_limits` (validates `LogHeader`), `close`,
+  `checkpoint`, `setup_needed_modules` (`Logger::set_db` call site); `load_logs`/`process_redo`/
+  `process_undo` → one `process_log` (skips the header region first); `insert`/`update`/
+  `remove`/`rollback_by_id`'s logging call sites (one `log()` call each instead of paired
+  `log_redo`+`log_undo`); new `StoreError::LogHeaderMismatch`/`LogCorruption` variants.
 - `store/src/tuple.rs` — `undo_id: Option<UndoId>` → `pre_lsn: Option<LsnId>` (plus
   `set_undo_id`/any other direct references).
 - `store/src/tables/bplustree.rs` — `MAX_ENTRY_BYTES` comment label only, no numeric change.
@@ -312,38 +398,50 @@ still carries whatever fault was injected up to that point.
   - `test_replay_seeds_lsn_watermark_from_prior_session`
   - `test_lsn_watermark_does_not_regress_after_new_writes_post_reopen`
   - `test_checkpoint_truncates_redo_and_undo_log_files` (name itself becomes wrong — "one log
-    file" — needs renaming, not just updating)
+    file" — needs renaming, not just updating; also needs a new assertion that the header
+    survives the truncate)
   - `test_checkpoint_keeps_log_bounded_across_many_rounds`
   - Two `logger::tests` calls to `set_db(MemFile::new(), MemFile::new())` (now one `MemFile`
-    argument).
+    argument plus header bytes).
   Every one of these needs its helper usage (`crash_clone`, `count_log_records`,
   `wait_for_durable_logs`, all defined in `store/src/db.rs`'s test module,
   `store/src/db.rs:1848-1891`) updated from "two files" to "one file" shape, not just a mechanical
   rename — several assert on redo/undo record counts independently, which no longer makes sense
-  once there's one merged stream.
+  once there's one merged stream, and `count_log_records` needs to skip the header before
+  counting framed records.
+  - New tests (not migrations of existing ones): `LogHeader` mismatch on `page_size`/`version`/
+    `magic` individually (§2/§10), header survives a checkpoint truncate, torn-tail-vs-corruption
+    scan rule (§3/§10) for each of the three cases in that rule.
 
-## 11. Explicitly out of scope for this design
+## 12. Explicitly out of scope for this design
 
 - T1 (commit durability timing), T2 (page-LSN gating), T3/T5/T16 (checkpoint/header discipline),
   T11 (wall-clock timestamps), S1 (header versioning/checksum) — separate phases per
   `audit-progress.md`, untouched here even though some (T2 especially) will eventually want to
-  read the same per-record LSN this design introduces.
+  read the same per-record LSN this design introduces, and S1's own eventual main-file header
+  versioning can likely reuse §2's exact validate-before-lock pattern.
 - Any on-disk backward compatibility with pre-T4/S2 database files — confirmed not required.
 - Performance work (P1, P8) — the plan already notes P1 (two fsyncs per commit) is incidentally
-  fixed by §5's single runner/single fsync, but that's a side effect, not a benchmarked goal of
+  fixed by §6's single runner/single fsync, but that's a side effect, not a benchmarked goal of
   this pass.
 
-## 12. Suggested implementation order (for the eventual coding pass, not done here)
+## 13. Suggested implementation order (for the eventual coding pass, not done here)
 
-1. `FaultyFile` test wrapper (§9) — build first, so the rest of the work can be red/green tested
-   against real torn-tail/corruption scenarios from day one, matching this repo's established
-   test-first process (`audit-progress.md`'s own stated process for every finding so far).
-2. Record framing + checksum (§2) in isolation — encode/decode/scan-rule unit tests, no `Logger`
+1. `FaultyFile` test wrapper (§10) — build first, so the rest of the work can be red/green tested
+   against real torn-tail/corruption/mismatched-header scenarios from day one, matching this
+   repo's established test-first process (`audit-progress.md`'s own stated process for every
+   finding so far).
+2. `LogHeader` (§2) in isolation — encode/decode/validate unit tests (magic/version/page_size
+   mismatch each rejected with the right error), independent of everything else.
+3. Record framing + checksum (§3) in isolation — encode/decode/scan-rule unit tests, no `Logger`
    or `Db` wiring yet.
-3. Unified `Operation`/`LogRecord`/`LogMsg` (§3-4) and the single `log_runner` (§5) — get one
-   file/one thread writing framed records, with existing tests still pointed at two files
-   temporarily disabled/ignored rather than half-migrated.
-4. LSN-keyed `Logger` bookkeeping + retire `UndoId` (§6).
-5. `process_log`'s three passes (§7) and `Db<F>`/file-layout changes (§8).
-6. Migrate the 12+2 entangled tests (§10) to the new one-file shape; add S2's own new
-   torn-tail/corruption tests and T4's own new atomicity tests using `FaultyFile`.
+4. Unified `Operation`/`LogRecord`/`LogMsg` (§4-5) and the single `log_runner` (§6, including the
+   post-checkpoint-truncate header rewrite) — get one file/one thread writing header-then-framed-
+   records, with existing tests still pointed at two files temporarily disabled/ignored rather
+   than half-migrated.
+5. LSN-keyed `Logger` bookkeeping + retire `UndoId` (§7).
+6. `process_log`'s three passes (§8, header-skip included) and `Db<F>`/file-layout changes (§9,
+   including `open_using`'s header validation).
+7. Migrate the 12+2 entangled tests (§11) to the new one-file shape; add S2's own new
+   torn-tail/corruption tests, T4's own new atomicity tests, and §2's header-mismatch tests, all
+   using `FaultyFile`.
