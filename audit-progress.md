@@ -14,26 +14,35 @@ Performance findings (P1-P10) are deferred entirely — no tests written yet; re
 actually implementing Phase 6/7 of the fix plan, since a benchmark written before the fix mostly
 just documents current (slow) behavior rather than proving anything.
 
-**Current status: Phases 1, 2, and 3 are DONE.** All 12 Phase 1 findings (T8, T9, T6, T12, T14,
-S3, S4, S5, S6, S7 — S7 counted once, covering both its prefix and Ord sub-issues), Phase 2's
-T10/T4/S2, and Phase 3's T2/T1/P10 are fixed and `[t-green]`. T4+S2 shipped together as one WAL
-redesign (single framed/checksummed log file, `LogHeader` mismatch detection, `UndoId` retired in
-favor of LSN-keyed lookups) — full design in `T4_S2_WAL_DESIGN.md`. T2/T1/P10 design in
-`T2_T1_P10_DURABILITY_DESIGN.md`; T2 fixed the actual root cause (pages stamped from the flush
-watermark instead of their own operation's lsn), T1 added a real durability-wait to `commit()`
-(catching a cold-start-sentinel bug in the process), P10 made the group-commit linger adaptive.
-Also caught and fixed, mid-Phase-3, a genuine pre-existing bug unrelated to any single finding: a
+**Current status: Phases 1-5's correctness work is DONE; only deferred-performance and one
+deliberately-deferred feature (T7) remain.** All 12 Phase 1 findings (T8, T9, T6, T12, T14, S3,
+S4, S5, S6, S7 — S7 counted once, covering both its prefix and Ord sub-issues), Phase 2's
+T10/T4/S2, Phase 3's T2/T1/P10, Phase 4's T3/T5/T16/S1/T17, and (from Phase 5 onward) T11/T15/S8
+are fixed (or, for T15, verified with no fix needed) and `[t-green]`. T4+S2 shipped together as
+one WAL redesign (single framed/checksummed log file, `LogHeader` mismatch detection, `UndoId`
+retired in favor of LSN-keyed lookups) — full design in `T4_S2_WAL_DESIGN.md`. T2/T1/P10 design
+in `T2_T1_P10_DURABILITY_DESIGN.md`. T3/T5/T16/S1/T17 (quiesced checkpoint, durable header write,
+free-list reconciliation, header versioning/checksum, per-table drop_table locking) design in
+`PHASE4_CHECKPOINT_DESIGN.md`. T11 replaced wall-clock transaction timestamps with a monotonic
+per-Db sequence; S8 closed two lock-poisoning risks (`ArcLock`, `Page`) and converted every
+production `panic!` in `bplustree.rs` plus `resolve_visible`'s missing-`txn_id` panic to typed
+errors.
+Also caught and fixed along the way, each unrelated to the finding being worked at the time: a
 nondeterministic (HashMap-iteration-order-dependent) replay ordering bug in `process_log`'s redo
-pass, found by re-verifying Phase 2's own "396 passed" claim after a session boundary and
-noticing a test failed 5/6 standalone reruns despite being part of that green commit — see the
-`process_log` note further down and commit `b9c1437`.
+pass (commit `b9c1437`); a `get_page`-on-a-mid-overflow-chain-page decode hazard found while
+building T16's free-list reconciliation walk; and a regression T17 caused in a previously-`[t-green]`
+T12 test (documented under both entries).
 `squeal-sql --lib`: 346 passed, 0 failed throughout. Whole workspace builds clean throughout. One
-test (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) is a
+test (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) was a
 known pre-existing, unrelated flaky/timing-sensitive test (confirmed via repeated standalone runs
-during T12's work) — not part of this audit's scope. 3 sub-findings deliberately have no test
-(T7, S7's `u64::MAX` sentinel, S7's `Eq`-capacity question) — see their own entries for why; not
-blocking, since nothing regressed them. Full `store` suite after Phase 3: **399 passed, 0
-failed**. Phases 4-7 remain untouched, catalogued below as `[ ]`.
+during T12's work) — now passes reliably alongside everything else in the current full run.
+Three sub-findings deliberately have no test (T7, S7's `u64::MAX` sentinel, S7's `Eq`-capacity
+question) — see their own entries for why; not blocking, since nothing regressed them. Full
+`store` suite as of the T11/T15/S8 commit: **418 passed, 0 failed**.
+**What's left**: T7 (needs a stats/back-pressure API designed first, not a bug fix), S7's two
+deferred sub-issues (dispositioned, not forgotten), and every P-series performance finding
+(P1-P10, S9) — all explicitly deferred per this doc's own scope decision above. Phases 6-7 are
+performance-only and untouched.
 
 ## Phase 1 — ALL FIXED
 
