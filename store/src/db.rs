@@ -177,6 +177,21 @@ pub struct Db<F: DBFile + 'static> {
     // (whoever owned the row before this remove), not the remover. Must be
     // carried explicitly.
     pending_tombstone_reclaims: RwLock<Vec<(HashSet<TransactionId>, TransactionId, Record)>>,
+    // STORE_AUDIT.md T3: quiesced checkpoint. checkpoint() takes the write
+    // side for its whole run, blocking any new transaction from becoming
+    // active (begin_with_conflict_policy takes the read side, but only
+    // around its own final tx_mgr.begin call — see that method's comment
+    // for why not any earlier) — so the set of in-flight transactions can
+    // only shrink once a checkpoint starts, never grow, and checkpoint()
+    // can safely wait for it to reach empty before flushing+truncating.
+    // Without this, checkpoint() (auto-triggered from begin() whenever the
+    // log exceeds 16 MiB, not just on an explicit call) could flush a page
+    // an active or merely-abandoned-but-not-yet-reverted transaction had
+    // written, then truncate the only record of that transaction ever
+    // having existed — after a crash, a fresh session finds no trace of it
+    // in either transaction set and (see TransactionManager::is_committed)
+    // concludes it must have committed.
+    checkpoint_gate: RwLock<()>,
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -297,6 +312,7 @@ where
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
+            checkpoint_gate: RwLock::new(()),
         };
         sf.load_system_tables()?;
         sf.load_logs()?;
@@ -393,6 +409,17 @@ where
     }
 
     pub fn checkpoint(&self) -> Result<(), StoreError> {
+        // STORE_AUDIT.md T3: quiesced checkpoint. Take the write side of
+        // checkpoint_gate for this whole call — blocks any NEW transaction
+        // from becoming active (begin_with_conflict_policy takes the read
+        // side around its own tx_mgr.begin call), so the set of in-flight
+        // transactions can only shrink from here, never grow. Then wait for
+        // that set (both `active` and `aborting` — see the wait helper's
+        // own comment on why both) to actually reach empty before touching
+        // any page or the log, so nothing this flush+truncate does can ever
+        // discard the only record of a write that hasn't committed yet.
+        let _gate = self.checkpoint_gate.write();
+        self.wait_for_no_in_flight_transactions()?;
         // Must happen before the log truncate below, and really before
         // anything else here: write_system_tables() persists the
         // generator's current sequences (including the transaction-id
@@ -411,11 +438,40 @@ where
         hdr.page_count = self.page_count();
         let ts = timestamp();
         hdr.last_checkpoint = ts;
-        self.buffer.write_header(hdr)?;
+        // STORE_AUDIT.md T5: write_header_synced (not write_header) — waits
+        // for the header write to be physically written AND fsynced before
+        // returning, so the log truncation right below can never run ahead
+        // of it. Without this, a crash between the (fire-and-forget) header
+        // write landing in the writer thread's channel and the log actually
+        // being truncated could truncate first, leaving a stale header
+        // (wrong page_count/last_checkpoint) paired with an already-empty
+        // log on reopen.
+        self.buffer.write_header_synced(hdr)?;
         self.logger.checkpoint(ts)?;
         self.last_checkpoint
             .store(ts, std::sync::atomic::Ordering::Relaxed);
         Ok(())
+    }
+
+    // STORE_AUDIT.md T3: blocks until no transaction is active or merely
+    // abandoned-and-not-yet-reverted. Actively drains `aborting` itself
+    // (not just polls) — drain_aborting() normally only ever runs from
+    // begin(), which is blocked by checkpoint_gate's write side for as
+    // long as this call is in progress, so nothing else would ever make
+    // that set shrink otherwise, livelocking. No timeout: an indefinite
+    // wait is the accepted tradeoff of a quiesced checkpoint (see
+    // PHASE4_CHECKPOINT_DESIGN.md's own note on why — a long-lived reader
+    // or forgotten transaction blocking a checkpoint is a known, deferred
+    // limitation, not something this fix newly introduces).
+    fn wait_for_no_in_flight_transactions(&self) -> Result<(), StoreError> {
+        loop {
+            self.drain_aborting();
+            let active = self.tx_mgr.get_active_transactions()?;
+            if active.is_empty() && self.tx_mgr.aborting_ids().is_empty() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn load_logs(&self) -> Result<usize, StoreError> {
@@ -601,6 +657,15 @@ where
         if self.log_file.get_metadata()?.len > 16 * 1024 * 1024 {
             self.checkpoint()?;
         }
+        // STORE_AUDIT.md T3: acquired fresh here, AFTER the auto-checkpoint
+        // call above (never around it — checkpoint() takes checkpoint_gate's
+        // WRITE side, so holding the read side across that call would
+        // self-deadlock), and held only long enough to register the new
+        // transaction. This is what makes checkpoint()'s own wait
+        // meaningful: no transaction can become active while a checkpoint
+        // holds the write side, so the in-flight set it's waiting to drain
+        // can only shrink, never grow, once it starts waiting.
+        let _gate = self.checkpoint_gate.read();
         self.tx_mgr.begin(policy)
     }
 
@@ -1694,6 +1759,7 @@ where
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
+            checkpoint_gate: RwLock::new(()),
         })
     }
 
@@ -6281,6 +6347,103 @@ mod tests {
             "commit() must not return until its own commit record (and everything logged \
              earlier in this transaction) is actually durable, not just queued for the log \
              runner thread"
+        );
+    }
+
+    // STORE_AUDIT.md T3: checkpoint() flushed EVERY dirty page (including
+    // one written by a transaction that was abandoned, not committed) and
+    // then truncated the log — after a crash, a fresh session finds no
+    // trace of that transaction in either the active or aborting set and
+    // (see TransactionManager::is_committed: "absent from both" means
+    // committed) wrongly treats its write as committed.
+    //
+    // Adapted from the audit's own reproduction: it used mem::forget (a
+    // transaction that never drops, so Transaction::drop's own move into
+    // `aborting` never runs) — under a QUIESCED checkpoint (the fix this
+    // test verifies), that specific shape is unfixable by construction:
+    // checkpoint() must wait for every in-flight transaction to actually
+    // resolve, and a forgotten one never will, by definition, regardless
+    // of design. That's an accepted, inherent limit of quiescing (a
+    // genuinely leaked transaction blocks all future checkpoints forever
+    // either way), not a gap this fix leaves open — a real caller bug, not
+    // a data-integrity one. The scenario this fix DOES need to close is a
+    // transaction that's abandoned normally (dropped without an explicit
+    // commit/rollback, moving to `aborting` for later reclaim) or one
+    // that's still genuinely active — both tested below.
+    #[test]
+    fn test_audit_t3_checkpoint_reverts_an_abandoned_write_before_flushing() {
+        let (db, tid) = make_db_with_table();
+        {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(7, b"uncommitted"), &t).unwrap();
+            // t drops here without commit/rollback — moves to `aborting`,
+            // not reclaimed until something drains it (normally only
+            // begin(), which checkpoint() itself now also does — see
+            // wait_for_no_in_flight_transactions).
+        }
+        db.checkpoint().unwrap();
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
+        let reader = db2.begin().unwrap();
+        assert!(
+            db2.find(tid, id(7), &reader).unwrap().is_none(),
+            "checkpoint must not let an abandoned, never-committed write survive as if \
+             it had committed — either by reverting it before flushing (this fix), or \
+             (if that somehow didn't happen) by leaving enough log behind for replay to \
+             still catch it"
+        );
+    }
+
+    // Proves the gate actually blocks/waits rather than the fix merely
+    // happening to handle the already-resolved (dropped) case above:
+    // a transaction genuinely still active (mid-work, on another thread)
+    // must delay checkpoint() until it finishes, and its write — since it
+    // DOES go on to commit — must survive.
+    #[test]
+    fn test_audit_t3_checkpoint_waits_for_a_still_active_transaction() {
+        let (db, tid) = make_db_with_table();
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let db_w = db.clone();
+        let started_w = started.clone();
+        let release_w = release.clone();
+        let writer = thread::spawn(move || {
+            let t = db_w.begin().unwrap();
+            db_w.insert(tid, row(9, b"in-flight"), &t).unwrap();
+            started_w.wait();
+            // Hold the transaction open until the main thread has had a
+            // real chance to observe checkpoint() still blocked.
+            while !release_w.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            db_w.commit(t).unwrap();
+        });
+
+        started.wait();
+        // The writer's transaction is active right now. Run checkpoint()
+        // on its own thread and confirm it does NOT complete while that's
+        // still true.
+        let db_c = db.clone();
+        let checkpointer = thread::spawn(move || db_c.checkpoint());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            !checkpointer.is_finished(),
+            "checkpoint() must wait for a still-active transaction to finish, not run \
+             (and truncate the log) while it's mid-write"
+        );
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        checkpointer.join().unwrap().unwrap();
+
+        let reader = db.begin().unwrap();
+        assert_eq!(
+            db.find(tid, id(9), &reader).unwrap().unwrap().data.to_vec(),
+            b"in-flight",
+            "the transaction's write legitimately committed once checkpoint's wait let it \
+             finish — it must still be there, not discarded"
         );
     }
 }

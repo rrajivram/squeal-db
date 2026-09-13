@@ -26,6 +26,15 @@ use crate::{
 enum BufMsg {
     WritePage(WriteMsg),
     WriteHeader(Header),
+    // STORE_AUDIT.md T5: like WriteHeader, but with a reply channel the
+    // caller blocks on — the writer thread pwrite's AND fsyncs the header
+    // before replying, so the caller (Db::checkpoint) knows the header is
+    // actually durable before it lets anything truncate the log. Plain
+    // WriteHeader stays fire-and-forget for callers that don't need that
+    // guarantee (Db::close, whose own buffer.shutdown() call right after
+    // already flushes and syncs the whole file — same-channel FIFO order
+    // already guarantees the header write is processed first).
+    WriteHeaderSynced(Header, Sender<Result<(), StoreError>>),
     // Drop any deferred (pending) writes for this page: it has just been freed,
     // so an as-yet-unflushed write of its old contents must not survive to
     // clobber the next occupant after the slot is reallocated.
@@ -190,6 +199,15 @@ where
 
     pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
         Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
+    }
+
+    // STORE_AUDIT.md T5: see WriteHeaderSynced's own comment — blocks until
+    // the header is physically written AND fsynced, not just queued.
+    pub(crate) fn write_header_synced(&self, header: Header) -> Result<(), StoreError> {
+        let (tx, rx) = bounded(1);
+        self.write_tx.send(BufMsg::WriteHeaderSynced(header, tx))?;
+        rx.recv()
+            .map_err(|e| StoreError::UnknownError(e.to_string()))?
     }
 
     // Unlike write_locked_page, this one stays synchronous (eager) rather
@@ -1288,6 +1306,22 @@ fn writer<F: DBFile>(
                     bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
                 }
                 pwrite_all(&file, &bytes, 0)?;
+            }
+            Ok(BufMsg::WriteHeaderSynced(header, tx)) => {
+                let res = (|| {
+                    let mut bytes = to_allocvec(&header)?;
+                    if bytes.len() < size_of::<Header>() {
+                        bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
+                    }
+                    pwrite_all(&file, &bytes, 0)?;
+                    // STORE_AUDIT.md T5: the whole point of this variant —
+                    // the caller (Db::checkpoint) must not truncate the log
+                    // until the header is confirmed durable, not just
+                    // handed to the OS via write().
+                    file.do_sync()?;
+                    Ok(())
+                })();
+                let _ = tx.send(res);
             }
             Ok(BufMsg::DiscardPending(page_id)) => {
                 // The slot was freed; drop its deferred write so it can't clobber

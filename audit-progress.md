@@ -539,9 +539,57 @@ Design doc: `T2_T1_P10_DURABILITY_DESIGN.md`.
   Full `store` suite: 399 passed, 0 failed (398 baseline + this test). `squeal-sql --lib`: 346
   passed, 0 failed. Whole workspace builds clean.
 
-### Phase 4 — fuzzy checkpoint + header discipline
-- [ ] **T3** — `checkpoint()` with an active transaction turns uncommitted writes into
-  committed ones after a crash. `CONFIRMED`.
+## Phase 4 — T3 FIXED; T5/T16/S1/T17 in progress
+
+Design doc: `PHASE4_CHECKPOINT_DESIGN.md`. **Decision confirmed with the user**: T3 uses the
+audit's simpler *quiesced checkpoint* design (checkpoint blocks new transactions and waits for
+in-flight ones to finish), not the full ARIES-style fuzzy checkpoint — this substantially
+simplifies T5/T16 too (see the design doc's own reasoning for why).
+
+- [t-green] **T3** — FIXED. `Db::checkpoint` flushed EVERY dirty page (including one written
+  by a transaction that was still active, or merely abandoned-and-not-yet-reverted) and then
+  truncated the WAL to nothing — the undo/redo trail that would have proven the write
+  uncommitted was gone, so a fresh session after a crash found no trace of that transaction in
+  either the active or aborting set and (`TransactionManager::is_committed`: "absent from
+  both" means committed) wrongly treated its write as committed. Auto-triggered from `begin()`
+  whenever the log exceeds 16 MiB, so this fires under ordinary sustained load, not just an
+  explicit `checkpoint()` call.
+  Fixed with a `checkpoint_gate: RwLock<()>` on `Db`: `checkpoint()` takes the WRITE side for
+  its entire run; `begin_with_conflict_policy` takes the READ side, but only around its own
+  final `tx_mgr.begin` call — deliberately NOT around the auto-checkpoint trigger a few lines
+  above it, which would self-deadlock (a thread can't hold the read side while `checkpoint()`
+  tries to take the write side on the very call it's making). Once `checkpoint()` holds the
+  write side, no NEW transaction can become active, so the in-flight set can only shrink from
+  there; a new `wait_for_no_in_flight_transactions` loop then blocks until it actually reaches
+  empty before touching any page or the log.
+  Two sets matter, not one: `active_transactions` (open, mid-work) AND `aborting_transactions`
+  (abandoned via `Transaction::drop`, not yet physically reverted) — a transaction sitting in
+  `aborting` is already correctly invisible, but if its page write survives a flush+truncate
+  un-reverted, a fresh session has no record of it at all and reaches the identical "absent
+  from both sets = committed" false conclusion, just via the abandoned-transaction path instead
+  of the still-open one. The wait loop actively calls `drain_aborting()` itself on every
+  iteration (not just polls): that's normally only ever triggered from `begin()`, which is
+  blocked by the very gate `checkpoint()` holds — without driving it itself, an abandoned
+  transaction could never be reclaimed while a checkpoint waits, livelocking. No timeout: an
+  indefinite wait is the accepted tradeoff of quiescing (matches the audit's own "long readers
+  block checkpoints; combine with T7's reader-pinning limits" framing — T7 stays deferred, same
+  as Phases 1-3).
+  Test design note: the audit's own reproduction used `mem::forget` (a transaction that never
+  drops, so `Transaction::drop`'s move into `aborting` never runs) — under a quiesced
+  checkpoint that specific shape is unfixable by construction (checkpoint must wait for every
+  in-flight transaction to actually resolve, and a forgotten one never will, regardless of
+  design) and isn't a data-integrity gap this fix leaves open, just an inherent, accepted limit
+  of quiescing (a genuinely leaked transaction blocks all future checkpoints forever either
+  way) — a caller bug, not a correctness one. Adapted to a normally-dropped (not forgotten)
+  abandoned transaction instead, which IS the scenario this fix needs to close.
+  Tests: `test_audit_t3_checkpoint_reverts_an_abandoned_write_before_flushing` (the adapted
+  reproduction above) and `test_audit_t3_checkpoint_waits_for_a_still_active_transaction` (a
+  genuinely still-open transaction on another thread, proving the gate actually blocks/waits —
+  checked via `JoinHandle::is_finished()` — rather than the fix merely happening to handle the
+  already-resolved dropped case). Confirmed meaningful: reliably red (3/3) with the wait call
+  temporarily disabled, reliably green (3/3) restored. Full `store` suite: 401 passed, 0 failed
+  (399 baseline + these 2 tests). `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace
+  builds clean.
 - [ ] **T5** — checkpoint sequence isn't crash-ordered; log truncation can precede the header
   write, and the header is never synced.
 - [ ] **T16** — free list / page count only persisted at checkpoint; crash recovery can
