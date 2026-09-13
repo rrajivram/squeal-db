@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::DBSizeType,
     error::StoreError,
-    logger::UndoId,
+    logger::LsnId,
     txn::TransactionId,
     valueitem::{IndexKey, ValueItem},
 };
@@ -77,7 +77,13 @@ impl Ord for DBIdType {
 pub struct Tuple {
     pub(crate) id: DBIdType,
     pub(crate) txn_id: Option<TransactionId>,
-    pub(crate) undo_id: Option<UndoId>,
+    // Back-pointer to the WAL record that carries this tuple's pre-image —
+    // None means "no ancestor" (only true of a fresh INSERT). Was a
+    // per-transaction positional UndoId (STORE_AUDIT.md T10: minted as
+    // `id.len() as u16`, wrapping at 65,536 ops); is now the record's own
+    // globally-unique LsnId, which can never wrap or alias a different
+    // transaction's/row's entry (T4_S2_WAL_DESIGN.md §7).
+    pub(crate) pre_lsn: Option<LsnId>,
     // Reference-counted so cloning a Tuple (page scans, undo records, find/get)
     // is an O(1) refcount bump instead of copying the whole payload. Serializes
     // identically to `Vec<u8>` in postcard (a seq of u8), so on-disk format is
@@ -105,13 +111,13 @@ impl Tuple {
         id: DBIdType,
         data: &[u8],
         txn_id: Option<TransactionId>,
-        undo_id: Option<UndoId>,
+        pre_lsn: Option<LsnId>,
     ) -> Self {
         let mut s = Self {
             id,
             data: Arc::from(data),
             txn_id,
-            undo_id,
+            pre_lsn,
             ..Default::default()
         };
         // serialized_size() over to_allocvec().len(): every Tuple construction
@@ -143,8 +149,8 @@ impl Tuple {
         self.txn_id.as_ref().map(|t| *t == tx_id).unwrap_or(false)
     }
 
-    pub fn set_undo_id(&mut self, id: UndoId) {
-        self.undo_id = Some(id);
+    pub fn set_pre_lsn(&mut self, lsn: LsnId) {
+        self.pre_lsn = Some(lsn);
         self.serialized_size = 0; // see set_txn_id
     }
 
@@ -256,7 +262,7 @@ mod tests {
             id: DBIdType::Int(0),
             data: vec![b'h', b'e', b'l', b'l', b'o'].into(),
             txn_id: None,
-            undo_id: None,
+            pre_lsn: None,
             ..Default::default()
         };
         let b = t.to();
@@ -272,7 +278,7 @@ mod tests {
             id: id.clone(),
             data: b"value".to_vec().into(),
             txn_id: None,
-            undo_id: None,
+            pre_lsn: None,
             ..Default::default()
         };
         let b = t.to();
@@ -286,7 +292,7 @@ mod tests {
         use crate::txn::TransactionId;
         let mut t = Tuple::new(5, b"hello");
         assert!(t.txn_id.is_none());
-        assert!(t.undo_id.is_none());
+        assert!(t.pre_lsn.is_none());
         // TransactionId::from(u64) mints a fresh timestamp on every call, so
         // two separately-constructed instances for the same numeric id are
         // not equal (identity includes ts, not just id) — reuse the same
@@ -294,7 +300,7 @@ mod tests {
         let txn_id = TransactionId::from(99);
         t.set_txn_id(txn_id.clone());
         assert_eq!(t.txn_id, Some(txn_id));
-        assert!(t.undo_id.is_none());
+        assert!(t.pre_lsn.is_none());
     }
 
     #[test]

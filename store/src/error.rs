@@ -106,6 +106,21 @@ pub enum StoreError {
     // panic on an out-of-bounds slice index instead of surfacing as data.
     #[error("Truncated or malformed value item bytes: {0}")]
     TruncatedValueItem(String),
+    // T4_S2_WAL_DESIGN.md §2: the WAL's own LogHeader (magic/version/
+    // page_size) disagreed with what the paired main database file
+    // expects — e.g. a log file restored from a different database, a
+    // different build's WAL format, or a different page size. Refused
+    // before any lock is taken and before recovery touches the file at
+    // all, rather than failing deep inside decode or silently replaying
+    // against the wrong page layout.
+    #[error("WAL header mismatch: {0}")]
+    LogHeaderMismatch(String),
+    // T4_S2_WAL_DESIGN.md §3: a record's checksum failed AND a complete,
+    // valid record follows it — which rules out "this is just the torn
+    // tail of an in-progress write" (nothing coherent would follow that).
+    // Real, mid-file corruption; recovery refuses to guess past it.
+    #[error("WAL corruption: {0}")]
+    LogCorruption(String),
 }
 
 impl<T> From<PoisonError<T>> for StoreError {

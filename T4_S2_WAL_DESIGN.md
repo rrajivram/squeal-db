@@ -445,3 +445,99 @@ returns `StoreError::LogHeaderMismatch` rather than proceeding into recovery.
 7. Migrate the 12+2 entangled tests (§11) to the new one-file shape; add S2's own new
    torn-tail/corruption tests, T4's own new atomicity tests, and §2's header-mismatch tests, all
    using `FaultyFile`.
+
+## 14. Implementation notes — where reality diverged from this design
+
+**Status: implemented.** Everything below is what actually shipped, kept alongside the original
+plan above (rather than silently editing it) so the record of what was proposed vs. what building
+it surfaced stays intact — matching this repo's own `audit-progress.md` convention.
+
+- **Checksum: `page::fnv1a_32`, not `crc32fast`.** `page.rs` already has a hand-rolled FNV-1a-32
+  hash used for exactly this job (physical page checksums — "cheap and good enough to catch
+  accidental corruption... nothing cryptographic needed", per its own comment). Reusing it for
+  WAL record framing needed zero new dependencies and keeps one checksum algorithm in the codebase
+  for the same purpose instead of two. `store/Cargo.toml` was NOT changed.
+- **`LogHeader::encoded_len()` is NOT `size_of::<LogHeader>()`.** This was a real bug, caught by a
+  failing integration test before it shipped: Rust pads a struct's in-memory layout for its
+  widest field's alignment (`page_size: u64` needs 8-byte alignment, padding the 14 meaningful
+  bytes up to 16), while postcard's actual encoding just concatenates each field with no padding
+  at all. `db.rs`'s own `Header` makes the identical `size_of` assumption and gets away with it
+  ONLY because the main file always has real page data immediately after its header — an
+  over-sized `read_exact` harmlessly absorbs a few bytes of that (postcard's `from_bytes` ignores
+  unconsumed trailing bytes) instead of hitting EOF. The log file has no such guarantee: a fresh
+  WAL has nothing at all after its header until the first record lands, so the same over-read hit
+  a real `UnexpectedEof`. Fixed by computing the encoded length directly (`to_allocvec` on a throwaway
+  instance) instead of trusting `size_of` to match it — `Header`'s matching risk is now flagged
+  here for whenever S1's own header-versioning work touches it, not fixed as part of this pass.
+- **`log_runner`'s checkpoint-truncate rewrite needs an explicit `seek(Start(0))` first.** Also
+  caught by a failing test (`test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file`,
+  pre-existing, not new): `Opener::truncate` resets a file's LENGTH but not its seek cursor.
+  Without an explicit seek back to the start, `write_all(&log_header_bytes)` right after
+  `truncate()` resumed writing at the OLD end-of-file position (now past the truncated length),
+  padding the gap with zero bytes instead of landing the header at the actual start of the file —
+  every subsequent read of "the header" was actually reading zeros. Confirmed via a targeted
+  `eprintln!` before diagnosing it properly; fixed with one `file.seek(SeekFrom::Start(0))?`
+  between `truncate()` and the header `write_all`.
+- **`Operation::Mod`'s `pre` is `Option<Record>`, not a plain `Record`.** The own-insert-then-
+  update case (a transaction revising a row it inserted itself, `Db::update`'s `build` closure)
+  needs a record logged for REDO (so replay reconstructs the final value) but must NOT contribute
+  a real pre-image to UNDO replay — traced why concretely: `revert_undo_ops` replays a
+  transaction's own ops in forward order (§7's decision), so if this Mod carried a real
+  pre-image, undoing it would run AFTER the original Add's own revert already removed the row,
+  re-materializing something that revert had just deleted. `pre: None` marks exactly this
+  "redo-only" case; `revert_undo_ops`/`process_log`'s undo pass both skip it outright, matching
+  the pre-unification code's behavior of never logging a second undo record for this case at all.
+- **`Del`'s redo replay never needed a derived tombstoned tuple.** §7 originally sketched redo
+  deriving `pre.tuple.clone()` + `.tombstone()` to reconstruct the post-image. Turned out
+  unnecessary once actually tracing the old `process_redo`'s own Del arm: it only ever called
+  `table.remove(r.tuple.id)` — using just the ID, discarding the rest of the record entirely. The
+  new `process_log`'s redo pass does the identical `table.remove(pre.tuple.id.clone())`, no
+  derivation step needed.
+- **`LsnId` is `pub`, not `pub(crate)`, even though it's otherwise an internal WAL/clock concept.**
+  Needed once `Tuple::pre_lsn`'s type (appearing in the public `Tuple::new_with`/`set_pre_lsn`
+  signatures) had to be nameable from `squeal-sql`, an external crate — a `pub(crate)` type in a
+  public function signature compiles as only a lint warning within the SAME crate but is a hard
+  error across a crate boundary. Exactly mirrors the retired `UndoId`'s own visibility split
+  (`pub struct UndoId(pub(crate) u16)`) for the identical reason: nameable everywhere, but only
+  ever constructible with a real value from inside `store` (external code can still write `None`
+  freely).
+- **No `FaultyFile` wrapper was built.** §10's generic fault-injecting `DBFile` wrapper was
+  designed but not implemented — every scenario it was meant to enable (torn tail, mid-file
+  corruption, header mismatch) turned out to need only ONE specific, known byte-level change
+  applied once to a `MemFile` snapshot, which is exactly what `crash_clone` + direct buffer
+  manipulation already does throughout this test suite (e.g.
+  `test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file`, pre-existing).
+  Added instead: `logger.rs`'s own unit tests exercise `scan_log`/`read_and_validate_log_header`
+  directly against hand-built byte buffers (no `Db`/`Logger` wiring at all —
+  `test_scan_log_torn_tail_at_payload_is_dropped_not_errored`,
+  `test_scan_log_checksum_mismatch_with_a_valid_record_after_is_real_corruption`, etc.), and
+  `db.rs` gained three end-to-end integration tests exercising the identical scenarios through
+  the real `Db::open_using` path (`test_open_using_refuses_a_log_file_from_a_different_page_size_database`,
+  `test_open_using_tolerates_a_torn_tail_and_recovers_everything_before_it`,
+  `test_open_using_refuses_a_log_file_with_mid_file_corruption`). A generic wrapper remains
+  available as future infrastructure (T1/T2/T5/T16 per `audit-progress.md`'s Phase 0 note) if a
+  later fix genuinely needs to inject a fault mid-flight across MULTIPLE writes rather than at one
+  known point in an otherwise-complete snapshot — not needed for T4/S2 itself.
+- **Log file naming: `<name>.wal`, replacing BOTH `.undo` and `.redo`.** Also updated
+  `store/src/named_memfile.rs`'s `NamedMemFile::delete` (its sibling-cleanup logic hardcoded the
+  old `.undo`/`.redo` suffixes) — missed on the first pass, caught by grepping the whole
+  workspace for `undo_file`/`redo_file`/`.undo`/`.redo` after the main implementation compiled,
+  not by a failing test (there wasn't one exercising `NamedMemFile::delete`'s sibling cleanup
+  specifically pre-existing, so this was a static-scan catch, not a red/green one — flagged here
+  rather than presented as more rigorously verified than it was).
+- **Blast radius was larger than estimated.** §11 originally counted "12+2" entangled tests.
+  Actual count of `open_using`/`close`/`crash_clone` call sites needing the 3-tuple→2-tuple
+  mechanical change: 32 `open_using(...)` calls and 20 `.close()` calls across `db.rs`'s test
+  module (not all distinct tests — several tests call more than one). Handled as a scripted,
+  whole-file substring replacement (`"f, u, r)"` → `"f, l)"`, etc. — verified safe first by
+  grepping that literally every occurrence of that substring in the file was this exact
+  destructure/call pattern and nothing else) rather than by hand, then let the compiler's own
+  type errors catch anything the script missed (which is exactly what a 3-tuple→2-tuple signature
+  change is good at catching — every leftover site is a hard type error, not a silent bug).
+- **Verification**: full `store --lib` suite green — **396 passed, 0 failed**
+  (`cargo test -p store --lib -- --test-threads=1`; 381 baseline-after-T10 + 15 new tests from
+  this pass: 3 `db.rs` integration tests + 12 `logger.rs` unit tests, confirmed by exact count
+  across two independent runs). `squeal-sql --lib` unaffected (346 passed, 0 failed) aside from
+  one signature ripple (`Database::close`'s own return type, `store/schema_ops/database.rs`) and
+  one stale comment (`squeal-sql/src/table.rs`). Whole workspace (`cargo build --workspace
+  --tests`) builds clean.

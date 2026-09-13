@@ -45,7 +45,7 @@ const LEAF_NODE: usize = 5;
 // Postcard varint upper bounds per field, for an Int-keyed entry:
 //   DBIdType::Int(u64::MAX)  → 1 (variant) + 10 (varint) = 11 B
 //   Option<TransactionId>    → 1 (Some) + 10 (u64 id) + 10 (u128 ts) = 21 B
-//   Option<UndoId>           → 1 (None)
+//   Option<LsnId>            → 1 (None)
 //   data Node::Inner(u64::MAX) as Vec<u8> → 1 (len) + 1 (variant) + 10 (varint) = 12 B
 //   flags                    → 1 B
 //   Total ≈ 46 B; 64 B gives comfortable headroom for any realistic payload
@@ -1594,7 +1594,7 @@ mod tests {
 
     fn make_logger() -> Arc<Logger> {
         let mut logger = Logger::new();
-        logger.set_db(MemFile::new(), MemFile::new()).unwrap();
+        logger.set_db(MemFile::new(), Vec::new()).unwrap();
         Arc::new(logger)
     }
 

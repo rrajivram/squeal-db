@@ -14,17 +14,18 @@ Performance findings (P1-P10) are deferred entirely — no tests written yet; re
 actually implementing Phase 6/7 of the fix plan, since a benchmark written before the fix mostly
 just documents current (slow) behavior rather than proving anything.
 
-**Current status: Phase 1 is DONE; Phase 2's T10 is DONE (T4+S2 staged, not yet started).** All
-12 Phase 1 findings (T8, T9, T6, T12, T14, S3, S4, S5, S6, S7 — S7 counted once, covering both its
-prefix and Ord sub-issues) plus Phase 2's T10 are fixed and `[t-green]`. Full `store` suite:
-**381 passed, 0 failed** (`cargo test -p store --lib -- --test-threads=1`). `squeal-sql --lib`:
-346 passed, 0 failed. Whole workspace builds clean. One test
+**Current status: Phase 1 is DONE; Phase 2 (T10, T4, S2) is DONE.** All 12 Phase 1 findings (T8,
+T9, T6, T12, T14, S3, S4, S5, S6, S7 — S7 counted once, covering both its prefix and Ord
+sub-issues) plus Phase 2's T10/T4/S2 are fixed and `[t-green]`. T4+S2 shipped together as one WAL
+redesign (single framed/checksummed log file, `LogHeader` mismatch detection, `UndoId` retired in
+favor of LSN-keyed lookups) — full design in `T4_S2_WAL_DESIGN.md`, implementation notes in that
+doc's §14. `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean. One test
 (`page::tests::test_separate_header_and_data_calls_can_observe_a_mismatched_pair`) is a known
 pre-existing, unrelated flaky/timing-sensitive test (confirmed via repeated standalone runs
 during T12's work) — not part of this audit's scope. 3 sub-findings deliberately have no test
 (T7, S7's `u64::MAX` sentinel, S7's `Eq`-capacity question) — see their own entries for why; not
-blocking, since nothing regressed them. T4+S2 (the rest of Phase 2 — single WAL redesign) remain
-staged, not started, per the user's decision to scope T10 as a standalone fix first. Phases 3-7
+blocking, since nothing regressed them. Full `store` suite after T4+S2: **396 passed, 0 failed**.
+Phases 3-7
 remain untouched, catalogued below as `[ ]`.
 
 ## Phase 1 — ALL FIXED
@@ -283,14 +284,82 @@ All tests below live in `store/src/db.rs`'s `mod tests` unless noted. Every find
   + this test), 0 failed, 0 regressions (`cargo test -p store --lib -- --test-threads=1`).
   `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace (`cargo build --workspace --tests`)
   builds clean.
-- [ ] **T4** — redo and undo are two independently-synced files; commit point isn't atomic.
-  Design done — see `T4_S2_WAL_DESIGN.md` (one framed/checksummed WAL, one runner thread, LSN
-  becomes the undo pointer, three-pass recovery, fault-injecting `DBFile` test wrapper, exact
-  blast radius). Implementation not started.
-- [ ] **S2** — log records have no framing/checksum; a torn tail makes the DB unopenable. Shares
-  T4's design doc (`T4_S2_WAL_DESIGN.md`, §2's record-framing/recovery-scan rule) — implementation
-  not started.
-- [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance)*
+- [t-green] **T4 + S2** — FIXED together (one root fix, per the design). Full design in
+  `T4_S2_WAL_DESIGN.md` (13 sections + a 14th documenting where implementation diverged from the
+  design). Summary of what shipped:
+  - **One WAL file** (`<name>.wal`) replacing the separate `.undo`/`.redo` pair — one runner
+    thread (`log_runner`, replacing `undo_log_runner`+`redo_log_runner`), one channel
+    (`LogMsg`), one fsync per batch. `Db<F>`'s `undo_file`/`redo_file` fields collapse to one
+    `log_file`; `create_core_db`/`open_using`/`close`/`Db::delete`/`begin`'s checkpoint-size
+    check all updated. T4's "commit isn't atomic" is closed as a structural consequence — there
+    is only one artifact, so there's no "redo landed, undo didn't" state left to reach.
+  - **Framed, checksummed records** (`[u32 len][u32 checksum][payload]`, `logger::scan_log`) —
+    S2's actual fix. Checksum is `page::fnv1a_32` (the SAME hash already used for physical page
+    checksums), not a new `crc32fast` dependency — reused rather than adding a second algorithm
+    for the identical job. Recovery scan rule: a checksum failure with nothing valid after it is
+    a torn tail (dropped silently); a checksum failure with a complete, valid record after it is
+    real corruption (`StoreError::LogCorruption`, refuses to open).
+  - **`LogHeader`** (magic/version/page_size), added on top of the original sketch per explicit
+    follow-up feedback: written once at file creation, validated at `open_using` BEFORE any lock
+    is taken, so a log file paired with the wrong database (wrong page size, wrong WAL version,
+    wrong file entirely) is refused cleanly (`StoreError::LogHeaderMismatch`) instead of failing
+    deep inside decode or silently misreading a different page layout. Survives checkpoint's
+    truncate — `log_runner` restores it verbatim immediately after each truncate.
+  - **Combined pre/post-image `Operation`** (`Add{txn,post}`, `Mod{txn,pre:Option<Record>,post}`,
+    `Del{txn,pre}`) — one `Logger::log`/`log_new` call per write instead of paired
+    `log_redo`+`log_undo`. `Mod.pre: Option<Record>` (not plain `Record`, per the design's
+    original sketch) — `None` marks a "redo-only" record for the own-insert-then-update chain,
+    which must NOT contribute a real pre-image to undo replay (traced why: `revert_undo_ops`
+    replays forward, so a real pre-image there would re-materialize a row the original Add's own
+    revert just removed in the same pass).
+  - **`UndoId` retired entirely**, not just widened past T10 — `Tuple.undo_id: Option<UndoId>` →
+    `Tuple.pre_lsn: Option<LsnId>`, an LSN minted once, globally, by `LsnClock::next_lsn`, never
+    reused. `Logger`'s `undo_txns: HashMap<TransactionId, Vec<Operation>>` → `records:
+    HashMap<LsnId, Operation>` + `by_txn: HashMap<TransactionId, Vec<LsnId>>`; `find_undo_tuple`
+    → `find_record(lsn)`, no `TransactionId` needed at all. `LsnId` kept `pub` (field
+    `pub(crate)`) — mirrors `UndoId`'s exact old visibility split, needed because `Tuple::pre_lsn`
+    appears in public signatures `squeal-sql` (a different crate) calls.
+  - **Recovery**: `load_logs`/`process_redo`/`process_undo` → one `process_log`, three passes
+    (analysis/redo/undo) over the single scanned buffer. Dropped the old `inprogress`/`rollback`
+    `HashSet`s outright — both were built by the pre-existing code and never actually read
+    afterward in either old function; "not in `committed`" already fully characterizes "needs
+    undo" either way.
+  - **Two real bugs caught by tests during implementation, not found by inspection**: (1)
+    `LogHeader::encoded_len()` initially used `size_of::<LogHeader>()`, which is NOT the same as
+    its postcard-encoded length (Rust pads the struct's layout to 16 bytes for `page_size: u64`'s
+    8-byte alignment; postcard's actual encoding is 14 bytes, no padding) — `db.rs`'s own
+    `Header` makes the identical assumption and gets away with it only because the main file
+    always has real page data after its header to absorb an over-read; the WAL doesn't. Fixed by
+    computing the true length via `to_allocvec` instead of trusting `size_of`. (2) `log_runner`'s
+    post-checkpoint header rewrite wrote at the OLD (pre-truncate) seek position instead of byte
+    0 — `Opener::truncate` resets a file's length but not its cursor — silently padding the file
+    with zeros instead of landing the header at the start. Both caught by
+    `test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file` (pre-existing)
+    failing, not by code review.
+  - **No `FaultyFile` wrapper built** (§10 in the design doc sketched one) — every scenario it
+    was meant to enable turned out to need only one known byte-level change applied once to a
+    `MemFile` snapshot, which `crash_clone` + direct buffer manipulation already does throughout
+    this suite. Covered instead by `logger.rs`'s own unit tests against hand-built byte buffers
+    (no `Db`/`Logger` wiring) plus three new `db.rs` integration tests through the real
+    `Db::open_using` path: `test_open_using_refuses_a_log_file_from_a_different_page_size_database`,
+    `test_open_using_tolerates_a_torn_tail_and_recovers_everything_before_it`,
+    `test_open_using_refuses_a_log_file_with_mid_file_corruption`.
+  - **Blast radius larger than the design doc's "12+2" estimate**: 32 `open_using(...)` calls and
+    20 `.close()` calls across `db.rs`'s test module needed the 3-tuple→2-tuple mechanical
+    change (several tests call more than one). Handled as a verified whole-file substring
+    replacement, with the compiler's own type errors catching anything missed. Also caught (by
+    grep, not a failing test — flagged as such rather than presented as more rigorously verified
+    than it was): `store/src/named_memfile.rs`'s `NamedMemFile::delete` hardcoded the old
+    `.undo`/`.redo` sibling-cleanup suffixes; updated to `.wal`.
+  - Tests: all of the above plus every migrated pre-existing replay/checkpoint test green. Full
+    `store` suite: **396 passed, 0 failed** (`cargo test -p store --lib -- --test-threads=1`;
+    381 baseline-after-T10 + 15 new tests — 3 `db.rs` integration tests + 12 `logger.rs` unit
+    tests — confirmed by exact count across two independent runs). `squeal-sql --lib`: 346
+    passed, 0 failed (unaffected aside from `Database::close`'s return-type ripple and one stale
+    comment). Whole workspace (`cargo build --workspace --tests`) builds clean.
+- [ ] **P1** — two fsyncs per commit where one would do. *(deferred — performance; T4's WAL
+  unification incidentally also gets this down to one fsync per batch, but it was never
+  separately benchmarked as a goal of this pass.)*
 - [ ] **P8** — three clones of every pre-image per operation. *(deferred — performance)*
 
 ### Phase 3 — page-LSN gating + durable commit

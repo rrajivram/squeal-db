@@ -40,16 +40,17 @@ pub struct NamedMemFile {
 }
 
 impl NamedMemFile {
-    /// Drops `name`'s entry (and its `.undo`/`.redo` siblings, mirroring
-    /// `Db::create_core_db`'s own file layout) from the registry, if
-    /// present. Call this directly rather than through
-    /// `Db::<NamedMemFile>::delete` — that method is hardcoded to the real
-    /// filesystem regardless of `F`, so it can't target this registry.
+    /// Drops `name`'s entry (and its `.wal` sibling, mirroring
+    /// `Db::create_core_db`'s own file layout — a single WAL file, per
+    /// T4_S2_WAL_DESIGN.md, replacing the old separate `.undo`/`.redo`
+    /// pair) from the registry, if present. Call this directly rather than
+    /// through `Db::<NamedMemFile>::delete` — that method is hardcoded to
+    /// the real filesystem regardless of `F`, so it can't target this
+    /// registry.
     pub fn delete(name: &str) {
         let mut reg = REGISTRY.lock().unwrap();
         reg.remove(name);
-        reg.remove(&format!("{name}.undo"));
-        reg.remove(&format!("{name}.redo"));
+        reg.remove(&format!("{name}.wal"));
     }
 }
 

@@ -21,7 +21,7 @@ use crate::schema_ops::schema::Schema;
 // entry) with its own key (DBIdType — a Rec(IndexKey) key costs more
 // than the raw field bytes alone: an enum tag, the IndexKey's own
 // Vec-length prefix, and one enum tag per ValueItem), Option<TransactionId>,
-// Option<UndoId>, a flags byte, and postcard's own length-prefix on the
+// Option<LsnId>, a flags byte, and postcard's own length-prefix on the
 // data field — none of which the raw sum of ValueItem::size() calls
 // below accounts for. Since store's own historical default entry
 // budget for a plain Int key is 64 bytes (MAX_ENTRY_BYTES), padding by

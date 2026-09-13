@@ -12,10 +12,15 @@ use crate::cursor::RangeCursor;
 use crate::cursor::TableCursor;
 use crate::error::StoreError;
 use crate::generator::Generator;
+use crate::logger::LogHeader;
+use crate::logger::LogRecord;
 use crate::logger::Logger;
-use crate::logger::MsgType;
+use crate::logger::LsnId;
 use crate::logger::Operation;
 use crate::logger::Record;
+use crate::logger::read_and_validate_log_header;
+use crate::logger::scan_log;
+use crate::logger::write_log_header;
 use crate::memfile::MemFile;
 use crate::page::Page;
 use crate::run::Run;
@@ -35,7 +40,6 @@ use memmap::MmapOptions;
 use parking_lot::RwLock;
 use portable_atomic::AtomicU128;
 use postcard::from_bytes;
-use postcard::take_from_bytes;
 use postcard::to_allocvec;
 use serde::Deserialize;
 use serde::Serialize;
@@ -152,8 +156,7 @@ pub struct Db<F: DBFile + 'static> {
     name: String,
     pub(crate) header: Arc<Header>,
     file: F,
-    pub(crate) undo_file: F,
-    pub(crate) redo_file: F,
+    pub(crate) log_file: F,
     page_count: Arc<AtomicU64>,
     tables: Arc<RwLock<HashMap<TableIdType, Arc<BPlusTree<F>>>>>,
     generator: Arc<Generator>,
@@ -234,10 +237,9 @@ where
     pub fn open_using<S: AsRef<str>>(
         name: S,
         file: F,
-        undo_file: F,
-        redo_file: F,
+        log_file: F,
     ) -> Result<Arc<Self>, StoreError> {
-        Self::open_using_with_limits(name, file, undo_file, redo_file, DEFAULT_MAX_PENDING_WRITES)
+        Self::open_using_with_limits(name, file, log_file, DEFAULT_MAX_PENDING_WRITES)
     }
 
     // Like open_using, but also controls the writer thread's pending-write
@@ -245,8 +247,7 @@ where
     pub fn open_using_with_limits<S: AsRef<str>>(
         name: S,
         file: F,
-        undo_file: F,
-        redo_file: F,
+        log_file: F,
         max_pending_writes: usize,
     ) -> Result<Arc<Self>, StoreError> {
         let mut bytes = vec![0u8; size_of::<Header>()];
@@ -257,9 +258,14 @@ where
         if header.magic != MAGIC {
             return Err(StoreError::FileError);
         }
+        let mut log_file = log_file;
+        // T4_S2_WAL_DESIGN.md §2: validated BEFORE any lock is taken, so a
+        // wrongly-paired log file (wrong database, wrong WAL version, wrong
+        // page size) is refused with zero side effects — nothing gets
+        // locked, nothing gets recovered against it.
+        let log_header_bytes = read_and_validate_log_header(&mut log_file, header.page_size)?;
         file.do_lock()?;
-        undo_file.do_lock()?;
-        redo_file.do_lock()?;
+        log_file.do_lock()?;
         let gens = Arc::new(Generator::new());
         let page_count = Arc::new(AtomicU64::new(header.page_count));
         let nm = Self::setup_needed_modules(
@@ -267,8 +273,8 @@ where
             gens.clone(),
             page_count.clone(),
             file.do_clone()?,
-            undo_file.do_clone()?,
-            redo_file.do_clone()?,
+            log_file.do_clone()?,
+            log_header_bytes,
             max_pending_writes,
         )?;
         let sf = Self {
@@ -276,8 +282,7 @@ where
             page_count,
             header,
             file,
-            undo_file,
-            redo_file,
+            log_file,
             name: name.as_ref().to_string(),
             tables: Arc::new(RwLock::new(HashMap::new())),
             // Must be the same Arc<Generator> passed to setup_needed_modules:
@@ -303,27 +308,20 @@ where
     }
 
     pub fn open<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
-        let uf_name = name.as_ref().to_string() + ".undo";
-        let rf_name = name.as_ref().to_string() + ".redo";
+        let lf_name = name.as_ref().to_string() + ".wal";
         let f = OpenOptions::new()
             .create(false)
             .read(true)
             .write(true)
             .clone();
         let f = F::open(f, name.as_ref())?;
-        let undo_file = OpenOptions::new()
+        let log_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .clone();
-        let undo_file = F::open(undo_file, uf_name)?;
-        let redo_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .clone();
-        let redo_file = F::open(redo_file, rf_name)?;
-        Self::open_using(name, f, undo_file, redo_file)
+        let log_file = F::open(log_file, lf_name)?;
+        Self::open_using(name, f, log_file)
     }
 
     /*
@@ -336,7 +334,7 @@ where
     // hand the underlying files back), so this unwraps the Arc first: it
     // errors instead of panicking if some other clone (e.g. a TableCursor,
     // or another thread) is still holding a reference.
-    pub fn close(self: Arc<Self>) -> Result<(F, F, F), StoreError> {
+    pub fn close(self: Arc<Self>) -> Result<(F, F), StoreError> {
         let db = Arc::try_unwrap(self).map_err(|_| {
             StoreError::UnknownError(
                 "Db::close: other Arc<Db> references still exist (e.g. a live TableCursor or \
@@ -361,8 +359,7 @@ where
             logger,
             tables,
             file,
-            undo_file,
-            redo_file,
+            log_file,
             ..
         } = db;
         drop(tables);
@@ -388,7 +385,7 @@ where
         // test_free_pages_do_not_accumulate_across_multiple_close_reopen_cycles.
         logger.checkpoint(ts)?;
         logger.shutdown()?;
-        Ok((file, undo_file, redo_file))
+        Ok((file, log_file))
     }
 
     pub fn page_count(&self) -> DBSizeType {
@@ -421,143 +418,126 @@ where
         Ok(())
     }
 
-    fn load_logs(&self) -> Result<(usize, usize), StoreError> {
-        let (mut redo_count, mut undo_count) = (0, 0);
+    fn load_logs(&self) -> Result<usize, StoreError> {
+        // Skip the LogHeader (already read and validated separately, by
+        // create_core_db/open_using, before this ever runs) — process_log
+        // must only ever see the framed-record region after it, or it
+        // misreads the header's own bytes as a bogus first frame.
+        let header_len = LogHeader::encoded_len();
         // mmap-ing a zero-length file errors ("memory map must have a
-        // non-zero length") rather than yielding an empty mapping — and a
-        // brand-new database's redo/undo files are exactly that (0 bytes,
-        // nothing ever written yet), so this isn't an edge case, it's the
-        // state of every single fresh Db::create::<File>() call. Skip the
-        // mmap entirely when there's nothing to read.
-        if let Some(redo_file) = self.redo_file.as_any().downcast_ref::<File>()
-            && redo_file.metadata()?.len() > 0
-        {
-            let map = unsafe { MmapOptions::new().map(redo_file)? };
-            let buf = &map[..];
-            redo_count = self.process_redo(buf)?;
-        }
-        if let Some(undo_file) = self.undo_file.as_any().downcast_ref::<File>()
-            && undo_file.metadata()?.len() > 0
-        {
-            let map = unsafe { MmapOptions::new().map(undo_file)? };
-            let buf = &map[..];
-            undo_count = self.process_undo(buf)?;
-        }
-        if let Some(redo_file) = self.redo_file.as_any().downcast_ref::<MemFile>() {
-            let buf = &redo_file.data()[..];
-            redo_count = self.process_redo(buf)?;
-        }
-        if let Some(undo_file) = self.undo_file.as_any().downcast_ref::<MemFile>() {
-            let buf = &undo_file.data()[..];
-            undo_count = self.process_undo(buf)?;
-        }
+        // non-zero length") rather than yielding an empty mapping. In
+        // practice the log file is never zero-length by the time this
+        // runs: create_core_db/open_using already wrote or validated its
+        // LogHeader before load_logs is ever called. Guarded anyway, since
+        // nothing here should assume it.
+        let count = if let Some(log_file) = self.log_file.as_any().downcast_ref::<File>() {
+            let len = log_file.metadata()?.len() as usize;
+            if len > header_len {
+                let map = unsafe { MmapOptions::new().map(log_file)? };
+                self.process_log(&map[header_len..])?
+            } else {
+                0
+            }
+        } else if let Some(log_file) = self.log_file.as_any().downcast_ref::<MemFile>() {
+            let data = log_file.data();
+            if data.len() > header_len {
+                self.process_log(&data[header_len..])?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
 
-        println!("{} redo found, {} undo found", redo_count, undo_count);
+        println!("{count} log record(s) found");
 
-        Ok((redo_count, undo_count))
+        Ok(count)
     }
 
-    fn process_redo(&self, buffer: &[u8]) -> Result<usize, StoreError> {
-        let mut count = 0;
-        let mut buf = buffer;
-        let (mut committed, mut inprogress, mut rollback) =
-            (HashSet::new(), HashSet::new(), HashSet::new());
-        let mut lsn_id = None;
-        while !buf.is_empty() {
-            let (redo, remaining) = take_from_bytes::<MsgType>(buf)?;
-            buf = remaining;
-            match redo {
-                MsgType::Redo(redo) => {
-                    let op = redo.operation;
-                    lsn_id = Some(redo.lsn_id);
-                    match op {
-                        Operation::Add(t, _r) | Operation::Mod(t, _r) | Operation::Del(t, _r) => {
-                            inprogress.insert(t);
-                        }
-                        Operation::Commit(t, _ts) => {
-                            committed.insert(t);
-                        }
-                        Operation::Rollback(t, _ts) => {
-                            rollback.insert(t);
-                        }
-                    }
+    // Replaces the old two-file process_redo/process_undo with one
+    // three-pass scan over the single WAL (T4_S2_WAL_DESIGN.md §8):
+    // analysis (which txns committed), redo (replay every record for a
+    // committed txn), undo (revert every record for a txn that never
+    // committed — abandoned or explicitly rolled back, treated identically,
+    // exactly as the old process_undo already did: "not in `committed`"
+    // fully characterizes "needs undo" either way). `buffer` is the WAL's
+    // content AFTER its LogHeader — `load_logs` above hands this the raw
+    // mmap/MemFile bytes directly since the header was already read and
+    // validated separately (by create_core_db/open_using), never mixed
+    // into the same scan as the framed records.
+    fn process_log(&self, buffer: &[u8]) -> Result<usize, StoreError> {
+        let scanned = scan_log(buffer)?;
+        let count = scanned.records.len();
+
+        // --- Pass 1: analysis ---
+        let mut committed: HashSet<TransactionId> = HashSet::new();
+        let mut by_txn: HashMap<TransactionId, Vec<&LogRecord>> = HashMap::new();
+        let mut max_lsn: Option<u64> = None;
+        for record in &scanned.records {
+            max_lsn = Some(match max_lsn {
+                Some(m) if m >= record.lsn.0 => m,
+                _ => record.lsn.0,
+            });
+            match &record.operation {
+                Operation::Add { txn, .. }
+                | Operation::Mod { txn, .. }
+                | Operation::Del { txn, .. } => {
+                    by_txn.entry(txn.clone()).or_default().push(record);
                 }
-                _ => {
-                    panic!("Unknown message in redo log: {:?}", redo)
+                Operation::Commit(t, _ts) => {
+                    committed.insert(t.clone());
                 }
+                // Dropped the old code's separate `rollback` HashSet here —
+                // it was built (in both process_redo and process_undo) and
+                // never actually consulted afterward in either one. "not in
+                // `committed`" below already covers an explicit rollback
+                // exactly the same as a never-committed abandoned txn.
+                Operation::Rollback(_, _) => {}
             }
-            count += 1;
         }
-        let mut buf = buffer;
-        while !buf.is_empty() {
-            let (redo, remaining) = take_from_bytes(buf)?;
-            buf = remaining;
-            if let MsgType::Redo(redo) = redo {
-                let op = redo.operation;
-                match op {
-                    Operation::Add(t, r) if committed.contains(&t) => {
-                        self.table_by_id(r.table_id)?
-                            .insert_if_needed(&r.tuple, t)?;
+
+        // --- Pass 2: redo — every record for a COMMITTED txn ---
+        for (txn, ops) in &by_txn {
+            if !committed.contains(txn) {
+                continue;
+            }
+            for record in ops {
+                match &record.operation {
+                    Operation::Add { post, .. } => {
+                        self.table_by_id(post.table_id)?
+                            .insert_if_needed(&post.tuple, txn.clone())?;
                     }
-                    Operation::Mod(t, r) if committed.contains(&t) => {
-                        self.table_by_id(r.table_id)?.update_if_needed(r.tuple)?;
+                    Operation::Mod { post, .. } => {
+                        self.table_by_id(post.table_id)?
+                            .update_if_needed(post.tuple.clone())?;
                     }
-                    Operation::Del(t, r) if committed.contains(&t) => {
-                        self.table_by_id(r.table_id)?.remove(r.tuple.id)?;
+                    Operation::Del { pre, .. } => {
+                        self.table_by_id(pre.table_id)?
+                            .remove(pre.tuple.id.clone())?;
                     }
                     _ => {}
                 }
-            };
+            }
         }
-        if let Some(lsn_id) = lsn_id {
-            self.logger.clock().mark_written(lsn_id);
+
+        // --- Pass 3: undo — every record for a txn that never committed ---
+        for (txn, ops) in &by_txn {
+            if committed.contains(txn) {
+                continue;
+            }
+            let ops: Vec<Operation> = ops.iter().map(|r| r.operation.clone()).collect();
+            self.revert_undo_ops(&ops, txn)?;
+        }
+
+        if let Some(lsn) = max_lsn {
+            let lsn = LsnId(lsn);
+            self.logger.clock().mark_written(lsn);
             // See LsnClock::advance_counter_past's own doc comment: without
             // this, the counter restarts at 0 on reopen, and the first new
             // write's redo record landing regresses the watermark this just
             // set right back down.
-            self.logger.clock().advance_counter_past(lsn_id);
+            self.logger.clock().advance_counter_past(lsn);
         }
-        Ok(count)
-    }
-
-    fn process_undo(&self, buffer: &[u8]) -> Result<usize, StoreError> {
-        let mut count = 0;
-        let mut buf = buffer;
-        let (mut committed, mut inprogress, mut rollback) =
-            (HashSet::new(), HashSet::new(), HashSet::new());
-        let mut operations = HashMap::new();
-        while !buf.is_empty() {
-            let (redo, remaining) = take_from_bytes::<MsgType>(buf)?;
-            buf = remaining;
-            match redo {
-                MsgType::Undo(undo) => {
-                    let op = undo.operation;
-                    match &op {
-                        Operation::Add(t, _r) | Operation::Mod(t, _r) | Operation::Del(t, _r) => {
-                            inprogress.insert(t.clone());
-                            operations
-                                .entry(t.clone())
-                                .and_modify(|v: &mut Vec<_>| v.push(op.clone()))
-                                .or_insert(vec![op.clone()]);
-                        }
-                        Operation::Commit(t, _ts) => {
-                            committed.insert(t.clone());
-                        }
-                        Operation::Rollback(t, _ts) => {
-                            rollback.insert(t.clone());
-                        }
-                    }
-                }
-                _ => {
-                    panic!("Unknown message in redo log: {:?}", redo)
-                }
-            }
-            count += 1;
-        }
-        operations.retain(|k, _v| !committed.contains(k));
-        operations
-            .iter()
-            .try_for_each(|(id, ops)| self.revert_undo_ops(ops, id))?;
         Ok(count)
     }
 
@@ -594,9 +574,7 @@ where
         // pending_tombstone_reclaims's own doc comment) because some
         // reader's snapshot might still have needed the pre-delete version.
         self.drain_ready_tombstone_reclaims(&self.tx_mgr.get_active_transactions()?);
-        if self.redo_file.get_metadata()?.len > 16 * 1024 * 1024
-            || self.undo_file.get_metadata()?.len > 16 * 1024 * 1024
-        {
+        if self.log_file.get_metadata()?.len > 16 * 1024 * 1024 {
             self.checkpoint()?;
         }
         self.tx_mgr.begin(policy)
@@ -617,13 +595,14 @@ where
         self.require_active(&id)?;
         // Capture the tombstoned rows to reclaim BEFORE writing the commit
         // marker: logging a Commit op discards this txn's undo records (see
-        // Logger::log_undo), so we must read them first.
+        // Logger::log's Rollback/Commit-adjacent discard path), so we must
+        // read them first.
         let del_records: Vec<Record> = self
             .logger
             .get_undo_operations(id.clone())?
             .into_iter()
             .filter_map(|o| match o {
-                Operation::Del(_, r) => Some(r),
+                Operation::Del { pre, .. } => Some(pre),
                 _ => None,
             })
             .collect();
@@ -636,8 +615,7 @@ where
         // the caller's state from the DB's (a committed remove the caller thought
         // had failed).
         let op = Operation::Commit(id.clone(), timestamp());
-        self.logger.log_redo(op.clone())?;
-        self.logger.log_undo(op)?;
+        self.logger.log_new(op)?;
         // Mark committed BEFORE deciding whether id's undo trail can be
         // dropped now or must wait — not after. STORE_AUDIT.md T14
         // follow-up: with the old ordering (decide-then-commit), there was
@@ -809,8 +787,7 @@ where
             return Err(e);
         }
         let op = Operation::Rollback(id.clone(), timestamp());
-        self.logger.log_redo(op.clone())?;
-        self.logger.log_undo(op)?;
+        self.logger.log_new(op)?;
         self.tx_mgr.finish_rolled_back(id.clone());
         Ok(())
     }
@@ -829,14 +806,24 @@ where
     fn revert_undo_ops(&self, ops: &Vec<Operation>, id: &TransactionId) -> Result<(), StoreError> {
         for o in ops {
             match o {
-                Operation::Add(_, r) => {
-                    let table = self.table_by_id(r.table_id)?;
-                    retry_on_contention(|| table.remove_if_txn(r.tuple.id.clone(), id))?;
+                Operation::Add { post, .. } => {
+                    let table = self.table_by_id(post.table_id)?;
+                    retry_on_contention(|| table.remove_if_txn(post.tuple.id.clone(), id))?;
                 }
-                Operation::Del(_, r) | Operation::Mod(_, r) => {
-                    let table = self.table_by_id(r.table_id)?;
-                    retry_on_contention(|| table.update_if_txn(r.tuple.clone(), id))?;
+                Operation::Del { pre, .. } => {
+                    let table = self.table_by_id(pre.table_id)?;
+                    retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
                 }
+                // pre: None is a "redo-only" Mod (see Operation::Mod's own
+                // doc comment) — the own-insert-then-update chain, where
+                // the original Add's own revert (above) already removes
+                // the row entirely. Reverting a real pre-image here too
+                // would re-materialize a row the Add's revert just removed.
+                Operation::Mod { pre: Some(pre), .. } => {
+                    let table = self.table_by_id(pre.table_id)?;
+                    retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
+                }
+                Operation::Mod { pre: None, .. } => {}
                 _ => {}
             }
         }
@@ -908,9 +895,11 @@ where
         let mut tuple = tuple;
         tuple.set_txn_id(tx_id.clone());
         let page_id = self.table_by_id(id)?.insert(tuple.clone(), tx_id.clone())?;
-        let op = Operation::Add(tx_id, Record::new(id, tuple, Some(page_id)));
-        self.logger.log_undo(op.clone())?;
-        self.logger.log_redo(op)?;
+        let op = Operation::Add {
+            txn: tx_id,
+            post: Record::new(id, tuple, Some(page_id)),
+        };
+        self.logger.log_new(op)?;
         Ok(())
     }
 
@@ -958,21 +947,22 @@ where
         let build = |current: &Tuple| {
             self.check_write_conflict(current, &txn)?;
             // STORE_AUDIT.md T9: a row this SAME transaction inserted has
-            // no *committed* ancestor at all (undo_id is None from the
-            // insert onward — see Tuple::set_undo_id's own callers), so
+            // no *committed* ancestor at all (pre_lsn is None from the
+            // insert onward — see Tuple::set_pre_lsn's own callers), so
             // find_last_committed below would otherwise return None and
             // this whole call would incorrectly fail with KeyNotFound.
-            // There is nothing to resolve here, and nothing new needs
-            // logging either: keep undo_id at None (so a LATER own-update
-            // in the same chain is recognized the same way, and so
-            // concurrent readers' find_visible_to still correctly treats
-            // this row as having no ancestor — i.e. not existing yet, per
-            // its own phantom-insert protection) and just revise the data
-            // in place. The original insert's own undo entry
-            // (Operation::Add) already fully reverts this row (by
-            // removing it) on rollback; before_write below skips logging
-            // a second, redundant undo record for exactly this reason.
-            if current.txn_id.as_ref() == Some(&txn) && current.undo_id.is_none() {
+            // There is nothing to resolve here: keep pre_lsn at None (so a
+            // LATER own-update in the same chain is recognized the same
+            // way, and so concurrent readers' find_visible_to still
+            // correctly treats this row as having no ancestor — i.e. not
+            // existing yet, per its own phantom-insert protection) and
+            // just revise the data in place. The original insert's own
+            // undo entry (Operation::Add) already fully reverts this row
+            // (by removing it) on rollback; before_write below still logs
+            // this write (redo needs to know about it), just as a
+            // "redo-only" Mod (`pre: None`) that undo replay skips — see
+            // Operation::Mod's own doc comment.
+            if current.txn_id.as_ref() == Some(&txn) && current.pre_lsn.is_none() {
                 let mut updated = current.clone();
                 updated.set_data(&new_tuple.data);
                 return Ok((current.clone(), updated));
@@ -988,29 +978,40 @@ where
                 .into_owned();
             let mut updated = old_tuple.clone();
             updated.set_txn_id(txn.clone());
-            updated.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            // Mint the lsn now (not just log a fresh one in before_write):
+            // updated's own pre_lsn field must point at the EXACT record
+            // before_write is about to log below, so a concurrent reader
+            // resolving this tuple's pre_lsn later finds the matching
+            // record already recorded (see next_lsn's own doc comment).
+            updated.set_pre_lsn(self.logger.next_lsn());
             updated.set_data(&new_tuple.data);
             Ok((old_tuple, updated))
         };
-        // Undo log must be written BEFORE the tree is mutated: once
-        // `updated` (carrying undo_id) lands in the tree, a concurrent
-        // reader on another thread can observe it immediately and try to
-        // resolve that undo_id via find_last_committed. If the undo entry
-        // doesn't exist yet, that lookup panics (find_undo_tuple returns
-        // None where the code expects Some).
+        // Log must be written BEFORE the tree is mutated: once `updated`
+        // (carrying pre_lsn) lands in the tree, a concurrent reader on
+        // another thread can observe it immediately and try to resolve
+        // that pre_lsn via find_last_committed. If the record doesn't
+        // exist yet, that lookup panics (find_record returns None where
+        // the code expects Some).
         let before_write = |old_tuple: &Tuple, updated: &Tuple| {
-            let redo_op = Operation::Mod(txn.clone(), Record::new(tid, updated.clone(), None));
-            self.logger.log_redo(redo_op)?;
             // See build's own comment: revising this transaction's own
-            // fresh insert needs no separate undo record — its undo_id
-            // stays None, and the original Add's undo entry already
-            // covers full rollback (removal). Unlike remove()'s tombstone
-            // counterpart, nothing at commit time keys off a Mod undo
-            // record's presence, so it's safe to skip outright here.
-            if updated.undo_id.is_some() {
-                let undo_op = Operation::Mod(txn.clone(), Record::new(tid, old_tuple.clone(), None));
-                self.logger.log_undo(undo_op)?;
-            }
+            // fresh insert has no real pre-image to restore on rollback —
+            // the original Add's undo entry already covers full rollback
+            // (removal) — but redo still needs this write recorded, so a
+            // record is always logged here, just with `pre: None` in that
+            // case (mint a fresh lsn for it, since build() didn't need to
+            // pre-announce one via updated.pre_lsn).
+            let lsn = updated.pre_lsn.unwrap_or_else(|| self.logger.next_lsn());
+            let pre = updated
+                .pre_lsn
+                .is_some()
+                .then(|| Record::new(tid, old_tuple.clone(), None));
+            let op = Operation::Mod {
+                txn: txn.clone(),
+                pre,
+                post: Record::new(tid, updated.clone(), None),
+            };
+            self.logger.log(lsn, op)?;
             Ok(())
         };
         self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)?;
@@ -1031,11 +1032,10 @@ where
             // STORE_AUDIT.md T9 — see update()'s matching comment: a row
             // this SAME transaction inserted has no committed ancestor at
             // all, so find_last_committed below would otherwise fail with
-            // KeyNotFound. Tombstone it in place, keeping undo_id at None;
+            // KeyNotFound. Tombstone it in place, keeping pre_lsn at None;
             // the original insert's own undo entry already fully reverts
-            // this row (by removing it) on rollback, so before_write skips
-            // logging a second, redundant undo record.
-            if current.txn_id.as_ref() == Some(&txn) && current.undo_id.is_none() {
+            // this row (by removing it) on rollback.
+            if current.txn_id.as_ref() == Some(&txn) && current.pre_lsn.is_none() {
                 let mut tombstoned = current.clone();
                 tombstoned.tombstone();
                 return Ok((current.clone(), tombstoned));
@@ -1052,20 +1052,25 @@ where
             let mut tombstoned = old_tuple.clone();
             tombstoned.set_txn_id(txn.clone());
             tombstoned.tombstone();
-            tombstoned.set_undo_id(self.logger.next_undo_id(txn.clone())?);
+            // Mint the lsn now — see update()'s matching comment: this
+            // tombstone's own pre_lsn must point at the EXACT Del record
+            // before_write is about to log below, so a concurrent reader
+            // resolving it later (find_visible_to, walking back to the
+            // pre-delete version) finds the matching record already there.
+            tombstoned.set_pre_lsn(self.logger.next_lsn());
             Ok((old_tuple, tombstoned))
         };
-        // Same ordering requirement as update(): log undo/redo before the
+        // Same ordering requirement as update(): log before the
         // tombstoned tuple becomes visible in the tree, so a concurrent
-        // reader can never observe an undo_id that doesn't resolve yet.
+        // reader can never observe a pre_lsn that doesn't resolve yet.
         //
-        // Unlike update()'s Mod undo record, this Del undo record is always
-        // logged, even for the own-fresh-insert case above where
-        // `tombstoned.undo_id` stays None: Db::commit's tombstone-reclaim
+        // Unlike update()'s Mod record, this Del record's `pre` is always
+        // present, even for the own-fresh-insert case above where
+        // `tombstoned.pre_lsn` stays None: Db::commit's tombstone-reclaim
         // pass finds rows to physically clean up (and their index entries)
-        // by scanning the undo log specifically for Operation::Del records
-        // (see del_records there), not by inspecting undo_id. Skipping it
-        // here left an own-insert-then-remove-then-commit tombstone's index
+        // by scanning the log specifically for Operation::Del records (see
+        // del_records there), not by inspecting pre_lsn. Skipping it here
+        // left an own-insert-then-remove-then-commit tombstone's index
         // entry permanently orphaned, causing a real, permanent DuplicateKey
         // on any later insert of the same key (STORE_AUDIT.md T9 follow-up).
         // Replaying this Del's undo on rollback (restoring `old_tuple`,
@@ -1075,10 +1080,16 @@ where
         // expects or already gone, both tolerated by update_if_txn /
         // remove_if_txn.
         let before_write = |old_tuple: &Tuple, tombstoned: &Tuple| {
-            let redo_op = Operation::Del(txn.clone(), Record::new(tid, tombstoned.clone(), None));
-            self.logger.log_redo(redo_op)?;
-            let undo_op = Operation::Del(txn.clone(), Record::new(tid, old_tuple.clone(), None));
-            self.logger.log_undo(undo_op)?;
+            // See build's own comment: the own-fresh-insert case (pre_lsn
+            // stays None on the tombstone) still needs a real lsn to log
+            // this Del record under — mint one fresh, since build() didn't
+            // pre-announce one via tombstoned.pre_lsn in that case.
+            let lsn = tombstoned.pre_lsn.unwrap_or_else(|| self.logger.next_lsn());
+            let op = Operation::Del {
+                txn: txn.clone(),
+                pre: Record::new(tid, old_tuple.clone(), None),
+            };
+            self.logger.log(lsn, op)?;
             Ok(())
         };
         self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)
@@ -1203,24 +1214,33 @@ where
                 Visibility::Found(Cow::Borrowed(tuple))
             } else {
                 let mut tuple = tuple.clone();
-                let mut txn = txn;
                 loop {
                     // A genuine dead end: this tuple has no prior version
                     // at all (only true of a fresh INSERT), so there is
                     // nothing further back to find. Must NOT be treated
                     // the same as a missing undo record below — see
                     // Visibility's own doc comment.
-                    let Some(undo_id) = tuple.undo_id else {
+                    let Some(pre_lsn) = tuple.pre_lsn else {
                         return Visibility::NoAncestor;
                     };
 
-                    // Tolerate a missing undo record: an aborting txn's undo can
+                    // Tolerate a missing record: an aborting txn's undo can
                     // be discarded concurrently once its rows are reverted. If we
                     // can't walk further, treat the row as ambiguous rather than
                     // panicking or silently asserting it has no ancestor.
-                    let Some(next_tuple) = self.logger.find_undo_tuple(txn.clone(), undo_id)
-                    else {
+                    let Some(op) = self.logger.find_record(pre_lsn) else {
                         return Visibility::MissingUndoRecord;
+                    };
+                    let next_tuple = match op {
+                        Operation::Add { post, .. } => post.tuple,
+                        Operation::Mod { pre: Some(pre), .. } => pre.tuple,
+                        Operation::Del { pre, .. } => pre.tuple,
+                        // A record without a usable pre-image (a "redo-only"
+                        // Mod, or a Commit/Rollback marker) should never be
+                        // what a pre_lsn points at — defensive fallback,
+                        // matching the old code's leniency (it mapped every
+                        // Add/Del/Mod to a tuple unconditionally).
+                        _ => return Visibility::MissingUndoRecord,
                     };
                     let Some(next_txn) = next_tuple.txn_id.clone() else {
                         return Visibility::NoAncestor;
@@ -1233,7 +1253,6 @@ where
                         return Visibility::Found(Cow::Owned(next_tuple));
                     }
                     tuple = next_tuple;
-                    txn = next_txn;
                 }
             }
         } else {
@@ -1519,12 +1538,12 @@ where
         gens: Arc<Generator>,
         page_counter: Arc<AtomicU64>,
         file: F,
-        undo_file: F,
-        redo_file: F,
+        log_file: F,
+        log_header_bytes: Vec<u8>,
         max_pending_writes: usize,
     ) -> Result<NeededObjects<F>, StoreError> {
         let mut logger = Logger::new();
-        logger.set_db(undo_file, redo_file)?;
+        logger.set_db(log_file, log_header_bytes)?;
         // Buffer shares the logger's WAL clock, so page-flush deferral and redo
         // LSNs are scoped to this one database (not a process global).
         let clock = logger.clock();
@@ -1555,39 +1574,31 @@ where
         page_size: DBSizeType,
         max_pending_writes: usize,
     ) -> Result<Self, StoreError> {
-        let uf_name = name.to_string() + ".undo";
-        let rf_name = name.to_string() + ".redo";
+        let lf_name = name.to_string() + ".wal";
         // STORE_AUDIT.md S4: create(true) opens-or-creates, so Db::create
         // on an already-existing path silently reopened it, then
         // unconditionally overwrote its header with page_count=0 and
         // started handing out pages from scratch — destroying any
         // existing data at that path with no warning at all.
         // create_new(true) instead fails with an AlreadyExists io error if
-        // any of the three files is already there, matching create()'s
-        // documented contract of making a brand new database. Db::open
-        // (the "load an existing database" entry point) is unaffected — it
-        // has its own, separate file-opening path.
+        // either file is already there, matching create()'s documented
+        // contract of making a brand new database. Db::open (the "load an
+        // existing database" entry point) is unaffected — it has its own,
+        // separate file-opening path.
         let f = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .clone();
         let mut f = F::open(f, &name)?;
-        let undo_file = OpenOptions::new()
+        let log_file = OpenOptions::new()
             .create_new(true)
             .read(true)
             .write(true)
             .clone();
-        let undo_file = F::open(undo_file, uf_name)?;
-        let redo_file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .clone();
-        let redo_file = F::open(redo_file, rf_name)?;
+        let mut log_file = F::open(log_file, lf_name)?;
         f.do_lock()?;
-        undo_file.do_lock()?;
-        redo_file.do_lock()?;
+        log_file.do_lock()?;
         let header = Header {
             magic: MAGIC,
             first_page_offset: ZERO_PAGE_SIZE,
@@ -1597,6 +1608,11 @@ where
         };
         let bytes = to_allocvec(&header)?;
         f.write_all(&bytes)?;
+        // T4_S2_WAL_DESIGN.md §2: written synchronously right alongside the
+        // main file's own header, before anything (including the log
+        // runner thread, spawned by setup_needed_modules below) ever
+        // touches the log file.
+        let log_header_bytes = write_log_header(&mut log_file, page_size)?;
         let header = Arc::new(header);
         let gens = Generator::new();
         gens.create_generator(SYSTEM_TABLE_NAME, None)?;
@@ -1607,8 +1623,8 @@ where
             gens.clone(),
             page_count.clone(),
             f.do_clone()?,
-            undo_file.do_clone()?,
-            redo_file.do_clone()?,
+            log_file.do_clone()?,
+            log_header_bytes,
             max_pending_writes,
         )?;
 
@@ -1617,8 +1633,7 @@ where
             name,
             header,
             file: f,
-            undo_file,
-            redo_file,
+            log_file,
             page_count,
             tables: Arc::new(RwLock::new(HashMap::new())),
             generator: gens,
@@ -1716,8 +1731,7 @@ where
     }
 
     pub fn delete<S: AsRef<str>>(name: S) -> Result<(), StoreError> {
-        let uf_name = name.as_ref().to_string() + ".undo";
-        let rf_name = name.as_ref().to_string() + ".redo";
+        let lf_name = name.as_ref().to_string() + ".wal";
         // STORE_AUDIT.md S5: locking is otherwise only ever checked on the
         // way IN (create/open take an exclusive advisory lock) — delete()
         // never checked it at all, so it could unlink a live, in-use
@@ -1730,7 +1744,7 @@ where
         // owns it right now. A path that doesn't exist yet fails this
         // open with NotFound, same as remove_file below would have — not
         // a new failure mode, just surfaced one step earlier.
-        for path in [name.as_ref(), uf_name.as_str(), rf_name.as_str()] {
+        for path in [name.as_ref(), lf_name.as_str()] {
             let opts = OpenOptions::new().read(true).write(true).clone();
             let f = F::open(opts, path)?;
             f.do_lock().map_err(|_| {
@@ -1740,8 +1754,7 @@ where
             })?;
         }
         remove_file(name.as_ref())?;
-        remove_file(uf_name)?;
-        remove_file(rf_name)?;
+        remove_file(lf_name)?;
         Ok(())
     }
 }
@@ -1820,14 +1833,13 @@ mod tests {
         cursor::Cursor,
         db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
-        logger::MsgType,
+        logger::LogHeader,
         memfile::MemFile,
         table::TableIdType,
         tuple::{DBIdType, Tuple},
         txn::{ConflictPolicy, TransactionId},
         valueitem::ValueItem,
     };
-    use postcard::take_from_bytes;
     use std::fs::File;
     type TestDB = Db<MemFile>;
 
@@ -1840,54 +1852,45 @@ mod tests {
     // Simulates a crash: direct clones of the live db's file handles
     // (MemFile::do_clone shares the underlying buffer), without going
     // through close(). close() is a clean shutdown — it flushes
-    // everything and truncates the redo/undo logs, since a cleanly-closed
-    // db has nothing left that needs replaying — so it can never be used
-    // to test replay itself. This is what actually leaves whatever's
-    // durable so far sitting in the (unclosed, untruncated) logs, exactly
-    // like an abrupt process stop would.
-    fn crash_clone(db: &TestDB) -> (MemFile, MemFile, MemFile) {
-        (
-            db.file.do_clone().unwrap(),
-            db.undo_file.do_clone().unwrap(),
-            db.redo_file.do_clone().unwrap(),
-        )
+    // everything and truncates the log, since a cleanly-closed db has
+    // nothing left that needs replaying — so it can never be used to test
+    // replay itself. This is what actually leaves whatever's durable so
+    // far sitting in the (unclosed, untruncated) log, exactly like an
+    // abrupt process stop would.
+    fn crash_clone(db: &TestDB) -> (MemFile, MemFile) {
+        (db.file.do_clone().unwrap(), db.log_file.do_clone().unwrap())
     }
 
     // Passive record count (unlike Db::load_logs, which actually replays):
-    // just walks MsgType entries off the raw bytes.
+    // skips the LogHeader, then walks framed records off the raw bytes via
+    // the same scan_log recovery uses.
     fn count_log_records(file: &MemFile) -> usize {
         let data = file.data();
-        let mut buf = &data[..];
-        let mut count = 0;
-        while !buf.is_empty() {
-            let (_msg, remaining) = take_from_bytes::<MsgType>(buf).unwrap();
-            buf = remaining;
-            count += 1;
+        let header_len = LogHeader::encoded_len();
+        if data.len() < header_len {
+            return 0;
         }
-        count
+        crate::logger::scan_log(&data[header_len..]).unwrap().records.len()
     }
 
-    // log_redo/log_undo's send() over a bounded(1) channel only guarantees
-    // the *previous* message has been dequeued by the writer thread, not
-    // that it (or the message just sent) has actually been written to the
-    // file yet — under contention (e.g. many tests running in parallel)
-    // that write can lag behind the point where a test's last commit()
-    // call returns. crash_clone must not race that: it takes a raw,
-    // point-in-time clone, so a snapshot taken too early silently omits
-    // the last record(s), which then corrupts replay (e.g. a Commit
-    // marker missing from the undo log makes an already-committed
-    // transaction look abandoned). Poll for the expected counts instead of
-    // assuming synchronous delivery.
-    fn wait_for_durable_logs(db: &TestDB, expected_redo: usize, expected_undo: usize) {
+    // log()'s send() over a bounded channel only guarantees the *previous*
+    // message has been dequeued by the writer thread, not that it (or the
+    // message just sent) has actually been written to the file yet — under
+    // contention (e.g. many tests running in parallel) that write can lag
+    // behind the point where a test's last commit() call returns.
+    // crash_clone must not race that: it takes a raw, point-in-time clone,
+    // so a snapshot taken too early silently omits the last record(s),
+    // which then corrupts replay (e.g. a Commit marker missing makes an
+    // already-committed transaction look abandoned). Poll for the expected
+    // count instead of assuming synchronous delivery.
+    fn wait_for_durable_logs(db: &TestDB, expected: usize) {
         for _ in 0..1000 {
-            if count_log_records(&db.redo_file) == expected_redo
-                && count_log_records(&db.undo_file) == expected_undo
-            {
+            if count_log_records(&db.log_file) == expected {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        panic!("timed out waiting for {expected_redo} redo / {expected_undo} undo records to land");
+        panic!("timed out waiting for {expected} log record(s) to land");
     }
 
     // The file header's page_count is only ever (re)written to disk by an
@@ -1949,8 +1952,8 @@ mod tests {
         let db = db.unwrap();
         assert_eq!(db.header.first_page_offset, ZERO_PAGE_SIZE);
         assert_eq!(db.page_count(), 3);
-        let (f, u, r) = db.close().unwrap();
-        let db = TestDB::open_using(DB_NAME, f, u, r);
+        let (f, l) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME, f, l);
         assert!(db.is_ok());
         let db = db.unwrap();
         assert_eq!(db.header.page_count, 3);
@@ -1976,8 +1979,8 @@ mod tests {
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, ZERO_PAGE_SIZE + 5 * DEFAULT_PAGE_SIZE);
         assert_eq!(db.page_count(), 5);
-        let (f, u, r) = db.close().unwrap();
-        let db = TestDB::open_using(DB_NAME, f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME, f, l).unwrap();
         assert_eq!(db.page_count(), 5);
         //FileDB::delete(DB_NAME).unwrap_or_default();
     }
@@ -1992,8 +1995,8 @@ mod tests {
         let r = db.create_table("table_1".to_string());
         assert!(r.is_ok());
         assert_eq!(db.get_tables().unwrap().len(), 1);
-        let (f, u, r) = db.close().unwrap();
-        let db = TestDB::open_using(DB_NAME, f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db = TestDB::open_using(DB_NAME, f, l).unwrap();
         let t = db.get_tables().unwrap();
         assert!(t.len() == 1);
         assert_eq!(t[0].name, "table_1");
@@ -2210,9 +2213,9 @@ mod tests {
         db.create_table("rows".to_string()).unwrap();
         db.drop_table("rows").unwrap();
         assert_eq!(db.get_tables().unwrap().len(), 0);
-        let (f, u, r) = db.close().unwrap();
+        let (f, l) = db.close().unwrap();
 
-        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        let db2 = FileDB::open_using(&db_name, f, l).unwrap();
         assert_eq!(db2.get_tables().unwrap().len(), 0);
         assert_eq!(db2.table_id_by_name("rows").unwrap(), None);
         // The name must still be free after reopen too — proves the
@@ -3232,8 +3235,8 @@ mod tests {
         db.commit(txn1).unwrap();
         db.rollback(txn2).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let reader = db2.begin().unwrap();
         let found = db2.find(tid, id(1), &reader).unwrap();
@@ -3588,8 +3591,8 @@ mod tests {
         db.insert(tid, row(1, b"persistent"), &txn).unwrap();
         db.commit(txn).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let txn2 = db2.begin().unwrap();
         let found = db2.find(tid, id(1), &txn2).unwrap();
@@ -3613,8 +3616,8 @@ mod tests {
         db.insert(tid, row(1, b"v1"), &txn).unwrap();
         db.commit(txn).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let txn2 = db2.begin().unwrap();
         assert_ne!(
@@ -3637,8 +3640,8 @@ mod tests {
         db.remove(tid, id(7), &txn).unwrap();
         db.commit(txn).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let txn2 = db2.begin().unwrap();
         let found = db2.find(tid, id(7), &txn2).unwrap();
@@ -3947,8 +3950,8 @@ mod tests {
         db.commit(txn).unwrap();
 
         // Close and reopen — overflow pages must be readable from disk
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let txn2 = db2.begin().unwrap();
         let found = db2.find(tid, id(99), &txn2).unwrap();
@@ -4101,8 +4104,8 @@ mod tests {
         let t = db.begin().unwrap();
         db.insert(tid, row(1, &reins), &t).unwrap();
         db.commit(t).unwrap();
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         let t = db2.begin().unwrap();
         assert_eq!(
             db2.find(tid, id(1), &t)
@@ -4408,8 +4411,8 @@ mod tests {
 
         db.checkpoint().unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         let t2 = db2.begin().unwrap();
         assert_eq!(
             db2.find(tid, id(1), &t2)
@@ -4440,10 +4443,10 @@ mod tests {
             db.commit(t).unwrap();
         }
 
-        wait_for_durable_logs(&db, 20, 20);
+        wait_for_durable_logs(&db, 20);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let t = db2.begin().unwrap();
         for i in 0..10u64 {
@@ -4480,10 +4483,10 @@ mod tests {
             .unwrap();
         std::mem::forget(uncommitted);
 
-        wait_for_durable_logs(&db, 3, 3);
+        wait_for_durable_logs(&db, 3);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let t = db2.begin().unwrap();
         assert_eq!(
@@ -4528,10 +4531,10 @@ mod tests {
             .unwrap();
         std::mem::forget(abandoned);
 
-        wait_for_durable_logs(&db, 11, 11);
+        wait_for_durable_logs(&db, 11);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let t = db2.begin().unwrap();
         assert_eq!(
@@ -4563,10 +4566,10 @@ mod tests {
         }
 
         // First "crash": replay runs once against the original records.
-        wait_for_durable_logs(&db, 10, 10);
+        wait_for_durable_logs(&db, 10);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         // A second "crash", of db2, with nothing new having happened on
         // it: process_redo/process_undo call the BPlusTree-level methods
@@ -4576,10 +4579,10 @@ mod tests {
         // safe as the first. db2's own header still needs syncing before
         // ITS crash_clone — its page_count may have moved (replay itself
         // can allocate pages) since db2 opened.
-        wait_for_durable_logs(&db2, 10, 10);
+        wait_for_durable_logs(&db2, 10);
         sync_header_without_truncating_logs(&db2);
-        let (f2, u2, r2) = crash_clone(&db2);
-        let db3 = TestDB::open_using("txn_test.db", f2, u2, r2).unwrap();
+        let (f2, l2) = crash_clone(&db2);
+        let db3 = TestDB::open_using("txn_test.db", f2, l2).unwrap();
 
         let t = db3.begin().unwrap();
         for i in 0..5u64 {
@@ -4629,22 +4632,22 @@ mod tests {
         db.insert(tid, row(2, b"lost-on-crash"), &t).unwrap();
         db.commit(t).unwrap();
 
-        // Simulate a crash right here: live clones of the (unclosed,
-        // untruncated) redo/undo logs — close() would now truncate them,
-        // since a clean close leaves nothing that needs replaying. Bounded
-        // (1) redo/undo channels make log_redo/log_undo block until the
-        // runner thread has actually received each record, so these
-        // clones reliably contain row 2's Add+Commit (logged after the
-        // checkpoint's truncate, so they're the only two records in it).
-        wait_for_durable_logs(&db, 2, 2);
-        let (_, undo_file, redo_file) = crash_clone(&db);
+        // Simulate a crash right here: a live clone of the (unclosed,
+        // untruncated) log — close() would now truncate it, since a clean
+        // close leaves nothing that needs replaying. The bounded log
+        // channel makes log() block until the runner thread has actually
+        // received each record, so this clone reliably contains row 2's
+        // Add+Commit (logged after the checkpoint's truncate, so they're
+        // the only two records in it).
+        wait_for_durable_logs(&db, 2);
+        let (_, log_file) = crash_clone(&db);
 
         // Rebuild a "crashed" main file from the pre-insert snapshot —
         // independent bytes, not sharing the live file's buffer.
         let crashed_file = MemFile::new();
         crashed_file.pwrite(&stale_main_file_bytes, 0).unwrap();
 
-        let db2 = TestDB::open_using("txn_test.db", crashed_file, undo_file, redo_file).unwrap();
+        let db2 = TestDB::open_using("txn_test.db", crashed_file, log_file).unwrap();
 
         let t = db2.begin().unwrap();
         assert_eq!(
@@ -4662,6 +4665,121 @@ mod tests {
                 .data
                 .to_vec(),
             b"lost-on-crash"
+        );
+    }
+
+    // --- T4_S2_WAL_DESIGN.md: LogHeader mismatch / torn-tail / corruption,
+    // exercised end-to-end through Db::open_using (not just scan_log/
+    // read_and_validate_log_header in isolation — logger.rs's own test
+    // module already covers those directly). Uses the same raw byte-
+    // surgery-on-a-MemFile pattern
+    // test_replay_recovers_a_write_whose_page_flush_never_reached_the_main_file
+    // above already relies on, rather than a separate fault-injecting
+    // DBFile wrapper: every scenario here only needs one specific, known
+    // corruption applied once to a snapshot taken via crash_clone, which
+    // plain byte manipulation on MemFile's own buffer already does
+    // directly and exactly — a generic wrapper would mean plumbing fault
+    // injection through Db::create_core_db/open_using's generic `F: DBFile`
+    // open path for no additional coverage here.
+
+    // A log file created for one database's page_size, paired with a
+    // DIFFERENT database's main file, must be refused before recovery
+    // ever runs against it — not decoded, not silently tolerated.
+    #[test]
+    fn test_open_using_refuses_a_log_file_from_a_different_page_size_database() {
+        let db_4k = TestDB::create_with_page_size("mismatch_4k.db", 4096).unwrap();
+        let db_8k = TestDB::create_with_page_size("mismatch_8k.db", 8192).unwrap();
+
+        let (_, log_file_from_8k) = crash_clone(&db_8k);
+        let (main_file_4k, _) = crash_clone(&db_4k);
+
+        let err = match TestDB::open_using("mismatch_4k.db", main_file_4k, log_file_from_8k) {
+            Err(e) => e,
+            Ok(_) => panic!("expected LogHeaderMismatch, got Ok"),
+        };
+        assert!(
+            matches!(err, StoreError::LogHeaderMismatch(_)),
+            "expected LogHeaderMismatch, got {err:?}"
+        );
+    }
+
+    // A torn tail (crash mid write_all, leaving a partial final record) must
+    // not fail Db::open at all — recovery drops the incomplete record and
+    // opens normally with everything before it intact.
+    #[test]
+    fn test_open_using_tolerates_a_torn_tail_and_recovers_everything_before_it() {
+        let (db, tid) = make_db_with_table();
+        // Transaction 1: fully committed, Add+Commit both intact — must
+        // survive. Transaction 2: its own Commit marker (the log's very
+        // last record) is what gets torn below.
+        let t1 = db.begin().unwrap();
+        db.insert(tid, row(1, b"fully-committed"), &t1).unwrap();
+        db.commit(t1).unwrap();
+        let t2 = db.begin().unwrap();
+        db.insert(tid, row(2, b"torn-away"), &t2).unwrap();
+        db.commit(t2).unwrap();
+        wait_for_durable_logs(&db, 4);
+        sync_header_without_truncating_logs(&db);
+
+        let (main_file, log_file) = crash_clone(&db);
+        let mut torn_bytes = log_file.data();
+        // Truncate off the last few bytes — landing mid-payload of the
+        // last complete record (transaction 2's Commit marker), simulating
+        // a crash partway through its write_all.
+        torn_bytes.truncate(torn_bytes.len() - 3);
+        let torn_log_file = MemFile::new();
+        torn_log_file.pwrite(&torn_bytes, 0).unwrap();
+
+        let db2 = TestDB::open_using("txn_test.db", main_file, torn_log_file)
+            .expect("a torn tail must not fail Db::open");
+        let t = db2.begin().unwrap();
+        assert_eq!(
+            db2.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
+            b"fully-committed",
+            "everything before the torn record must still be recovered"
+        );
+        assert!(
+            db2.find(tid, id(2), &t).unwrap().is_none(),
+            "transaction 2's own Commit marker was torn off, so it must NOT appear \
+             committed — recovery correctly treats it the same as a crash before commit"
+        );
+    }
+
+    // Real, mid-file corruption — a checksum mismatch with more valid,
+    // complete records after it — must refuse to open rather than silently
+    // treat it as a torn tail (which would incorrectly stop recovery early,
+    // discarding records that actually did land durably).
+    #[test]
+    fn test_open_using_refuses_a_log_file_with_mid_file_corruption() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(2, b"v2"), &t).unwrap();
+        db.commit(t).unwrap();
+        wait_for_durable_logs(&db, 4);
+        sync_header_without_truncating_logs(&db);
+
+        let (main_file, log_file) = crash_clone(&db);
+        let mut corrupted = log_file.data();
+        // Flip a byte inside the FIRST record's payload (right after the
+        // header + one frame's worth of length/checksum prefix) — leaves
+        // the rest of the file (including the second record) intact and
+        // valid, so this can't be mistaken for a torn tail.
+        let header_len = LogHeader::encoded_len();
+        let flip_at = header_len + 9; // a few bytes into record 1's payload
+        corrupted[flip_at] ^= 0xFF;
+        let corrupted_log_file = MemFile::new();
+        corrupted_log_file.pwrite(&corrupted, 0).unwrap();
+
+        let err = match TestDB::open_using("txn_test.db", main_file, corrupted_log_file) {
+            Err(e) => e,
+            Ok(_) => panic!("expected LogCorruption, got Ok"),
+        };
+        assert!(
+            matches!(err, StoreError::LogCorruption(_)),
+            "expected LogCorruption, got {err:?}"
         );
     }
 
@@ -4691,47 +4809,36 @@ mod tests {
     // try_clone (Opener::do_clone's impl) dups the fd, giving a second
     // handle onto the same underlying open file — writes through either are
     // visible via the other, just like MemFile's Arc-shared buffer.
-    fn crash_clone_file(db: &FileDB) -> (File, File, File) {
-        (
-            db.file.do_clone().unwrap(),
-            db.undo_file.do_clone().unwrap(),
-            db.redo_file.do_clone().unwrap(),
-        )
+    fn crash_clone_file(db: &FileDB) -> (File, File) {
+        (db.file.do_clone().unwrap(), db.log_file.do_clone().unwrap())
     }
 
     // Passive record count straight off disk, by path rather than through a
     // shared fd — sidesteps any concern about interfering with the writer
     // thread's own seek position (see Opener::pread's doc comment on why
-    // clones of the same fd share a cursor).
+    // clones of the same fd share a cursor). Skips the LogHeader, then
+    // walks framed records the same way count_log_records (MemFile
+    // version) does.
     fn count_log_records_at_path(path: &str) -> usize {
         let data = std::fs::read(path).unwrap_or_default();
-        let mut buf = &data[..];
-        let mut count = 0;
-        while !buf.is_empty() {
-            let (_msg, remaining) = take_from_bytes::<MsgType>(buf).unwrap();
-            buf = remaining;
-            count += 1;
+        let header_len = LogHeader::encoded_len();
+        if data.len() < header_len {
+            return 0;
         }
-        count
+        crate::logger::scan_log(&data[header_len..]).unwrap().records.len()
     }
 
-    // See wait_for_durable_logs (MemFile version) — same log_redo/log_undo
+    // See wait_for_durable_logs (MemFile version) — same log()
     // send()-doesn't-imply-written race applies to the File backend too.
-    fn wait_for_durable_logs_file(db_name: &str, expected_redo: usize, expected_undo: usize) {
-        let redo_path = format!("{db_name}.redo");
-        let undo_path = format!("{db_name}.undo");
+    fn wait_for_durable_logs_file(db_name: &str, expected: usize) {
+        let log_path = format!("{db_name}.wal");
         for _ in 0..1000 {
-            if count_log_records_at_path(&redo_path) == expected_redo
-                && count_log_records_at_path(&undo_path) == expected_undo
-            {
+            if count_log_records_at_path(&log_path) == expected {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
         }
-        panic!(
-            "timed out waiting for {expected_redo} redo / {expected_undo} undo file-backed \
-             records to land"
-        );
+        panic!("timed out waiting for {expected} file-backed log record(s) to land");
     }
 
     // mmap-ing a zero-length file is a classic edge case (some mmap
@@ -4746,8 +4853,8 @@ mod tests {
         db.create_table("rows".to_string()).unwrap();
 
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone_file(&db);
-        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        let (f, l) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, l).unwrap();
         assert_eq!(db2.get_tables().unwrap().len(), 1);
 
         // STORE_AUDIT.md S5: delete() now refuses to remove a still-locked
@@ -4772,10 +4879,10 @@ mod tests {
             db.commit(t).unwrap();
         }
 
-        wait_for_durable_logs_file(&db_name, 20, 20);
+        wait_for_durable_logs_file(&db_name, 20);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone_file(&db);
-        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        let (f, l) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, l).unwrap();
 
         let t = db2.begin().unwrap();
         for i in 0..10u64 {
@@ -4817,15 +4924,15 @@ mod tests {
             db.commit(t).unwrap();
         }
 
-        wait_for_durable_logs_file(&db_name, 10, 10);
+        wait_for_durable_logs_file(&db_name, 10);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone_file(&db);
-        let db2 = FileDB::open_using(&db_name, f, u, r).unwrap();
+        let (f, l) = crash_clone_file(&db);
+        let db2 = FileDB::open_using(&db_name, f, l).unwrap();
 
-        wait_for_durable_logs_file(&db_name, 10, 10);
+        wait_for_durable_logs_file(&db_name, 10);
         sync_header_without_truncating_logs(&db2);
-        let (f2, u2, r2) = crash_clone_file(&db2);
-        let db3 = FileDB::open_using(&db_name, f2, u2, r2).unwrap();
+        let (f2, l2) = crash_clone_file(&db2);
+        let db3 = FileDB::open_using(&db_name, f2, l2).unwrap();
 
         let t = db3.begin().unwrap();
         for i in 0..5u64 {
@@ -4873,7 +4980,7 @@ mod tests {
             db.commit(t).unwrap();
         }
         // 5 Add + 5 Commit redo records, each with its own increasing lsn.
-        wait_for_durable_logs(&db, 10, 10);
+        wait_for_durable_logs(&db, 10);
         let watermark_before_crash = db.logger.clock().last_written();
         assert_ne!(
             watermark_before_crash.0,
@@ -4883,8 +4990,8 @@ mod tests {
         );
 
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         assert_eq!(
             db2.logger.clock().last_written(),
@@ -4911,10 +5018,10 @@ mod tests {
                 .unwrap();
             db.commit(t).unwrap();
         }
-        wait_for_durable_logs(&db, 10, 10);
+        wait_for_durable_logs(&db, 10);
         sync_header_without_truncating_logs(&db);
-        let (f, u, r) = crash_clone(&db);
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let watermark_after_replay = db2.logger.clock().last_written();
 
@@ -4945,8 +5052,8 @@ mod tests {
         db.checkpoint().unwrap();
         let page_count_at_checkpoint = db.page_count();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         assert_eq!(db2.page_count(), page_count_at_checkpoint);
 
         let t = db2.begin().unwrap();
@@ -4964,7 +5071,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_truncates_redo_and_undo_log_files() {
+    fn test_checkpoint_truncates_the_log_file_down_to_just_its_header() {
         let (db, tid) = make_db_with_table();
         for i in 0..20u64 {
             let t = db.begin().unwrap();
@@ -4975,22 +5082,20 @@ mod tests {
         db.checkpoint().unwrap();
         // close() calls logger.shutdown(), which sends ShutDown on the same
         // (FIFO) channel checkpoint()'s truncate message went to, then
-        // blocks on the runner threads joining — so by the time close()
+        // blocks on the runner thread joining — so by the time close()
         // returns, the truncate is guaranteed to have actually run.
         // checkpoint() returning on its own only guarantees the truncate
         // was *requested* (Logger::checkpoint is fire-and-forget), not
         // that it's completed yet.
-        let (_, undo_file, redo_file) = db.close().unwrap();
+        let (_, log_file) = db.close().unwrap();
 
+        // T4_S2_WAL_DESIGN.md §2: truncate() sets the file to zero bytes,
+        // but log_runner immediately restores the LogHeader afterward — so
+        // the truncated length is the header's own size, not literal zero.
         assert_eq!(
-            undo_file.get_metadata().unwrap().len,
-            0,
-            "undo log must be truncated after a checkpoint"
-        );
-        assert_eq!(
-            redo_file.get_metadata().unwrap().len,
-            0,
-            "redo log must be truncated after a checkpoint"
+            log_file.get_metadata().unwrap().len,
+            LogHeader::encoded_len() as u64,
+            "the log file must be truncated down to just its header after a checkpoint"
         );
     }
 
@@ -5005,16 +5110,13 @@ mod tests {
         let (db, tid) = make_db_with_table();
 
         // checkpoint()'s truncate is fire-and-forget (Logger::checkpoint
-        // just enqueues it — see test_checkpoint_truncates_redo_and_undo_
-        // log_files) — poll briefly for it to actually land before
-        // checking either file's size, or this races the runner threads
-        // and can observe a stale, pre-truncate length.
-        fn wait_for_logs_to_settle(db: &TestDB) {
+        // just enqueues it) — poll briefly for it to actually land before
+        // checking the file's size, or this races the runner thread and
+        // can observe a stale, pre-truncate length.
+        let header_len = LogHeader::encoded_len() as u64;
+        fn wait_for_log_to_settle(db: &TestDB, header_len: u64) {
             let mut tries = 0;
-            while (db.redo_file.get_metadata().unwrap().len > 0
-                || db.undo_file.get_metadata().unwrap().len > 0)
-                && tries < 200
-            {
+            while db.log_file.get_metadata().unwrap().len > header_len && tries < 200 {
                 thread::sleep(Duration::from_millis(1));
                 tries += 1;
             }
@@ -5025,19 +5127,13 @@ mod tests {
             db.insert(tid, row(round, b"v"), &t).unwrap();
             db.commit(t).unwrap();
             db.checkpoint().unwrap();
-            wait_for_logs_to_settle(&db);
+            wait_for_log_to_settle(&db, header_len);
 
             assert_eq!(
-                db.redo_file.get_metadata().unwrap().len,
-                0,
-                "round {round}: redo log must be empty once its checkpoint settles \
-                 — it must not accumulate round over round"
-            );
-            assert_eq!(
-                db.undo_file.get_metadata().unwrap().len,
-                0,
-                "round {round}: undo log must be empty once its checkpoint settles \
-                 — it must not accumulate round over round"
+                db.log_file.get_metadata().unwrap().len,
+                header_len,
+                "round {round}: the log must be truncated down to just its header once its \
+                 checkpoint settles — it must not accumulate round over round"
             );
         }
     }
@@ -5131,8 +5227,8 @@ mod tests {
     fn test_free_pages_empty_by_default_persists_as_empty() {
         let (db, _tid) = make_db_with_table();
         assert!(db.buffer.get_free_pages().is_empty());
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         assert!(
             db2.buffer.get_free_pages().is_empty(),
             "a DB that never freed anything must not spuriously report free pages"
@@ -5159,8 +5255,8 @@ mod tests {
             "shrinking an 8-page object to 4 pages must free some overflow pages"
         );
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         let freed_after = db2.buffer.get_free_pages();
 
         assert_eq!(
@@ -5183,8 +5279,8 @@ mod tests {
         db.update(tid, row(1, &shrunk), &t).unwrap();
         db.commit(t).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let free_count = db2.buffer.get_free_pages().len();
         assert!(free_count > 0);
@@ -5236,8 +5332,8 @@ mod tests {
         db.update(tid, row(1, &shrunk), &t).unwrap();
         db.commit(t).unwrap();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
 
         let reused_id = db2.buffer.alloc_page(false).unwrap();
         assert!(
@@ -5298,8 +5394,8 @@ mod tests {
         db.update(tid, row(1, &big_payload(8, 4 * page)), &t)
             .unwrap();
         db.commit(t).unwrap();
-        let (f, u, r) = db.close().unwrap();
-        let db = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db = TestDB::open_using("txn_test.db", f, l).unwrap();
         let round1_free: HashSet<PageId> = db.buffer.get_free_pages().into_iter().collect();
         assert!(!round1_free.is_empty());
 
@@ -5316,8 +5412,8 @@ mod tests {
         let round2_free_before_close: HashSet<PageId> =
             db.buffer.get_free_pages().into_iter().collect();
 
-        let (f, u, r) = db.close().unwrap();
-        let db2 = TestDB::open_using("txn_test.db", f, u, r).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
         let round2_free_after_reopen: HashSet<PageId> =
             db2.buffer.get_free_pages().into_iter().collect();
 

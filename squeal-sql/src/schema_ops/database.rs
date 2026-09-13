@@ -92,7 +92,7 @@ where
         Ok(database)
     }
 
-    pub fn close(self: Arc<Self>) -> Result<(F, F, F), SchemaError> {
+    pub fn close(self: Arc<Self>) -> Result<(F, F), SchemaError> {
         for schema in self.schemas.read().values() {
             schema.flush_metadata()?;
         }

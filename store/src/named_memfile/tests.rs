@@ -68,16 +68,16 @@ fn test_delete_clears_prior_state_for_that_name() {
 }
 
 #[test]
-fn test_delete_also_clears_undo_and_redo_siblings() {
-    let name = "test_delete_also_clears_undo_and_redo_siblings";
-    let undo = format!("{name}.undo");
+fn test_delete_also_clears_the_wal_sibling() {
+    let name = "test_delete_also_clears_the_wal_sibling";
+    let wal = format!("{name}.wal");
     NamedMemFile::delete(name);
 
-    let mut f = open(&undo);
-    f.write_all(b"stale-undo").unwrap();
+    let mut f = open(&wal);
+    f.write_all(b"stale-wal").unwrap();
     NamedMemFile::delete(name);
 
-    let mut f2 = open(&undo);
+    let mut f2 = open(&wal);
     let mut buf = vec![0u8; 10];
     assert_eq!(f2.read(&mut buf).unwrap(), 0);
 }
