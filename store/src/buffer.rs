@@ -56,7 +56,14 @@ struct WriteMsg {
     transient_retries: u32,
 }
 
-#[derive(Debug, Clone)]
+// STORE_AUDIT.md P2: no longer Clone — ArcLockGuard now wraps a real
+// parking_lot::ArcReentrantMutexGuard, which is deliberately !Send (a
+// reentrant guard's whole correctness model depends on the OS thread that
+// acquired it being the one that releases/re-enters it — moving it to
+// another thread would let a different thread masquerade as the owner).
+// Confirmed via grep before removing: nothing actually cloned a whole
+// WritePageHandle (only its `.page: Arc<Page>` field, which stays Clone).
+#[derive(Debug)]
 pub(crate) struct WritePageHandle {
     pub(crate) page_num: PageId,
     lock: ArcLockGuard<PageId>,

@@ -858,8 +858,60 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   *(deferred — performance)*
 
 ### Phase 6 — locking and cache
-- [ ] **P2** — `ArcLock` is a global serialization point with busy-polling.
-  *(deferred — performance)*
+
+**Process note for this phase**: per-finding methodology changed here from the rest of this
+doc. Everything above used a failing test that the fix turns green. Performance findings have
+no "wrong behavior" to assert against — the methodology instead is a benchmark recorded
+*before* the change and again *after*, with the comparison (and full reasoning about what it
+does and doesn't show) written up in `store/benches/BASELINE.md`, which already held this exact
+pattern for prior perf work (removing `AnyTuplePage`'s `RwLock`, `Tuple.data` → `Arc<[u8]>`,
+borrowed serialization). `[t-green]` below means "benchmarked before/after, change applied,
+full test suite still green" — not "a red test now passes."
+
+- [t-green] **P2** — FIXED, with an honestly-reported tradeoff (full numbers and reasoning in
+  `store/benches/BASELINE.md`'s own P2 section — summarized here). `ArcLock<PageId>` (backing
+  every `PageBuffer::get_page_mut` call) kept one entry per key in a `HashMap` behind a single
+  `RwLock`, took that map's *write* side on every `lock()` call regardless of which key was
+  involved, and had waiters re-take that same write lock every 100us in a sleep-poll loop
+  instead of actually blocking — plus a documented, separate bug: `lock()` accepted a `timeout`
+  parameter and silently overrode it with a hardcoded 60s wait (the one real caller,
+  `get_page_mut`, has always passed 5ms — see S9's own mention of this same bug).
+  Fixed: the map now holds one real `Arc<parking_lot::ReentrantMutex<()>>` per key, created once
+  and cached — `lock()` only touches the map briefly (a `read()` once a key has been seen
+  before) to fetch-or-create that per-key mutex; the actual wait/reentrancy/timeout is handled
+  by `try_lock_arc_for` directly on it (a real futex-based block, honoring the real timeout).
+  `ArcLockGuard` now wraps `parking_lot`'s own `ArcReentrantMutexGuard` instead of a hand-rolled
+  `Arc<u8>` + `ThreadId` scheme; deliberately `!Send` (parking_lot's own choice — a reentrant
+  guard's correctness depends on staying on the thread that acquired it), which meant dropping
+  `WritePageHandle`'s vestigial `Clone` derive (confirmed via grep: nothing ever cloned a whole
+  handle, only its `.page: Arc<Page>` field, which stays `Clone`).
+  **Benchmarked, not just asserted**: `cargo bench -p store --bench arclock` (new) —
+  `uncontended_single_thread` −70%, `disjoint_keys_concurrent` (8 threads, disjoint keys, the
+  audit's own stated motivation) −11%. `same_key_contended`/`same_key_contended_with_work`
+  (genuinely hot key, with and without ~1us of real per-hold work) **regressed +96–113%** —
+  `ReentrantMutex`'s own bookkeeping plus a separate lock-registry map's indirection costs more
+  than the old design's "probably free, just re-check" fast path saved for this specific
+  access pattern; confirmed not a zero-work-benchmark artifact (the with-work variant regressed
+  by roughly the same margin). Allocation-count proxy (new `#[ignore]`d test,
+  `arclock::alloc_proxy_disjoint_keys_concurrent`, using `store::alloc::stats()` — a cleaner
+  signal than wall clock since it isn't sensitive to machine load): allocation events for 16,000
+  lock/unlock cycles across 8 keys dropped from 16,042 to 52 (−99.7%), bytes from 394,580 to
+  11,508 (−97%) — an asymptotic win (allocations ∝ distinct keys now, not ∝ operations), since
+  the old design allocated a fresh `Arc::new(0)` on every non-reentrant acquisition even for a
+  key it had served thousands of times before.
+  **End-to-end stress** (`examples/stress --threads 16 --ops 20000 --backend mem`): 76,941 ops/s
+  before, 76,946 ops/s after — flat, no measurable difference either way. `ArcLock`'s own cost,
+  in either direction, is a rounding error against the full insert/find path — the audit's own
+  motivating claim ("on the Mem backend this is the documented reason throughput drops with
+  more threads") does not reproduce against the current codebase. Kept the fix anyway: honoring
+  the timeout and replacing an active busy-poll with real blocking are correct independent of
+  this particular throughput measurement, and the allocation win is real. Not attempted this
+  pass: the audit's own suggested design of storing the lock directly in the page's cache entry
+  (`PageEntry`) rather than a separate lock-registry map — likely would have closed the
+  same-key regression (no second lookup/indirection), but needs its own `PageBuffer`
+  eviction-logic investigation; flagged here as a follow-up, not silently dropped.
+  Correctness: `store` lib 417/417 (+1 `#[ignore]`d perf test), `squeal-sql` lib 346/346,
+  workspace builds clean, stress (mem, 16t) `RESULT: PASS` both before and after, 0 mismatches.
 - [ ] **P3** — cache bookkeeping does two `SystemTime::now()` calls + a heap update per page
   access. *(deferred — performance)*
 - [ ] **P5** — inner-node routing clones and decodes every entry on the page.

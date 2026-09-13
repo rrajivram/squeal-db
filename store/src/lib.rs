@@ -31,7 +31,10 @@ static GLOBAL: alloc::TrackingAllocator = alloc::TrackingAllocator::new();
 static GLOBAL: dhat::Alloc = dhat::Alloc;
 
 pub mod alloc;
-mod arclock;
+// STORE_AUDIT.md P2: pub, not just pub(crate), so store/benches/arclock.rs
+// (a separate compilation unit, like every criterion bench) can reach it
+// directly for contention benchmarking — see that bench's own comment.
+pub mod arclock;
 mod buffer;
 mod constant;
 pub mod db;
