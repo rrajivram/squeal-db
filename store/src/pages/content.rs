@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     error::StoreError,
-    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage, run::RunPage},
+    pages::{PageTuple, anytuple::AnyTuplePage, fixedtuple::FixedTuplePage, run::RunPage, slotted::SlottedPage},
 };
 
 // Discriminant persisted per-page (see PageHeader's own field) identifying
@@ -27,6 +27,20 @@ impl PageContentKind {
     // since a Run's pages are first-class store content now, not a
     // per-caller custom registration.
     pub const RUN_TUPLE: PageContentKind = PageContentKind(2);
+    // STORE_AUDIT.md P6. NOT the default `Page::new` builds for a data page
+    // — see `slotted.rs`'s own top comment ("Why this isn't the default")
+    // for why: a real, measured ~22x slower repeated in-memory access cost
+    // that outweighs its genuine load/flush win once a page is cache-hot,
+    // which caused a ~45-50% end-to-end regression when it briefly was the
+    // default. Registered anyway (kept, not deleted) so the type stays a
+    // working, tested, `PageContentRegistry`-integrated exploration rather
+    // than dead code nothing can construct. Deliberately PageContentKind(4),
+    // not 3: buffer.rs's own test module already hands out kind 3 to a
+    // hand-rolled custom content kind (`TEST_BUCKET_KIND`) registered on top
+    // of `builtin()` — reusing 3 here would make that test's own
+    // `.register(TEST_BUCKET_KIND, ..)` call fail with
+    // DuplicatePageContentKind.
+    pub const SLOTTED_TUPLE: PageContentKind = PageContentKind(4);
 }
 
 pub type PageContentFactory =
@@ -76,6 +90,12 @@ impl PageContentRegistry {
             .register(
                 PageContentKind::RUN_TUPLE,
                 Arc::new(|bytes| Ok(Box::new(RunPage::from_bytes(bytes)?) as Box<dyn PageTuple>)),
+            )
+            .expect("built-in kinds register exactly once");
+        registry
+            .register(
+                PageContentKind::SLOTTED_TUPLE,
+                Arc::new(|bytes| Ok(Box::new(SlottedPage::from_bytes(bytes)?) as Box<dyn PageTuple>)),
             )
             .expect("built-in kinds register exactly once");
         registry

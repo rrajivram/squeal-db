@@ -166,7 +166,39 @@ doesn't waste time re-verifying it.
 - Update `audit-progress.md`'s P6 entry (currently `[ ]`, Phase 7) and `STORE_AUDIT.md`
   cross-references once implemented.
 
-## Status
+## Status — implemented, benchmarked, wiring reverted (design itself missed one axis)
 
-Design only, per explicit request — **no code written this pass**. `audit-progress.md`'s P6
-line updated to point here; still `[ ]` (not started) since nothing has landed yet.
+This *was* implemented (`store/src/pages/slotted.rs`, full test suite, registered in
+`PageContentRegistry` as `SLOTTED_TUPLE`) and briefly made `Page::new`'s default for data
+pages, in a later pass than this document's own scoping-only status originally described.
+
+Integration testing (the full `store`/`squeal-sql` suites — this session's standard "confirm
+meaningful through real usage" gate) caught a real bug: `SlottedPage::replace`'s remove-then-
+add fallback deleted the old slot *before* confirming the new (bigger) tuple would fit, so a
+capacity failure silently dropped the row forever while reporting "nothing happened." Fixed
+(see `slotted.rs`'s own comment on the fix, and `audit-progress.md`'s P6 entry for the full
+story) and covered by a dedicated regression test.
+
+Then benchmarked — and reverted. This design document reasoned carefully about **load/flush**
+cost (the audit's own framing: "a one-row change rewrites and re-encodes a 16 KiB page") but
+never weighed **repeated in-memory access** cost for an already-cached page, which turned out
+to be the dominant axis: `AnyTuplePage` decodes once, on load, into a live `BTreeMap`, so every
+later access is a free comparison; `SlottedPage` decodes nothing on load, but its O(log N)
+binary search fully decodes a whole candidate `Tuple` on *every* comparison of *every* access,
+paying that cost over and over rather than once. Measured ~22x slower repeated `get()` on an
+already-loaded page, and a ~45-50% end-to-end stress-harness regression (107K → 54-60K ops/s)
+— that gap alone, not any remaining correctness issue, is why `Page::new` was reverted to
+building `AnyTuplePage`/`FixedTuplePage` as before.
+
+Disposition, per explicit direction: `SlottedPage` is kept, not deleted — a real, working,
+fully-tested design exploration, documented (its own top comment, `content.rs`'s
+`SLOTTED_TUPLE` doc comment) with exactly why it's dormant and the one identified-but-
+unattempted path back (decode only the `id` field during binary search — `Tuple`'s first
+declared struct field, self-delimiting under postcard's declaration-order serialization —
+instead of the whole `Tuple`). `bplustree.rs`'s `write_data`/`update`/`update_checked`, which
+had gained `PageCapacityError`-fallback handling for `SlottedPage`'s stricter capacity
+semantics, were reverted to their pre-P6 form along with `page.rs`'s `Page::new`.
+
+`audit-progress.md`'s P6 line reflects this outcome; `STORE_AUDIT.md`'s own P6 item stays
+open/deferred, since the underlying finding (whole-page re-serialization on flush) remains
+real and unaddressed by anything currently active.

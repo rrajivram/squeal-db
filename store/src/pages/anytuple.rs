@@ -489,4 +489,34 @@ mod tests {
             "removing one tied id must not remove the other"
         );
     }
+
+    // STORE_AUDIT.md P6 — see slotted.rs's matching bench and its own doc
+    // comment on why SlottedPage is NOT the default despite existing:
+    // repeated in-memory access to an already-loaded page is what this
+    // measures (not load/flush cost), and it's the axis SlottedPage loses
+    // badly on. Throwaway (not a committed criterion bench), #[ignore]d.
+    #[test]
+    #[ignore]
+    fn bench_repeated_get_on_an_already_loaded_page() {
+        let mut p = AnyTuplePage::new();
+        for i in 0..200u64 {
+            p.add(Tuple::new(i, b"0123456789012345678901234567890123456789")).unwrap();
+        }
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        const ITERS: u64 = 2_000_000;
+        let start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let id = DBIdType::Int(state % 200);
+            std::hint::black_box(p.get(&id).unwrap());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "AnyTuplePage bench_repeated_get_on_an_already_loaded_page: {ITERS} gets in \
+             {elapsed:?} ({:.0} gets/s)",
+            ITERS as f64 / elapsed.as_secs_f64()
+        );
+    }
 }

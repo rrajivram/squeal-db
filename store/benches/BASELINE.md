@@ -537,6 +537,50 @@ readable without `postcard`. `successor` already cuts each routing decision to e
 captures the large majority of the win; a fixed layout would only shave that one remaining decode,
 a much smaller marginal return for a genuine on-disk format change. See `audit-progress.md`.
 
+## Result — STORE_AUDIT.md P6: slotted pages, implemented, benchmarked, and reverted
+
+Full writeup: `P6_SLOTTED_PAGE_DESIGN.md`, `audit-progress.md`'s P6 entry. Short version: a new
+`PageTuple` impl, `SlottedPage` (`store/src/pages/slotted.rs` — fixed header, id-sorted slot
+directory, tuple bytes packed from the back), was implemented to fix the audit's real finding
+("a one-row change rewrites and re-encodes a 16 KiB page" — `AnyTuplePage::to_bytes()`
+postcard-re-encodes every tuple on every flush). Briefly made `Page::new`'s default for data
+pages, and — critically — this is the one fix in the whole STORE_AUDIT.md pass where measuring
+after wiring it in changed the decision, not just the write-up.
+
+Direct microbenchmark, `bench_repeated_get_on_an_already_loaded_page` (both `anytuple.rs` and
+`slotted.rs` — identical 200-tuple page, 2,000,000 scattered `get()` calls):
+
+| impl | gets/s |
+|---|---|
+| `AnyTuplePage` | ~23.3M |
+| `SlottedPage` | ~1.07M |
+
+~22x slower. Reason: `AnyTuplePage` decodes every tuple once, on `from_bytes` (page load), into
+a live `BTreeMap` — every later access for as long as the page stays cache-resident is a free,
+no-decode comparison. `SlottedPage` decodes nothing on load, but its O(log N) binary search
+fully `postcard`-decodes a *whole* candidate `Tuple` (every field, not just `id`) on *every*
+comparison of *every* access — never amortized the way `AnyTuplePage`'s one-time decode is.
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`), with `SlottedPage`
+wired in as the default: **107K → 54,000-60,000 ops/s — a real, reproducible ~45-50%
+regression**, the opposite of P6's goal. This is why the wiring was reverted (kept
+`AnyTuplePage`/`FixedTuplePage` as `Page::new`'s default); after reverting, throughput measured
+back at 107,300-107,329 ops/s (2 runs), matching the pre-P6 (post-P5) baseline exactly.
+
+Along the way, integrating `SlottedPage` for real (running the full `store`/`squeal-sql` suites
+against it, this session's standard gate) caught a genuine data-loss bug — `replace`'s
+remove-then-add fallback deleted the old entry before confirming the new one would fit, losing
+rows silently on a capacity failure. Fixed and covered by a dedicated regression test
+(`test_replace_that_cannot_possibly_fit_leaves_the_old_entry_intact`, `slotted.rs`) — see
+`audit-progress.md` for the full mechanism. `SlottedPage` is kept in the tree (not deleted),
+fully tested and registered in `PageContentRegistry`, documented as dormant with the reasoning
+above and the one identified-but-unattempted path back (decode only the `id` field during
+binary search instead of the whole `Tuple`).
+
+Correctness: `store` lib 462/462 (+8 `#[ignore]`d total this session), `squeal-sql` lib
+346/346, workspace builds clean, stress `RESULT: PASS`, 0 mismatches (both with `SlottedPage`
+wired in, and after reverting).
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

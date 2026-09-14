@@ -8,6 +8,7 @@ pub mod anytuple;
 pub mod content;
 pub mod fixedtuple;
 pub mod run;
+pub mod slotted;
 
 pub type TupleType = Tuple;
 

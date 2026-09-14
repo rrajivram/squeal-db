@@ -1225,10 +1225,56 @@ full test suite still green" — not "a red test now passes."
 
 ### Phase 7 — slotted pages
 - [ ] **P6** — whole-page re-serialization on every flush; deep clone on every `write_page`.
-  *(deferred — performance)*. **Scoping/design pass done, no code yet**: full slotted-page
-  layout, capacity-accounting fix, `From<PageDto>` dispatch-path question (resolved: confirmed
-  dead/legacy, no `SLOTTED_TUPLE` arm needed), Parquet-non-foreclosure reasoning, and staged
-  test-first rollout plan all written up in `P6_SLOTTED_PAGE_DESIGN.md`.
+  *(deferred — performance, tried and reverted; see below)*. Design pass written up in
+  `P6_SLOTTED_PAGE_DESIGN.md` (slotted-page layout, capacity-accounting fix, Parquet-non-
+  foreclosure reasoning, staged rollout plan). Fully **implemented** as a new `PageTuple`
+  impl, `SlottedPage` (`store/src/pages/slotted.rs`) — fixed header, id-sorted slot
+  directory, tuple bytes packed from the back, `to_bytes()` a plain buffer clone,
+  `from_bytes()` parsing only the (small, fixed-size) directory. Briefly wired in as
+  `Page::new`'s default for data pages.
+  While integrating, the full `store`/`squeal-sql` suites (the "confirm meaningful through
+  real usage" step this whole session's methodology relies on) caught a real, serious bug:
+  `SlottedPage::replace`'s remove-then-add fallback (for a tuple that grew past its old span)
+  called `delete_slot` *before* confirming the new tuple would actually fit — if the
+  subsequent `ensure_room` then failed, the old entry was already gone, permanently, while
+  the caller was told `PageCapacityError` ("nothing happened, try elsewhere"). Reproduced by
+  `test_table_scan_correct_after_updating_every_row_across_multiple_data_pages` (db.rs, pre-
+  existing): 500 same-value updates, each just barely growing its own tuple (an old
+  `pre_lsn: None` becomes `Some(lsn)`), eventually exhausts a page's slack and silently drops
+  a row. Fixed: compute (without mutating) the max space a full compaction could free once
+  the old slot's own bytes are also counted as dead, and fail *before* touching the
+  directory if that's still not enough — a capacity error now genuinely means the page is
+  untouched. Added a fast, dedicated unit test for the exact mechanism
+  (`test_replace_that_cannot_possibly_fit_leaves_the_old_entry_intact`, slotted.rs).
+  Confirmed meaningful the usual way (reverted the fix, confirmed red; restored, confirmed
+  green) on top of the full suite going 460→461→462 passed across the fix.
+  **Then benchmarked, and reverted the wiring** (kept `AnyTuplePage`/`FixedTuplePage` as the
+  default) after the stress harness showed a real, reproducible **~45-50% END-TO-END
+  regression** (107K → 54-60K ops/s) — the opposite of P6's goal. Root cause, confirmed via a
+  direct microbenchmark (`bench_repeated_get_on_an_already_loaded_page`, both
+  `anytuple.rs`/`slotted.rs`): `AnyTuplePage` decodes every tuple once, on load, into a live
+  `BTreeMap` — every subsequent access for as long as the page stays cache-resident is then a
+  free, no-decode comparison. `SlottedPage` decodes nothing on load, but its O(log N) binary
+  search fully `postcard`-decodes a *whole* candidate `Tuple` (not just the `id` it needs) on
+  *every* comparison, *every* access — never amortized. Measured ~23.3M gets/s (AnyTuplePage)
+  vs. ~1.07M gets/s (SlottedPage) on an identical page — ~22x. For a page touched many times
+  while resident (the common case, especially given this session's own P2/P3 caching work),
+  that dominates completely and swamps the genuine load/flush win. This is a gap in the
+  original scoping pass, not something the design doc anticipated — it reasoned carefully
+  about flush/load cost but not repeated-access cost.
+  **Disposition**: `SlottedPage` is kept (not deleted) — fully implemented, tested, and
+  registered in `PageContentRegistry` (`SLOTTED_TUPLE` kind) — but `Page::new` was reverted to
+  building `AnyTuplePage`/`FixedTuplePage` as before, per explicit direction. `slotted.rs`'s
+  own top comment ("Why this isn't the default") and `content.rs`'s `SLOTTED_TUPLE` doc
+  comment both carry the full explanation, including the one plausible path back (decode only
+  the `id` field — `Tuple`'s first declared struct field, self-delimiting under postcard's
+  declaration-order serialization — during binary search instead of the whole `Tuple`) that
+  was identified but not attempted. `bplustree.rs`'s write_data/update/update_checked, which
+  had gained `PageCapacityError`-fallback handling specifically for `SlottedPage`'s stricter
+  capacity semantics, were reverted to their pre-P6 form along with `page.rs`'s `Page::new`.
+  Full `store` suite: 462 passed, 0 failed (+8 `#[ignore]`d total this session), `squeal-sql
+  --lib`: 346 passed, 0 failed. E2E stress confirmed back at 107,300-107,329 ops/s (2 runs),
+  matching the pre-P6 (post-P5) baseline exactly.
 - [t-green] **P9** — FIXED, first half (chain-reuse); second half (async continuation-page
   writes) deliberately deferred, see below. `handle_large_page_size` (`buffer.rs`) unconditionally
   tore down and rebuilt a row's WHOLE overflow chain on every single write to an already-oversized
