@@ -1225,7 +1225,10 @@ full test suite still green" — not "a red test now passes."
 
 ### Phase 7 — slotted pages
 - [ ] **P6** — whole-page re-serialization on every flush; deep clone on every `write_page`.
-  *(deferred — performance)*
+  *(deferred — performance)*. **Scoping/design pass done, no code yet**: full slotted-page
+  layout, capacity-accounting fix, `From<PageDto>` dispatch-path question (resolved: confirmed
+  dead/legacy, no `SLOTTED_TUPLE` arm needed), Parquet-non-foreclosure reasoning, and staged
+  test-first rollout plan all written up in `P6_SLOTTED_PAGE_DESIGN.md`.
 - [t-green] **P9** — FIXED, first half (chain-reuse); second half (async continuation-page
   writes) deliberately deferred, see below. `handle_large_page_size` (`buffer.rs`) unconditionally
   tore down and rebuilt a row's WHOLE overflow chain on every single write to an already-oversized
