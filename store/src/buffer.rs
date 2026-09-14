@@ -85,9 +85,54 @@ enum PageEntry {
     Weak(Weak<Page>),
 }
 
+// STORE_AUDIT.md P2 survey follow-up: fixed regardless of max_entries —
+// unlike max_entries itself (a real capacity bound), shard count has no
+// correctness meaning, only a concurrency-spreading one. A small
+// max_entries (common in tests) just means most shards stay empty, which
+// is harmless.
+const BUFFER_SHARD_COUNT: usize = 16;
+
+// The outcome of trying to free exactly one Strong slot. Distinct from a
+// bare `Option<(PageId, Arc<Page>)>` because "evicted a clean page" (no
+// flush needed) and "access_map had nothing left to offer" must not be
+// conflated — a caller that can't tell them apart would treat a
+// just-freed clean slot the same as total exhaustion and wrongly fall
+// back to tolerating a capacity overflow it didn't actually need to.
+enum Evicted {
+    /// A slot was freed. `Some` if the victim was dirty and needs flushing.
+    Yes(Option<(PageId, Arc<Page>)>),
+    /// access_map is empty — nothing left to evict.
+    Exhausted,
+}
+
+// Distinguishes install()'s two callers, which need genuinely different
+// "what if page_num is already Strong" semantics — see install's own
+// comment for why one lock-per-page-num critical section can't just pick
+// one behavior for both.
+#[derive(Clone, Copy)]
+enum InstallMode {
+    /// Writer path (write_page/write_locked_page via cache_strong): the
+    /// caller holds page_num's per-page lock and is the authority on its
+    /// latest contents — always overwrite whatever is currently cached.
+    Overwrite,
+    /// Reader path (get_or_install, called from get_page): our `page` may
+    /// be a stale disk read or a just-upgraded Weak, and a concurrent
+    /// writer's Strong entry — if one is already there — is always at
+    /// least as fresh. Return that instead of clobbering it.
+    ReuseIfPresent,
+}
+
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
-    buffer: RwLock<HashMap<PageId, PageEntry>>,
+    // STORE_AUDIT.md P2 survey follow-up: sharded (Vec of independent
+    // RwLocks, picked by PageId's own hash — same scheme as ArcLock/
+    // ShardedMap), not a single RwLock<HashMap<..>>. This is the map every
+    // get_page/get_page_mut call touches, so it's the highest-traffic lock
+    // in the whole system — see PageBuffer::shard_for and install's own
+    // comments for how eviction (a GLOBAL decision via access_map, which
+    // stays unsharded-in-spirit — it already shards itself) stays correct
+    // without ever needing to hold two shards' locks at once.
+    buffer: Vec<RwLock<HashMap<PageId, PageEntry>>>,
     header: Arc<Header>,
     page_size: DBSizeType,
     page_count: Arc<AtomicU64>,
@@ -169,7 +214,9 @@ where
             page_size,
             max_entries,
             strong_count: AtomicUsize::new(0),
-            buffer: RwLock::new(HashMap::new()),
+            buffer: (0..BUFFER_SHARD_COUNT)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
             write_tx,
             self_file: RwLock::new(read_file),
             write_handle: Some(write_handle),
@@ -182,6 +229,13 @@ where
             clock,
             content_registry,
         })
+    }
+
+    fn shard_for(&self, page_num: &PageId) -> &RwLock<HashMap<PageId, PageEntry>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        page_num.hash(&mut hasher);
+        &self.buffer[(hasher.finish() as usize) % self.buffer.len()]
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {
@@ -541,21 +595,28 @@ where
     // it. checkpoint() and shutdown() both need every dirty page durable
     // before they proceed, so both call this first.
     fn flush_dirty_cached_pages(&self) -> Result<(), StoreError> {
-        let dirty: Vec<(PageId, Arc<Page>)> = {
-            let buffer = self.buffer.read();
-            buffer
-                .iter()
-                .filter_map(|(page_num, entry)| match entry {
-                    PageEntry::Strong(arc) if arc.is_dirty() => Some((*page_num, arc.clone())),
-                    _ => None,
-                })
-                .collect()
-            // `buffer`'s read lock drops here, before sending — same
-            // reasoning as flush_evicted: sending on the bounded channel
-            // while holding any lock on `buffer` risks stalling concurrent
-            // cache access for as long as the writer thread takes to make
-            // room.
-        };
+        // Collects one shard at a time — each shard's read lock drops at
+        // the end of its own iterator chain, before the next shard is even
+        // touched, so no two shards' locks are ever held together. Same
+        // reasoning as flush_evicted: sending on the bounded channel while
+        // holding any shard lock risks stalling concurrent cache access
+        // for as long as the writer thread takes to make room.
+        let dirty: Vec<(PageId, Arc<Page>)> = self
+            .buffer
+            .iter()
+            .flat_map(|shard| {
+                shard
+                    .read()
+                    .iter()
+                    .filter_map(|(page_num, entry)| match entry {
+                        PageEntry::Strong(arc) if arc.is_dirty() => {
+                            Some((*page_num, arc.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         for (page_num, page) in dirty {
             self.write_tx.send(BufMsg::WritePage(WriteMsg {
                 page_num,
@@ -772,11 +833,11 @@ where
         }
         // Bound to a let, not matched on directly: a match scrutinee's
         // temporaries stay alive for the whole arm body, so matching
-        // straight on `self.buffer.read()?...` would keep this read guard
-        // held while the arms below try to re-acquire the same lock via
-        // cache_strong/write() — a self-deadlock with no other thread
-        // involved.
-        let existing = self.buffer.read().get(&page_num).cloned();
+        // straight on `self.shard_for(&page_num).read()?...` would keep
+        // this read guard held while the arms below try to re-acquire the
+        // same shard's lock via cache_strong/write() — a self-deadlock
+        // with no other thread involved.
+        let existing = self.shard_for(&page_num).read().get(&page_num).cloned();
         match existing {
             Some(PageEntry::Strong(arc)) => {
                 // STORE_AUDIT.md P3: a plain relaxed bool store — no lock,
@@ -796,7 +857,7 @@ where
                 // happens after the file write completed, so the backing
                 // file is now guaranteed current. Prune the stale tombstone
                 // while we're here rather than leaving it around forever.
-                self.buffer.write().remove(&page_num);
+                self.shard_for(&page_num).write().remove(&page_num);
             }
             None => {}
         }
@@ -851,73 +912,127 @@ where
         Ok(handle)
     }
 
-    // Inserts/refreshes page_num as the live (Strong) resident. Holds the
-    // buffer write lock for the entire operation so that:
-    //   1. The already_strong check and the insert are atomic — two threads
-    //      cannot both see Weak/None for the same page and both increment
-    //      strong_count (which was the source of the "access map empty" panic).
-    //   2. The access_map update happens under the same lock, so evict_lru
-    //      cannot pop a page that is in access_map but not yet in the buffer.
+    // Inserts/refreshes page_num as the live (Strong) resident. Thin
+    // wrapper over install() for WRITERS (write_page/write_locked_page),
+    // which hold the per-page lock and are the authority on the page's
+    // latest contents — always overwrites.
     fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
-        let evicted = {
-            let mut buffer = self.buffer.write();
-            self.cache_strong_locked(&mut buffer, page_num, page)
-            // `buffer`'s write lock drops here, before the flush below —
-            // see flush_evicted's own doc comment on why that ordering
-            // matters.
-        };
-        self.flush_evicted(evicted)
+        let (_, flushes) = self.install(page_num, page, InstallMode::Overwrite);
+        self.flush_evicted(flushes)
     }
 
-    // Install `page` as the Strong resident, evicting/counting/LRU-updating under
-    // the caller's held buffer write lock. This UNCONDITIONALLY overwrites — it
-    // is for WRITERS (write_page/write_locked_page), which hold the per-page lock
-    // and are the authority on the page's latest contents.
+    // Reader-side cache fill. Thin wrapper over install() that returns the
+    // WINNING Arc — a Strong entry already there (a concurrent writer's
+    // fresher version) beats our freshly-loaded/upgraded one, since a slow
+    // reader must never clobber a concurrent writer's newer write.
+    fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
+        let (winner, flushes) = self.install(page_num, page, InstallMode::ReuseIfPresent);
+        // Best-effort: a reader installing a freshly-loaded page is not in
+        // a position to usefully propagate a flush failure (get_or_install
+        // has no Result to return it through, and every caller is itself a
+        // read path) — an evicted dirty page that fails to flush here stays
+        // dirty in the cache and will be picked up by a later eviction,
+        // checkpoint, or shutdown instead. Logged so a persistent failure
+        // isn't silent.
+        if let Err(e) = self.flush_evicted(flushes) {
+            error!("failed to flush an evicted dirty page: {e}");
+        }
+        winner
+    }
+
+    // The shared engine behind cache_strong/get_or_install. Installs `page`
+    // as page_num's Strong resident, evicting elsewhere first if the cache
+    // is already at max_entries, and returns (the Arc now cached for
+    // page_num, every dirty victim evicted along the way that still needs
+    // flushing).
     //
-    // Returns whatever evict_lru_locked evicted (if it needed to evict at
-    // all, and if the victim was dirty) — the caller is responsible for
-    // flushing it, and must do so only after releasing `buffer`'s write
-    // lock (see cache_strong/get_or_install).
-    fn cache_strong_locked(
+    // STORE_AUDIT.md P2 survey follow-up: with `buffer` sharded, the old
+    // single-RwLock design's easy invariant — "the already-Strong check and
+    // the insert happen atomically, under the one lock the whole cache
+    // shares" — no longer holds for free. This never holds two shards'
+    // locks at once (no lock-ordering discipline needed, so no deadlock
+    // risk): checking/inserting into page_num's own target shard, and
+    // evicting a victim from whatever (possibly different) shard it lives
+    // in, are two fully independent, sequential critical sections,
+    // coordinated only through the lock-free global strong_count/access_map.
+    // A retry loop handles the case where eviction was needed: drop the
+    // target shard's lock, evict one victim via evict_one(), then loop back
+    // and re-check the target shard (capacity may now be available, or a
+    // concurrent installer may have raced us to page_num in the meantime).
+    //
+    // `mode` exists because the two callers need genuinely different
+    // "page_num is already Strong" behavior — see InstallMode's own comment.
+    fn install(
         &self,
-        buffer: &mut HashMap<PageId, PageEntry>,
         page_num: PageId,
         page: Arc<Page>,
-    ) -> Option<(PageId, Arc<Page>)> {
-        let already_strong = matches!(buffer.get(&page_num), Some(PageEntry::Strong(_)));
-        let mut evicted = None;
-        // STORE_AUDIT.md P3: only a NEW transition to Strong needs an
-        // access_map entry at all — CLOCK doesn't reorder on every access,
-        // so a page already tracked (already_strong) needs nothing here
-        // beyond the mark_referenced() below, which every path gets
-        // regardless. See PageBuffer's own doc comment on access_map's
-        // new role.
-        if !already_strong {
-            if self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries {
-                evicted = self.evict_lru_locked(buffer);
+        mode: InstallMode,
+    ) -> (Arc<Page>, Vec<(PageId, Arc<Page>)>) {
+        let mut flushes = Vec::new();
+        // Set once evict_one() reports the access_map genuinely has nothing
+        // left to offer — forces the next pass to insert past max_entries
+        // rather than retrying eviction forever. See Evicted::Exhausted.
+        let mut force_insert = false;
+        loop {
+            let shard = self.shard_for(&page_num);
+            let mut guard = shard.write();
+            let existing_strong = match guard.get(&page_num) {
+                Some(PageEntry::Strong(arc)) => Some(arc.clone()),
+                _ => None,
+            };
+            if let Some(arc) = existing_strong {
+                if matches!(mode, InstallMode::ReuseIfPresent) {
+                    arc.mark_referenced();
+                    return (arc, flushes);
+                }
+                page.mark_referenced();
+                guard.insert(page_num, PageEntry::Strong(page.clone()));
+                return (page, flushes);
+            }
+            // page_num isn't Strong yet — this is a genuinely new resident,
+            // so it needs an access_map entry and, if the cache is already
+            // full, a victim evicted first.
+            if !force_insert
+                && self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries
+            {
+                drop(guard);
+                match self.evict_one() {
+                    Evicted::Yes(maybe_dirty) => {
+                        flushes.extend(maybe_dirty);
+                        continue;
+                    }
+                    Evicted::Exhausted => {
+                        // Under correct accounting this shouldn't happen,
+                        // but if strong_count drifted (e.g. a crash
+                        // recovery path) don't loop forever — tolerate a
+                        // capacity overflow instead.
+                        force_insert = true;
+                        continue;
+                    }
+                }
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.access_map.push(page_num, self.next_seq());
+            page.mark_referenced();
+            guard.insert(page_num, PageEntry::Strong(page.clone()));
+            return (page, flushes);
         }
-        page.mark_referenced();
-        buffer.insert(page_num, PageEntry::Strong(page));
-        evicted
     }
 
-    // Sends the flush a page eviction (see evict_lru_locked) uncovered —
+    // Sends the flush every dirty victim install()'s eviction uncovered —
     // the same BufMsg::WritePage the writer thread already knows how to
     // handle (LSN-gate, dedup-by-superseding an older still-pending write
     // for the same page, keeping the page alive via its own Arc clone
     // while in flight — see WriteMsg's own doc comments), just triggered
     // by "this page is leaving the cache" instead of "this page was just
-    // mutated". MUST be called without the buffer's write lock held: the
+    // mutated". MUST be called without any shard's write lock held: the
     // channel is bounded, so a full one blocks the sender — while holding
-    // that lock, this would stall every other reader/writer touching the
-    // cache for as long as the writer thread takes to make room, not just
-    // the caller of this specific eviction.
-    fn flush_evicted(&self, evicted: Option<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
-        if let Some((page_num, page)) = evicted {
+    // a shard lock, this would stall every other reader/writer touching
+    // that shard for as long as the writer thread takes to make room, not
+    // just the caller of this specific eviction.
+    fn flush_evicted(&self, evicted: Vec<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
+        for (page_num, page) in evicted {
             self.write_tx.send(BufMsg::WritePage(WriteMsg {
                 page_num,
                 page,
@@ -927,45 +1042,15 @@ where
         Ok(())
     }
 
-    // Reader-side cache fill. If a Strong resident already exists (a writer's
-    // current version), return THAT and never overwrite it — otherwise a slow
-    // reader that upgraded a stale Weak (or read an older copy from disk) would
-    // clobber a concurrent writer's fresh version, silently losing that write.
-    // Only when there is no Strong do we install our `page`.
-    fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
-        let evicted = {
-            let mut buffer = self.buffer.write();
-            if let Some(PageEntry::Strong(arc)) = buffer.get(&page_num) {
-                let arc = arc.clone();
-                arc.mark_referenced();
-                return arc;
-            }
-            self.cache_strong_locked(&mut buffer, page_num, page.clone())
-            // `buffer`'s write lock drops here, before the flush below.
-        };
-        // Best-effort: a reader installing a freshly-loaded page is not in
-        // a position to usefully propagate a flush failure (get_or_install
-        // has no Result to return it through, and every caller is itself a
-        // read path) — the evicted page stays dirty in that case and will
-        // be picked up by a later eviction, checkpoint, or shutdown
-        // instead. Logged so a persistent failure isn't silent.
-        if let Err(e) = self.flush_evicted(evicted) {
-            error!("failed to flush an evicted dirty page: {e}");
-        }
-        page
-    }
-
-    // Downgrades the LRU resident to Weak. Takes the caller's already-held
-    // write lock to avoid the evict/insert race (see cache_strong). Loops
-    // past stale access_map entries (those whose victims are no longer Strong
-    // in the buffer — can happen if update_page_access ran for a page that
-    // was concurrently evicted by another thread's LRU-refresh call).
-    // Returns the evicted victim's (page_num, Arc) if — and only if — it was
-    // dirty, so the caller can flush it once it's safe to do so (see this
-    // method's own callers: never while `buffer`'s write lock is still
-    // held, which would stall every other reader/writer in the whole cache
-    // for as long as the flush's channel send took to accept it). A clean
-    // victim needs no flush at all — its on-disk copy already matches.
+    // Frees exactly one Strong slot, chosen by access_map (see access_map's
+    // own doc comment on the CLOCK/second-chance scheme). Takes only the
+    // victim's own shard's write lock — never install()'s target shard's,
+    // by construction (see install's own comment) — so this never risks a
+    // two-shard deadlock. Loops past stale access_map entries (victims no
+    // longer Strong in their shard — can happen if a page was concurrently
+    // evicted some other way) and past referenced victims (given a second
+    // chance instead of evicted — see below).
+    //
     // STORE_AUDIT.md P3: CLOCK / second-chance eviction. access_map still
     // gives the same thing it always did — the oldest-tracked candidate,
     // across its own shards — but candidates are ordered by insertion
@@ -977,30 +1062,29 @@ where
     // makes the hot path (PageBuffer::get_page's Strong-hit branch) able
     // to skip touching access_map at all — only eviction, not every
     // access, ever reorders anything.
-    fn evict_lru_locked(
-        &self,
-        buffer: &mut HashMap<PageId, PageEntry>,
-    ) -> Option<(PageId, Arc<Page>)> {
+    fn evict_one(&self) -> Evicted {
         loop {
             match self.access_map.pop() {
                 None => {
                     // access_map is empty. Under correct accounting this
                     // shouldn't happen, but if strong_count drifted (e.g. due
-                    // to a crash recovery path) don't panic — just allow the
-                    // buffer to temporarily exceed max_entries.
-                    return None;
+                    // to a crash recovery path) don't panic — let the caller
+                    // decide how to tolerate it.
+                    return Evicted::Exhausted;
                 }
                 Some((victim, _)) => {
-                    if let Some(PageEntry::Strong(arc)) = buffer.get(&victim) {
+                    let mut guard = self.shard_for(&victim).write();
+                    if let Some(PageEntry::Strong(arc)) = guard.get(&victim) {
                         if arc.take_referenced() {
                             // Second chance: accessed since it was last
                             // swept (or since insertion) — give it another
                             // lap instead of evicting it now.
+                            drop(guard);
                             self.access_map.push(victim, self.next_seq());
                             continue;
                         }
-                        // Cloned before downgrading: once `buffer.insert`
-                        // below replaces the map's own Strong entry, that
+                        // Cloned before downgrading: once `guard.insert`
+                        // below replaces the shard's own Strong entry, that
                         // entry's Arc gets dropped — without a separate
                         // owned clone here, a page that's dirty and held
                         // nowhere else would be freed (and its unflushed
@@ -1008,17 +1092,17 @@ where
                         // chance to hand it back for flushing.
                         let arc = arc.clone();
                         let weak = Arc::downgrade(&arc);
-                        buffer.insert(victim, PageEntry::Weak(weak));
+                        guard.insert(victim, PageEntry::Weak(weak));
                         self.strong_count
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        return if arc.is_dirty() {
+                        return Evicted::Yes(if arc.is_dirty() {
                             Some((victim, arc))
                         } else {
                             None
-                        };
+                        });
                     }
-                    // Stale entry: victim is already Weak or absent in the
-                    // buffer (evicted some other way, or never actually
+                    // Stale entry: victim is already Weak or absent in its
+                    // shard (evicted some other way, or never actually
                     // installed). Keep looping to find the next candidate.
                 }
             }
@@ -1635,7 +1719,7 @@ mod tests {
 
     use postcard::from_bytes;
 
-    use super::{BufMsg, PageEntry, WriteMsg};
+    use super::{BufMsg, Evicted, PageEntry, WriteMsg};
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
     use crate::page::{PAGE_OVERHEAD, Page, PageId};
@@ -2061,25 +2145,29 @@ mod tests {
         let _ = buf2.shutdown();
     }
 
-    // STORE_AUDIT.md P3: direct, white-box test of evict_lru_locked's
-    // actual decision — not an end-to-end test through get_page. An
-    // earlier version of this test drove it through get_page instead,
-    // repeatedly re-accessing "page 0" while pushing pages through a full
-    // cache; it passed even with the second-chance check deleted entirely,
-    // because re-fetching an EVICTED page transparently reinstalls it with
-    // a fresh insertion sequence, which looks identical to "never evicted"
-    // by Strong/Weak state alone — and checking Arc identity across
+    // STORE_AUDIT.md P3: direct, white-box test of evict_one's actual
+    // decision — not an end-to-end test through get_page. An earlier
+    // version of this test drove it through get_page instead, repeatedly
+    // re-accessing "page 0" while pushing pages through a full cache; it
+    // passed even with the second-chance check deleted entirely, because
+    // re-fetching an EVICTED page transparently reinstalls it with a fresh
+    // insertion sequence, which looks identical to "never evicted" by
+    // Strong/Weak state alone — and checking Arc identity across
     // iterations didn't help either, since holding any external reference
     // to a page keeps its Weak entry upgradeable, masking a real eviction
     // as a same-object "reuse". Constructing the cache state directly
-    // (bypassing get_page/cache_strong_locked entirely) is what actually
-    // isolates the mechanism: two Strong pages, one marked referenced, one
-    // not, both already registered in access_map in insertion order —
-    // evict_lru_locked must skip the referenced one (a real behavioral
-    // difference from plain FIFO, which would target it as the oldest)
-    // and evict the other one instead.
+    // (bypassing get_page/install entirely) is what actually isolates the
+    // mechanism: two Strong pages, one marked referenced, one not, both
+    // already registered in access_map in insertion order — evict_one must
+    // skip the referenced one (a real behavioral difference from plain
+    // FIFO, which would target it as the oldest) and evict the other one
+    // instead. Inserted directly into their own shards (via shard_for)
+    // rather than through install/cache_strong, since P2's follow-up
+    // sharded `buffer` itself — see PageBuffer's own doc comment on why
+    // that's still safe to read back afterward without ever holding two
+    // shards' locks at once.
     #[test]
-    fn test_evict_lru_locked_gives_a_referenced_page_a_second_chance() {
+    fn test_evict_one_gives_a_referenced_page_a_second_chance() {
         let (buf, _) = make_buffer(2, 10);
         let page_a = Arc::new(Page::new_data(PAGE_SIZE));
         let page_b = Arc::new(Page::new_data(PAGE_SIZE));
@@ -2088,20 +2176,24 @@ mod tests {
 
         let id_a: PageId = 0u64.into();
         let id_b: PageId = 1u64.into();
-        {
-            let mut map = buf.buffer.write();
-            map.insert(id_a, PageEntry::Strong(page_a.clone()));
-            map.insert(id_b, PageEntry::Strong(page_b.clone()));
-        }
+        buf.shard_for(&id_a)
+            .write()
+            .insert(id_a, PageEntry::Strong(page_a.clone()));
+        buf.shard_for(&id_b)
+            .write()
+            .insert(id_b, PageEntry::Strong(page_b.clone()));
         // A inserted (logically) before B, so a plain FIFO/LRU-by-age
         // policy with no referenced check would target A first.
         buf.access_map.push(id_a, buf.next_seq());
         buf.access_map.push(id_b, buf.next_seq());
 
-        let mut map = buf.buffer.write();
-        buf.evict_lru_locked(&mut map);
+        match buf.evict_one() {
+            Evicted::Yes(_) => {}
+            Evicted::Exhausted => panic!("expected a victim to be evicted"),
+        }
 
-        let is_strong = |id: PageId| matches!(map.get(&id), Some(PageEntry::Strong(_)));
+        let is_strong =
+            |id: PageId| matches!(buf.shard_for(&id).read().get(&id), Some(PageEntry::Strong(_)));
         assert!(
             is_strong(id_a),
             "the referenced page must be given a second chance, not evicted"
@@ -2484,4 +2576,45 @@ mod tests {
         let _ = buf2.shutdown();
     }
 
+    // STORE_AUDIT.md P2 survey follow-up: throwaway (not a criterion bench,
+    // same call as P3's own microbenchmark — see BASELINE.md) measurement
+    // of get_page's Strong-hit path under concurrency, on disjoint pages
+    // spread across 8 threads. Run with --ignored, alone, on both this
+    // (sharded `buffer`) revision and the pre-sharding revision (a single
+    // RwLock<HashMap<..>>) to compare — cache is pre-populated first so the
+    // loop measures lock-acquisition contention, not disk I/O or eviction.
+    #[test]
+    #[ignore]
+    fn bench_get_page_concurrent_disjoint_pages() {
+        const NUM_PAGES: u64 = 8 * 64;
+        const THREADS: u64 = 8;
+        const ITERS_PER_THREAD: u64 = 200_000;
+        let (buf, _) = make_buffer(NUM_PAGES, NUM_PAGES as usize + 1);
+        for i in 0..NUM_PAGES {
+            let _ = buf.get_page(i.into()).unwrap();
+        }
+        let buf = Arc::new(buf);
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let buf = buf.clone();
+                s.spawn(move || {
+                    let base = t * (NUM_PAGES / THREADS);
+                    let span = NUM_PAGES / THREADS;
+                    for i in 0..ITERS_PER_THREAD {
+                        let page_num: PageId = (base + (i % span)).into();
+                        let _ = buf.get_page(page_num).unwrap();
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench_get_page_concurrent_disjoint_pages: {THREADS} threads x {ITERS_PER_THREAD} \
+             iters in {elapsed:?} ({:.0} ops/s)",
+            (THREADS * ITERS_PER_THREAD) as f64 / elapsed.as_secs_f64()
+        );
+        let buf = Arc::try_unwrap(buf).unwrap_or_else(|_| panic!("buf still shared"));
+        let _ = buf.shutdown();
+    }
 }

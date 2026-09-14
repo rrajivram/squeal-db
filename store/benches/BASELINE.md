@@ -321,6 +321,52 @@ consistent with the rest of this phase.
 Correctness: `store` lib 423/423 (+1 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
 clean, stress `RESULT: PASS`, 0 mismatches.
 
+## Result — P3 follow-up, same pass: shard `buffer` itself (16 shards, hashed by `PageId`)
+
+The P3 fix above only changed what feeds `access_map`; `buffer` (the main
+`PageId -> PageEntry` cache map every `get_page`/`get_page_mut` call touches) was still a single
+`RwLock<HashMap<..>>` — flagged by the earlier P2 survey as the highest-traffic lock left
+unsharded, deferred pending its own investigation because eviction needs a cache-wide "which page
+is globally oldest" answer, which a naively sharded map can't give per-shard alone.
+
+Fix: kept `strong_count`/`access_map` global (`access_map` is already a `ShardedPQ`, which shards
+itself internally and exposes a global-max `pop()`), and sharded only
+`buffer: Vec<RwLock<HashMap<PageId, PageEntry>>>` (16 shards, hashed by `PageId` via a new
+`shard_for` helper). Collapsed `cache_strong_locked`/`get_or_install`/`evict_lru_locked` (each
+written against one `&mut HashMap` under one caller-held lock) into `install(page_num, page,
+mode: InstallMode)` + a standalone `evict_one()`, since sharding removes the single lock that used
+to make "check if already Strong, evict if needed, insert" atomic for free. `install` never holds
+two shards' locks at once — it drops the target shard's lock entirely before calling `evict_one`
+(which locks only the victim's own, possibly different, shard), then loops back to recheck. No
+lock-ordering discipline needed, so no deadlock risk. `InstallMode` (`Overwrite` for writers,
+`ReuseIfPresent` for readers) preserves the original reader-vs-writer "what if it's already
+Strong" semantics; `Evicted` (`Yes(Option<..>)` vs `Exhausted`) tells "evicted a clean page" apart
+from "nothing left to evict", which the retry loop needs to handle differently.
+
+New throwaway (not committed as a criterion bench, same call as P3's own microbenchmark above)
+in-crate `#[ignore]`d test, `bench_get_page_concurrent_disjoint_pages`: 8 threads, each hammering
+`get_page` on its own disjoint slice of a pre-warmed, all-Strong cache — isolates lock contention
+from disk I/O or eviction. Run via `cargo test --release -- --ignored`, alone, on this revision
+and on the pre-sharding one (`git show 0c176ec:store/src/buffer.rs`, patched with the identical
+bench):
+
+| revision | ops/s (3 runs) |
+|---|---|
+| before (single `RwLock<HashMap<..>>`) | 22.1M / 26.6M / 20.8M |
+| after (16-shard `Vec<RwLock<HashMap<..>>>`) | 38.3M / 37.9M / 39.1M |
+
+A real, reproducible ~55-70% win. Smaller than `ArcLock`'s disjoint-key win because `get_page`'s
+hot path already only takes a *read* lock — `parking_lot::RwLock` readers don't serialize against
+each other even unsharded. The win here is purely from spreading the lock's own reader-count
+atomic across independent cache lines instead of every thread bouncing the same one.
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): 76,884–76,931 ops/s
+across two runs — flat, same story as every other change in this file: this workload isn't
+bottlenecked on this lock either way.
+
+Correctness: `store` lib 423/423 (+2 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
+clean, stress `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

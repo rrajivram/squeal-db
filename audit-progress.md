@@ -1021,9 +1021,55 @@ full test suite still green" — not "a red test now passes."
   phase; this workload's bottleneck isn't in cache bookkeeping either way.
   Full `store` suite: 423 passed, 0 failed (+1 `#[ignore]`d), `squeal-sql --lib`: 346 passed, 0
   failed. Whole workspace builds clean.
-  **Deliberately deferred to its own pass (see below)**: sharding `buffer` (the main
-  `PageId -> PageEntry` cache map) itself — this fix only changed what feeds `access_map`, not
-  the map's own locking, which the P2 survey already flagged as needing its own investigation.
+  **Follow-up, same pass — shard `buffer` itself (the main `PageId -> PageEntry` cache map)**.
+  This fix above only changed what feeds `access_map`, not the map's own locking — the P2 survey
+  flagged `buffer` as the highest-traffic lock left unsharded (every `get_page`/`get_page_mut`
+  call touches it), but deferred it pending its own investigation, since unlike `ArcLock`/
+  `ShardedMap`'s independent-keys case, eviction needs an evict-across-the-whole-cache "which
+  page is globally oldest" decision, which a naively sharded map can't answer per-shard alone.
+  Resolved by keeping `strong_count`/`access_map` global (unsharded — `access_map` is a
+  `ShardedPQ`, which already shards itself and exposes a global-max `pop()`) and sharding only
+  `buffer: Vec<RwLock<HashMap<PageId, PageEntry>>>` (16 shards, hashed by `PageId`, via a new
+  `shard_for` helper) — the two never need to agree on internal structure, just on which
+  `PageId`s are currently Strong. `cache_strong_locked`/`get_or_install`/`evict_lru_locked`
+  (each written against a single `&mut HashMap` under one caller-held lock) collapsed into one
+  `install(page_num, page, mode: InstallMode) -> (Arc<Page>, Vec<(PageId, Arc<Page>)>)` plus a
+  standalone `evict_one(&self) -> Evicted`, since sharding removes the one lock that used to make
+  "check if already Strong, evict if needed, insert" trivially atomic. `install` never holds two
+  shards' locks at once (no lock-ordering discipline needed, so no deadlock risk): it takes
+  page_num's target shard's lock, and if eviction is needed, drops that lock entirely before
+  calling `evict_one` (which takes only the victim's own shard's lock, elsewhere), then loops
+  back to recheck the target shard — `InstallMode` (`Overwrite` for writers, `ReuseIfPresent` for
+  readers) preserves the reader-vs-writer "what if it's already Strong" semantics the original
+  single-lock code got for free. `Evicted` (`Yes(Option<(PageId, Arc<Page>)>)` vs `Exhausted`)
+  disambiguates "evicted a clean page, nothing to flush" from "access_map had nothing left to
+  offer", which the retry loop needs to tell apart (the latter forces the insert through instead
+  of retrying forever).
+  Test: `test_evict_lru_locked_gives_a_referenced_page_a_second_chance` renamed to
+  `test_evict_one_gives_a_referenced_page_a_second_chance` and adapted to insert directly into
+  each page's own shard (via `shard_for`) rather than one shared map — otherwise unchanged, still
+  a direct white-box call to the eviction function. Re-confirmed meaningful the same way as
+  before (temporarily disabled the second-chance check, confirmed the test fails; restored,
+  confirmed it passes again).
+  Measured with a new throwaway (not a committed criterion bench, same call as P3's own
+  microbenchmark above) in-crate test, `bench_get_page_concurrent_disjoint_pages`: 8 threads, each
+  hammering `get_page` on its own disjoint slice of a pre-warmed, all-Strong cache (isolating lock
+  contention from disk I/O or eviction). Run via `cargo test --release -- --ignored`, alone, on
+  both this revision and the pre-sharding one (`git show 0c176ec:store/src/buffer.rs`, patched
+  with the identical bench):
+  | revision | ops/s |
+  |---|---|
+  | before (single `RwLock<HashMap<..>>`) | ~20.8M – 26.6M (3 runs) |
+  | after (16-shard `Vec<RwLock<HashMap<..>>>`) | ~37.9M – 39.1M (3 runs) |
+  A real, reproducible ~55-70% win on this specific access pattern — smaller than `ArcLock`'s
+  disjoint-key win because `get_page`'s hot path already only takes a *read* lock (readers don't
+  serialize against each other under `parking_lot::RwLock` even unsharded); the win here is
+  purely from spreading the lock's own reader-count atomic across independent cache lines instead
+  of every thread bouncing the same one.
+  End-to-end stress (mem, 16t): 76,884–76,931 ops/s across two runs — flat, consistent with every
+  other number in this file; this workload isn't bottlenecked on this lock either, sharded or not.
+  Full `store` suite: 423 passed, 0 failed (+2 `#[ignore]`d), `squeal-sql --lib`: 346 passed, 0
+  failed. Whole workspace builds clean.
 - [ ] **P5** — inner-node routing clones and decodes every entry on the page.
   *(deferred — performance)*
 - [ ] **S9** — resource exhaustion knobs: no cap on tuple count/undo trail/active txns;
