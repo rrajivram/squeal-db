@@ -1324,8 +1324,9 @@ where
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
+            let reader_snapshot = self.snapshot_of(&txn_id);
             let visible = self
-                .find_visible_to(&tuple, &txn_id)?
+                .find_visible_to(&tuple, &txn_id, &reader_snapshot)?
                 .map(|t| t.into_owned());
             // A committed tombstone means the key was removed — it must be
             // invisible even if its physical row hasn't been reclaimed yet.
@@ -1786,21 +1787,38 @@ where
     // race (a new reader beginning in between this commit's active-set
     // snapshot and the commit actually taking effect) rather than the
     // common path.
+    // STORE_AUDIT.md P7: resolves and clones `reader`'s snapshot exactly
+    // once. Callers that only need it for a single find_visible_to call
+    // (Db::find) get the same cost as before; callers driving a multi-row
+    // scan (TableCursor, RangeCursor) call this ONCE at construction and
+    // reuse the result for every row instead of re-resolving (and
+    // re-cloning) it on every call — see find_visible_to's own comment.
+    // Full TransactionId (id + ts), not just the numeric id — see
+    // TransactionInner's own PartialEq comment on why the numeric id alone
+    // isn't a safe identity across a reopen.
+    pub(crate) fn snapshot_of(&self, reader: &TransactionId) -> HashSet<TransactionId> {
+        self.tx_mgr
+            .snapshot(reader)
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+
+    // STORE_AUDIT.md P7: `reader_snapshot` is a caller-supplied reference,
+    // not resolved (and cloned!) inside this function on every call. A
+    // reader's snapshot is captured once at `begin()` and never changes for
+    // the rest of that transaction's lifetime (see TransactionManager::
+    // begin's own comment) — so a scan calling this once per row candidate
+    // (TableCursor::next, RangeCursor::next) can resolve it ONCE, up front,
+    // and pass the same `&HashSet` to every call instead of an M-rows x
+    // N-concurrent-txns amount of repeat cloning. Db::find (a single lookup,
+    // not a per-row loop) resolves its own one-off snapshot immediately
+    // before calling this, so callers are the same either way for that case.
     pub(crate) fn find_visible_to<'a>(
         &self,
         tuple: &'a Tuple,
         reader: &TransactionId,
+        reader_snapshot: &HashSet<TransactionId>,
     ) -> Result<Option<Cow<'a, Tuple>>, StoreError> {
-        // Cloned once up front rather than held as a lock guard for the
-        // whole (potentially multi-hop) undo-chain walk below. Full
-        // TransactionId (id + ts), not just the numeric id — see
-        // TransactionInner's own PartialEq comment on why the numeric id
-        // alone isn't a safe identity across a reopen.
-        let reader_snapshot: HashSet<TransactionId> = self
-            .tx_mgr
-            .snapshot(reader)
-            .map(|s| s.clone())
-            .unwrap_or_default();
         let reader_ts = reader.ts();
         match self.resolve_visible(tuple, |txn| {
             txn == reader

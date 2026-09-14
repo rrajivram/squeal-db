@@ -67,19 +67,33 @@ const TXN_GENERATOR_NANE: &str = "__system.transactions";
 // over every named generator) the numeric id sequence already uses.
 const TXN_TS_GENERATOR_NAME: &str = "__system.transactions.ts";
 
+// STORE_AUDIT.md P7 (second half): a transaction is either still in flight
+// (Active) or aborted-but-not-yet-physically-reverted (Aborting) — those
+// used to be two separate `RwLock<HashSet<TransactionId>>`s, so
+// `is_committed` (called on every undo-chain hop `resolve_visible` walks)
+// took two independent lock reads to answer one question. Collapsed into
+// one `RwLock<HashMap<TransactionId, TxnState>>`: presence/absence alone
+// still says "not committed"/"committed" (no per-committed-txn record is
+// kept, matching the old design's footprint), but now via a single lock
+// acquisition and lookup instead of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TxnState {
+    Active,
+    Aborting,
+}
+
 #[derive(Debug)]
 pub(crate) struct TransactionManager {
     gens: Arc<Generator>,
-    active_transactions: RwLock<HashSet<TransactionId>>,
-    // Aborted transactions whose writes have NOT yet been physically reverted.
-    // A transaction is "committed" (and therefore visible) only if it is in
-    // NEITHER `active_transactions` NOR here: committing removes it from
-    // `active`, so it falls through to visible; aborting moves it here and it
-    // stays invisible until `Db` drains it (replays its undo log, then calls
-    // abort_complete). This is what keeps a dropped/aborted txn's un-reverted
-    // rows from being read as committed — without storing any per-committed-txn
-    // record. Both sets are bounded by concurrency / abort backlog, not history.
-    aborting_transactions: RwLock<HashSet<TransactionId>>,
+    // A transaction is "committed" (and therefore visible) only if it is
+    // absent from this map entirely: committing removes it, so it falls
+    // through to visible; aborting flips its entry to Aborting in place
+    // (still present, still invisible) until `Db` drains it (replays its
+    // undo log, then calls abort_complete, which removes it). This is what
+    // keeps a dropped/aborted txn's un-reverted rows from being read as
+    // committed — without storing any per-committed-txn record. Bounded by
+    // concurrency / abort backlog, not history.
+    transaction_states: RwLock<HashMap<TransactionId, TxnState>>,
     transaction_data: RwLock<HashMap<u64, TransactionData>>,
 }
 
@@ -163,8 +177,7 @@ impl TransactionManager {
         gens.create_generator(TXN_TS_GENERATOR_NAME, Some(1))?;
         Ok(Self {
             gens,
-            active_transactions: RwLock::new(HashSet::new()),
-            aborting_transactions: RwLock::new(HashSet::new()),
+            transaction_states: RwLock::new(HashMap::new()),
             transaction_data: RwLock::new(HashMap::new()),
         })
     }
@@ -183,11 +196,20 @@ impl TransactionManager {
     }
 
     pub(crate) fn active_count(&self) -> usize {
-        self.active_transactions.read().len()
+        self.transaction_states
+            .read()
+            .values()
+            .filter(|s| **s == TxnState::Active)
+            .count()
     }
 
     pub(crate) fn get_active_transactions(&self) -> Result<HashSet<TransactionId>, StoreError> {
-        Ok(self.active_transactions.read().iter().cloned().collect())
+        Ok(self
+            .transaction_states
+            .read()
+            .iter()
+            .filter_map(|(id, s)| (*s == TxnState::Active).then(|| id.clone()))
+            .collect())
     }
 
     pub(crate) fn create_transaction(
@@ -235,11 +257,21 @@ impl TransactionManager {
         // with respect to real time by construction, not by assumption
         // about the clock.
         let (txn, snapshot) = {
-            let mut active = self.active_transactions.write();
+            let mut states = self.transaction_states.write();
             let ts = self.gens.gen_key(TXN_TS_GENERATOR_NAME)? as u128;
             let txn = TransactionId::new(id, ts);
-            let snapshot = active.iter().cloned().collect::<HashSet<_>>();
-            active.insert(txn.clone());
+            // Filtered to Active only, matching the old two-separate-sets
+            // design exactly (the snapshot was always built from
+            // active_transactions alone, never aborting_transactions).
+            // Doesn't actually change find_visible_to's behavior either
+            // way: an Aborting txn is never committed, so its predicate's
+            // `is_committed(txn) && ...` already short-circuits before
+            // `reader_snapshot.contains(txn)` is ever consulted for it.
+            let snapshot = states
+                .iter()
+                .filter_map(|(id, s)| (*s == TxnState::Active).then(|| id.clone()))
+                .collect::<HashSet<_>>();
+            states.insert(txn.clone(), TxnState::Active);
             (txn, snapshot)
         };
         self.transaction_data.write().insert(
@@ -268,7 +300,7 @@ impl TransactionManager {
     }
 
     pub(crate) fn is_transaction_active(&self, txn: &TransactionId) -> bool {
-        self.active_transactions.read().contains(txn)
+        matches!(self.transaction_states.read().get(txn), Some(TxnState::Active))
     }
 
     /// The policy `txn` was `begin()`-ed with — defaults to
@@ -286,15 +318,18 @@ impl TransactionManager {
     }
 
     /// A transaction's writes are visible ("committed") only if it is neither
-    /// still in flight nor aborting-with-unreverted-writes. Absence from both
-    /// sets is the definition of committed — no per-committed-txn record is kept.
+    /// still in flight nor aborting-with-unreverted-writes. Absence from
+    /// `transaction_states` is the definition of committed — no
+    /// per-committed-txn record is kept. STORE_AUDIT.md P7 (second half):
+    /// one lock read now, not two — Active and Aborting used to live in
+    /// separate sets, so this needed two independent RwLock acquisitions
+    /// to answer what's now a single map lookup.
     pub(crate) fn is_committed(&self, txn: &TransactionId) -> bool {
-        !self.active_transactions.read().contains(txn)
-            && !self.aborting_transactions.read().contains(txn)
+        !self.transaction_states.read().contains_key(txn)
     }
 
     pub(crate) fn commit(&self, txn: TransactionId) -> Result<(), StoreError> {
-        self.active_transactions.write().remove(&txn);
+        self.transaction_states.write().remove(&txn);
         self.transaction_data.write().remove(&txn.0.id);
         Ok(())
     }
@@ -313,12 +348,22 @@ impl TransactionManager {
     // aborting twice is harmless" reasoning that only holds while nothing
     // else has already finished it.
     pub(crate) fn abort(&self, txn: TransactionId) -> Result<(), StoreError> {
-        let mut active = self.active_transactions.write();
-        if !active.remove(&txn) {
-            return Err(StoreError::TransactionAlreadyFinished);
+        // One write-lock acquisition now instead of two (see
+        // transaction_states' own doc comment) — this also closes a narrow
+        // window the old two-set design had: between removing `txn` from
+        // `active` and inserting it into `aborting`, a concurrent
+        // is_committed(txn) (itself two separate reads) could observe it
+        // absent from BOTH sets and momentarily misreport it as committed.
+        // Flipping the state in place, under one lock, makes that
+        // in-between state unobservable.
+        let mut states = self.transaction_states.write();
+        match states.get_mut(&txn) {
+            Some(state @ TxnState::Active) => {
+                *state = TxnState::Aborting;
+                Ok(())
+            }
+            _ => Err(StoreError::TransactionAlreadyFinished),
         }
-        self.aborting_transactions.write().insert(txn);
-        Ok(())
     }
 
     /// Retire a transaction whose writes were already physically reverted by a
@@ -328,7 +373,7 @@ impl TransactionManager {
     /// no drain ever touches it: the owner reverts its own writes with no
     /// cross-thread interference, then calls this.
     pub(crate) fn finish_rolled_back(&self, txn: TransactionId) {
-        self.active_transactions.write().remove(&txn);
+        self.transaction_states.write().remove(&txn);
         self.transaction_data.write().remove(&txn.0.id);
     }
 
@@ -336,13 +381,17 @@ impl TransactionManager {
     /// replayed (all its rows reverted). Now it becomes "committed" by absence,
     /// but no rows carrying its id remain, so nothing reads it as committed.
     pub(crate) fn abort_complete(&self, txn: &TransactionId) {
-        self.aborting_transactions.write().remove(txn);
+        self.transaction_states.write().remove(txn);
         self.transaction_data.write().remove(&txn.0.id);
     }
 
     /// Snapshot of transactions whose undo still needs to be replayed.
     pub(crate) fn aborting_ids(&self) -> Vec<TransactionId> {
-        self.aborting_transactions.read().iter().cloned().collect()
+        self.transaction_states
+            .read()
+            .iter()
+            .filter_map(|(id, s)| (*s == TxnState::Aborting).then(|| id.clone()))
+            .collect()
     }
 
     /// Back-compat shim: an explicit rollback with no undo replay just parks the
@@ -766,5 +815,61 @@ mod tests {
         );
         txn.commit().unwrap();
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    // STORE_AUDIT.md P7 (second half) — throwaway (not a committed criterion
+    // bench, same call as this session's other direct microbenchmarks)
+    // measurement of is_committed's per-call cost under concurrency. Old
+    // code took two separate RwLock reads (one over active_transactions,
+    // one over aborting_transactions); new code takes one (over the merged
+    // transaction_states map). `#[ignore]`d since it's a raw wall-clock
+    // loop, not something that needs to run on every `cargo test`. Run the
+    // identical test text against this revision and against
+    // `git show <pre-fix commit>:store/src/txn.rs` (patched with this same
+    // fn) to get a before/after comparison — see BASELINE.md.
+    #[test]
+    #[ignore]
+    fn bench_is_committed_concurrent() {
+        const THREADS: u64 = 8;
+        const ITERS_PER_THREAD: u64 = 500_000;
+        const NOISE_TXNS: u64 = 100;
+
+        let mgr = make_mgr_arc();
+        // Populate transaction_states with a realistic mix of Active and
+        // Aborting entries so the map/lookup isn't trivially empty.
+        let mut held = vec![];
+        for i in 0..NOISE_TXNS {
+            let t = mgr.begin(ConflictPolicy::ContinueOnConflict).unwrap();
+            if i % 2 == 0 {
+                let id = t.id();
+                t.rollback().unwrap();
+                held.push(id); // kept aborting (never drained via abort_complete)
+            } else {
+                held.push(t.id());
+                std::mem::forget(t); // stays Active
+            }
+        }
+        // A synthetic id never registered at all — is_committed's most common
+        // real-world case (querying an arbitrary writer id found in a tuple).
+        let never_registered = TransactionId::for_test(u64::MAX, u128::MAX);
+
+        let start = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                let mgr = mgr.clone();
+                let id = never_registered.clone();
+                s.spawn(move || {
+                    for _ in 0..ITERS_PER_THREAD {
+                        assert!(mgr.is_committed(&id));
+                    }
+                });
+            }
+        });
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench_is_committed_concurrent: {THREADS} threads x {ITERS_PER_THREAD} \
+             iters in {elapsed:?} ({:.0} ops/s)",
+            (THREADS * ITERS_PER_THREAD) as f64 / elapsed.as_secs_f64()
+        );
     }
 }

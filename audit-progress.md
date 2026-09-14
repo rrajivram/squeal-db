@@ -854,8 +854,51 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   replay must still converge on the update) rather than leaving it an unverified assumption. It
   passed immediately, with no code change — confirming, not fixing.
 - [ ] **P4** — every row and index entry carries a 128-bit timestamp. *(deferred — performance)*
-- [ ] **P7** — per-row visibility check clones the reader's whole snapshot set.
-  *(deferred — performance)*
+- [t-green] **P7** — FIXED, both halves. `Db::find_visible_to` used to resolve AND clone the
+  reader's whole snapshot `HashSet<TransactionId>` on every call — for a scan of M rows under N
+  concurrently active transactions (`TableCursor::next`/`RangeCursor::next` each call it once per
+  row candidate), that's M clones of an N-entry set to answer a question ("what is my reader's
+  snapshot") whose answer never changes for the whole scan (captured once at `begin()`, per
+  `TransactionManager::create_transaction`, and never mutated after). Fixed by adding
+  `Db::snapshot_of(&TransactionId) -> HashSet<TransactionId>` and changing `find_visible_to` to
+  take the resolved snapshot as a `&HashSet` parameter instead of resolving it internally.
+  `Db::find` (a single lookup, not a per-row loop) resolves its own one-off snapshot immediately
+  before calling it — same cost as before for that caller. `TableCursor`/`RangeCursor` each gained
+  a `reader_snapshot: HashSet<TransactionId>` field, resolved once in their constructor and reused
+  across every row for the cursor's whole lifetime.
+  Allocation-count proxy (`store::alloc::stats()`, `cursor::tests::alloc_proxy_table_scan_snapshot`,
+  `#[ignore]`d): a scan of 2,000 rows with 100 concurrently active "noise" transactions — before,
+  2,026 allocation events / 2,765,383 bytes (1382.69 bytes/row); after, 27 allocation events /
+  446,543 bytes (223.27 bytes/row). Measured by running the identical caller-level test (just
+  `table_scan` + a `next()` loop — the fix is entirely internal, invisible to the test) against
+  both this revision and the pre-fix one.
+  Second half — the audit's own suggested companion fix: `TransactionManager::is_committed`
+  (called on every undo-chain hop `resolve_visible` walks) took two separate `RwLock` reads, one
+  over `active_transactions: RwLock<HashSet<TransactionId>>` and one over a second, independent
+  `aborting_transactions: RwLock<HashSet<TransactionId>>`. Collapsed both into one
+  `transaction_states: RwLock<HashMap<TransactionId, TxnState>>` (`TxnState::Active` |
+  `TxnState::Aborting`; absence from the map is still the definition of committed, matching the
+  old design's zero-footprint-for-committed-txns property — no `Committed(commit_ts)` variant
+  needed, since visibility already compares against `TransactionId::ts()` directly).
+  `is_committed` drops to one lock read and one lookup. `abort` (move Active → Aborting) also
+  drops from two lock acquisitions (remove from one set, insert into the other) to one — which
+  incidentally closes a narrow pre-existing race: the old two-step version had a real window,
+  between the removal and the insertion, where a concurrent `is_committed` could observe the
+  transaction absent from BOTH sets and momentarily misreport it as committed. Not separately
+  flagged by the audit and not chased as its own "T" fix (the window was nanoseconds wide,
+  uncontended-lock-acquisition-only), but a genuine side benefit of the collapse.
+  Throwaway (not a committed criterion bench) wall-clock measurement, `txn::tests::
+  bench_is_committed_concurrent`, `#[ignore]`d: 8 threads concurrently calling `is_committed` on
+  a never-registered id (the common real case — checking an arbitrary writer id found in a tuple),
+  against a manager pre-populated with 100 Active/Aborting noise transactions. Before (two
+  RwLocks): ~3.36M–3.56M ops/s (3 runs). After (one merged RwLock): ~12.3M–13.1M ops/s (3 runs) —
+  roughly 3.5-4x, bigger than a simple "half the locks" 2x would suggest, consistent with
+  contended `RwLock` read acquisition across independent cache lines scaling worse than linearly
+  with lock count.
+  End-to-end stress (mem, 16t): 76,878–76,958 ops/s across two runs — flat, same story as every
+  other change in this file: this workload isn't bottlenecked on either of these paths.
+  Full `store` suite: 423 passed, 0 failed (+4 `#[ignore]`d total across this session's
+  benchmarks), `squeal-sql --lib`: 346 passed, 0 failed. Whole workspace builds clean.
 
 ### Phase 6 — locking and cache
 

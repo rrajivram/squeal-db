@@ -367,6 +367,60 @@ bottlenecked on this lock either way.
 Correctness: `store` lib 423/423 (+2 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
 clean, stress `RESULT: PASS`, 0 mismatches.
 
+## Result — STORE_AUDIT.md P7: hoist the per-row snapshot clone; merge active/aborting txn sets
+
+`Db::find_visible_to` resolved AND cloned the reader's whole snapshot `HashSet<TransactionId>` on
+every call — `TableCursor::next`/`RangeCursor::next` call it once per row candidate, so a scan of
+M rows under N concurrently active transactions did M clones of an N-entry set, all to answer a
+question whose answer never changes for the life of the scan (a snapshot is captured once at
+`begin()` and never mutated after).
+
+Fix: `find_visible_to` now takes the resolved snapshot as a `&HashSet` parameter (via a new
+`Db::snapshot_of` helper) instead of resolving it internally. `TableCursor`/`RangeCursor` each
+resolve it once, in their constructor, and reuse it for every row. `Db::find` (a single lookup,
+not a loop) resolves its own one-off snapshot right before the call — unchanged cost for that
+caller.
+
+Allocation-count proxy (`store::alloc::stats()`, `cursor::tests::alloc_proxy_table_scan_snapshot`,
+`#[ignore]`d) — scan of 2,000 rows, 100 concurrently active noise transactions:
+
+| revision | allocation events | bytes | bytes/row |
+|---|---|---|---|
+| before | 2,026 | 2,765,383 | 1382.69 |
+| after | 27 | 446,543 | 223.27 |
+
+Run by executing the identical caller-level test (just `table_scan` + a `next()` loop — the fix
+is entirely internal, invisible to the test itself) against both this revision and
+`git show <pre-fix>:store/src/{db,cursor}.rs`.
+
+**Second half, same pass** — the audit's own suggested companion fix: `TransactionManager::
+is_committed` (called on every undo-chain hop) took two separate `RwLock` reads, one over
+`active_transactions: RwLock<HashSet<TransactionId>>` and a second, independent
+`aborting_transactions: RwLock<HashSet<TransactionId>>`. Collapsed into one `transaction_states:
+RwLock<HashMap<TransactionId, TxnState>>` (`Active` | `Aborting`; absence from the map is still
+"committed", matching the old zero-footprint-for-committed-txns design). `is_committed` drops to
+one lock read; `abort` drops from two lock acquisitions to one (and incidentally closes a narrow,
+previously-unflagged race: the old two-step abort had a real window where a concurrent
+`is_committed` could see the txn absent from both sets and momentarily misreport it committed).
+
+Throwaway wall-clock measurement (`txn::tests::bench_is_committed_concurrent`, `#[ignore]`d): 8
+threads calling `is_committed` on a never-registered id, against a manager pre-populated with 100
+Active/Aborting noise transactions:
+
+| revision | ops/s (3 runs) |
+|---|---|
+| before (two `RwLock`s) | 3.36M / 3.37M / 3.56M |
+| after (one merged `RwLock`) | 12.3M / 12.6M / 13.1M |
+
+~3.5-4x — bigger than a simple "half the locks" 2x, consistent with contended `RwLock` read
+acquisition across independent cache lines scaling worse than linearly with lock count.
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): 76,878–76,958 ops/s
+across two runs — flat, same story as every other change in this file.
+
+Correctness: `store` lib 423/423 (+4 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
+workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

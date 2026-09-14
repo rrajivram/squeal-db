@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
@@ -56,6 +57,14 @@ pub struct TableCursor<F: DBFile + 'static> {
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: ScanTxn,
+    // STORE_AUDIT.md P7: resolved once at construction, not once per row.
+    // A reader's snapshot is captured at begin() and never changes for the
+    // rest of that transaction's life (see TransactionManager::begin's own
+    // comment) — the old code called Db::find_visible_to, which re-resolved
+    // AND cloned this same HashSet on every single row candidate, an M
+    // rows x N concurrent txns amount of allocation for a value that's
+    // identical on every call within one scan.
+    reader_snapshot: HashSet<TransactionId>,
 }
 
 pub struct RangeCursor<F: DBFile + 'static> {
@@ -74,6 +83,8 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
     done: bool,
+    // See TableCursor's identically-named field's own comment.
+    reader_snapshot: HashSet<TransactionId>,
 }
 
 impl<F: DBFile> TableCursor<F>
@@ -94,12 +105,14 @@ where
             .next_data_page(None)?
             .ok_or(StoreError::UnknownError("No data page found".into()))?;
         let current_iter = current_page.iter();
+        let reader_snapshot = db.snapshot_of(&transaction.id());
         Ok(Self {
             db,
             table,
             current_iter,
             current_page,
             transaction,
+            reader_snapshot,
         })
     }
 
@@ -141,6 +154,7 @@ where
         // with KeyNotFound if `start` wasn't a real row).
         let current_leaf = db.table_by_id(table)?.find_leaf_page(&start)?;
         let current_iter = current_leaf.iter();
+        let reader_snapshot = db.snapshot_of(&transaction.id());
         Ok(Self {
             db,
             table,
@@ -150,6 +164,7 @@ where
             start,
             end,
             done: false,
+            reader_snapshot,
         })
     }
 
@@ -224,7 +239,10 @@ where
                     let Some(tuple) = table.resolve_index_entry(&entry)? else {
                         continue;
                     };
-                    match self.db.find_visible_to(&tuple, &reader)? {
+                    match self
+                        .db
+                        .find_visible_to(&tuple, &reader, &self.reader_snapshot)?
+                    {
                         Some(committed) if !committed.is_tombstoned() => {
                             return Ok(Some(committed.into_owned()));
                         }
@@ -271,7 +289,10 @@ where
         let reader = self.transaction.id();
         loop {
             match self.next_tuple()? {
-                Some(t) => match self.db.find_visible_to(&t, &reader)? {
+                Some(t) => match self
+                    .db
+                    .find_visible_to(&t, &reader, &self.reader_snapshot)?
+                {
                     Some(committed) if !committed.is_tombstoned() => {
                         return Ok(Some(committed.into_owned()));
                     }
@@ -705,5 +726,70 @@ mod tests {
             second_pass, first_pass,
             "reset must let the same cursor re-scan the identical (start, end) range"
         );
+    }
+
+    // STORE_AUDIT.md P7 — allocation-count proxy, complementing wall-clock
+    // intuition with a hard number. `#[ignore]`d (run explicitly, alone)
+    // because `crate::alloc::stats()` reads this whole PROCESS's global
+    // allocator counters — any other test allocating concurrently would
+    // pollute the delta. Run with:
+    //   cargo test -p store --lib cursor::tests::alloc_proxy_table_scan_snapshot \
+    //     -- --ignored --nocapture --test-threads=1
+    //
+    // Old code (Db::find_visible_to) re-resolved AND cloned the reader's
+    // whole snapshot HashSet on every row candidate — for a scan of ROWS
+    // rows with NOISE_TXNS other transactions concurrently active (so N =
+    // NOISE_TXNS entries per clone), that's ROWS clones of an N-entry
+    // HashSet to answer a question whose answer never changes for the
+    // life of the scan. New code (TableCursor::new) resolves it exactly
+    // once. This test's own body is intentionally caller-level only (just
+    // `table_scan` + a `next()` loop) — the fix is entirely internal to
+    // cursor.rs/db.rs, so the identical test text was run against both the
+    // pre-fix and post-fix revisions to get the before/after numbers
+    // recorded in BASELINE.md.
+    #[test]
+    #[ignore]
+    #[cfg(not(feature = "dhat-heap"))]
+    fn alloc_proxy_table_scan_snapshot() {
+        const ROWS: u64 = 2_000;
+        const NOISE_TXNS: u64 = 100;
+
+        let db = Db::<MemFile>::create("cursor_alloc_proxy.db").unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        for i in 1..=ROWS {
+            db.insert(tid, Tuple::new(i, format!("v{i}").as_bytes()), &t)
+                .unwrap();
+        }
+        db.commit(t).unwrap();
+
+        // Keep NOISE_TXNS transactions active so the reader's own snapshot
+        // (captured at its begin()) is non-trivially sized.
+        let noise: Vec<_> = (0..NOISE_TXNS).map(|_| db.begin().unwrap()).collect();
+
+        let before = crate::alloc::stats();
+        let mut cursor = db.table_scan(tid).unwrap();
+        let mut count = 0u64;
+        while cursor.next().unwrap().is_some() {
+            count += 1;
+        }
+        let after = crate::alloc::stats();
+        assert_eq!(count, ROWS);
+
+        let alloc_events: usize = after
+            .size_histogram
+            .iter()
+            .zip(before.size_histogram.iter())
+            .map(|(a, b)| a - b)
+            .sum();
+        let bytes = after.total_allocated - before.total_allocated;
+        println!(
+            "table_scan of {ROWS} rows, {NOISE_TXNS} concurrent noise txns: \
+             {alloc_events} allocation events ({:.4}/row), {bytes} bytes ({:.2}/row)",
+            alloc_events as f64 / ROWS as f64,
+            bytes as f64 / ROWS as f64,
+        );
+
+        drop(noise);
     }
 }
