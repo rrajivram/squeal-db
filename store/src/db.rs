@@ -35,6 +35,7 @@ use crate::txn::ConflictPolicy;
 use crate::txn::Transaction;
 use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
+use crate::utils::shardedmap::ShardedMap;
 use log::LevelFilter;
 use log::info;
 use memmap::MmapOptions;
@@ -307,7 +308,9 @@ pub struct Db<F: DBFile + 'static> {
     // not-yet-published table after a failed CREATE TABLE) can't already
     // have a live scan against it; a long-lived scan racing a drop is the
     // same class of deferred limitation as T3's long-reader caveat.
-    table_locks: RwLock<HashMap<TableIdType, Arc<RwLock<()>>>>,
+    // STORE_AUDIT.md P2 survey: sharded (ShardedMap), same treatment as
+    // ArcLock — see table_guard's own comment.
+    table_locks: ShardedMap<TableIdType, Arc<RwLock<()>>>,
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -459,7 +462,7 @@ where
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
             checkpoint_gate: RwLock::new(()),
-            table_locks: RwLock::new(HashMap::new()),
+            table_locks: ShardedMap::new(16),
         };
         sf.load_system_tables()?;
         // STORE_AUDIT.md T16: reconcile the just-loaded (possibly stale)
@@ -1247,14 +1250,8 @@ where
     // ever) — never held while anyone waits on the per-table lock it
     // returns.
     fn table_guard(&self, id: TableIdType) -> Arc<RwLock<()>> {
-        if let Some(lock) = self.table_locks.read().get(&id) {
-            return lock.clone();
-        }
         self.table_locks
-            .write()
-            .entry(id)
-            .or_insert_with(|| Arc::new(RwLock::new(())))
-            .clone()
+            .get_or_insert_with(id, || Arc::new(RwLock::new(())))
     }
 
     // STORE_AUDIT.md T17: insert/update/remove/find's replacement for a
@@ -2082,7 +2079,7 @@ where
             buffer: nm.buffer,
             pending_tombstone_reclaims: RwLock::new(Vec::new()),
             checkpoint_gate: RwLock::new(()),
-            table_locks: RwLock::new(HashMap::new()),
+            table_locks: ShardedMap::new(16),
         })
     }
 

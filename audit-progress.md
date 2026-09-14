@@ -926,6 +926,61 @@ full test suite still green" — not "a red test now passes."
   no offsetting benefit for that access pattern. End-to-end stress: still flat (76,924 ops/s).
   Kept the sharded design: disjoint-page access is the realistic common case and the audit's own
   stated motivation; full numbers and reasoning in `store/benches/BASELINE.md`'s own P2 section.
+  **Broader survey, prompted by "where else could this help"**: grepped every `RwLock`/`Mutex`
+  around a `HashMap`/`HashSet` in `store/src` and assessed each for the same pattern (a hot,
+  read-mostly, independent-keys registry whose *own* lock state — not its contents — is the
+  bottleneck):
+  - `logger.rs`'s `records: RwLock<HashMap<LsnId, Operation>>` / `by_txn: RwLock<HashMap<
+    TransactionId, Vec<LsnId>>>` — written on every insert/update/remove (`log_undo`), read on
+    every rollback/discard. Same independence profile as `ArcLock` (no cross-key invariants) —
+    a straightforward sharding candidate. **Done below.**
+  - `db.rs`'s `table_locks: RwLock<HashMap<TableIdType, Arc<RwLock<()>>>>` (this doc's own T17
+    fix) — structurally identical to `ArcLock`'s pre-sharding design. Same fix, smaller expected
+    payoff since most workloads have few tables. **Done below.**
+  - `db.rs`'s `tables: RwLock<HashMap<TableIdType, Arc<BPlusTree<F>>>>` — read once per operation,
+    but typically only a handful of distinct tables exist, so there's less to spread across
+    shards (the benefit would be "divide one reader-count atomic's traffic across N," not "keys
+    stop colliding on the same shard"). Lower priority; not done this pass.
+  - `buffer.rs`'s `buffer: RwLock<HashMap<PageId, PageEntry>>` — the actual page cache, touched
+    on *every* `get_page`/`get_page_mut` call (more traffic than `ArcLock`, which only fires on
+    writes) — the single highest-traffic lock in the system and the biggest theoretical win.
+    Deliberately NOT attempted this pass: unlike `ArcLock`'s independent per-key mutexes, this
+    map has real cross-key invariants (`evict_lru_locked` picks a victim from `access_map` that
+    could land in a different shard than the page being inserted; `cache_strong_locked`'s
+    "check strong_count, maybe evict, then insert" sequence currently relies on one lock
+    covering all of it atomically). Sharding it safely needs its own investigation, closer in
+    scope to P6's slotted-page work than a quick follow-up — flagged as a distinct, larger
+    future item, not silently dropped.
+  - `txn.rs`'s `active_transactions`/`aborting_transactions` — hot, but `create_transaction`
+    depends on capturing a fully atomic snapshot of the whole set under one lock (the T11-era
+    invariant that ts-ordering must agree with snapshot-registration order — see T11's own
+    entry). Sharding would need redesigning that snapshot capture across N locks, with real risk
+    of reintroducing the exact race that invariant exists to close. Not a good candidate.
+  - `generator.rs`'s `gens`, `named_memfile.rs`'s `Registry` — tiny, fixed key counts (a handful
+    of named sequences; a test-only mock-file registry) — not enough contention surface to
+    matter.
+- [t-green] **P2 survey follow-up — shard `logger.rs`'s `records`/`by_txn` and `db.rs`'s
+  `table_locks`**. Same treatment as `ArcLock` (a sharded map, picked by the key's own `Hash`),
+  applied to the two candidates identified above as low-risk/high-similarity to `ArcLock`'s own
+  fix. Extracted the pattern into a small, reusable `utils::shardedmap::ShardedMap<K, V>`
+  (`get`/`insert`/`remove`/`with_entry_or_default`/`get_or_insert_with`, 16 shards by default)
+  rather than hand-rolling the same sharding logic a third and fourth time — `ArcLock` itself
+  was deliberately left as-is (its guard-returning `lock()` doesn't fit this generic shape
+  cleanly, and it was already correct and separately benchmarked). `logger.rs`'s `records`/
+  `by_txn` (written on every insert/update/remove, read on every rollback/discard — no
+  cross-key invariants, same independence profile as `ArcLock`) and `db.rs`'s `table_locks`
+  (this doc's own T17 fix, structurally identical to `ArcLock`'s pre-sharding design) both now
+  use it.
+  No dedicated micro-benchmark built for these two specific call sites — the underlying
+  mechanism (one shared `RwLock`'s reader-count atomic bouncing across cores under concurrent
+  access, unrelated to what the map holds) is the exact one already measured and confirmed for
+  `ArcLock`; re-deriving the same physical effect a second time would be redundant, not
+  additional evidence. Verified instead via: full `store`/`squeal-sql` suites green (422/422,
+  346/346, +5 new `ShardedMap` unit tests), and end-to-end stress (mem, 16t) — 76,958 ops/s,
+  consistent with every other number in this file's P2 section (flat; this particular stress
+  workload isn't bottlenecked on any of these locks, in any of the designs tried).
+  `db.rs`'s `tables` map and `buffer.rs`'s main page-cache map remain explicitly NOT sharded —
+  see the survey above for why each is a worse or riskier candidate.
 - [ ] **P3** — cache bookkeeping does two `SystemTime::now()` calls + a heap update per page
   access. *(deferred — performance)*
 - [ ] **P5** — inner-node routing clones and decodes every entry on the page.

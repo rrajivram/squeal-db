@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::SeekFrom,
     mem::size_of,
     sync::{Arc, atomic::AtomicU64},
@@ -21,6 +21,7 @@ use crate::{
     table::TableIdType,
     tuple::Tuple,
     txn::TransactionId,
+    utils::shardedmap::ShardedMap,
 };
 
 /// Per-database write-ahead-log clock. Was two process-global statics, which
@@ -487,11 +488,11 @@ pub(crate) struct Logger {
     // `LsnClock::next_lsn`, and never reused within a session, so a lookup
     // by LSN can never alias a different transaction's — or a different
     // row's — entry the way a wrapped positional index could.
-    records: RwLock<HashMap<LsnId, Operation>>,
+    records: ShardedMap<LsnId, Operation>,
     // Which LSNs belong to which transaction — for revert (rollback replays
     // exactly its own txn's ops) and for cleanup (discarding a finished
     // txn's records means removing its LSNs from both maps).
-    by_txn: RwLock<HashMap<TransactionId, Vec<LsnId>>>,
+    by_txn: ShardedMap<TransactionId, Vec<LsnId>>,
     // Committed transactions whose undo trail can't be discarded YET —
     // mirrors TransactionManager's aborting/drain_aborting pattern: don't
     // clean up immediately if doing so could pull a still-open reader's
@@ -588,8 +589,8 @@ impl Logger {
     pub(crate) fn log(&self, lsn: LsnId, op: Operation) -> Result<(), StoreError> {
         match &op {
             Operation::Add { txn, .. } | Operation::Mod { txn, .. } | Operation::Del { txn, .. } => {
-                self.records.write().insert(lsn, op.clone());
-                self.by_txn.write().entry(txn.clone()).or_default().push(lsn);
+                self.records.insert(lsn, op.clone());
+                self.by_txn.with_entry_or_default(txn.clone(), |v| v.push(lsn));
             }
             // Rollback physically reverts the transaction's writes before
             // this op is even logged (see Db::rollback_by_id) — nothing is
@@ -619,10 +620,9 @@ impl Logger {
     }
 
     fn discard_txn_records(&self, id: &TransactionId) {
-        if let Some(lsns) = self.by_txn.write().remove(id) {
-            let mut records = self.records.write();
+        if let Some(lsns) = self.by_txn.remove(id) {
             for lsn in lsns {
-                records.remove(&lsn);
+                self.records.remove(&lsn);
             }
         }
     }
@@ -691,12 +691,10 @@ impl Logger {
         // rely on this returning `Ok` so they can reach their final
         // tx_mgr.commit/rollback call and actually deactivate the
         // transaction — see Transaction::into_id.
-        let by_txn = self.by_txn.read();
-        let Some(lsns) = by_txn.get(&id) else {
+        let Some(lsns) = self.by_txn.get(&id) else {
             return Ok(Vec::new());
         };
-        let records = self.records.read();
-        Ok(lsns.iter().filter_map(|l| records.get(l).cloned()).collect())
+        Ok(lsns.iter().filter_map(|l| self.records.get(l)).collect())
     }
 
     /// Resolves a tuple's `pre_lsn` pointer to the operation that recorded
@@ -705,7 +703,7 @@ impl Logger {
     /// at all: the record already carries its own txn, and an LSN is
     /// globally unique so there's nothing to disambiguate by transaction.
     pub(crate) fn find_record(&self, lsn: LsnId) -> Option<Operation> {
-        self.records.read().get(&lsn).cloned()
+        self.records.get(&lsn)
     }
 
     pub(crate) fn checkpoint(&self, ts: u128) -> Result<(), StoreError> {

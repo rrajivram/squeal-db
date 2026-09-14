@@ -265,6 +265,31 @@ flagged as unattempted follow-up work.
 Correctness: `store` lib 417/417 (+1 `#[ignore]`d), `squeal-sql` lib 346/346,
 workspace builds clean, stress (mem, 16t) `RESULT: PASS`, 0 mismatches.
 
+## Result — P2 survey follow-up: shard `logger.rs`'s undo maps and `db.rs`'s `table_locks`
+
+Prompted by asking where else in `store/src` the same pattern (a hot, read-mostly registry
+whose *own* `RwLock` state, not its contents, is the bottleneck) shows up — full survey in
+`audit-progress.md`'s P2 entry. Two candidates matched `ArcLock`'s exact shape (independent
+keys, no cross-key invariants): `logger.rs`'s `records`/`by_txn` (written on every insert/
+update/remove, read on every rollback/discard) and `db.rs`'s `table_locks` (this doc's own T17
+fix). Extracted the sharding logic into a small, reusable `utils::shardedmap::ShardedMap<K, V>`
+rather than hand-rolling it a third and fourth time; both now use it (16 shards, same as
+`ArcLock`).
+
+No dedicated micro-benchmark for these two — the physical effect being fixed (one shared
+reader-count atomic bouncing across cores) is the *exact* one already measured for `ArcLock`
+above; a second benchmark would confirm the same physics again, not add evidence. Verified via
+the full test suite (422/422 `store`, +5 new `ShardedMap` unit tests, 346/346 `squeal-sql`) and
+one end-to-end stress run: **76,958 ops/s** — consistent with every other number in this file's
+P2 section (flat; this stress workload isn't bottlenecked on these locks in any design tried).
+`db.rs`'s `tables` map and `buffer.rs`'s main page-cache map were surveyed and deliberately NOT
+sharded this pass (few enough distinct tables to blunt the benefit; real cross-key invariants
+in the page cache's eviction path respectively) — see `audit-progress.md` for the full reasoning
+per candidate.
+
+Correctness: `store` lib 422/422 (+1 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
+clean, stress (mem, 16t) `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →
