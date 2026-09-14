@@ -290,6 +290,37 @@ per candidate.
 Correctness: `store` lib 422/422 (+1 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
 clean, stress (mem, 16t) `RESULT: PASS`, 0 mismatches.
 
+## Result — STORE_AUDIT.md P3: CLOCK eviction instead of timestamp + heap update per access
+
+`PageBuffer::get_page`'s cache-hit path called `update_page_access` (a `timestamp()` call plus a
+`ShardedPQ::change_priority`, an O(log n) heap reorder under a shard lock) and, separately,
+`Page::accessed()` (another `timestamp()` call) on *every* hit — the overwhelming majority of
+all page accesses. A throwaway, since-deleted microbenchmark isolating just this cost (2x
+`timestamp()` + one `change_priority`, vs. a bare `AtomicBool` swap) measured **~47ns vs. ~1ns**
+— confirmed worth fixing before touching the eviction logic.
+
+Fix: `Page` gains `referenced: AtomicBool` (replacing the `accessed`/`saved`/`written:
+AtomicU128` fields the audit also flagged as dead — confirmed via grep that nothing ever read
+any of the three back). A hit now just calls `mark_referenced()` — a relaxed store, no lock, no
+syscall, no heap touch. `access_map` (`ShardedPQ`, internals unchanged) is now keyed by a
+monotonic insertion sequence instead of a timestamp, and is only touched when a page first
+becomes Strong or during an eviction sweep — never on an ordinary hit. Eviction checks
+`take_referenced()` before committing: a page accessed since it was last considered gets a
+second chance (cleared, re-pushed with a fresh sequence, sweep continues) instead of being
+evicted immediately.
+
+No new criterion bench for the end-to-end hit-path cost — the isolated 47x number above already
+demonstrates the mechanism directly, and the interesting remaining question (does this show up
+in real page-cache-heavy workloads) is the same "flat at the E2E level for this stress
+workload" story every other change in this file has told, confirmed below rather than
+re-litigated per change.
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): 76,908 ops/s — flat,
+consistent with the rest of this phase.
+
+Correctness: `store` lib 423/423 (+1 `#[ignore]`d), `squeal-sql` lib 346/346, workspace builds
+clean, stress `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

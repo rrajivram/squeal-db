@@ -13,7 +13,6 @@ use postcard::{from_bytes, to_allocvec};
 
 use crate::{
     arclock::{ArcLock, ArcLockGuard},
-    constant::timestamp,
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::{LsnClock, LsnId},
@@ -103,7 +102,13 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // to tell "shut down properly" apart from "dropped without shutdown".
     write_handle: Option<JoinHandle<Result<(), StoreError>>>,
     self_file: RwLock<F>,
-    access_map: ShardedPQ<PageId, u128>,
+    // STORE_AUDIT.md P3: still a ShardedPQ (its own sharded locking already
+    // handles concurrent eviction-candidate tracking fine) but priorities
+    // are now insertion-sequence numbers (next_seq()), not timestamps —
+    // see evict_lru_locked's own comment for the full CLOCK/second-chance
+    // scheme this backs.
+    access_map: ShardedPQ<PageId, u64>,
+    insertion_seq: AtomicU64,
     locks: Arc<ArcLock<PageId>>,
     free_pages: RwLock<Vec<PageId>>,
     // This database's WAL clock, shared with its Logger. Read to stamp a page's
@@ -169,6 +174,7 @@ where
             self_file: RwLock::new(read_file),
             write_handle: Some(write_handle),
             access_map: ShardedPQ::new(max_entries / 10),
+            insertion_seq: AtomicU64::new(0),
             page_count: page_counter,
             header,
             locks: ArcLock::new(),
@@ -240,7 +246,6 @@ where
     // test_freed_overflow_pages_persist_across_close_reopen.
     pub(crate) fn write_page(&self, page_num: PageId, page: &Page) -> Result<(), StoreError> {
         let page = Arc::new(page.clone());
-        page.written();
         self.handle_large_page_size(page_num, &page)?;
         self.cache_strong(page_num, page.clone())?;
         write_page(
@@ -307,7 +312,6 @@ where
             page,
             lock: _lock,
         } = handle;
-        page.written();
         self.handle_large_page_size(page_num, &page)?;
         self.cache_strong(page_num, page)
         // _lock drops here, releasing the per-page lock after cache is updated.
@@ -775,9 +779,10 @@ where
         let existing = self.buffer.read().get(&page_num).cloned();
         match existing {
             Some(PageEntry::Strong(arc)) => {
-                // Pure LRU timestamp refresh — page is already resident and
-                // counted; no eviction or count change needed here.
-                self.update_page_access(page_num)?;
+                // STORE_AUDIT.md P3: a plain relaxed bool store — no lock,
+                // no timestamp, no heap/priority-queue update. See Page::
+                // mark_referenced's own comment.
+                arc.mark_referenced();
                 return Ok(arc);
             }
             Some(PageEntry::Weak(weak)) => {
@@ -814,7 +819,6 @@ where
         // a newer Strong while we were reading from disk; don't overwrite it with
         // the older on-disk copy.
         let page = self.get_or_install(page_num, page);
-        page.accessed();
         Ok(page)
     }
 
@@ -839,7 +843,6 @@ where
             .lock(page_num, 5000)
             .ok_or(StoreError::LockContentionError)?;
         let page = self.get_page(page_num)?;
-        page.accessed();
         let handle = WritePageHandle {
             lock,
             page_num,
@@ -883,19 +886,21 @@ where
     ) -> Option<(PageId, Arc<Page>)> {
         let already_strong = matches!(buffer.get(&page_num), Some(PageEntry::Strong(_)));
         let mut evicted = None;
+        // STORE_AUDIT.md P3: only a NEW transition to Strong needs an
+        // access_map entry at all — CLOCK doesn't reorder on every access,
+        // so a page already tracked (already_strong) needs nothing here
+        // beyond the mark_referenced() below, which every path gets
+        // regardless. See PageBuffer's own doc comment on access_map's
+        // new role.
         if !already_strong {
             if self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries {
                 evicted = self.evict_lru_locked(buffer);
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.access_map.push(page_num, self.next_seq());
         }
-        let priority = u128::MAX - timestamp();
-        if !self.access_map.contains(&page_num) {
-            self.access_map.push(page_num, priority);
-        } else {
-            self.access_map.change_priority(&page_num, priority);
-        }
+        page.mark_referenced();
         buffer.insert(page_num, PageEntry::Strong(page));
         evicted
     }
@@ -932,12 +937,7 @@ where
             let mut buffer = self.buffer.write();
             if let Some(PageEntry::Strong(arc)) = buffer.get(&page_num) {
                 let arc = arc.clone();
-                let priority = u128::MAX - timestamp();
-                if !self.access_map.contains(&page_num) {
-                    self.access_map.push(page_num, priority);
-                } else {
-                    self.access_map.change_priority(&page_num, priority);
-                }
+                arc.mark_referenced();
                 return arc;
             }
             self.cache_strong_locked(&mut buffer, page_num, page.clone())
@@ -966,6 +966,17 @@ where
     // held, which would stall every other reader/writer in the whole cache
     // for as long as the flush's channel send took to accept it). A clean
     // victim needs no flush at all — its on-disk copy already matches.
+    // STORE_AUDIT.md P3: CLOCK / second-chance eviction. access_map still
+    // gives the same thing it always did — the oldest-tracked candidate,
+    // across its own shards — but candidates are ordered by insertion
+    // sequence (next_seq(), a plain AtomicU64 fetch_add), not wall-clock
+    // time, and a candidate found to have been accessed since it was last
+    // considered (Page::take_referenced()) isn't evicted: it's cleared and
+    // re-pushed with a fresh sequence number (a "second chance"), moving
+    // it to the back of the queue, and the sweep continues. This is what
+    // makes the hot path (PageBuffer::get_page's Strong-hit branch) able
+    // to skip touching access_map at all — only eviction, not every
+    // access, ever reorders anything.
     fn evict_lru_locked(
         &self,
         buffer: &mut HashMap<PageId, PageEntry>,
@@ -981,6 +992,13 @@ where
                 }
                 Some((victim, _)) => {
                     if let Some(PageEntry::Strong(arc)) = buffer.get(&victim) {
+                        if arc.take_referenced() {
+                            // Second chance: accessed since it was last
+                            // swept (or since insertion) — give it another
+                            // lap instead of evicting it now.
+                            self.access_map.push(victim, self.next_seq());
+                            continue;
+                        }
                         // Cloned before downgrading: once `buffer.insert`
                         // below replaces the map's own Strong entry, that
                         // entry's Arc gets dropped — without a separate
@@ -1000,28 +1018,25 @@ where
                         };
                     }
                     // Stale entry: victim is already Weak or absent in the
-                    // buffer (e.g. update_page_access ran after eviction).
-                    // Keep looping to find the next LRU Strong candidate.
+                    // buffer (evicted some other way, or never actually
+                    // installed). Keep looping to find the next candidate.
                 }
             }
         }
     }
 
-    // LRU timestamp refresh for pages that are already Strong residents.
-    // Called on the hot read path (Strong hit in get_page) without acquiring
-    // the buffer lock — it only touches access_map, which has its own
-    // fine-grained locks via ShardedPQ.
-    fn update_page_access(&self, page_num: PageId) -> Result<(), StoreError> {
-        // pop() is max-first; invert the timestamp so the least-recently
-        // touched page (smallest raw timestamp) ends up with the largest
-        // priority and gets evicted first.
-        let priority = u128::MAX - timestamp();
-        if !self.access_map.contains(&page_num) {
-            self.access_map.push(page_num, priority);
-        } else {
-            self.access_map.change_priority(&page_num, priority);
-        }
-        Ok(())
+    // Monotonic insertion-order counter backing access_map's priority —
+    // inverted (u64::MAX - seq) so the OLDEST sequence number, i.e. the
+    // earliest-inserted-or-last-given-a-second-chance page, is the largest
+    // priority and pop()s first (ShardedPQ::pop is max-first). Plain
+    // fetch_add, no timestamp: this only needs a total order among pages
+    // this PageBuffer has itself ever tracked, never anything comparable
+    // across a reopen or another Db instance.
+    fn next_seq(&self) -> u64 {
+        u64::MAX
+            - self
+                .insertion_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
@@ -1620,7 +1635,7 @@ mod tests {
 
     use postcard::from_bytes;
 
-    use super::{BufMsg, WriteMsg};
+    use super::{BufMsg, PageEntry, WriteMsg};
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
     use crate::page::{PAGE_OVERHEAD, Page, PageId};
@@ -2046,6 +2061,57 @@ mod tests {
         let _ = buf2.shutdown();
     }
 
+    // STORE_AUDIT.md P3: direct, white-box test of evict_lru_locked's
+    // actual decision — not an end-to-end test through get_page. An
+    // earlier version of this test drove it through get_page instead,
+    // repeatedly re-accessing "page 0" while pushing pages through a full
+    // cache; it passed even with the second-chance check deleted entirely,
+    // because re-fetching an EVICTED page transparently reinstalls it with
+    // a fresh insertion sequence, which looks identical to "never evicted"
+    // by Strong/Weak state alone — and checking Arc identity across
+    // iterations didn't help either, since holding any external reference
+    // to a page keeps its Weak entry upgradeable, masking a real eviction
+    // as a same-object "reuse". Constructing the cache state directly
+    // (bypassing get_page/cache_strong_locked entirely) is what actually
+    // isolates the mechanism: two Strong pages, one marked referenced, one
+    // not, both already registered in access_map in insertion order —
+    // evict_lru_locked must skip the referenced one (a real behavioral
+    // difference from plain FIFO, which would target it as the oldest)
+    // and evict the other one instead.
+    #[test]
+    fn test_evict_lru_locked_gives_a_referenced_page_a_second_chance() {
+        let (buf, _) = make_buffer(2, 10);
+        let page_a = Arc::new(Page::new_data(PAGE_SIZE));
+        let page_b = Arc::new(Page::new_data(PAGE_SIZE));
+        page_a.mark_referenced(); // A: accessed since it was cached.
+        // B is left un-referenced (fresh Page starts with referenced=false).
+
+        let id_a: PageId = 0u64.into();
+        let id_b: PageId = 1u64.into();
+        {
+            let mut map = buf.buffer.write();
+            map.insert(id_a, PageEntry::Strong(page_a.clone()));
+            map.insert(id_b, PageEntry::Strong(page_b.clone()));
+        }
+        // A inserted (logically) before B, so a plain FIFO/LRU-by-age
+        // policy with no referenced check would target A first.
+        buf.access_map.push(id_a, buf.next_seq());
+        buf.access_map.push(id_b, buf.next_seq());
+
+        let mut map = buf.buffer.write();
+        buf.evict_lru_locked(&mut map);
+
+        let is_strong = |id: PageId| matches!(map.get(&id), Some(PageEntry::Strong(_)));
+        assert!(
+            is_strong(id_a),
+            "the referenced page must be given a second chance, not evicted"
+        );
+        assert!(
+            !is_strong(id_b),
+            "the un-referenced page must be the one actually evicted"
+        );
+    }
+
     // The other half of the same deferral: a page that's mutated but never
     // evicted (cache well under capacity) must still become durable once
     // checkpoint() runs — flush_dirty_cached_pages exists specifically to
@@ -2417,4 +2483,5 @@ mod tests {
         assert!(matches!(err, StoreError::PageChecksumMismatch(id) if id == continuation_id));
         let _ = buf2.shutdown();
     }
+
 }

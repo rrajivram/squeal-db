@@ -8,12 +8,10 @@ use std::sync::{
 };
 
 use parking_lot::RwLock;
-use portable_atomic::AtomicU128;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    constant::timestamp,
     db::DBSizeType,
     error::StoreError,
     logger::{LsnClock, LsnId},
@@ -252,9 +250,17 @@ pub(crate) struct Page {
     // test page); such a page keeps its lsn and, being low, writes promptly.
     lsn_clock: Option<Arc<LsnClock>>,
     flags: AtomicU16,
-    accessed: AtomicU128,
-    saved: AtomicU128,
-    written: AtomicU128,
+    // STORE_AUDIT.md P3: replaces the old accessed/saved/written AtomicU128
+    // timestamps, none of which anything ever read back (confirmed via
+    // grep — only ever written, or copied field-to-field on clone). Set on
+    // every cache access (PageBuffer::get_page's Strong-hit path) via
+    // mark_referenced(); cleared and tested by the CLOCK eviction sweep
+    // via take_referenced(). A plain bool store/swap, not a timestamp: no
+    // syscall, no ordering to compare, and (per PageBuffer's own doc
+    // comment on its eviction ring) no heap/priority-queue update needed
+    // on every access — only a page actually being considered for
+    // eviction ever looks at this.
+    referenced: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -319,7 +325,6 @@ impl Page {
         content_kind: PageContentKind,
     ) -> Self {
         let ds = size - PAGE_OVERHEAD as DBSizeType;
-        let ts = timestamp();
         Self {
             inner: RwLock::new(PageInner {
                 data: content,
@@ -335,9 +340,7 @@ impl Page {
             lsn: RwLock::new(LsnId(0)),
             lsn_clock: None,
             flags: AtomicU16::new(flags),
-            accessed: AtomicU128::new(ts),
-            saved: AtomicU128::new(ts),
-            written: AtomicU128::new(ts),
+            referenced: AtomicBool::new(false),
         }
     }
 
@@ -637,17 +640,27 @@ impl Page {
         self.inner.read().data.count()
     }
 
-    pub(crate) fn written(&self) {
-        self.written
-            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
+    // STORE_AUDIT.md P3: called on every cache hit (PageBuffer::get_page's
+    // Strong-hit branch) — a plain relaxed store, no lock, no syscall.
+    // Replaces update_page_access's per-hit timestamp() + ShardedPQ
+    // change_priority (measured ~47x slower for the combined old cost vs.
+    // this alone). Only the CLOCK eviction sweep (PageBuffer::evict_*)
+    // ever reads this back, via take_referenced().
+    pub(crate) fn mark_referenced(&self) {
+        self.referenced
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    pub(crate) fn accessed(&self) {
-        self.accessed
-            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
-    }
-    pub(crate) fn saved(&self) {
-        self.saved
-            .store(timestamp(), std::sync::atomic::Ordering::Relaxed);
+
+    // Test-and-clear: returns whether this page was referenced since the
+    // last time this was called (or since creation), clearing the flag in
+    // the same step — the "second chance" test in a CLOCK sweep. A plain
+    // swap, not a load-then-store: a concurrent mark_referenced() racing
+    // this can only make the result MORE conservative (a page accessed
+    // right as it's being considered for eviction is treated as
+    // referenced either way — it never loses a genuine, concurrent access).
+    pub(crate) fn take_referenced(&self) -> bool {
+        self.referenced
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn contains(&self, id: DBIdType) -> Result<bool, StoreError> {
@@ -745,9 +758,7 @@ impl Page {
             flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(header.lsn),
             lsn_clock: None,
-            accessed: AtomicU128::new(timestamp()),
-            written: AtomicU128::new(timestamp()),
-            saved: AtomicU128::new(timestamp()),
+            referenced: AtomicBool::new(false),
         })
     }
 
@@ -874,9 +885,7 @@ impl From<PageDto> for Page {
             flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(value.lsn),
             lsn_clock: None,
-            accessed: AtomicU128::new(timestamp()),
-            written: AtomicU128::new(timestamp()),
-            saved: AtomicU128::new(timestamp()),
+            referenced: AtomicBool::new(false),
         }
     }
 }
@@ -937,9 +946,7 @@ impl Clone for Page {
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(*self.lsn.read()),
             lsn_clock: self.lsn_clock.clone(),
-            accessed: AtomicU128::new(self.accessed.load(std::sync::atomic::Ordering::Relaxed)),
-            written: AtomicU128::new(self.written.load(std::sync::atomic::Ordering::Relaxed)),
-            saved: AtomicU128::new(self.saved.load(std::sync::atomic::Ordering::Relaxed)),
+            referenced: AtomicBool::new(self.referenced.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }
 }

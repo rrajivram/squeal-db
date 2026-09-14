@@ -981,8 +981,49 @@ full test suite still green" — not "a red test now passes."
   workload isn't bottlenecked on any of these locks, in any of the designs tried).
   `db.rs`'s `tables` map and `buffer.rs`'s main page-cache map remain explicitly NOT sharded —
   see the survey above for why each is a worse or riskier candidate.
-- [ ] **P3** — cache bookkeeping does two `SystemTime::now()` calls + a heap update per page
-  access. *(deferred — performance)*
+- [t-green] **P3** — FIXED. `PageBuffer::get_page`'s Strong-hit path called `update_page_access`
+  (a `timestamp()` call plus a `ShardedPQ::change_priority`, an O(log n) heap reorder under a
+  shard lock) and, separately, `Page::accessed()` (ANOTHER `timestamp()` call) — on every single
+  cache hit, the overwhelming majority of all page accesses. Measured directly (a throwaway,
+  since-deleted benchmark): ~47ns for the combined old cost vs. ~1ns for a bare atomic swap —
+  confirmed worth fixing before touching anything.
+  Replaced with CLOCK (second-chance): `Page` gains a `referenced: AtomicBool` (replacing the
+  `accessed`/`saved`/`written: AtomicU128` fields the audit also flagged — confirmed via grep
+  that nothing ever read any of the three back, only wrote them or copied them field-to-field on
+  clone). `mark_referenced()` (a plain relaxed store) is called on every hit — no lock, no
+  syscall, no heap touch at all. `access_map` (`ShardedPQ`, unchanged internally — its own
+  sharding already handled concurrent-candidate-tracking fine) still gives the oldest-tracked
+  candidate on eviction, but keyed by a monotonic insertion sequence (`next_seq`, a plain
+  `AtomicU64` fetch_add) instead of a timestamp, and ONLY touched when a page first becomes
+  Strong or is swept during eviction — never on an ordinary hit. `evict_lru_locked` now checks
+  `Page::take_referenced()` (test-and-clear) before committing to an eviction: if the candidate
+  was accessed since it was last considered, it's given a second chance (cleared, re-pushed with
+  a fresh sequence number, sweep continues) instead of being evicted immediately.
+  Test: `test_evict_lru_locked_gives_a_referenced_page_a_second_chance` — a direct, white-box
+  test of `evict_lru_locked` itself (constructs two Strong pages, one marked referenced, in
+  known insertion order, calls eviction directly) rather than driving it through `get_page`. An
+  EARLIER version of this test did exactly that (repeatedly re-accessing "page 0" while pushing
+  pages through a full cache) and passed even with the second-chance check deleted entirely,
+  because re-fetching an evicted page transparently reinstalls it with a fresh sequence —
+  indistinguishable from "never evicted" by Strong/Weak state alone — and checking Arc identity
+  across iterations didn't help either, since holding any external reference to a page keeps its
+  Weak entry upgradeable, which masks a real eviction as a same-object reuse. Documented at
+  length in the test's own comment so this mistake isn't repeated. Confirmed meaningful via the
+  direct test instead: reliably fails (evicts the referenced page) with the check disabled,
+  reliably passes restored.
+  The pre-existing `test_evicting_a_dirty_page_flushes_it_before_a_fresh_buffer_can_see_it` also
+  now implicitly exercises CLOCK's "every fresh page gets one free pass" property (confirmed it
+  still passes: with 11 pages ever cached and capacity 10, the sweep needs two laps — the first
+  gives page0 its one-time free pass since nothing has touched its `referenced` bit yet, the
+  second finds it cleared and actually evicts it — the audit's own quiescing-adjacent property
+  that a page is never evicted the very instant it's created).
+  End-to-end stress (mem, 16t): 76,908 ops/s — flat, consistent with every other number in this
+  phase; this workload's bottleneck isn't in cache bookkeeping either way.
+  Full `store` suite: 423 passed, 0 failed (+1 `#[ignore]`d), `squeal-sql --lib`: 346 passed, 0
+  failed. Whole workspace builds clean.
+  **Deliberately deferred to its own pass (see below)**: sharding `buffer` (the main
+  `PageId -> PageEntry` cache map) itself — this fix only changed what feeds `access_map`, not
+  the map's own locking, which the P2 survey already flagged as needing its own investigation.
 - [ ] **P5** — inner-node routing clones and decodes every entry on the page.
   *(deferred — performance)*
 - [ ] **S9** — resource exhaustion knobs: no cap on tuple count/undo trail/active txns;
