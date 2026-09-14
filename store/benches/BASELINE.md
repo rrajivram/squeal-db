@@ -464,6 +464,40 @@ this workload isn't oriented around large overflow-value updates specifically.
 Correctness: `store` lib 424/424 (+5 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
 workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
 
+## Result — STORE_AUDIT.md P4: drop the dead txn_id from index/routing entries
+
+Index/routing entries (`Node::Inner`/`Node::Leaf`-encoded `Tuple`s, resolved purely by key) were
+unconditionally stamped with a live `TransactionId` on every construction site, despite nothing
+ever reading it back — visibility is resolved entirely through the DATA tuple. Fixed by passing
+`None` at all 6 construction sites (`Option<TransactionId>` already serializes to a 1-byte
+discriminant for `None`, no format restructuring needed) and shrinking `MAX_ENTRY_BYTES` (the
+worst-case per-entry budget controlling `nodes_per_page = page_size / index_entry_size`) from 64
+to 48 to reflect it.
+
+Measured actual per-entry byte savings (`Tuple::size()`, not just the worst-case budget) —
+postcard's varint cost scales with the runtime VALUE, not the field's declared type width, so the
+real savings depends on how "mature" the database is:
+
+| TransactionId magnitude | with live txn_id | without (None) | saved |
+|---|---|---|---|
+| small (id=1, ts=1 — a fresh test db) | 12 B | 10 B | 2 B |
+| large (id/ts ≈ 50,000,000 — a mature db) | 18 B | 10 B | 8 B |
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): **76,873 → 89,517-89,625
+ops/s (3 runs) — a genuine, reproducible ~16.5% improvement.** The first fix in this whole
+performance pass to move the E2E number at all — every other one (P2, P3, P7, P9, buffer-sharding)
+stayed flat. Makes sense here specifically: smaller index entries mean shallower trees and less
+split/allocation overhead during the stress workload's own inserts, not just smaller on-disk bytes.
+
+Correctness: `store` lib 426/426 (+5 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
+workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
+
+Deliberately not done: narrowing `TransactionInner.ts` from `u128` to `u64` (the audit's other
+suggested P4 lever) — investigated and found near-zero-value now that T11 made `ts` a small
+logical counter rather than a wall-clock nanosecond timestamp: postcard's varint cost tracks the
+runtime value, not the declared width, so a `u128` holding a small counter already encodes
+byte-identically to a `u64` holding the same value. See `audit-progress.md`'s P4 entry.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

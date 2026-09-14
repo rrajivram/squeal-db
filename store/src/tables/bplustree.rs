@@ -44,13 +44,29 @@ const LEAF_NODE: usize = 5;
 //
 // Postcard varint upper bounds per field, for an Int-keyed entry:
 //   DBIdType::Int(u64::MAX)  → 1 (variant) + 10 (varint) = 11 B
-//   Option<TransactionId>    → 1 (Some) + 10 (u64 id) + 10 (u128 ts) = 21 B
+//   Option<TransactionId>    → 1 (None) — STORE_AUDIT.md P4: index/routing
+//                              entries never carry a real txn_id anymore
+//                              (see insert_index's own comment), so this is
+//                              always the 1-byte None discriminant, not the
+//                              21 B a live Some(TransactionId) used to cost.
 //   Option<LsnId>            → 1 (None)
 //   data Node::Inner(u64::MAX) as Vec<u8> → 1 (len) + 1 (variant) + 10 (varint) = 12 B
 //   flags                    → 1 B
-//   Total ≈ 46 B; 64 B gives comfortable headroom for any realistic payload
-//   of *that* shape — not a general bound for every key shape.
-pub(crate) const MAX_ENTRY_BYTES: u64 = 64;
+//   Total ≈ 26 B; 48 B gives comfortable headroom for any realistic payload
+//   of *that* shape — not a general bound for every key shape. Directly
+//   controls fanout: BPlusTree::new sets nodes_per_page = page_size /
+//   index_entry_size, so shrinking this (64 → 48, following P4's fix)
+//   proportionally raises nodes_per_page for the same page_size — e.g. a
+//   33% fanout increase for any large, realistic page_size. Kept well above
+//   the computed 26 B floor (not shrunk further to it) because several
+//   bplustree.rs tests derive a deliberately tiny page_size as `MAX_ENTRY_
+//   BYTES * nodes_per_page` with no separate PAGE_OVERHEAD term (PAGE_
+//   OVERHEAD is a fixed ~112 B tax per page regardless of page_size) — at
+//   nodes_per_page=4 that tax alone can swallow most of a page_size sized
+//   too close to the true per-entry floor, confirmed empirically: 40 broke
+//   6 of those tests (capacity/ordering failures at nodes_per_page=4), 48
+//   passes all of them with real margin to spare.
+pub(crate) const MAX_ENTRY_BYTES: u64 = 48;
 
 pub(crate) struct BPlusTree<F: DBFile + 'static> {
     pub(crate) table: Table,
@@ -299,10 +315,17 @@ where
         txn: TransactionId,
         lsn: LsnId,
     ) -> Result<PageId, StoreError> {
+        // STORE_AUDIT.md P4: index/routing entries never carry a real
+        // txn_id — visibility is resolved through the DATA tuple
+        // (Db::find_visible_to), never consulted for a routing entry
+        // itself (confirmed via grep: nothing ever reads an index page's
+        // Tuple::txn_id back). Every construction site below passes None
+        // instead of a live TransactionId for exactly this reason — see
+        // MAX_ENTRY_BYTES's own comment for the budgeted bytes this saves.
         let id_tuple = Tuple::new_with(
             tuple_id,
             &to_allocvec(&Node::Leaf(data_page_id))?,
-            Some(txn.clone()),
+            None,
             None,
         );
         // insert_recursive's own inner-node routing returns PageCapacityError
@@ -325,7 +348,7 @@ where
             // insert_recursive holds the root lock the root may already be split.
             let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
             if handle.page.count()? == self.table.nodes_per_page - 1 {
-                self.split_root_page(handle, txn.clone(), &id_tuple.id, lsn)?;
+                self.split_root_page(handle, &id_tuple.id, lsn)?;
             } else {
                 drop(handle);
             }
@@ -1103,10 +1126,11 @@ where
             }
             Ok(())
         } else {
+            // STORE_AUDIT.md P4: see insert_index's identical comment.
             let new_entry = Tuple::new_with(
                 id.clone(),
                 &to_allocvec(&Node::Leaf(new_page_id))?,
-                Some(txn),
+                None,
                 None,
             );
             handle.page.replace_tuple(&id, new_entry)?;
@@ -1148,7 +1172,7 @@ where
                     // lock and no-ops if some other thread already split it
                     // first, so this is safe even if the race resolves a
                     // different way than assumed here.
-                    self.split_root_page(handle, txn_id.clone(), &tuple.id, lsn)?;
+                    self.split_root_page(handle, &tuple.id, lsn)?;
                     return self.insert_recursive(tuple, txn_id, start, None, lsn);
                 }
                 // This used to be reachable: a non-root leaf could be
@@ -1264,19 +1288,20 @@ where
                         // (up to the old upper bound, row_id.id) moved to `sibling`. The
                         // existing entry routed that whole range to `p`, so it must now
                         // point at `sibling`; a new entry routes the smaller half to `p`.
+                        // STORE_AUDIT.md P4: see insert_index's identical comment.
                         page.replace_tuple(
                             &row_id.id,
                             Tuple::new_with(
                                 row_id.id.clone(),
                                 &to_allocvec(&Node::Inner(sibling))?,
-                                Some(txn_id.clone()),
+                                None,
                                 None,
                             ),
                         )?;
                         page.add_tuple(Tuple::new_with(
                             separator.clone(),
                             &to_allocvec(&Node::Inner(p))?,
-                            Some(txn_id.clone()),
+                            None,
                             None,
                         ))?;
                         // Crab into the destination child: lock it *before* the
@@ -1542,7 +1567,6 @@ where
         id: DBIdType,
         left_page: PageId,
         right_page: PageId,
-        txn_id: TransactionId,
         lsn: LsnId,
     ) -> Result<(), StoreError> {
         let mut handle = self.buffer.get_page_mut(self.table.first_index_page)?;
@@ -1556,16 +1580,12 @@ where
         page.clear()?;
         let left_node = Node::Inner(left_page);
         let right_node = Node::Inner(right_page);
-        let new_t = Tuple::new_with(
-            id.clone(),
-            &to_allocvec(&left_node)?,
-            Some(txn_id.clone()),
-            None,
-        );
+        // STORE_AUDIT.md P4: see insert_index's identical comment.
+        let new_t = Tuple::new_with(id.clone(), &to_allocvec(&left_node)?, None, None);
         let end_t = Tuple::new_with(
             DBIdType::Int(DBSizeType::MAX),
             &to_allocvec(&right_node)?,
-            Some(txn_id.clone()),
+            None,
             None,
         );
         page.add_tuple(new_t)?;
@@ -1577,7 +1597,6 @@ where
     fn split_root_page(
         &self,
         handle: WritePageHandle,
-        txn_id: TransactionId,
         incoming_id: &DBIdType,
         lsn: LsnId,
     ) -> Result<(), StoreError> {
@@ -1652,7 +1671,7 @@ where
             .try_for_each(|t| right_page.add_tuple(t.clone()))?;
         self.buffer.write_locked_page_with_lsn(left_handle, lsn)?;
         self.buffer.write_locked_page_with_lsn(right_handle, lsn)?;
-        self.update_root_page(separator_id, left_page_id, right_page_id, txn_id, lsn)?;
+        self.update_root_page(separator_id, left_page_id, right_page_id, lsn)?;
         Ok(())
     }
 
@@ -1975,6 +1994,78 @@ mod tests {
             ip.count().unwrap() >= 2,
             "inner root must hold at least 2 child pointers, got {}",
             ip.count().unwrap()
+        );
+    }
+
+    // STORE_AUDIT.md P4: direct behavioral confirmation that a real,
+    // post-split index page's routing entries carry no live TransactionId
+    // — not just that insert_index/update_index_entry/update_root_page's
+    // construction sites were edited to pass None, but that the actual
+    // cached/on-disk entries reflect it. Reads the root's own entries
+    // after it's been forced to split (so this exercises update_root_page,
+    // not just insert_index's leaf-level path).
+    #[test]
+    fn test_index_routing_entries_carry_no_live_txn_id() {
+        let page_size = MAX_ENTRY_BYTES * 4;
+        let tree = make_tree(page_size);
+        for i in 1u64..=5 {
+            tree.insert(Tuple::new(i, b"x"), txn()).unwrap();
+        }
+        let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
+        assert!(ip.is_flag_set(INNER_NODE), "sanity: root must have split");
+        let entries: Vec<_> = ip.iter().collect();
+        assert!(!entries.is_empty(), "sanity: root must have routing entries");
+        for entry in &entries {
+            assert!(
+                entry.txn_id.is_none(),
+                "index routing entry {:?} carries a live txn_id — dead weight \
+                 P4 removed, since visibility is resolved through the data \
+                 tuple, never the routing entry",
+                entry.id
+            );
+        }
+    }
+
+    // STORE_AUDIT.md P4 — quantifies the actual per-entry byte savings from
+    // no longer stamping a live TransactionId on an index/routing entry,
+    // using the exact same Tuple::size() (postcard serialized size) the
+    // page-capacity accounting itself relies on.
+    #[test]
+    fn test_dropping_txn_id_from_a_routing_entry_shrinks_its_serialized_size() {
+        let id = DBIdType::Int(12345);
+        let data = postcard::to_allocvec(&Node::Leaf(PageId::from(6789u64))).unwrap();
+        let without_txn = Tuple::new_with(id.clone(), &data, None, None);
+        // Small ids (a freshly-opened test db's txn() helper: id=1, ts=1) vs a
+        // "mature database" magnitude, since postcard's varint cost scales
+        // with the VALUE, not the field's declared width — a small live
+        // TransactionId costs little over None; a large one costs much more,
+        // and only None ever costs the same 1 byte regardless.
+        let with_small_txn = Tuple::new_with(id.clone(), &data, Some(txn()), None);
+        let with_large_txn = Tuple::new_with(
+            id,
+            &data,
+            Some(TransactionId::new(50_000_000, 50_000_000)),
+            None,
+        );
+        assert!(
+            without_txn.size() < with_small_txn.size(),
+            "dropping the dead txn_id must shrink the entry even for a small id: \
+             with={} without={}",
+            with_small_txn.size(),
+            without_txn.size()
+        );
+        assert!(
+            with_small_txn.size() < with_large_txn.size(),
+            "sanity: a larger TransactionId must cost more bytes than a small one"
+        );
+        eprintln!(
+            "routing entry size: without txn_id = {} B, with a small live one = {} B \
+             ({} B saved), with a large one = {} B ({} B saved)",
+            without_txn.size(),
+            with_small_txn.size(),
+            with_small_txn.size() - without_txn.size(),
+            with_large_txn.size(),
+            with_large_txn.size() - without_txn.size(),
         );
     }
 

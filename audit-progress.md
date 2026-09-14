@@ -853,7 +853,64 @@ simplifies T5/T16 too (see the design doc's own reasoning for why).
   insert, checkpointed; committed update, page flush never reaches the main file before a crash;
   replay must still converge on the update) rather than leaving it an unverified assumption. It
   passed immediately, with no code change — confirming, not fixing.
-- [ ] **P4** — every row and index entry carries a 128-bit timestamp. *(deferred — performance)*
+- [t-green] **P4** — FIXED, the "index entries carry dead weight" half; the "u128 → u64 for
+  data-tuple ts" half deliberately NOT done, see below. `bplustree.rs`'s index/routing entries
+  (`Tuple`s whose `data` is a serialized `Node::Inner`/`Node::Leaf` structural pointer, resolved
+  purely by key) were unconditionally stamped with a real, live `Some(txn_id.clone())` on every
+  construction site — confirmed via grep that nothing anywhere ever reads an index page's
+  `Tuple::txn_id` back (visibility is resolved entirely through the DATA tuple, in `db.rs`'s
+  `find_visible_to`/`resolve_visible`, never through a routing entry). Pure dead weight on every
+  single index entry in the tree.
+  Fix: every routing-entry construction site (`insert_index`, `update_index_entry`,
+  `insert_recursive`'s split-handling, `update_root_page`, 6 sites total) now passes `None`
+  instead of a live `TransactionId` — `Option<TransactionId>` already serializes to a 1-byte
+  discriminant for `None` regardless of the inner type, so this needed no `Tuple`/format
+  restructuring at all, just changing what gets passed in. `update_root_page`/`split_root_page`'s
+  `txn_id`/`TransactionId` parameters became fully dead as a direct consequence and were removed,
+  with their call sites updated. `insert_index`/`insert_recursive`/`update_index_entry`'s own
+  `txn`/`txn_id` parameters also became logically pointless (only ever pass-through after this fix)
+  but were deliberately LEFT IN PLACE — full removal would cascade further up into `insert_at_lsn`
+  and its callers (`Db::insert`) for zero measurable benefit (an `Arc` clone is cheap; the win here
+  is disk bytes, not parameter-passing overhead), and Rust's `unused_variables` lint doesn't flag
+  a value that's still being passed through, so there's no compiler-enforced pressure to chase it
+  either. `MAX_ENTRY_BYTES` (the worst-case per-entry byte budget that directly sets `nodes_per_page
+  = page_size / index_entry_size` for the default `Int`-keyed table path) shrunk from 64 to 48,
+  reflecting the removed field's worst-case contribution — not shrunk all the way to the newly
+  computed ~26 B floor, because several `bplustree.rs` tests derive a deliberately tiny `page_size`
+  as `MAX_ENTRY_BYTES * small_N` with no separate `PAGE_OVERHEAD` term; at `nodes_per_page=4`,
+  `PAGE_OVERHEAD`'s fixed ~112 B tax dominates a page_size that tight, and empirically broke 6 of
+  those tests at `MAX_ENTRY_BYTES=40` (capacity/ordering failures) even though 40 is still well
+  above the real 26 B floor. 48 passes all of them with real margin; for any realistic (large)
+  `page_size` this is still a genuine 64→48 (33%) fanout increase either way, since `PAGE_OVERHEAD`
+  is negligible at real page sizes.
+  Tests: `test_index_routing_entries_carry_no_live_txn_id` (behavioral — inserts enough rows to
+  force a root split, exercising `update_root_page` not just the leaf-level path, then asserts
+  every cached routing entry's `txn_id` is `None`) and
+  `test_dropping_txn_id_from_a_routing_entry_shrinks_its_serialized_size` (quantifies the actual
+  measured `Tuple::size()` delta: only 2 B saved for a small/fresh `TransactionId` since postcard's
+  varint cost scales with the VALUE not the declared type width — id=1,ts=1 costs almost nothing
+  over `None` — but 8 B saved for a "mature database" magnitude id/ts around 50,000,000; this is
+  the honest, measured picture, not the audit's own worst-case-only estimate). Confirmed meaningful
+  via the usual red/green: temporarily restored a live `Some(txn_id)` at both `insert_index`'s and
+  `update_root_page`'s construction sites, confirmed the behavioral test fails; restored, confirmed
+  it passes again.
+  **End-to-end stress (mem, 16t): 76,873 → 89,517-89,625 ops/s (3 runs) — a genuine, reproducible
+  ~16.5% throughput improvement.** The first fix in this whole performance pass to move the E2E
+  number at all (every other one — P2/P3/P7/P9/buffer-sharding — stayed flat); makes sense here
+  specifically because smaller index entries directly mean shallower trees / less split/allocation
+  overhead during the stress workload's own inserts, not just smaller bytes on disk.
+  Full `store` suite: 426 passed, 0 failed (+5 `#[ignore]`d total this session), `squeal-sql --lib`:
+  346 passed, 0 failed. Whole workspace builds clean.
+  **Deliberately NOT done**: narrowing `TransactionInner.ts` from `u128` to `u64` (the audit's
+  other stated P4 lever, "a `u64` logical start timestamp is enough and is 1-9 bytes as a
+  varint"). Investigated and found to be a near-zero-value change given what T11 already did:
+  postcard's varint encoding cost is a function of the RUNTIME VALUE, not the field's declared bit
+  width — `ts` is now a small monotonic logical counter (T11), not a wall-clock nanosecond
+  timestamp, so a `u128` holding a small counter value encodes byte-identically to a `u64` holding
+  the same value. Narrowing the Rust type would shrink `TransactionInner`'s in-memory layout by
+  8 bytes but change nothing about what's actually written to disk. Not implemented, since there's
+  no real win to capture — this is exactly why the "carries dead weight on index entries" half
+  above was the one worth chasing.
 - [t-green] **P7** — FIXED, both halves. `Db::find_visible_to` used to resolve AND clone the
   reader's whole snapshot `HashSet<TransactionId>` on every call — for a scan of M rows under N
   concurrently active transactions (`TableCursor::next`/`RangeCursor::next` each call it once per
