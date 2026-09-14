@@ -220,6 +220,21 @@ struct PageInner {
     has_overflow: bool,
     next_page: DBSizeType,
     high_key: Option<DBIdType>,
+    // STORE_AUDIT.md P9: number of continuation pages in this page's own
+    // overflow chain (not counting the primary page itself), as of the
+    // last time handle_large_page_size (buffer.rs) actually built or
+    // confirmed one — NOT decoded from the on-disk format (the header
+    // itself carries no page count, only has_overflow + next_page), so a
+    // Page freshly reconstructed from bytes (from_bytes/From<PageDto>)
+    // always starts at 0. That's safe, not stale: a real chain length is
+    // always >= 1 (see handle_large_page_size's own assert), so 0 can
+    // never falsely match one — a cold Page just conservatively takes the
+    // full free+rebuild path once, exactly like before this field existed,
+    // then tracks accurately from then on for as long as this same Arc
+    // stays cached. Lives inside `inner`, not a separate atomic, for the
+    // exact same reason has_overflow/next_page do (see this struct's own
+    // comment): it's meaningless read torn against either of them.
+    overflow_page_count: DBSizeType,
 }
 
 ///Page Invariants
@@ -332,6 +347,7 @@ impl Page {
                 has_overflow: false,
                 next_page: 0,
                 high_key: None,
+                overflow_page_count: 0,
             }),
             dirty: AtomicBool::new(true),
             page_data_size: ds,
@@ -421,6 +437,17 @@ impl Page {
 
     pub(crate) fn set_next_page(&self, next_page: PageId) -> Result<(), StoreError> {
         self.inner.write().next_page = next_page.0;
+        self.set_dirty(true)?;
+        Ok(())
+    }
+
+    // STORE_AUDIT.md P9: see PageInner's own comment on overflow_page_count.
+    pub(crate) fn overflow_page_count(&self) -> DBSizeType {
+        self.inner.read().overflow_page_count
+    }
+
+    pub(crate) fn set_overflow_page_count(&self, count: DBSizeType) -> Result<(), StoreError> {
+        self.inner.write().overflow_page_count = count;
         self.set_dirty(true)?;
         Ok(())
     }
@@ -750,6 +777,7 @@ impl Page {
                 has_overflow,
                 next_page: header.next_page,
                 high_key: header.high_key,
+                overflow_page_count: 0,
             }),
             dirty: AtomicBool::new(false),
             page_data_size: header.page_data_size,
@@ -877,6 +905,7 @@ impl From<PageDto> for Page {
                 has_overflow,
                 next_page: value.next_page,
                 high_key: value.high_key,
+                overflow_page_count: 0,
             }),
             dirty: AtomicBool::new(false),
             page_data_size: value.page_data_size,
@@ -938,6 +967,7 @@ impl Clone for Page {
                 has_overflow: inner.has_overflow,
                 next_page: inner.next_page,
                 high_key: inner.high_key.clone(),
+                overflow_page_count: inner.overflow_page_count,
             }),
             dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
             page_data_size: self.page_data_size,

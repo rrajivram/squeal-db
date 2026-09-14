@@ -1122,8 +1122,68 @@ full test suite still green" — not "a red test now passes."
 ### Phase 7 — slotted pages
 - [ ] **P6** — whole-page re-serialization on every flush; deep clone on every `write_page`.
   *(deferred — performance)*
-- [ ] **P9** — overflow chains do synchronous, unbatched header writes.
-  *(deferred — performance)*
+- [t-green] **P9** — FIXED, first half (chain-reuse); second half (async continuation-page
+  writes) deliberately deferred, see below. `handle_large_page_size` (`buffer.rs`) unconditionally
+  tore down and rebuilt a row's WHOLE overflow chain on every single write to an already-oversized
+  page, even when the required page count hadn't changed at all — free every existing continuation
+  page (each freed page itself synchronously re-written blank via `reset_freed_page` → `write_page`),
+  then allocate a brand-new chain with fresh page ids and N synchronous `write_page_header` pwrite
+  calls. Documented in `ARCHITECTURE.md` as the reason large-value writes ran at ~600–1000/s.
+  Fix: `Page` gains `overflow_page_count: DBSizeType` (inside `PageInner`'s existing `inner` lock —
+  same bundling-for-atomicity reasoning as `has_overflow`/`next_page`, since it's meaningless read
+  torn against either). `handle_large_page_size` now checks, before touching anything, whether the
+  page already has an overflow chain of EXACTLY the length the new size still needs — if so, it
+  returns immediately, doing nothing at all: no free, no realloc, no header writes. The actual byte
+  content still gets correctly rewritten regardless by the async writer thread's own `write_page`
+  (it walks whatever chain linkage is already on disk and overwrites content+checksum per physical
+  page, unaffected by this change either way). A page freshly reconstructed from disk bytes
+  (`from_bytes`/`From<PageDto>`) always starts at `overflow_page_count = 0`, which can never
+  falsely match a real chain length (always `>= 1`) — so a cold page's first oversized write always
+  conservatively takes the full rebuild path exactly like before this fix, then tracks accurately
+  for as long as the same `Arc<Page>` stays cache-resident, which — confirmed by tracing
+  `BPlusTree::update`'s call path — is exactly the case for repeated updates to the same large-value
+  row (`get_page_mut` returns the cached Strong `Arc`, mutated in place, reinstalled by identity via
+  `write_locked_page`; only the separate `write_page` API, used for allocation-time formatting, not
+  row updates, always wraps a fresh `Arc` and so never benefits from this specific fast path).
+  Test: `test_repeated_same_size_overflow_write_reuses_the_existing_chain` — writes an oversized
+  page, records its physical chain page ids, rewrites it with different content but the same total
+  size via `get_page_mut`/`write_locked_page` (the same pattern a real `update()` call uses), and
+  asserts the chain's page ids and `page_count` are unchanged, and the new content reads back
+  correctly. Confirmed meaningful: temporarily disabled the chain-length check, confirmed the test
+  fails (it reused a fresh page id instead of the original), restored, confirmed it passes again.
+  A stale, now-inaccurate comment on `BPlusTree::update_if_needed` (which used to describe this
+  exact always-rebuild cost as unconditional) was updated to reflect that a same-length replay no
+  longer pays it either way.
+  Throwaway (not a committed criterion bench) wall-clock measurement, `buffer::tests::
+  bench_repeated_same_size_overflow_write`, `#[ignore]`d: 2,000 repeated same-size updates to a
+  single already-oversized page (mem backend — a conservative, CPU/allocation-only proxy; the
+  audit's own ~600-1000/s number was measured against real disk I/O, where the eliminated
+  synchronous pwrites carry real latency this proxy can't reflect). Before (always rebuild):
+  618K–1.36M writes/s (3 runs, includes JIT/cache warmup noise on the first). After (chain reuse):
+  2.6M–6.3M writes/s (3 runs) — roughly 2-4x even without real disk latency in the mix.
+  End-to-end stress (mem, 16t): 76,873 ops/s — flat; this stress workload isn't oriented around
+  large overflow-value updates specifically.
+  Full `store` suite: 424 passed, 0 failed (+5 `#[ignore]`d total this session), `squeal-sql --lib`:
+  346 passed, 0 failed. Whole workspace builds clean.
+  **Deliberately deferred, not implemented in this pass**: the audit's second suggested fix,
+  "queue continuation-page writes through the writer thread like every other page" (i.e., make a
+  freshly-built chain's placeholder header writes async instead of synchronous pwrites). Scoped
+  and rejected as unsafe to do as a drop-in change: `write_page`'s own async content-distribution
+  walk (the writer thread, processing a queued `WritePage` message) reads each continuation page's
+  header via a plain synchronous `read_page_header` to learn its `next_page`/`is_overflow` linkage
+  — it does not build that linkage itself, only fills in content+checksum for whatever chain is
+  already physically on disk. That walk, and any SUBSEQUENT `handle_large_page_size` call for the
+  same page (which now also reads chain state — this fix's own `overflow_page_count` avoids a disk
+  read, but a length-CHANGED path still calls `free_overflow_pages`, itself a synchronous chain
+  walk via `read_page_header`), both depend on the chain's structural (not content) writes already
+  being durable by the time they run. Making those structural writes async would reopen exactly
+  the same "read a not-yet-materialized write" race this session's `install`/`Evicted` design
+  (buffer-map sharding) and `TransactionManager::abort` merge (P7) were specifically built to
+  avoid — except here it's not a lock-ordering problem, it's an ordering-across-two-different-
+  channels-of-completion problem (an async queue vs. a synchronous same-thread read), which needs
+  its own dedicated design (e.g., an in-memory, always-authoritative record of a page's full chain
+  shape, not just its length) rather than a quick drop-in swap. A good candidate for its own future
+  investigation, not rushed into this pass.
 
 ### Not yet slotted into a phase by the audit itself
 - [t-green] **T15** — see Phase 5's T11 entry above (verified alongside it; no separate fix

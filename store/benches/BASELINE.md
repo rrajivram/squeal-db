@@ -421,6 +421,49 @@ across two runs — flat, same story as every other change in this file.
 Correctness: `store` lib 423/423 (+4 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
 workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
 
+## Result — STORE_AUDIT.md P9: skip the overflow-chain rebuild when its length hasn't changed
+
+`handle_large_page_size` tore down and rebuilt a whole overflow chain on every write to an
+already-oversized page — free every existing continuation page (each re-written blank
+synchronously), then allocate a brand-new chain with fresh page ids and N synchronous
+`write_page_header` pwrites — even when the required page count hadn't changed at all.
+Documented in `ARCHITECTURE.md` as the reason large-value writes ran at ~600-1000/s.
+
+Fix: `Page` gains `overflow_page_count` (bundled into the same lock as `has_overflow`/`next_page`
+for the same tearing-prevention reason). If the existing chain already has exactly the length the
+new size needs, `handle_large_page_size` returns immediately — no free, no realloc, no writes at
+all. A page freshly loaded from disk always starts at 0 (can never falsely match a real length, always
+`>= 1`), so a cold page's first oversized write still takes the full rebuild path; the fast path
+only kicks in once the same cached `Arc<Page>` has already built a chain once, which is exactly the
+case for repeated updates to the same large-value row.
+
+Throwaway (not a committed criterion bench) wall-clock measurement, `buffer::tests::
+bench_repeated_same_size_overflow_write`, `#[ignore]`d — 2,000 repeated same-size updates to a
+single already-oversized page (mem backend, so this is a conservative CPU/allocation-only proxy;
+the audit's ~600-1000/s figure was against real disk I/O, where the now-eliminated synchronous
+pwrites carry real latency this proxy can't capture):
+
+| revision | writes/s (3 runs) |
+|---|---|
+| before (always rebuild) | 618K / 1.32M / 1.36M |
+| after (reuse unchanged chain) | 2.60M / 5.96M / 6.27M |
+
+Roughly 2-4x even without real disk latency in the mix — expect a much larger relative win on a
+real disk backend, where this change turns O(chain length) synchronous pwrites into zero.
+
+Second suggested fix in the audit ("queue continuation-page writes through the writer thread")
+deliberately NOT implemented this pass — scoped and rejected as unsafe to do as a drop-in change;
+see `audit-progress.md`'s P9 entry for the full reasoning (the async writer thread's content-walk,
+and any subsequent `handle_large_page_size` call for the same page, both depend on the chain's
+structural writes already being durable by the time they run — making those async reopens a
+read-before-write race that needs its own dedicated design, not a quick swap).
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): 76,873 ops/s — flat;
+this workload isn't oriented around large overflow-value updates specifically.
+
+Correctness: `store` lib 424/424 (+5 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
+workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

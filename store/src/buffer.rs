@@ -372,6 +372,39 @@ where
     }
 
     fn handle_large_page_size(&self, page_id: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
+        // STORE_AUDIT.md P9: if the page already has an overflow chain of
+        // EXACTLY the length the new size still needs, leave it alone
+        // entirely — no free, no realloc, no synchronous header writes at
+        // all. The actual byte CONTENT gets rewritten regardless by the
+        // async writer thread's own write_page (it walks whatever chain
+        // linkage is already on disk and overwrites content+checksum per
+        // physical page — see its own comment), so an unchanged-length
+        // chain needs nothing further from this function. Before this
+        // existed, every single write to an already-oversized page tore
+        // down its whole chain and rebuilt a brand new one (fresh page
+        // ids, N synchronous pwrites) even when nothing about its shape
+        // had changed — documented in ARCHITECTURE.md as the reason
+        // large-value writes ran at ~600-1000/s.
+        //
+        // page.overflow_page_count() lives inside Page's own `inner` lock
+        // (see PageInner's own comment) so it can never be read torn
+        // against has_overflow/next_page. It's only ever set by the
+        // rebuild branch below succeeding — a Page freshly reconstructed
+        // from disk bytes (from_bytes/From<PageDto>) always starts at 0,
+        // which can never equal a real chain length (always >= 1, see the
+        // assert below), so a cold Page's first oversized write always
+        // conservatively falls through to a full rebuild, exactly like
+        // before this field existed, then tracks accurately afterward for
+        // as long as this same Arc stays cached.
+        if page.has_overflow() {
+            let header = page.header();
+            if header.used_size() > header.usable_data_size() {
+                let overflow_pages = (header.used_size() - 1) / header.usable_data_size();
+                if page.overflow_page_count() == overflow_pages {
+                    return Ok(());
+                }
+            }
+        }
         if page.has_overflow() {
             if let Some(next_page) = self.free_overflow_pages(page_id, page.header())? {
                 page.set_next_page(next_page)?;
@@ -383,6 +416,7 @@ where
             // next_page pointer (now pointing at a data page, not an overflow page),
             // corrupting the data chain and eventually producing invalid page IDs.
             page.set_overflow(false);
+            page.set_overflow_page_count(0)?;
             // Patch the disk header: free_overflow_pages left next_page pointing at
             // the freed overflow chain start. Rewrite with the restored value so no
             // stale overflow pointer remains on disk.
@@ -473,6 +507,11 @@ where
             // call uses the overflow path and distributes data across the chain.
             page.set_overflow(true);
             page.set_next_page(first_page)?;
+            // STORE_AUDIT.md P9: record the freshly-built chain's length so
+            // the NEXT write to this same (still-cached) page can skip
+            // straight past this whole rebuild if nothing about its shape
+            // has changed — see this function's own opening comment.
+            page.set_overflow_page_count(overflow_pages)?;
             return Ok(());
         }
         Ok(())
@@ -1865,6 +1904,79 @@ mod tests {
         let _ = buf.shutdown();
     }
 
+    fn overflow_chain_ids(buf: &PageBuffer<MemFile>, primary: PageId) -> Vec<PageId> {
+        let mut ids = vec![];
+        let primary_header = buf.read_page_header(primary).unwrap();
+        let mut cur = primary_header.next_page();
+        loop {
+            ids.push(cur);
+            let h = buf.read_page_header(cur).unwrap();
+            if !h.is_overflow() {
+                break;
+            }
+            cur = h.next_page();
+        }
+        ids
+    }
+
+    // STORE_AUDIT.md P9: a same-size rewrite of an already-oversized page
+    // must reuse the exact same physical overflow chain, not tear it down
+    // and allocate a fresh one — see handle_large_page_size's own comment.
+    // Goes through get_page_mut/write_locked_page (not write_page, which
+    // always wraps a brand-new Arc — see write_page's own doc comment) to
+    // exercise the same cached Arc a real BPlusTree::update() call reuses
+    // across successive writes to the same row, since that persistence
+    // (via Page's own overflow_page_count field) is exactly what the fix
+    // relies on.
+    #[test]
+    fn test_repeated_same_size_overflow_write_reuses_the_existing_chain() {
+        let page_size = 300u64;
+        let (buf, page_counter, _) = make_buffer_ps(page_size, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+
+        let big_data = vec![1u8; page_size as usize];
+        let page = Page::new_data(page_size);
+        page.add_tuple(Tuple::new(1, &big_data)).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+
+        let chain_before = overflow_chain_ids(&buf, page_id);
+        assert!(
+            !chain_before.is_empty(),
+            "sanity: this write must have needed overflow pages"
+        );
+        let count_after_first_write = page_counter.load(Ordering::Relaxed);
+
+        let handle = buf.get_page_mut(page_id).unwrap();
+        let different_big_data = vec![2u8; page_size as usize];
+        handle
+            .page
+            .replace_tuple(&DBIdType::Int(1), Tuple::new(1, &different_big_data))
+            .unwrap();
+        buf.write_locked_page(handle).unwrap();
+
+        let chain_after = overflow_chain_ids(&buf, page_id);
+        let count_after_second_write = page_counter.load(Ordering::Relaxed);
+
+        assert_eq!(
+            chain_before, chain_after,
+            "a same-size rewrite must reuse the exact same overflow chain page ids, \
+             not tear down and reallocate a fresh one"
+        );
+        assert_eq!(
+            count_after_first_write, count_after_second_write,
+            "no new pages should have been allocated for a same-size rewrite"
+        );
+
+        let reread = buf.get_page(page_id).unwrap();
+        assert_eq!(
+            reread.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            different_big_data,
+            "chain reuse must not leave stale bytes behind"
+        );
+
+        let _ = buf.shutdown();
+    }
+
     #[test]
     fn test_oversized_page_disk_roundtrip() {
         let page_size = 300u64;
@@ -2615,6 +2727,46 @@ mod tests {
             (THREADS * ITERS_PER_THREAD) as f64 / elapsed.as_secs_f64()
         );
         let buf = Arc::try_unwrap(buf).unwrap_or_else(|_| panic!("buf still shared"));
+        let _ = buf.shutdown();
+    }
+
+    // STORE_AUDIT.md P9 — throwaway (not a committed criterion bench, same
+    // call as this session's other direct microbenchmarks) wall-clock
+    // measurement of repeated same-size updates to a single overflow page —
+    // the case handle_large_page_size's chain-reuse fast path targets. Run
+    // the identical test text against this revision and against
+    // `git show <pre-fix>:store/src/buffer.rs` (patched with this same fn,
+    // dropping the now-nonexistent overflow_page_count() call in favor of
+    // whatever the old code did — i.e. nothing, since the old code has no
+    // such check) to get a before/after comparison — see BASELINE.md.
+    #[test]
+    #[ignore]
+    fn bench_repeated_same_size_overflow_write() {
+        const ITERS: u64 = 2_000;
+        let page_size = 300u64;
+        let (buf, _, _) = make_buffer_ps(page_size, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+        let big_data = vec![0u8; page_size as usize];
+        let page = Page::new_data(page_size);
+        page.add_tuple(Tuple::new(1, &big_data)).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+
+        let start = std::time::Instant::now();
+        for i in 0..ITERS {
+            let handle = buf.get_page_mut(page_id).unwrap();
+            let data = vec![(i % 256) as u8; page_size as usize];
+            handle
+                .page
+                .replace_tuple(&DBIdType::Int(1), Tuple::new(1, &data))
+                .unwrap();
+            buf.write_locked_page(handle).unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench_repeated_same_size_overflow_write: {ITERS} writes in {elapsed:?} \
+             ({:.0} writes/s)",
+            ITERS as f64 / elapsed.as_secs_f64()
+        );
         let _ = buf.shutdown();
     }
 }

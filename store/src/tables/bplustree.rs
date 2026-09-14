@@ -643,17 +643,23 @@ where
     // case when a crash happens after the corresponding page write already
     // landed), skipping update()'s underlying work entirely in that case.
     //
-    // This isn't just an optimization — update() unconditionally tears
-    // down and rebuilds the row's overflow chain (write_locked_page's
-    // handle_large_page_size: free whatever overflow pages are currently
-    // linked, then allocate however many the tuple's current size needs).
-    // That's correct for a genuine content change, but replaying it
-    // against a tuple whose content hasn't actually changed still frees
-    // the existing chain and immediately reallocates one of the same
-    // length — and there's no guarantee the free list hands back the same
-    // pages it was just given, so the net effect can be extra pages left
-    // on the free list that a real update would never have produced.
-    // Confirmed via test_freed_overflow_pages_persist_across_close_reopen.
+    // STORE_AUDIT.md P9: this used to matter for a second, bigger reason —
+    // update() unconditionally tore down and rebuilt the row's overflow
+    // chain on every call (write_locked_page's handle_large_page_size:
+    // free whatever overflow pages are currently linked, then allocate
+    // however many the tuple's current size needs), even when replaying
+    // against a tuple whose content hadn't actually changed. There was no
+    // guarantee the free list handed back the same pages it was just
+    // given, so the net effect could be extra pages left on the free list
+    // that a real update would never have produced (confirmed via
+    // test_freed_overflow_pages_persist_across_close_reopen). Now that
+    // handle_large_page_size skips the teardown/rebuild entirely whenever
+    // the required overflow page count hasn't changed, that specific
+    // concern no longer applies to a same-length replay either way — this
+    // early-return is still worth keeping for a byte-identical replay
+    // (skips logging/dirty-page work too, not just chain rebuilding), but
+    // isn't the only thing standing between a redo replay and free-list
+    // churn anymore.
     pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
         let id = tuple.id.clone();
         if let Some(current) = self.find(id)?
