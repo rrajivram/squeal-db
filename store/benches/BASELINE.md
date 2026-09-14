@@ -204,6 +204,67 @@ Correctness: `store` lib 417/417 (+1 `#[ignore]`d), `squeal-sql` lib 346/346,
 workspace builds clean, stress (mem, 16t) `RESULT: PASS` both before and after,
 0 mismatches.
 
+## Result — P2 follow-up: shard the lock registry (16 shards, hashed by key)
+
+Prompted by a direct question: does `disjoint_keys_concurrent`'s modest −11%
+(above) mean the single `RwLock` around the lock-registry map is *also* a
+bottleneck, the same way `buffer.rs`'s `access_map` needed `ShardedPQ` to stop
+being one? Yes — even taken only on its `read()` side (the common path once a
+key exists), one `RwLock` still has a single shared reader-count atomic that
+every thread's read()/drop bounces across cores; 8 threads all touching that
+one cache line, 2000 times each, is exactly the kind of false sharing sharding
+exists to remove. Sharded the map itself (`Vec<RwLock<HashMap<...>>>>`, picked
+by `T`'s own `Hash` — more general than `ShardedPQ`'s `Rem<usize>` scheme,
+which only works because its key is numeric) rather than anything about the
+per-key `ReentrantMutex`, since the hypothesis was specifically about the
+*registry's* lock, not the per-key one.
+
+`cargo bench -p store --bench arclock`, all three points now for comparison:
+
+| bench                          | original | unsharded fix | **sharded (16)** | Δ vs original | Δ vs unsharded |
+|---------------------------------|----------|----------------|-------------------|----------------|-----------------|
+| `uncontended_single_thread`     | 44.2 ns  | 13.1 ns        | 16.1 ns           | −64%           | +23% (hash cost) |
+| `disjoint_keys_concurrent`      | 2.345 ms | 2.088 ms       | **0.324 ms**      | **−86%**       | **−84%**        |
+| `same_key_contended`            | 1.306 ms | 2.780 ms       | 3.229 ms          | +147%          | +16%            |
+| `same_key_contended_with_work`  | 1.301 ms | 2.549 ms       | 3.182 ms          | +145%          | +25%            |
+
+Confirms the hypothesis precisely: sharding turns the disjoint-key case from a
+disappointing −11% into a genuinely large −86%, because it was never really
+about the map's *contents* (each key's own entry) — it was the registry lock's
+own internal state being hammered by every thread regardless of which key they
+wanted. It does nothing for `same_key_contended` (every thread hashing to the
+SAME key still lands on the SAME shard, so that case is exactly as contended
+as the unsharded design) and adds a small, expected tax everywhere else — one
+`DefaultHasher` computation per call — visible in `uncontended_single_thread`
+and compounding the existing same-key regression a bit further.
+
+Allocation proxy, same workload: 41 events / 2,144 bytes (down from 52 / 11,508
+unsharded, 16,042 / 394,580 original) — fewer, not more, despite 16 pre-
+allocated shard maps up front, since spreading entries across shards means
+less per-shard `HashMap` resizing overhead than one map absorbing all of them.
+
+**End-to-end** (same stress command): 76,924 ops/s — flat again, consistent
+with every other variant measured here. `ArcLock` genuinely is not what this
+particular workload's throughput is bottlenecked on, so none of these designs
+(original, unsharded fix, sharded fix) is distinguishable at the whole-system
+level for it. That doesn't make the micro-level results meaningless — a
+different, more page-contended workload (many transactions hammering few hot
+rows, or a working set close to `max_entries` under heavy churn) would be far
+more likely to actually feel the difference between these three, in either
+direction.
+
+**Kept: the sharded design.** The disjoint-key case is the audit's own stated
+motivation and the realistic common case (a working database touches many
+different pages far more often than one thread hammers a single page with no
+other work between acquisitions); the same-key cost, while real, is worse in a
+narrower, less representative scenario and — per the reasoning above — could
+likely be closed separately by the audit's own alternate suggestion (lock
+inside the page's cache entry, no separate registry lookup at all), still
+flagged as unattempted follow-up work.
+
+Correctness: `store` lib 417/417 (+1 `#[ignore]`d), `squeal-sql` lib 346/346,
+workspace builds clean, stress (mem, 16t) `RESULT: PASS`, 0 mismatches.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →

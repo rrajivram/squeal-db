@@ -69,11 +69,34 @@ where
     }
 }
 
+// STORE_AUDIT.md P2 follow-up: sharded the same way `buffer.rs`'s
+// `ShardedPQ` shards its eviction heap, for the same reason — a single
+// `RwLock`, even taken only on its *read* side by every caller (see
+// `get_or_create`), still has one shared reader-count atomic that every
+// thread's read()/drop bounces across cores. `disjoint_keys_concurrent`
+// (benches/arclock.rs) only improved ~11% over the old design despite the
+// keys involved being completely unrelated — far short of the near-linear
+// scaling that ought to be possible — which is exactly the signature of
+// that kind of false sharing on the lock's own internal state, not real
+// contention over the map's *contents*. `SHARD_COUNT` shards means threads
+// hashing to different shards (the common case once there are more shards
+// than threads) touch entirely different cache lines. Hashed by `T`'s own
+// `Hash` impl (not `ShardedPQ`'s `Rem<usize> + From<usize>` scheme, which
+// only works because its key is numeric) — more general, and `ArcLock<T>`
+// already requires `Hash` for the map itself.
+//
+// This does NOT help genuinely hot-key contention (`same_key_contended` in
+// the same bench file): every thread locking the SAME key hashes to the
+// SAME shard, so that case is exactly as contended as an unsharded design
+// — sharding only spreads DIFFERENT keys apart, it can't split one key's
+// own mutex across shards.
+const SHARD_COUNT: usize = 16;
+
 pub struct ArcLock<T>
 where
     T: Sized + Clone + Debug,
 {
-    locks: Arc<RwLock<HashMap<T, Arc<ReentrantMutex<()>>>>>,
+    shards: Arc<Vec<RwLock<HashMap<T, Arc<ReentrantMutex<()>>>>>>,
 }
 
 impl<T> ArcLock<T>
@@ -82,21 +105,31 @@ where
 {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            locks: Arc::new(RwLock::new(HashMap::new())),
+            shards: Arc::new((0..SHARD_COUNT).map(|_| RwLock::new(HashMap::new())).collect()),
         })
     }
 
+    fn shard_for(&self, val: &T) -> &RwLock<HashMap<T, Arc<ReentrantMutex<()>>>> {
+        use std::hash::Hasher;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        val.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
+    }
+
     // Read-mostly: once a key's mutex has been created, every later caller
-    // (including concurrent ones on OTHER keys) only ever takes the map's
-    // *read* side here — the write side is only needed the first time a
-    // given key is ever locked. This is the fix for the "every lock() call
-    // serializes on one global write lock" problem: two threads locking two
-    // different, already-seen keys now don't contend on this map at all.
+    // (including concurrent ones on OTHER keys, most of which now land in a
+    // DIFFERENT shard entirely) only ever takes that one shard's *read*
+    // side here — the write side is only needed the first time a given key
+    // is ever locked. This is the fix for the "every lock() call serializes
+    // on one global write lock" problem: two threads locking two different,
+    // already-seen keys now don't contend on each other at all, whether or
+    // not they happen to land in the same shard.
     fn get_or_create(&self, val: &T) -> Arc<ReentrantMutex<()>> {
-        if let Some(existing) = self.locks.read().get(val) {
+        let shard = self.shard_for(val);
+        if let Some(existing) = shard.read().get(val) {
             return existing.clone();
         }
-        self.locks
+        shard
             .write()
             .entry(val.clone())
             .or_insert_with(|| Arc::new(ReentrantMutex::new(())))
@@ -131,15 +164,22 @@ where
     // preserves existing behavior (the map still only grows) rather than
     // introducing new eviction that wasn't part of this finding.
     pub fn cleanup(&self) {
-        let mut map = self.locks.write();
-        let unused = map
-            .iter()
-            .filter(|&(_, v)| Arc::strong_count(v) == 1)
-            .map(|(k, _)| k.clone())
-            .collect::<Vec<_>>();
-        for u in unused {
-            map.remove(&u);
+        for shard in self.shards.iter() {
+            let mut map = shard.write();
+            let unused = map
+                .iter()
+                .filter(|&(_, v)| Arc::strong_count(v) == 1)
+                .map(|(k, _)| k.clone())
+                .collect::<Vec<_>>();
+            for u in unused {
+                map.remove(&u);
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn total_len(&self) -> usize {
+        self.shards.iter().map(|s| s.read().len()).sum()
     }
 }
 
@@ -149,7 +189,7 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            locks: self.locks.clone(),
+            shards: self.shards.clone(),
         }
     }
 }
@@ -159,7 +199,8 @@ where
     T: Debug + Clone,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Locks: {}", self.locks.read().len())?;
+        let total: usize = self.shards.iter().map(|s| s.read().len()).sum();
+        write!(f, "Locks: {total}")?;
         Ok(())
     }
 }
@@ -212,15 +253,15 @@ mod arclock_tests {
         );
     }
 
-    // STORE_AUDIT.md S8: `locks` used to be a std::sync::RwLock, which
-    // poisons permanently on any panic while held — an unrelated bug
+    // STORE_AUDIT.md S8: `shards` used to be a single std::sync::RwLock,
+    // which poisons permanently on any panic while held — an unrelated bug
     // elsewhere (in a completely different call that happened to be
     // holding this same lock at the wrong moment) would turn every FUTURE
     // ArcLock::lock/cleanup/Debug call across the whole process into a
     // panic too, since each one .unwrap()s the lock result. For a page
     // lock registry backing every page in the database, one unrelated
     // panic anywhere would have taken down every other page's locking
-    // entirely. Reproduced directly against the internal `locks` field
+    // entirely. Reproduced directly against one shard's internal lock
     // (same-file access) rather than trying to engineer a panic inside
     // ArcLock's own methods.
     #[test]
@@ -228,7 +269,7 @@ mod arclock_tests {
         let lock = ArcLock::new();
         let l = lock.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = l.locks.write();
+            let _guard = l.shards[0].write();
             panic!("simulated bug elsewhere, unrelated to ArcLock itself");
         }));
         assert!(result.is_err(), "sanity: the panic above must actually unwind");
@@ -321,20 +362,20 @@ mod arclock_tests {
         let l1 = lock.lock(1, 0).unwrap();
         let l2 = lock.lock(2, 0).unwrap();
         let l3 = lock.lock(3, 0).unwrap();
-        assert_eq!(lock.locks.read().len(), 3);
+        assert_eq!(lock.total_len(), 3);
         lock.cleanup();
-        assert_eq!(lock.locks.read().len(), 3);
+        assert_eq!(lock.total_len(), 3);
         drop(l1);
         drop(l2);
         lock.cleanup();
-        assert_eq!(lock.locks.read().len(), 1);
+        assert_eq!(lock.total_len(), 1);
         // A different thread is blocked by l3.
         let tlock = lock.clone();
         let blocked = thread::spawn(move || tlock.lock(3, 500).is_some()).join().unwrap();
         assert!(!blocked);
         drop(l3);
         lock.cleanup();
-        assert_eq!(lock.locks.read().len(), 0);
+        assert_eq!(lock.total_len(), 0);
     }
 
     // Regression test for a real bug in the OLD hand-rolled design: the map

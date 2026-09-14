@@ -912,6 +912,20 @@ full test suite still green" — not "a red test now passes."
   eviction-logic investigation; flagged here as a follow-up, not silently dropped.
   Correctness: `store` lib 417/417 (+1 `#[ignore]`d perf test), `squeal-sql` lib 346/346,
   workspace builds clean, stress (mem, 16t) `RESULT: PASS` both before and after, 0 mismatches.
+  **Follow-up, same pass**: disjoint-key's disappointing −11% raised the question of whether the
+  lock-registry map's own single `RwLock` was *itself* a bottleneck the same way `buffer.rs`'s
+  `access_map` needed `ShardedPQ` for — even taken only on `read()`, one `RwLock`'s shared
+  reader-count atomic still bounces across cores under concurrent access. Sharded it (16 shards,
+  `Vec<RwLock<HashMap<...>>>>`, picked by `T`'s own `Hash` rather than `ShardedPQ`'s
+  numeric-key-only `Rem` scheme). Confirmed the hypothesis precisely: `disjoint_keys_concurrent`
+  went from −11% to **−86%** vs. the original design (0.324 ms vs. 2.345 ms) — it was never
+  really about the map's contents, it was the registry lock's own internal state. Same-key
+  contention, unhelped by sharding by construction (every thread wanting the same key still
+  hashes to the same shard), got a bit worse on top of the already-regressed number (+147% vs.
+  original, +16% vs. the unsharded fix) — the cost of one extra hash computation per call with
+  no offsetting benefit for that access pattern. End-to-end stress: still flat (76,924 ops/s).
+  Kept the sharded design: disjoint-page access is the realistic common case and the audit's own
+  stated motivation; full numbers and reasoning in `store/benches/BASELINE.md`'s own P2 section.
 - [ ] **P3** — cache bookkeeping does two `SystemTime::now()` calls + a heap update per page
   access. *(deferred — performance)*
 - [ ] **P5** — inner-node routing clones and decodes every entry on the page.
