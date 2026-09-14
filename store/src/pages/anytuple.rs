@@ -154,6 +154,21 @@ impl PageTuple for AnyTuplePage {
             .and_then(|(_k, v)| v.last())
             .cloned())
     }
+
+    // STORE_AUDIT.md P5: see PageTuple::successor's own comment. `range`
+    // takes `id` by reference directly (BTreeMap::range is generic over
+    // any borrowed form of the key), so this needs no clone of `id`
+    // itself — only the one matched entry (if any) gets cloned, via
+    // `Tuple`'s cheap Arc-backed `data` field.
+    fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        Ok(self
+            .data
+            .range((Excluded(id), Unbounded))
+            .next()
+            .and_then(|(_k, v)| v.first())
+            .cloned())
+    }
 }
 
 #[inline(always)]
@@ -235,6 +250,48 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().data.to_vec(), b"value");
         assert!(p.get(&DBIdType::Int(999)).unwrap().is_none());
+    }
+
+    // STORE_AUDIT.md P5: successor() is the whole point of this fix —
+    // route_to_leaf/remove_index_entry/update_index_entry/insert_recursive
+    // all now depend on it returning exactly "the smallest key strictly
+    // greater than id" via BTreeMap::range, not a linear scan.
+    #[test]
+    fn test_successor_returns_first_key_greater_than_id() {
+        let mut p = make_page();
+        p.add(Tuple::new(1, b"a")).unwrap();
+        p.add(Tuple::new(5, b"b")).unwrap();
+        p.add(Tuple::new(10, b"c")).unwrap();
+        let s = p.successor(&DBIdType::Int(3)).unwrap().unwrap();
+        assert_eq!(s.data.to_vec(), b"b", "successor of 3 must be the entry keyed 5");
+    }
+
+    #[test]
+    fn test_successor_of_an_existing_key_skips_past_it_not_returns_it() {
+        let mut p = make_page();
+        p.add(Tuple::new(5, b"exact")).unwrap();
+        p.add(Tuple::new(10, b"next")).unwrap();
+        let s = p.successor(&DBIdType::Int(5)).unwrap().unwrap();
+        assert_eq!(
+            s.data.to_vec(),
+            b"next",
+            "successor must be strictly greater, never the exact match itself"
+        );
+    }
+
+    #[test]
+    fn test_successor_returns_none_when_id_is_at_or_past_every_key() {
+        let mut p = make_page();
+        p.add(Tuple::new(1, b"a")).unwrap();
+        p.add(Tuple::new(5, b"b")).unwrap();
+        assert!(p.successor(&DBIdType::Int(5)).unwrap().is_none());
+        assert!(p.successor(&DBIdType::Int(99)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_successor_on_an_empty_page_returns_none() {
+        let p = make_page();
+        assert!(p.successor(&DBIdType::Int(1)).unwrap().is_none());
     }
 
     #[test]

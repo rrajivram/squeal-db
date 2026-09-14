@@ -45,4 +45,18 @@ pub trait PageTuple {
     fn first(&self) -> Result<Option<TupleType>, StoreError>;
 
     fn last(&self) -> Result<Option<TupleType>, StoreError>;
+
+    // STORE_AUDIT.md P5: the smallest-keyed tuple whose id is strictly
+    // greater than `id`, or `None` if `id` is >= every key present —
+    // callers combine this with `last()` for that fallthrough case (see
+    // bplustree.rs's route_to_leaf/remove_index_entry/update_index_entry/
+    // insert_recursive, all of which used to answer this exact question
+    // via `values()` — a full clone of every tuple on the page into a
+    // fresh `Vec` — followed by a linear scan decoding each one in turn
+    // until the first match. For an inner-routing page with N entries,
+    // that's an O(N) clone plus up to O(N) `postcard` decodes for what is
+    // structurally a single B-tree range query. `AnyTuplePage` backs this
+    // with `BTreeMap::range`, an O(log N) lookup with no clone of
+    // anything but the one matched entry.
+    fn successor(&self, id: &DBIdType) -> Result<Option<TupleType>, StoreError>;
 }

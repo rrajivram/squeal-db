@@ -698,6 +698,16 @@ impl Page {
         self.inner.read().data.get(&id)
     }
 
+    // STORE_AUDIT.md P5: see PageTuple::successor's own comment — an O(log N)
+    // B-tree range lookup instead of iter()'s O(N) clone-everything-then-scan.
+    pub(crate) fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+        self.inner.read().data.successor(id)
+    }
+
+    pub(crate) fn last(&self) -> Result<Option<Tuple>, StoreError> {
+        self.inner.read().data.last()
+    }
+
     // The one atomic read anything that needs *both* a header and the raw
     // data bytes together should go through — including buffer.rs's
     // write_page, which used to call header()/to_data_bytes()/to_bytes() as

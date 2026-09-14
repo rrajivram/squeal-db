@@ -114,6 +114,10 @@ impl PageTuple for FixedTuplePage {
     fn last(&self) -> Result<Option<Tuple>, StoreError> {
         self.data.last()
     }
+
+    fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+        self.data.successor(id)
+    }
 }
 
 #[cfg(test)]

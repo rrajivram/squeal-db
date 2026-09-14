@@ -1170,8 +1170,55 @@ full test suite still green" — not "a red test now passes."
   other number in this file; this workload isn't bottlenecked on this lock either, sharded or not.
   Full `store` suite: 423 passed, 0 failed (+2 `#[ignore]`d), `squeal-sql --lib`: 346 passed, 0
   failed. Whole workspace builds clean.
-- [ ] **P5** — inner-node routing clones and decodes every entry on the page.
-  *(deferred — performance)*
+- [t-green] **P5** — FIXED, the "clones and scans every entry" half; the "fixed 9-byte `Node`
+  encoding, no `postcard`" half deliberately NOT done, see below. Every inner-node routing decision
+  (`route_to_leaf`, `remove_index_entry`, `update_index_entry`, `insert_recursive`'s split-target
+  scan — 4 call sites) answered "which child covers this key" by calling `Page::iter()`, which
+  clones EVERY tuple on the page into a fresh `Vec` (`AnyTuplePage::values()`), then linearly
+  scanned that `Vec`, `postcard`-decoding each entry's `Node` in turn until the first one whose key
+  exceeded the search key. For an inner page with N entries, that's an O(N) clone plus up to O(N)
+  decodes to answer what is structurally a single B-tree range query — and P4's own fanout increase
+  (64→48 `MAX_ENTRY_BYTES`) made N bigger for the same `page_size`, raising this cost further.
+  Fix: added `PageTuple::successor(&id) -> Option<Tuple>` — "the smallest-keyed tuple whose id is
+  strictly greater than `id`" — backed by `BTreeMap::range((Excluded(id), Unbounded)).next()` in
+  `AnyTuplePage` (O(log N), clones only the one matched entry), delegated in `FixedTuplePage`
+  (index pages), and an honest linear scan in `RunPage`/`TestBucketPage` (never actually used for
+  B+tree routing — those two have no positional ordering to exploit, same treatment their other
+  `PageTuple` methods already get). Added a plain `Page::successor`/`Page::last` pass-through (the
+  already-existing `PageTuple::last()` had never been wired up to `Page`'s own API before this).
+  All 4 call sites now do `page.successor(id)?.or_else(|| page.last())?` — `successor` alone for
+  the common "found a bounding entry" case, `last()` (also O(log N), no clone — B+tree ids ascend
+  in page-iteration order, so "successor is None" only happens once, at the end of the page) for
+  the fallthrough case (`id` >= every entry, route to the last child) the old linear scan's
+  `last_child` tracking used to cover.
+  Tests: 4 new unit tests directly on `AnyTuplePage::successor` (first-greater-than semantics,
+  skips-the-exact-match-itself, `None` at/past every key, `None` on an empty page). Confirmed
+  meaningful: temporarily changed the range bound from `Excluded` to `Included` (making successor
+  wrongly return an exact match instead of skipping past it), confirmed 2 of the 4 tests fail;
+  restored, confirmed all 4 pass. The full pre-existing `bplustree.rs` suite (430 tests, including
+  multi-level-split/leaf-chain-ordering/shallow-tree tests that exercise all 4 rewritten call sites
+  transitively) stayed green throughout — no behavioral change, only how the same answer gets
+  computed.
+  Throwaway (not a committed criterion bench) wall-clock measurement, `tables::bplustree::tests::
+  bench_find_traversal_cost`, `#[ignore]`d: 20,000 scattered `find()` lookups over a 20,000-row
+  tree at a 16 KiB page size (to approach the audit's own `nodes_per_page ≈ 256` reference case).
+  Before (clone-and-scan): 726K-877K lookups/s (3 runs). After (successor-based range query):
+  3.02M-3.42M lookups/s (3 runs) — roughly 3.5-4x.
+  **End-to-end stress (mem, 16t): 89,517 (post-P4) → 107,254-107,308 ops/s (3 runs) — another
+  genuine, reproducible ~20% improvement, stacking on P4's own ~16.5%.** Cumulative from this
+  whole pass's original 76,873 ops/s baseline: **+39.5%**. The second fix in this pass (after P4)
+  to move the E2E number — makes sense given how central `route_to_leaf` is: every single
+  `find`/`insert`/`update`/`remove` walks it at least once.
+  Full `store` suite: 430 passed, 0 failed (+6 `#[ignore]`d total this session), `squeal-sql --lib`:
+  346 passed, 0 failed. Whole workspace builds clean.
+  **Deliberately NOT done**: the audit's other stated P5 lever, storing `Node` as "a fixed 9-byte
+  encoding that can be read without postcard." With `successor` in place, each routing decision
+  now does exactly ONE `from_bytes::<Node>` call per tree level (down from up to N-per-level) —
+  the O(N)→O(1) fix above already captures the overwhelming majority of the win the audit
+  describes; a fixed-layout `Node` would only shave the cost of that one remaining decode per
+  level, a much smaller marginal return for a genuine on-disk format change to every routing
+  entry's payload. Not implemented in this pass — a reasonable candidate for later if profiling
+  ever shows the remaining single decode as a real bottleneck, but not chased speculatively here.
 - [ ] **S9** — resource exhaustion knobs: no cap on tuple count/undo trail/active txns;
   `retry_on_contention`'s timeout isn't honored (hardcoded 60s `ArcLock` wait);
   `begin()`'s inline checkpoint check costs two `fstat`s per call.

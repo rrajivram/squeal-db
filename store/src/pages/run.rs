@@ -106,6 +106,20 @@ impl PageTuple for RunPage {
     fn last(&self) -> Result<Option<Tuple>, StoreError> {
         Ok(self.data.last().cloned())
     }
+
+    // A Run has no real per-tuple key (see this module's own doc comment)
+    // — same honest-linear-scan treatment as get/contains/replace/remove
+    // above, since crate::run::Run never actually calls this (a Run is
+    // never used as a B+tree index page, the only real caller of
+    // successor()).
+    fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+        Ok(self
+            .data
+            .iter()
+            .filter(|t| t.id > *id)
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .cloned())
+    }
 }
 
 #[cfg(test)]

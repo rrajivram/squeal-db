@@ -896,41 +896,39 @@ where
             if !page.is_flag_set(INNER_NODE) {
                 return Ok(page);
             }
-            let mut last_child: Option<PageId> = None;
-            let mut matched_child: Option<PageId> = None;
-            for row in page.iter() {
-                if *id < row.id {
-                    let node = from_bytes::<Node>(&row.data)?;
-                    if let Node::Inner(page_num) = node {
-                        matched_child = Some(page_num);
-                        break;
-                    } else {
-                        // STORE_AUDIT.md S8: this page's own INNER_NODE
-                        // flag disagrees with this entry's actual content
-                        // — every real write path keeps these in sync, so
-                        // this can only mean a corrupted or hand-crafted
-                        // on-disk file. A panic here would be a process
-                        // crash for the host; surface it as a typed error.
-                        return Err(StoreError::Corruption(format!(
-                            "expected an inner routing entry, found a leaf entry at {:?}",
-                            row.id
-                        )));
-                    }
+            // STORE_AUDIT.md P5: successor(id) is the first entry whose key
+            // exceeds id — an O(log N) B-tree range lookup replacing the old
+            // O(N) clone-every-tuple-then-linear-decode-scan (`page.iter()`
+            // → `values()`). Falls back to last() (still O(log N), no
+            // clone) when id >= every entry, matching the old loop's
+            // last_child fallthrough: non-root inner nodes have no
+            // u64::MAX sentinel, so the last child covers everything from
+            // its own separator up to the parent's upper bound.
+            let entry = match page.successor(id)? {
+                Some(entry) => entry,
+                None => match page.last()? {
+                    Some(entry) => entry,
+                    // An INNER_NODE page always has at least one Node::Inner
+                    // entry (routing pages are never created empty) — this
+                    // is here so the match is exhaustive, not because it's
+                    // expected to happen.
+                    None => return Ok(page),
+                },
+            };
+            current = match from_bytes::<Node>(&entry.data)? {
+                Node::Inner(page_num) => page_num,
+                // STORE_AUDIT.md S8: this page's own INNER_NODE flag
+                // disagrees with this entry's actual content — every real
+                // write path keeps these in sync, so this can only mean a
+                // corrupted or hand-crafted on-disk file. A panic here
+                // would be a process crash for the host; surface it as a
+                // typed error.
+                Node::Leaf(_) => {
+                    return Err(StoreError::Corruption(format!(
+                        "expected an inner routing entry, found a leaf entry at {:?}",
+                        entry.id
+                    )));
                 }
-                let node = from_bytes::<Node>(&row.data)?;
-                if let Node::Inner(page_num) = node {
-                    last_child = Some(page_num);
-                }
-            }
-            // id >= all entry bounds: route to the last child.
-            // Non-root inner nodes have no u64::MAX sentinel; the last child
-            // covers all keys from its separator up to the parent's upper bound.
-            current = match matched_child.or(last_child) {
-                Some(child) => child,
-                // An INNER_NODE page always has at least one Node::Inner entry
-                // (routing pages are never created empty) — this is here so
-                // the match is exhaustive, not because it's expected to happen.
-                None => return Ok(page),
             };
         }
     }
@@ -1039,31 +1037,26 @@ where
         let handle = self.buffer.get_page_mut(start)?;
         drop(parent);
         if handle.page.is_flag_set(INNER_NODE) {
-            let mut last_child: Option<PageId> = None;
-            for row in handle.page.iter() {
-                if id < row.id {
-                    if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
-                        return self.remove_index_entry(id, page_num, Some(handle));
-                    } else {
-                        // STORE_AUDIT.md S8: see route_to_leaf's identical
-                        // comment.
-                        return Err(StoreError::Corruption(format!(
-                            "expected an inner routing entry, found a leaf entry at {:?}",
-                            row.id
-                        )));
-                    }
-                }
-                if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
-                    last_child = Some(page_num);
-                }
+            // STORE_AUDIT.md P5: see route_to_leaf's identical comment.
+            let entry = match handle.page.successor(&id)? {
+                Some(entry) => entry,
+                // id >= all separators: route to the last child (same
+                // fallthrough as route_to_leaf). Without this, a key in the
+                // rightmost child of a non-root inner node would never have
+                // its index entry removed.
+                None => match handle.page.last()? {
+                    Some(entry) => entry,
+                    None => return Ok(()),
+                },
+            };
+            match from_bytes::<Node>(&entry.data)? {
+                Node::Inner(page_num) => self.remove_index_entry(id, page_num, Some(handle)),
+                // STORE_AUDIT.md S8: see route_to_leaf's identical comment.
+                Node::Leaf(_) => Err(StoreError::Corruption(format!(
+                    "expected an inner routing entry, found a leaf entry at {:?}",
+                    entry.id
+                ))),
             }
-            // id >= all separators: route to the last child (same fallthrough as
-            // find_page). Without this, a key in the rightmost child of a
-            // non-root inner node would never have its index entry removed.
-            if let Some(child) = last_child {
-                return self.remove_index_entry(id, child, Some(handle));
-            }
-            Ok(())
         } else {
             // Tolerate an already-absent entry: a concurrent path may have
             // removed it, or a committed tombstone was reclaimed elsewhere.
@@ -1096,35 +1089,24 @@ where
         let handle = self.buffer.get_page_mut(start)?;
         drop(parent);
         if handle.page.is_flag_set(INNER_NODE) {
-            let mut last_child: Option<PageId> = None;
-            for row in handle.page.iter() {
-                if id < row.id {
-                    if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
-                        return self.update_index_entry(
-                            id,
-                            new_page_id,
-                            txn,
-                            page_num,
-                            Some(handle),
-                            lsn,
-                        );
-                    } else {
-                        // STORE_AUDIT.md S8: see route_to_leaf's identical
-                        // comment.
-                        return Err(StoreError::Corruption(format!(
-                            "expected an inner routing entry, found a leaf entry at {:?}",
-                            row.id
-                        )));
-                    }
+            // STORE_AUDIT.md P5: see route_to_leaf's identical comment.
+            let entry = match handle.page.successor(&id)? {
+                Some(entry) => entry,
+                None => match handle.page.last()? {
+                    Some(entry) => entry,
+                    None => return Ok(()),
+                },
+            };
+            match from_bytes::<Node>(&entry.data)? {
+                Node::Inner(page_num) => {
+                    self.update_index_entry(id, new_page_id, txn, page_num, Some(handle), lsn)
                 }
-                if let Node::Inner(page_num) = from_bytes::<Node>(&row.data)? {
-                    last_child = Some(page_num);
-                }
+                // STORE_AUDIT.md S8: see route_to_leaf's identical comment.
+                Node::Leaf(_) => Err(StoreError::Corruption(format!(
+                    "expected an inner routing entry, found a leaf entry at {:?}",
+                    entry.id
+                ))),
             }
-            if let Some(child) = last_child {
-                return self.update_index_entry(id, new_page_id, txn, child, Some(handle), lsn);
-            }
-            Ok(())
         } else {
             // STORE_AUDIT.md P4: see insert_index's identical comment.
             let new_entry = Tuple::new_with(
@@ -1271,14 +1253,18 @@ where
             // levels deep (a non-root inner node exists); the root always
             // carries a u64::MAX sentinel as its last entry (see
             // update_root_page), so real ids never run off the end there.
-            let mut rows = handle.page.iter();
-            let mut row_id = rows.next().unwrap();
-            while tuple.id >= row_id.id {
-                match rows.next() {
-                    Some(next) => row_id = next,
-                    None => break,
-                }
-            }
+            // STORE_AUDIT.md P5: see route_to_leaf's identical comment —
+            // successor(id), falling back to last() when tuple.id is >=
+            // every row, is exactly "the first row whose id exceeds the
+            // search key, or the last row if none does" the old
+            // clone-and-scan loop computed by hand.
+            let row_id = match handle.page.successor(&tuple.id)? {
+                Some(row) => row,
+                None => handle
+                    .page
+                    .last()?
+                    .expect("INNER_NODE page must have at least one entry"),
+            };
             let node = from_bytes::<Node>(&row_id.data)?;
             if let Node::Inner(p) = node {
                 match self.split_if_needed(p, &tuple, lsn)? {
@@ -3119,6 +3105,44 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::Corruption(_))),
             "expected StoreError::Corruption, got {result:?}"
+        );
+    }
+
+    // STORE_AUDIT.md P5 — throwaway (not a committed criterion bench, same
+    // call as this session's other direct microbenchmarks) wall-clock
+    // measurement of route_to_leaf's traversal cost. A big page_size (to
+    // approach the audit's own nodes_per_page ~256 reference case) with
+    // many rows forces real multi-level depth, so this exercises repeated
+    // full root-to-leaf walks, not a single-level page. Run the identical
+    // test text against this revision and against `git show <pre-fix>:
+    // store/src/tables/bplustree.rs` (patched with this same fn) to get a
+    // before/after comparison — see BASELINE.md.
+    #[test]
+    #[ignore]
+    fn bench_find_traversal_cost() {
+        const ROWS: u64 = 20_000;
+        const LOOKUPS: u64 = 20_000;
+        let page_size = 16 * 1024;
+        let tree = make_tree(page_size);
+        for i in 1..=ROWS {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+        let start = std::time::Instant::now();
+        // Scattered, not sequential, so this doesn't just retrace the same
+        // cached root-to-leaf path every time.
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        for _ in 0..LOOKUPS {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let id = 1 + (state % ROWS);
+            tree.find(DBIdType::Int(id)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "bench_find_traversal_cost: {LOOKUPS} lookups over {ROWS} rows (page_size={page_size}) \
+             in {elapsed:?} ({:.0} lookups/s)",
+            LOOKUPS as f64 / elapsed.as_secs_f64()
         );
     }
 }

@@ -2429,6 +2429,15 @@ mod tests {
         fn last(&self) -> Result<Option<Tuple>, StoreError> {
             Ok(self.tuples.last().cloned())
         }
+
+        fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
+            Ok(self
+                .tuples
+                .iter()
+                .filter(|t| t.id > *id)
+                .min_by(|a, b| a.id.cmp(&b.id))
+                .cloned())
+        }
     }
 
     impl TestBucketPage {

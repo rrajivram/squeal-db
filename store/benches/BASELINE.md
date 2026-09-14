@@ -498,6 +498,45 @@ logical counter rather than a wall-clock nanosecond timestamp: postcard's varint
 runtime value, not the declared width, so a `u128` holding a small counter already encodes
 byte-identically to a `u64` holding the same value. See `audit-progress.md`'s P4 entry.
 
+## Result — STORE_AUDIT.md P5: successor() instead of clone-every-tuple-then-linear-scan
+
+Every inner-node routing decision (`route_to_leaf`, `remove_index_entry`, `update_index_entry`,
+`insert_recursive`'s split-target scan) answered "which child covers this key" via `Page::iter()`
+— clones EVERY tuple on the page into a `Vec`, then linearly scans it, `postcard`-decoding each
+entry until the first match. O(N) clone + up to O(N) decodes for what's structurally one B-tree
+range query; P4's own fanout increase made N bigger for the same page_size, raising this cost
+further.
+
+Fix: `PageTuple::successor(&id)` — "smallest key strictly greater than id" — backed by
+`BTreeMap::range((Excluded(id), Unbounded)).next()` in `AnyTuplePage` (O(log N), clones only the
+matched entry). All 4 call sites now do `successor(id).or_else(last)` (both O(log N), no
+full-page clone) instead of the old scan.
+
+Throwaway (not a committed criterion bench) wall-clock measurement, `tables::bplustree::tests::
+bench_find_traversal_cost`: 20,000 scattered `find()` lookups over a 20,000-row tree at a 16 KiB
+page size (approaching the audit's own `nodes_per_page ≈ 256` reference case):
+
+| revision | lookups/s (3 runs) |
+|---|---|
+| before (clone-and-scan) | 726K / 860K / 877K |
+| after (successor-based range query) | 3.02M / 3.06M / 3.42M |
+
+Roughly 3.5-4x.
+
+**End-to-end** (`examples/stress --threads 16 --ops 20000 --backend mem`): **89,517 (post-P4) →
+107,254-107,308 ops/s (3 runs) — another genuine ~20% improvement, stacking on P4's own ~16.5%.
+Cumulative from this whole performance pass's original 76,873 ops/s baseline: +39.5%.** Makes
+sense given how central `route_to_leaf` is — every `find`/`insert`/`update`/`remove` walks it.
+
+Correctness: `store` lib 430/430 (+6 `#[ignore]`d total this session), `squeal-sql` lib 346/346,
+workspace builds clean, stress `RESULT: PASS`, 0 mismatches.
+
+Deliberately not done: the audit's other suggested P5 lever, a fixed 9-byte `Node` encoding
+readable without `postcard`. `successor` already cuts each routing decision to exactly one
+`from_bytes::<Node>` call per tree level (down from up to N) — the O(N)→O(1) fix above already
+captures the large majority of the win; a fixed layout would only shave that one remaining decode,
+a much smaller marginal return for a genuine on-disk format change. See `audit-progress.md`.
+
 ## How to compare after a change
 
 1. Micro:  `cargo bench -p store --bench page_store` (or `--bench arclock`) →
