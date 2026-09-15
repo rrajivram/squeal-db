@@ -8,7 +8,7 @@ use crate::{
     db::{DBFile, DBSizeType, Db},
     error::StoreError,
     page::{Page, PageId, PageTupleIterator, USABLE_DATA_MARGIN},
-    tuple::Tuple,
+    tuple::{DBIdType, Tuple},
 };
 
 /// The actual owner of a run's on-disk page chain — held behind an `Arc`
@@ -78,6 +78,25 @@ where
 {
     pub(crate) fn create(buffer: Arc<PageBuffer<F>>) -> Result<Self, StoreError> {
         let head = buffer.alloc_run_page()?;
+        Ok(Self {
+            pages: Arc::new(RunPages { buffer, head }),
+            tail: head,
+            pg_count: 1,
+            page_ids: vec![head],
+        })
+    }
+
+    // STORE_AUDIT.md P6 — like `create`, but every page this run ever
+    // allocates (this head page, and any grown via `new_slotted_page`)
+    // is backed by `SlottedPage` instead of `RunPage` — see
+    // `new_slotted_page`'s own comment for the access pattern this is
+    // for. A caller must pick one page kind for a whole run up front:
+    // mixing `new_page` (RunPage) and `new_slotted_page` (SlottedPage)
+    // pages within the same run works mechanically (each page tracks its
+    // own content kind) but isn't a scenario anything here is designed
+    // or tested for.
+    pub(crate) fn create_slotted(buffer: Arc<PageBuffer<F>>) -> Result<Self, StoreError> {
+        let head = buffer.alloc_slotted_page()?;
         Ok(Self {
             pages: Arc::new(RunPages { buffer, head }),
             tail: head,
@@ -161,6 +180,29 @@ where
         Ok(self.tail)
     }
 
+    /// Like `new_page`, but the new page is backed by `SlottedPage`
+    /// (STORE_AUDIT.md P6) instead of `RunPage` — individually
+    /// addressable, in-place-mutable slots (`get_slot_at`/`set_slot_at`/
+    /// `slots_at`) instead of one opaque append-only blob per page
+    /// (`set_content_at`/`get_content_at`). For a caller with a fixed,
+    /// page-per-bucket-range layout (e.g. a hash index mapping bucket
+    /// number to a specific page and slot within it) that mutates
+    /// individual slots repeatedly, rather than rewriting a whole page's
+    /// content atomically on every change. See `slotted.rs`'s own doc
+    /// comment for the cost this avoids: `set_content_at`/`get_content_at`
+    /// round-trip the WHOLE page's content through the caller's own
+    /// encoding on every touch — fine for "write it once, read it back
+    /// whole later," expensive for "mutate one small piece of it, over
+    /// and over."
+    pub fn new_slotted_page(&mut self) -> Result<PageId, StoreError> {
+        let new_id = self.pages.buffer.alloc_slotted_page()?;
+        self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
+        self.tail = new_id;
+        self.pg_count += 1;
+        self.page_ids.push(new_id);
+        Ok(self.tail)
+    }
+
     pub fn page_count(&self) -> usize {
         self.pg_count
     }
@@ -227,6 +269,66 @@ where
             .ok_or(StoreError::RunPageIndexOutOfRange(index, self.page_ids.len()))?;
         let page = self.pages.buffer.get_page(page_id)?;
         Ok(page.iter().next().map(|t| t.data().to_vec()))
+    }
+
+    /// Reads back one slot's raw bytes from a page allocated via
+    /// `new_slotted_page`/`create_slotted` — `None` if that exact slot id
+    /// has never been written (a slotted page's own way of representing
+    /// "empty," no `Option` wrapper needed in the caller's own encoding
+    /// the way `set_content_at`'s one-blob-per-page model required). Only
+    /// ever decodes the ONE slot asked for, not the whole page — the
+    /// point of this over `get_content_at`.
+    pub fn get_slot_at(&self, page_index: usize, slot: u64) -> Result<Option<Vec<u8>>, StoreError> {
+        let page_id = *self
+            .page_ids
+            .get(page_index)
+            .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
+        let page = self.pages.buffer.get_page(page_id)?;
+        Ok(page.get(DBIdType::Int(slot))?.map(|t| t.data().to_vec()))
+    }
+
+    /// Writes `data` as slot `slot`'s content on a page allocated via
+    /// `new_slotted_page`/`create_slotted` — write-once: errors (via
+    /// `StoreError::DuplicateKey`) if this exact slot already holds
+    /// something, since every known caller (a hash index's open-
+    /// addressing scheme, which only ever claims a slot once) treats a
+    /// slot as immutable once set. Only touches this one slot's own
+    /// bytes, not the whole page — the point of this over
+    /// `set_content_at`.
+    pub fn set_slot_at(&self, page_index: usize, slot: u64, data: &[u8]) -> Result<(), StoreError> {
+        let page_id = *self
+            .page_ids
+            .get(page_index)
+            .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
+        let handle = self.pages.buffer.get_page_mut(page_id)?;
+        handle.page.add_tuple(Tuple::new(slot, data))?;
+        self.pages.buffer.write_locked_page(handle)?;
+        Ok(())
+    }
+
+    /// Every occupied slot's `(slot id, raw bytes)` on a page allocated
+    /// via `new_slotted_page`/`create_slotted`, in ascending slot-id
+    /// order — the batch-read counterpart to `get_slot_at`, for a caller
+    /// sweeping a whole page's live entries at once (e.g. a hash index's
+    /// unmatched-left scan) rather than probing one slot at a time.
+    /// Empty slots cost nothing to skip — unlike `get_content_at`'s
+    /// one-blob model, an unoccupied slot was never written at all, not
+    /// an `Option::None` that still has to be decoded to find out.
+    pub fn slots_at(&self, page_index: usize) -> Result<Vec<(u64, Vec<u8>)>, StoreError> {
+        let page_id = *self
+            .page_ids
+            .get(page_index)
+            .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
+        let page = self.pages.buffer.get_page(page_id)?;
+        Ok(page
+            .iter()
+            .map(|t| {
+                let DBIdType::Int(slot) = t.id else {
+                    panic!("slotted Run pages are always Int-keyed by slot number")
+                };
+                (slot, t.data().to_vec())
+            })
+            .collect())
     }
 
     /// A fresh cursor over this run's own pages, starting from its head.
@@ -538,6 +640,81 @@ mod tests {
         assert!(
             matches!(err, crate::error::StoreError::RunPageIndexOutOfRange(5, 1)),
             "expected RunPageIndexOutOfRange(5, 1), got {err:?}"
+        );
+    }
+
+    // STORE_AUDIT.md P6 — sanity coverage for the new slotted-page Run
+    // API before wiring anything real (squeal-sql's HashedSource) on top
+    // of it.
+    #[test]
+    fn test_slot_at_round_trip_and_empty_slot_is_none() {
+        let db = Db::<MemFile>::create("run_slot_round_trip.db").unwrap();
+        let run = db.create_slotted_run().unwrap();
+
+        assert_eq!(
+            run.get_slot_at(0, 3).unwrap(),
+            None,
+            "an unwritten slot must read back as None, not an error"
+        );
+
+        run.set_slot_at(0, 3, b"hello").unwrap();
+        assert_eq!(run.get_slot_at(0, 3).unwrap(), Some(b"hello".to_vec()));
+        // A different slot on the same page stays untouched.
+        assert_eq!(run.get_slot_at(0, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn test_set_slot_at_twice_on_the_same_slot_errors() {
+        let db = Db::<MemFile>::create("run_slot_duplicate.db").unwrap();
+        let run = db.create_slotted_run().unwrap();
+        run.set_slot_at(0, 1, b"first").unwrap();
+        let err = run.set_slot_at(0, 1, b"second").unwrap_err();
+        assert!(
+            matches!(err, crate::error::StoreError::DuplicateKey(_)),
+            "expected DuplicateKey, got {err:?}"
+        );
+        // The original value must survive the failed overwrite attempt.
+        assert_eq!(run.get_slot_at(0, 1).unwrap(), Some(b"first".to_vec()));
+    }
+
+    #[test]
+    fn test_slots_at_returns_only_occupied_slots_in_ascending_order() {
+        let db = Db::<MemFile>::create("run_slots_at.db").unwrap();
+        let run = db.create_slotted_run().unwrap();
+        // Written out of order — slots_at must still come back sorted.
+        run.set_slot_at(0, 5, b"five").unwrap();
+        run.set_slot_at(0, 1, b"one").unwrap();
+        run.set_slot_at(0, 3, b"three").unwrap();
+
+        let got = run.slots_at(0).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                (1, b"one".to_vec()),
+                (3, b"three".to_vec()),
+                (5, b"five".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_new_slotted_page_grows_the_run_and_keeps_pages_independently_addressable() {
+        let db = Db::<MemFile>::create("run_new_slotted_page.db").unwrap();
+        let mut run = db.create_slotted_run().unwrap();
+        assert_eq!(run.page_count(), 1);
+
+        run.new_slotted_page().unwrap();
+        assert_eq!(run.page_count(), 2);
+
+        run.set_slot_at(0, 0, b"page zero slot zero").unwrap();
+        run.set_slot_at(1, 0, b"page one slot zero").unwrap();
+        assert_eq!(
+            run.get_slot_at(0, 0).unwrap(),
+            Some(b"page zero slot zero".to_vec())
+        );
+        assert_eq!(
+            run.get_slot_at(1, 0).unwrap(),
+            Some(b"page one slot zero".to_vec())
         );
     }
 }

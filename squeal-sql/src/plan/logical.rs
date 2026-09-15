@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 
 use parking_lot::RwLock;
 use sql_parser::{
@@ -55,6 +55,7 @@ pub(crate) struct LogicalPlan<F: DBFile> {
     // a caller already builds a step (e.g. TableSource::new) with
     // whatever else it needs before handing it off.
     mem: Arc<QueryMemory>,
+    start: Instant,
     _phanton: PhantomData<F>,
 }
 
@@ -767,11 +768,13 @@ where
         Self {
             tail: None,
             mem: QueryMemory::new(limit),
+            start: Instant::now(),
             _phanton: PhantomData,
         }
     }
 
     pub(crate) fn build(conn: Arc<Connection<F>>, query: &Query) -> Result<Self, SchemaError> {
+        let start = Instant::now();
         let mem = QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT);
         let mut visitor = QueryVisitor::new(conn.clone(), mem.clone());
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
@@ -780,6 +783,7 @@ where
         let mut this = Self {
             tail: None,
             mem,
+            start,
             _phanton: PhantomData,
         };
         assert!(visitor.steps.len() == 1);
@@ -807,7 +811,7 @@ where
             .tail
             .take()
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
-        Ok(StreamingResultSet::new(tail))
+        Ok(StreamingResultSet::new(tail, self.start))
     }
 }
 

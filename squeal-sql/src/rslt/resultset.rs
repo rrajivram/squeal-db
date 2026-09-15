@@ -2,7 +2,10 @@ use std::time::Instant;
 
 use store::valueitem::{IndexKey, ValueItem};
 
-use crate::{error::SchemaError, source::Source};
+use crate::{
+    error::SchemaError,
+    source::{QueryStats, Source},
+};
 
 // Neither this nor ResultType below needs a DBFile type parameter —
 // rows are materialized eagerly (see Schema::select_all), so a
@@ -22,10 +25,10 @@ pub struct StreamingResultSet {
 }
 
 impl StreamingResultSet {
-    pub(crate) fn new(begin: Box<dyn Source>) -> Self {
+    pub(crate) fn new(begin: Box<dyn Source>, start: Instant) -> Self {
         Self {
             begin,
-            start: Instant::now(),
+            start,
             count: 0,
         }
     }
@@ -47,19 +50,21 @@ impl StreamingResultSet {
     }
 
     pub fn next_result(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        self.start = Instant::now();
         self.count += 1;
         self.begin.as_mut().next()
     }
 
     pub fn next_result_as_strings(&mut self) -> Result<Option<Vec<String>>, SchemaError> {
-        self.start = Instant::now();
         self.count += 1;
         Ok(self
             .begin
             .as_mut()
             .next()?
             .map(|i| i.values().iter().map(|n| n.to_string()).collect::<Vec<_>>()))
+    }
+
+    pub fn get_query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        self.begin.stats()
     }
 }
 

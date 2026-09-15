@@ -858,6 +858,22 @@ where
         Ok(page_num)
     }
 
+    // STORE_AUDIT.md P6 — mirrors alloc_run_page exactly, but for a
+    // SlottedPage-backed page (see Page::new_slotted's own comment).
+    pub(crate) fn alloc_slotted_page(&self) -> Result<PageId, StoreError> {
+        let page_num = match self.free_pages.write().pop() {
+            Some(page) => page,
+            None => self
+                .page_count
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                .into(),
+        };
+        let mut p = Page::new_slotted(self.header.page_size);
+        p.set_clock(self.clock.clone());
+        self.write_page(page_num, &p)?;
+        Ok(page_num)
+    }
+
     pub(crate) fn get_page(&self, page_num: PageId) -> Result<Arc<Page>, StoreError> {
         let valid = page_num
             < self

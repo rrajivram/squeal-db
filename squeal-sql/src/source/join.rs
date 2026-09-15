@@ -181,6 +181,10 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.source.reset()
     }
+
+    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+        self.source.stats()
+    }
 }
 
 impl UnionJoin {

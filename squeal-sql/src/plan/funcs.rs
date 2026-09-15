@@ -18,9 +18,9 @@ use crate::{
 
 pub(crate) trait FuncTrait: Debug {
     fn name(&self) -> String;
-    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError>;
+    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError>;
     fn is_aggregate(&self) -> bool;
-    fn reset(&self) -> Result<(), SchemaError>;
+    fn reset(&mut self) -> Result<(), SchemaError>;
     fn fields(&self) -> Vec<usize>;
     /// The function's current accumulated value, without feeding it
     /// another row the way `eval` would. Only needed for a grand-total
@@ -96,7 +96,7 @@ impl FuncTrait for FuncObj {
         }
     }
 
-    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
         match self {
             FuncObj::Count(c) => c.eval(args),
         }
@@ -108,7 +108,7 @@ impl FuncTrait for FuncObj {
         }
     }
 
-    fn reset(&self) -> Result<(), SchemaError> {
+    fn reset(&mut self) -> Result<(), SchemaError> {
         match self {
             FuncObj::Count(c) => c.reset(),
         }
@@ -130,10 +130,10 @@ impl FuncTrait for FuncObj {
 #[derive(Debug)]
 pub(crate) struct Count {
     name: String,
-    values: Arc<RwLock<HashSet<ValueItem>>>,
+    values: HashSet<ValueItem>,
     distinct: bool,
     args: FuncArgs,
-    count: AtomicUsize,
+    count: usize,
 }
 
 impl Count {
@@ -155,29 +155,27 @@ impl Count {
         }
         let mut args = args;
         Ok(Self {
-            values: Arc::new(RwLock::new(HashSet::new())),
+            values: HashSet::new(),
             args: args.pop().unwrap(),
             distinct,
-            count: AtomicUsize::new(0),
+            count: 0,
             name,
         })
     }
 }
 
 impl FuncTrait for Count {
-    fn eval(&self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
         let res = if self.distinct {
-            let item = match &self.args {
+            let item = match &mut self.args {
                 FuncArgs::Field(exp) => exp.eval(args, 0)?,
                 FuncArgs::Wildcard => ValueItem::Integer(1),
             };
-            let mut v = self.values.write();
-            v.insert(item);
-            v.len()
+            self.values.insert(item);
+            self.values.len()
         } else {
+            self.count += 1;
             self.count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1
         };
         Ok(ValueItem::Integer(res as i64))
     }
@@ -190,9 +188,9 @@ impl FuncTrait for Count {
         "count".into()
     }
 
-    fn reset(&self) -> Result<(), SchemaError> {
-        self.count.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.values.write().clear();
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        self.count = 0;
+        self.values.clear();
         Ok(())
     }
 
@@ -202,9 +200,9 @@ impl FuncTrait for Count {
 
     fn current(&self) -> ValueItem {
         let res = if self.distinct {
-            self.values.read().len()
+            self.values.len()
         } else {
-            self.count.load(std::sync::atomic::Ordering::Relaxed)
+            self.count
         };
         ValueItem::Integer(res as i64)
     }
@@ -216,7 +214,7 @@ impl Clone for Count {
             values: self.values.clone(),
             args: self.args.clone(),
             distinct: self.distinct,
-            count: AtomicUsize::new(self.count.load(std::sync::atomic::Ordering::Relaxed)),
+            count: self.count,
             name: self.name.clone(),
         }
     }

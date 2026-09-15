@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Instant,
+};
 
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
@@ -13,7 +17,7 @@ use crate::{
     ds::bitvec::BitVec,
     error::SchemaError,
     plan::memory::QueryMemory,
-    source::{ProjectableField, Source, join::JoinType},
+    source::{ProjectableField, QueryStats, Source, join::JoinType, merge_stats},
 };
 
 pub(crate) struct HashedSource<F: DBFile + 'static> {
@@ -69,14 +73,32 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     // right_exhausted): which page/slot next_unmatched_left is
     // currently scanning, and that page's cached decoded content.
     sweep_page: usize,
+    // Index into sweep_page_data (a compacted list of only the OCCUPIED
+    // slots on sweep_page, in ascending slot-id order — see
+    // Run::slots_at), not the raw slot id itself. STORE_AUDIT.md P6: the
+    // slot id each entry actually lives at is carried alongside it (the
+    // `u64` in the tuple below), since it's no longer implied by
+    // position the way indexing into a full Vec<Option<HashValue>> used
+    // to make it.
     sweep_row: usize,
-    sweep_page_data: Option<Vec<Option<HashValue>>>,
+    sweep_page_data: Option<Vec<(u64, HashValue)>>,
+    left_time: u128,
+    next_time: u128,
+    probe_time: u128,
+    rehash_time: u128,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+// STORE_AUDIT.md P6: `left_value` used to be `Option<IndexKey>` even
+// though every real write path only ever stored `Some(item)` — a slot's
+// mere PRESENCE on the page already meant "occupied" (see `bitmask`),
+// so the `Option` inside the payload was redundant. Now that occupancy
+// is answered by whether `Run::get_slot_at` returns anything at all
+// (see `insert_with_hash`/`probe_matches`), there's nothing left for it
+// to disambiguate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct HashValue {
     hash: u64,
-    left_value: Option<IndexKey>,
+    left_value: IndexKey,
 }
 
 impl<F: DBFile + 'static> HashedSource<F> {
@@ -103,7 +125,8 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        let left_null = IndexKey::new_from_owned(vec![ValueItem::Null; left_source.fields().len()])?;
+        let left_null =
+            IndexKey::new_from_owned(vec![ValueItem::Null; left_source.fields().len()])?;
         let right_null =
             IndexKey::new_from_owned(vec![ValueItem::Null; right_source.fields().len()])?;
         let (run, records_per_page, num_pages) = Self::allocate_run(&db, record_size, 1)?;
@@ -132,15 +155,33 @@ impl<F: DBFile + 'static> HashedSource<F> {
             sweep_page: 0,
             sweep_row: 0,
             sweep_page_data: None,
+            next_time: 0,
+            left_time: 0,
+            probe_time: 0,
+            rehash_time: 0,
         })
     }
 
-    // Creates a Run with enough pages to hold at least `min_capacity`
-    // slots, every page pre-initialized to `records_per_page` empty
-    // (`None`) slots — mirrors what a prior version of this used a
-    // dedicated Run::new_from for (creating and initializing every page
-    // up front); reimplemented here via new_page() + set_content_at()
-    // now that Run's own API only ever creates a single page up front.
+    // STORE_AUDIT.md P6: per-slot overhead for a SlottedPage-backed run
+    // page — a fixed slot-directory entry (kept in sync by hand with
+    // store::pages::slotted's own SLOT_ENTRY_BYTES, which is private to
+    // that crate) plus Tuple/postcard framing for a HashValue payload
+    // (an id varint, None txn_id/pre_lsn, a flags byte, a data-length
+    // prefix, and the `hash: u64` field itself — usually close to its
+    // 10-byte varint worst case, since a real hash is close to uniform).
+    // Deliberately generous rather than tight: getting this wrong just
+    // means `records_per_page` under-packs a little (an early rehash),
+    // never a hard capacity-mismatch error, since SlottedPage's own
+    // add() is the real, authoritative check either way.
+    const SLOTTED_OVERHEAD_BYTES: usize = 40;
+
+    // Creates a Run (backed by SlottedPage — STORE_AUDIT.md P6) with
+    // enough pages to hold at least `min_capacity` slots. Unlike the
+    // prior plain-blob-per-page design, pages need no upfront
+    // initialization — an empty SlottedPage slot simply doesn't exist
+    // yet (see insert_with_hash/probe_matches, which test for that via
+    // `Run::get_slot_at` returning `None`), rather than needing a
+    // pre-written `Vec<Option<HashValue>>` placeholder to decode later.
     // `records_per_page` is a function of record_size and the DB's fixed
     // page size only, so it comes back out unchanged across calls
     // (new()'s initial single-page allocation and rehash()'s later
@@ -158,35 +199,19 @@ impl<F: DBFile + 'static> HashedSource<F> {
         record_size: usize,
         min_capacity: usize,
     ) -> Result<(Run<F>, usize, usize), SchemaError> {
-        let mut run = db.create_run()?;
-        let records_per_page = run.data_size() as usize / (record_size + size_of::<Option<u64>>());
+        let mut run = db.create_slotted_run()?;
+        let records_per_page = run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
         assert!(
             records_per_page > 0,
             "a single page must be able to hold at least one hash slot"
         );
         let num_pages = min_capacity.max(1).div_ceil(records_per_page).max(1);
-        let empty_page = to_allocvec(&vec![Option::<HashValue>::None; records_per_page])?;
-        // create() already allocated page 0 — only need num_pages - 1 more.
+        // create_slotted_run() already allocated page 0 — only need
+        // num_pages - 1 more.
         for _ in 1..num_pages {
-            run.new_page()?;
-        }
-        for i in 0..num_pages {
-            run.set_content_at(i, &empty_page)?;
+            run.new_slotted_page()?;
         }
         Ok((run, records_per_page, num_pages))
-    }
-
-    // Decodes one page's slots — the common step behind every read of
-    // the table (insert, probe, the unmatched-left sweep). Panics if
-    // the page was never initialized, which should be impossible:
-    // every page this struct ever reads from was allocated (and
-    // pre-filled with empty slots) by allocate_run.
-    fn load_page(&self, page_index: usize) -> Result<Vec<Option<HashValue>>, SchemaError> {
-        let data = self
-            .run
-            .get_content_at(page_index)?
-            .expect("every page allocated by allocate_run was initialized with content");
-        Ok(from_bytes(&data)?)
     }
 
     #[inline(always)]
@@ -248,38 +273,48 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // Marks every match found in `matched` as it goes — LEFT/FULL's
     // final unmatched-left sweep (next_unmatched_left) relies on this
     // to know which occupied slots were never claimed by any right row.
+    //
+    // STORE_AUDIT.md P6: reads exactly the slots this probe chain
+    // actually visits, one at a time (`Run::get_slot_at`), instead of
+    // decoding a whole page's `records_per_page` slots up front just to
+    // index into it for however many of them the chain happens to touch
+    // — typically far fewer, especially at a healthy (well under 100%)
+    // load factor. An empty slot is `None` directly (no `Option`-inside-
+    // the-payload indirection to check on top of it).
     fn probe_matches(&mut self, right: &IndexKey) -> Result<VecDeque<IndexKey>, SchemaError> {
+        let start_time = Instant::now();
         let hash = self.get_hash(right, &self.right_fields);
         let start = (hash % self.capacity as u64) as usize;
         let mut matches = VecDeque::new();
         let mut index = start;
-        let mut page_index = index / self.records_per_page;
-        let mut page_data = self.load_page(page_index)?;
         loop {
-            let row_index = index % self.records_per_page;
-            if let Some(v) = &page_data[row_index] {
-                if let Some(left) = &v.left_value
-                    && self.are_keys_equal(left, right, &self.left_fields, &self.right_fields)
-                {
-                    matches.push_back(left.clone());
-                    self.matched.set(index);
+            let page_index = index / self.records_per_page;
+            let row_index = (index % self.records_per_page) as u64;
+            match self.run.get_slot_at(page_index, row_index)? {
+                Some(bytes) => {
+                    let v: HashValue = from_bytes(&bytes)?;
+                    if self.are_keys_equal(&v.left_value, right, &self.left_fields, &self.right_fields) {
+                        matches.push_back(v.left_value);
+                        self.matched.set(index);
+                    }
                 }
-            } else {
-                break;
+                None => break,
             }
             index = (index + 1) % self.capacity;
             if index == start {
                 break;
             }
-            let new_page_index = index / self.records_per_page;
-            if new_page_index != page_index {
-                page_index = new_page_index;
-                page_data = self.load_page(page_index)?;
-            }
         }
+        self.probe_time += start_time.elapsed().as_nanos();
         Ok(matches)
     }
 
+    // STORE_AUDIT.md P6: writes exactly this one slot's own bytes
+    // (`Run::set_slot_at`), not the whole page's worth — the fix for the
+    // pattern this file used to hit on every single call: decode the
+    // whole page's `Vec<Option<HashValue>>`, mutate one element, then
+    // re-encode and rewrite the WHOLE thing, even for a page already
+    // holding hundreds of other slots untouched by this insert.
     fn insert_with_hash(&mut self, item: IndexKey, hash: u64) -> Result<(), SchemaError> {
         let mut index = (hash % self.capacity as u64) as usize;
         if !self.slot_available(index)? {
@@ -287,15 +322,9 @@ impl<F: DBFile + 'static> HashedSource<F> {
         }
         self.claim_slot(index)?;
         let page_index = index / self.records_per_page;
-        let mut vec_data = self.load_page(page_index)?;
-        let row_index = index % self.records_per_page;
-        assert!(vec_data[row_index].is_none());
-        vec_data[row_index] = Some(HashValue {
-            hash,
-            left_value: Some(item),
-        });
-        self.run
-            .set_content_at(page_index, &to_allocvec(&vec_data)?)?;
+        let row_index = (index % self.records_per_page) as u64;
+        let value = HashValue { hash, left_value: item };
+        self.run.set_slot_at(page_index, row_index, &to_allocvec(&value)?)?;
         Ok(())
     }
 
@@ -303,7 +332,14 @@ impl<F: DBFile + 'static> HashedSource<F> {
         IndexKey::hash_fields(fields.iter().map(|f| &key.values()[*f]))
     }
 
+    // STORE_AUDIT.md P6: `run_cursor` (a plain sequential walk over every
+    // tuple in the old run, page by page) now yields exactly one
+    // HashValue per step, not a whole page's Vec to flatten — a
+    // SlottedPage only ever stores tuples for slots that are actually
+    // occupied (see insert_with_hash), so there's no `None` filler to
+    // skip over the way the old `Vec<Option<HashValue>>` scheme needed.
     fn rehash(&mut self, new_capacity: usize) -> Result<(), SchemaError> {
+        let start = Instant::now();
         let count = self.count;
         let mut run_cursor = self.run.cursor()?;
         let (run, records_per_page, num_pages) =
@@ -319,17 +355,11 @@ impl<F: DBFile + 'static> HashedSource<F> {
             let data = run_cursor.next()?.ok_or(SchemaError::UnknownError(
                 "Did not expect empty run tuple".into(),
             ))?;
-            let data = data.data();
-            let vec_data = from_bytes::<Vec<Option<HashValue>>>(&data)?;
-            for v in vec_data {
-                if let Some(v) = v
-                    && let Some(l) = v.left_value
-                {
-                    self.insert_left(l)?;
-                    added += 1;
-                }
-            }
+            let value = from_bytes::<HashValue>(data.data())?;
+            self.insert_left(value.left_value)?;
+            added += 1;
         }
+        self.rehash_time = start.elapsed().as_nanos();
         Ok(())
     }
 
@@ -339,9 +369,11 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // strictly before any right-side probing starts, so `matched` never
     // needs replaying across a rehash — nothing has been matched yet.
     fn build_left(&mut self) -> Result<(), SchemaError> {
+        let start = Instant::now();
         while let Some(row) = self.sources[0].next()? {
             self.insert_left(row)?;
         }
+        self.left_time += start.elapsed().as_nanos();
         Ok(())
     }
 
@@ -349,13 +381,29 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // occupied-but-never-matched slot (per `matched`) still owes an
     // output row, paired with right_null. Scans the table page by page,
     // resuming across calls via sweep_page/sweep_row.
+    //
+    // STORE_AUDIT.md P6: `Run::slots_at` returns only the OCCUPIED slots
+    // on a page (each tagged with its own real slot id), so this only
+    // ever decodes real entries — no `None` placeholders to skip past
+    // the way indexing through a full `Vec<Option<HashValue>>` used to
+    // require, which matters most right after a rehash (the fresh
+    // capacity is ~2x the live count, so close to half of every page
+    // used to be wasted decode work here).
     fn next_unmatched_left(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        let start = Instant::now();
         loop {
             if self.sweep_page >= self.run.page_count() {
+                self.next_time += start.elapsed().as_nanos();
                 return Ok(None);
             }
             if self.sweep_page_data.is_none() {
-                self.sweep_page_data = Some(self.load_page(self.sweep_page)?);
+                let slots = self.run.slots_at(self.sweep_page)?;
+                let mut decoded = Vec::with_capacity(slots.len());
+                for (slot, bytes) in slots {
+                    decoded.push((slot, from_bytes::<HashValue>(&bytes)?));
+                }
+                self.sweep_page_data = Some(decoded);
+                self.sweep_row = 0;
             }
             let page_data = self.sweep_page_data.as_ref().unwrap();
             if self.sweep_row >= page_data.len() {
@@ -364,14 +412,12 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 self.sweep_page_data = None;
                 continue;
             }
-            let slot_index = self.sweep_page * self.records_per_page + self.sweep_row;
-            let slot = &page_data[self.sweep_row];
+            let (slot, value) = &page_data[self.sweep_row];
+            let slot_index = self.sweep_page * self.records_per_page + *slot as usize;
             self.sweep_row += 1;
-            if let Some(v) = slot
-                && let Some(left) = &v.left_value
-                && !self.matched.is_set(slot_index)
-            {
-                return Ok(Some(Self::combine(left, &self.right_null)?));
+            if !self.matched.is_set(slot_index) {
+                self.next_time += start.elapsed().as_nanos();
+                return Ok(Some(Self::combine(&value.left_value, &self.right_null)?));
             }
         }
     }
@@ -447,8 +493,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.sources[0].reset()?;
         self.sources[1].reset()?;
-        let (run, records_per_page, num_pages) =
-            Self::allocate_run(&self.db, self.record_size, 1)?;
+        let (run, records_per_page, num_pages) = Self::allocate_run(&self.db, self.record_size, 1)?;
         self.run = run;
         self.records_per_page = records_per_page;
         self.capacity = records_per_page * num_pages;
@@ -463,6 +508,21 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         self.sweep_row = 0;
         self.sweep_page_data = None;
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+        let mut stats = HashMap::new();
+        stats.insert("probe".to_string(), self.probe_time as f64);
+        stats.insert("rehash".into(), self.rehash_time as f64);
+        stats.insert("next".into(), self.next_time as f64);
+        stats.insert("build_left".into(), self.left_time as f64);
+        let this_stats = QueryStats { stats };
+        let name = format!("HashJoin:({:?})", self.join_type);
+        let mut res = vec![(name, this_stats)];
+        for s in &self.sources {
+            res = merge_stats(res, s.stats())
+        }
+        Some(res)
     }
 }
 
@@ -525,12 +585,16 @@ mod tests {
     // per-page decode insert_with_hash/probe_matches use internally,
     // just exposed here so a test can inspect the whole table's final
     // state directly.
-    fn dump_slots(source: &HashedSource<MemFile>) -> Vec<Option<HashValue>> {
+    // STORE_AUDIT.md P6: `slots_at` returns only occupied slots directly
+    // (no `Option` wrapper needed — see `HashValue`'s own doc comment),
+    // so this is a plain flatten now instead of decoding a whole
+    // `Vec<Option<HashValue>>` per page.
+    fn dump_slots(source: &HashedSource<MemFile>) -> Vec<HashValue> {
         let mut out = vec![];
         for page in 0..source.run.page_count() {
-            let data = source.run.get_content_at(page).unwrap().unwrap();
-            let vec_data: Vec<Option<HashValue>> = from_bytes(&data).unwrap();
-            out.extend(vec_data);
+            for (_, bytes) in source.run.slots_at(page).unwrap() {
+                out.push(from_bytes(&bytes).unwrap());
+            }
         }
         out
     }
@@ -573,8 +637,7 @@ mod tests {
             )
             .unwrap();
         let probe_key =
-            IndexKey::new_from_owned(vec![ValueItem::Integer(99), ValueItem::Integer(-1)])
-                .unwrap();
+            IndexKey::new_from_owned(vec![ValueItem::Integer(99), ValueItem::Integer(-1)]).unwrap();
         assert!(source.probe_matches(&probe_key).unwrap().is_empty());
     }
 
@@ -600,9 +663,8 @@ mod tests {
         // it only fires on the (capacity+1)th call — insert one more than
         // capacity, not exactly capacity, to actually trigger it.
         for i in 0..=initial_capacity as i64 {
-            let row =
-                IndexKey::new_from_owned(vec![ValueItem::Integer(i), ValueItem::Integer(0)])
-                    .unwrap();
+            let row = IndexKey::new_from_owned(vec![ValueItem::Integer(i), ValueItem::Integer(0)])
+                .unwrap();
             source.insert_left(row).unwrap();
         }
 
@@ -657,9 +719,7 @@ mod tests {
         let slots = dump_slots(&source);
         let present_ids: std::collections::HashSet<i64> = slots
             .iter()
-            .flatten()
-            .filter_map(|v| v.left_value.as_ref())
-            .map(|k| match &k.values()[0] {
+            .map(|v| match &v.left_value.values()[0] {
                 ValueItem::Integer(i) => *i,
                 other => panic!("unexpected key type: {other:?}"),
             })
@@ -675,7 +735,11 @@ mod tests {
     fn test_next_yields_only_matched_pairs_as_combined_left_then_right_rows() {
         let mut source = make_source();
         let rows = drain(&mut source);
-        assert_eq!(rows.len(), 2, "only the 2 matching pairs should be emitted: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "only the 2 matching pairs should be emitted: {rows:?}"
+        );
         assert!(rows.contains(&vec![
             ValueItem::Integer(2),
             ValueItem::Integer(200),
@@ -729,7 +793,8 @@ mod tests {
 
     #[test]
     fn test_next_finds_every_match_after_growing_across_multiple_pages() {
-        let db = Db::<MemFile>::create_with_page_size("hash_next_multi_page_test.db", 1024).unwrap();
+        let db =
+            Db::<MemFile>::create_with_page_size("hash_next_multi_page_test.db", 1024).unwrap();
         let n: i64 = 30; // enough distinct keys to force a rehash at 1024-byte pages
         let left_rows: Vec<Vec<ValueItem>> = (0..n)
             .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
@@ -760,8 +825,15 @@ mod tests {
             let ValueItem::Integer(right_id) = row[2] else {
                 panic!("expected an integer id, got {:?}", row[2])
             };
-            assert_eq!(left_id, right_id, "a joined row's left/right ids must match");
-            assert_eq!(left_id % 2, 0, "only even ids were ever inserted on the right side");
+            assert_eq!(
+                left_id, right_id,
+                "a joined row's left/right ids must match"
+            );
+            assert_eq!(
+                left_id % 2,
+                0,
+                "only even ids were ever inserted on the right side"
+            );
         }
     }
 
@@ -936,5 +1008,66 @@ mod tests {
         source.reset().unwrap();
         let second_pass = drain(&mut source);
         assert_eq!(second_pass, first_pass);
+    }
+
+    // STORE_AUDIT.md P6 — throwaway (not a committed criterion bench,
+    // same convention as this session's other direct microbenchmarks) an
+    // end-to-end measurement of a non-trivial hash join: 50,000 distinct
+    // left rows (several fields each, forcing multiple rehash-driven
+    // page-chain growths along the way) 1:1-joined against 50,000
+    // probing right rows — every right row finds exactly one match, the
+    // common real-world FK-join shape (e.g. orders 1:1-joined against
+    // one order_detail apiece). Exercises build_left's insert-heavy path
+    // and next()'s probe-heavy path in roughly equal measure. Run with:
+    //   cargo test -p squeal-sql --lib --release -- --ignored --nocapture \
+    //     source::hash::tests::bench_hash_join_50k_rows
+    #[test]
+    #[ignore]
+    fn bench_hash_join_50k_rows() {
+        const N: i64 = 50_000;
+        let left_rows: Vec<Vec<ValueItem>> = (0..N)
+            .map(|i| {
+                vec![
+                    ValueItem::Integer(i),
+                    ValueItem::Integer(i * 7),
+                    ValueItem::Str((format!("left-row-{i}"), 32)),
+                ]
+            })
+            .collect();
+        let right_rows: Vec<Vec<ValueItem>> = (0..N)
+            .map(|i| {
+                vec![
+                    ValueItem::Integer(i),
+                    ValueItem::Str((format!("right-row-{i}"), 32)),
+                ]
+            })
+            .collect();
+        let left = Box::new(VecSource::new(&["id", "val", "name"], left_rows));
+        let right = Box::new(VecSource::new(&["id", "name"], right_rows));
+        let mut source = HashedSource::new(
+            left,
+            right,
+            make_db(),
+            QueryMemory::new(64 * 1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+
+        let start = std::time::Instant::now();
+        let rows = drain(&mut source);
+        let elapsed = start.elapsed();
+        assert_eq!(rows.len(), N as usize, "every right row must find its one match");
+        eprintln!(
+            "bench_hash_join_50k_rows: {N} rows each side, {} output rows in {elapsed:?} \
+             ({:.0} joined rows/s) — build_left={}ms probe={}ms next={}ms rehash={}ms",
+            rows.len(),
+            rows.len() as f64 / elapsed.as_secs_f64(),
+            source.left_time / 1_000_000,
+            source.probe_time / 1_000_000,
+            source.next_time / 1_000_000,
+            source.rehash_time / 1_000_000,
+        );
     }
 }

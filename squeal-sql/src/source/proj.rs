@@ -33,7 +33,7 @@ impl Source for Projection {
         if let Some(res) = self.source.next()? {
             let mut out = vec![];
             let res = &[res];
-            for (i, f) in self.fields.iter().enumerate() {
+            for (i, f) in self.fields.iter_mut().enumerate() {
                 out.push(f.expr.eval(res, i)?);
             }
             return Ok(Some(IndexKey::new_from_owned(out)?));

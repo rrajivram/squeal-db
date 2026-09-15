@@ -1602,6 +1602,15 @@ where
         Run::create(self.buffer.clone())
     }
 
+    /// Like `create_run`, but every page (see `Run::create_slotted`'s own
+    /// comment) is backed by `SlottedPage` instead of `RunPage` —
+    /// individually addressable, in-place-mutable slots for a caller
+    /// with a fixed, page-per-bucket-range layout (e.g. a hash index)
+    /// that mutates one slot at a time, repeatedly.
+    pub fn create_slotted_run(&self) -> Result<Run<F>, StoreError> {
+        Run::create_slotted(self.buffer.clone())
+    }
+
     pub fn range_scan(
         self: &Arc<Self>,
         tid: TableIdType,

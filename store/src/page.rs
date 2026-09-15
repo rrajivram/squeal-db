@@ -313,6 +313,30 @@ impl Page {
         )
     }
 
+    // STORE_AUDIT.md P6 — a Run page (see new_run's own comment) backed
+    // by SlottedPage instead of RunPage, for a caller that wants
+    // individually addressable, in-place-mutable slots (crate::run::Run's
+    // get_slot_at/set_slot_at/slots_at) rather than one opaque
+    // append-only blob per page (set_content_at/get_content_at). See
+    // pages::slotted's own doc comment for why this beats a
+    // decode-whole-page-then-reencode approach for a workload (a hash
+    // index) that mutates one slot at a time, repeatedly, with no
+    // amortized in-memory structure to make repeat touches free the way
+    // a B+Tree's cache-resident AnyTuplePage does — the exact opposite
+    // access shape from the one that made SlottedPage a net loss as
+    // Page::new's own default (see slotted.rs's "Why this isn't the
+    // default").
+    pub(crate) fn new_slotted(size: DBSizeType) -> Self {
+        let capacity = (size - PAGE_OVERHEAD as DBSizeType) as usize;
+        Self::new_with_content(
+            size,
+            NONE,
+            None,
+            Box::new(crate::pages::slotted::SlottedPage::new(capacity)),
+            PageContentKind::SLOTTED_TUPLE,
+        )
+    }
+
     fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
         let (pt, content_kind): (Box<dyn PageTuple>, PageContentKind) =
             if let Some(record_size) = record_size {

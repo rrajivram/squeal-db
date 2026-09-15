@@ -1,11 +1,12 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
+use sql_parser::keyword::Query;
 use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{
     error::SchemaError,
     plan::{eval::EvalExpr, funcs::FuncTrait},
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source, merge_stats},
 };
 
 // Groups an already-sorted (by the GROUP BY key's raw field positions)
@@ -41,6 +42,8 @@ pub(crate) struct GroupSource {
     pending: Option<(IndexKey, Vec<ValueItem>)>,
     started: bool,
     done: bool,
+    time_spent: u128,
+    eval_time: u128,
 }
 
 impl GroupSource {
@@ -56,6 +59,8 @@ impl GroupSource {
             pending: None,
             started: false,
             done: false,
+            time_spent: 0,
+            eval_time: 0,
         }
     }
 
@@ -63,9 +68,9 @@ impl GroupSource {
         self.key_positions.iter().map(|&i| row[i].clone()).collect()
     }
 
-    fn reset_aggregates(&self) -> Result<(), SchemaError> {
-        for f in &self.fields {
-            for func in f.expr.get_funcs() {
+    fn reset_aggregates(&mut self) -> Result<(), SchemaError> {
+        for f in &mut self.fields {
+            for func in &mut f.expr.get_funcs() {
                 func.reset()?;
             }
         }
@@ -79,12 +84,14 @@ impl GroupSource {
     // guaranteed to already agree, so re-evaluating them costs a little
     // but changes nothing). Only the *last* call's return value for a
     // given group is ever actually used — see `next()`.
-    fn eval_row(&self, row: &IndexKey) -> Result<IndexKey, SchemaError> {
+    fn eval_row(&mut self, row: &IndexKey) -> Result<IndexKey, SchemaError> {
+        let start = Instant::now();
         let data = [row.clone()];
         let mut out = vec![];
-        for (i, f) in self.fields.iter().enumerate() {
+        for (i, f) in self.fields.iter_mut().enumerate() {
             out.push(f.expr.eval(&data, i)?);
         }
+        self.eval_time += start.elapsed().as_nanos();
         Ok(IndexKey::new_from_owned(out)?)
     }
 
@@ -96,7 +103,8 @@ impl GroupSource {
     // projected field is either a bare aggregate call or a GROUP BY key
     // column, and key_positions is empty in exactly this branch, so
     // there are no non-aggregate fields left to evaluate here.
-    fn empty_group_row(&self) -> Result<IndexKey, SchemaError> {
+    fn empty_group_row(&mut self) -> Result<IndexKey, SchemaError> {
+        let start = Instant::now();
         let mut out = vec![];
         for f in &self.fields {
             out.push(match &f.expr {
@@ -104,6 +112,7 @@ impl GroupSource {
                 _ => ValueItem::Null,
             });
         }
+        self.eval_time += start.elapsed().as_nanos();
         Ok(IndexKey::new_from_owned(out)?)
     }
 }
@@ -114,6 +123,7 @@ impl Source for GroupSource {
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        let start = Instant::now();
         if self.done {
             return Ok(None);
         }
@@ -128,6 +138,7 @@ impl Source for GroupSource {
             self.done = true;
             if !self.started && self.key_positions.is_empty() {
                 self.reset_aggregates()?;
+                self.time_spent += start.elapsed().as_nanos();
                 return Ok(Some(self.empty_group_row()?));
             }
             return Ok(None);
@@ -147,11 +158,13 @@ impl Source for GroupSource {
                         last_evaluated = self.eval_row(&current)?;
                     } else {
                         self.pending = Some((next_row, next_key));
+                        self.time_spent += start.elapsed().as_nanos();
                         return Ok(Some(last_evaluated));
                     }
                 }
                 None => {
                     self.done = true;
+                    self.time_spent += start.elapsed().as_nanos();
                     return Ok(Some(last_evaluated));
                 }
             }
@@ -164,6 +177,19 @@ impl Source for GroupSource {
         self.started = false;
         self.done = false;
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+        let query_stats = QueryStats {
+            stats: HashMap::from([
+                ("eval_ns".to_string(), self.eval_time as f64),
+                ("time_ns".into(), self.time_spent as f64),
+            ]),
+        };
+        Some(merge_stats(
+            vec![("GroupSource".into(), query_stats)],
+            self.source.stats(),
+        ))
     }
 }
 

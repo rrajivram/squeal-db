@@ -82,13 +82,13 @@ impl EvalExpr {
         }
     }
 
-    pub(crate) fn get_funcs(&self) -> Vec<&FuncObj> {
+    pub(crate) fn get_funcs(&mut self) -> Vec<&mut FuncObj> {
         match self {
             Self::Unary { field, .. } => field.get_funcs(),
             Self::Binary { lhs, rhs, .. } => {
                 let mut v = vec![];
-                v.extend_from_slice(&lhs.get_funcs());
-                v.extend_from_slice(&rhs.get_funcs());
+                v.extend(lhs.get_funcs());
+                v.extend(rhs.get_funcs());
                 v
             }
             Self::Function(f) => {
@@ -97,7 +97,11 @@ impl EvalExpr {
             _ => vec![],
         }
     }
-    pub(crate) fn eval(&self, data: &[IndexKey], _index: usize) -> Result<ValueItem, SchemaError> {
+    pub(crate) fn eval(
+        &mut self,
+        data: &[IndexKey],
+        _index: usize,
+    ) -> Result<ValueItem, SchemaError> {
         let v = match self {
             Self::Literal(v) => v,
             Self::Value(pos) => &data[0][*pos],

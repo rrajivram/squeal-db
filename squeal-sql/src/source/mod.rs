@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use store::valueitem::IndexKey;
 
@@ -25,10 +25,27 @@ pub struct ProjectableField {
     pub(crate) expr: EvalExpr,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct QueryStats {
+    stats: HashMap<String, f64>,
+}
+
 pub trait Source: Debug {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        None
+    }
+}
+
+fn merge_stats(
+    this_stats: Vec<(String, QueryStats)>,
+    that: Option<Vec<(String, QueryStats)>>,
+) -> Vec<(String, QueryStats)> {
+    let mut this_stats = this_stats;
+    this_stats.extend(that.unwrap_or(vec![]));
+    this_stats
 }
 
 // Shared by every other Source's own test module (join, limit, proj,
