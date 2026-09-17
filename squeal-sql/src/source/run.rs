@@ -1,10 +1,10 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
 
 use crate::{
     error::SchemaError,
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source},
 };
 
 // Streams a temp table's rows — the Run-backed equivalent of TableSource
@@ -13,6 +13,7 @@ use crate::{
 pub(crate) struct RunSource<F: DBFile + 'static> {
     cursor: RunCursor<F>,
     fields: Arc<[ProjectableField]>,
+    next_time: u128,
 }
 
 impl<F> RunSource<F>
@@ -24,6 +25,7 @@ where
         Self {
             cursor,
             fields: Arc::from(fields),
+            next_time: 0,
         }
     }
 }
@@ -39,10 +41,14 @@ where
         // like TableSource's real-table case, since a temp table has no
         // ALTER TABLE, so there's only ever one schema version to decode
         // against.
-        self.cursor
+        let start = Instant::now();
+        let out = self
+            .cursor
             .next()?
             .map(|tuple| Ok(IndexKey::from_bytes(tuple.data())?))
-            .transpose()
+            .transpose();
+        self.next_time += start.elapsed().as_nanos();
+        out
     }
 
     fn fields(&self) -> Arc<[ProjectableField]> {
@@ -51,6 +57,16 @@ where
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         Ok(self.cursor.reset()?)
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        Some(vec![(
+            "RunScan".to_string(),
+            QueryStats {
+                stats: HashMap::from([("next_ns".into(), self.next_time as f64)]),
+                level: 0,
+            },
+        )])
     }
 }
 

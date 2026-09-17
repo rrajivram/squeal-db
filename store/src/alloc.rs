@@ -1,30 +1,20 @@
 // This crate's #[global_allocator] (see lib.rs) — a global allocation
 // tracker (total/peak/current bytes, a coarse allocation-size
-// histogram), delegating actual allocation work to mimalloc rather than
-// std's System so the perf characteristics lib.rs's own comment
-// documents (mimalloc measurably cutting the cost of the copy-on-write
-// page clone/drop pattern) don't change just because something's now
-// also counting bytes. There can be exactly one #[global_allocator] per
-// binary, and this crate is the lowest-level one nearly everything else
-// in the workspace depends on, so this is the only place that
-// declaration can live if any consumer (e.g. squeal-cli) wants to read
-// allocator stats — see `stats()`.
-//
-// This whole module is gated out under dhat-heap: GLOBAL (see lib.rs)
-// becomes dhat::Alloc in that build, which none of TrackingAllocator's
-// own accessor methods apply to.
-#![cfg(not(feature = "dhat-heap"))]
+// histogram), delegating actual allocation work to std's System
+// allocator. There can be exactly one #[global_allocator] per binary,
+// and this crate is the lowest-level one nearly everything else in the
+// workspace depends on, so this is the only place that declaration can
+// live if any consumer (e.g. squeal-cli) wants to read allocator stats
+// — see `stats()`.
 
-use std::alloc::{GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-use mimalloc::MiMalloc;
 
 pub const SIZE_PER_BUCKET: usize = 10;
 pub const BUCKET_COUNT: usize = 100;
 
 pub struct TrackingAllocator {
-    inner: MiMalloc,
+    inner: System,
     allocated: AtomicUsize,
     deallocated: AtomicUsize,
     peak: AtomicUsize,
@@ -42,7 +32,7 @@ pub struct TrackingAllocator {
 impl TrackingAllocator {
     pub const fn new() -> Self {
         TrackingAllocator {
-            inner: MiMalloc,
+            inner: System,
             allocated: AtomicUsize::new(0),
             deallocated: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
@@ -95,7 +85,16 @@ impl TrackingAllocator {
     // peak if this pushed current usage past it.
     fn record_alloc(&self, size: usize) {
         let prev = self.allocated.fetch_add(size, Ordering::Relaxed);
-        let current = prev + size - self.deallocated.load(Ordering::Relaxed);
+        // Saturating, not a plain subtraction: `reset()` can zero
+        // `allocated`/`deallocated` mid-process, and a later dealloc()
+        // of memory that was allocated *before* that reset still bumps
+        // `deallocated` with nothing matching in the (now zeroed)
+        // `allocated` — without saturating, that transient
+        // deallocated > allocated state underflows this usize
+        // subtraction (silently wraps to near-usize::MAX in a release
+        // build) and corrupts `peak` permanently, since the bogus huge
+        // value then wins every future `current > peak` comparison.
+        let current = (prev + size).saturating_sub(self.deallocated.load(Ordering::Relaxed));
         let bucket = (size / SIZE_PER_BUCKET).min(BUCKET_COUNT - 1);
         self.allocations[bucket].fetch_add(1, Ordering::Relaxed);
 
@@ -131,16 +130,15 @@ unsafe impl GlobalAlloc for TrackingAllocator {
     }
 
     // Overridden rather than relying on GlobalAlloc's default impl
-    // (alloc(new) + memcpy + dealloc(old)): mimalloc has its own real
-    // realloc (can often grow/shrink a block in place, no copy at all —
-    // see libmimalloc-sys's mi_realloc_aligned), and leaving this
-    // unoverridden would silently discard that and force every Vec/
-    // String growth in the process through a full allocate-and-copy it
-    // might not have needed. Bookkeeping-wise this still needs to
+    // (alloc(new) + memcpy + dealloc(old)): System's own realloc can
+    // often grow/shrink a block in place, no copy at all, and leaving
+    // this unoverridden would silently discard that and force every
+    // Vec/String growth in the process through a full allocate-and-copy
+    // it might not have needed. Bookkeeping-wise this still needs to
     // account for the resize as if it were a dealloc(old) + alloc(new)
     // pair (see record_alloc) — the actual work just goes straight to
-    // mimalloc's own realloc instead of our own alloc()/dealloc(),
-    // which is what makes the in-place case possible again.
+    // System's own realloc instead of our own alloc()/dealloc(), which
+    // is what makes the in-place case possible again.
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
         if !new_ptr.is_null() {
@@ -183,10 +181,32 @@ pub struct AllocStats {
     pub realloc_shrank: usize,
 }
 
-// Snapshot of this process's allocator stats since startup — reads
-// directly off the installed #[global_allocator] (see lib.rs), so this
-// reflects every allocation any crate in the process made, not just
-// store's own.
+// Zeroes every counter (see `stats()`'s own doc comment on what they
+// track), so a subsequent `stats()` call reports only what's allocated/
+// deallocated *after* this point rather than since process startup —
+// e.g. resetting after loading test data so a following query's own
+// allocation footprint isn't mixed in with however much the load itself
+// cost. Note this makes `current_usage`/`peak_usage` a *delta* from the
+// reset point, not the process's true absolute heap size: zeroing
+// `allocated`/`deallocated` both to 0 means already-live data (loaded
+// pages, cached tables, etc.) is no longer reflected in either — that's
+// the intended tradeoff for a clean before/after window, not a bug.
+pub fn reset() {
+    crate::GLOBAL.allocated.store(0, Ordering::Relaxed);
+    crate::GLOBAL.deallocated.store(0, Ordering::Relaxed);
+    crate::GLOBAL.peak.store(0, Ordering::Relaxed);
+    for bucket in &crate::GLOBAL.allocations {
+        bucket.store(0, Ordering::Relaxed);
+    }
+    crate::GLOBAL.realloc_count.store(0, Ordering::Relaxed);
+    crate::GLOBAL.realloc_grew.store(0, Ordering::Relaxed);
+    crate::GLOBAL.realloc_shrank.store(0, Ordering::Relaxed);
+}
+
+// Snapshot of this process's allocator stats since startup (or since the
+// last `reset()` call) — reads directly off the installed
+// #[global_allocator] (see lib.rs), so this reflects every allocation
+// any crate in the process made, not just store's own.
 pub fn stats() -> AllocStats {
     AllocStats {
         total_allocated: crate::GLOBAL.total_allocated(),

@@ -1224,7 +1224,9 @@ mod dummy_tests {
 
     #[test]
     fn test1() {
-        exec("select a.*,b.* from (select c.* from c ) as a, (select d.* from d ) as b");
+        exec(
+            "select o.order_id, c.city, p.product_name, ca.category_name, od.quantity, od.unit_price from orders o join customers c on o.customer_id = c.customer_id join order_details od on od.order_id = o.order_id join products p on p.product_id = od.product_id join categories ca on ca.category_id = p.category_id ;",
+        );
     }
 
     #[test]

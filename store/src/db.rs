@@ -2017,7 +2017,7 @@ where
             page_counter,
             file,
             header,
-            1024,
+            8192,
             clock,
             max_pending_writes,
             content_registry,
@@ -2336,7 +2336,10 @@ mod tests {
         if data.len() < header_len {
             return 0;
         }
-        crate::logger::scan_log(&data[header_len..]).unwrap().records.len()
+        crate::logger::scan_log(&data[header_len..])
+            .unwrap()
+            .records
+            .len()
     }
 
     // log()'s send() over a bounded channel only guarantees the *previous*
@@ -2748,8 +2751,8 @@ mod tests {
         // does (see RunPages) — dropping the Run it came from must not
         // free pages the cursor is still reading, and the pages must
         // finally free once the cursor itself is also dropped.
-        let db: Arc<TestDB> = TestDB::create_with_page_size("run_cursor_keeps_alive.db", 512)
-            .unwrap();
+        let db: Arc<TestDB> =
+            TestDB::create_with_page_size("run_cursor_keeps_alive.db", 512).unwrap();
         let mut run = db.create_run().unwrap();
         run.append(b"a").unwrap();
         run.append(b"b").unwrap();
@@ -5292,7 +5295,10 @@ mod tests {
         if data.len() < header_len {
             return 0;
         }
-        crate::logger::scan_log(&data[header_len..]).unwrap().records.len()
+        crate::logger::scan_log(&data[header_len..])
+            .unwrap()
+            .records
+            .len()
     }
 
     // See wait_for_durable_logs (MemFile version) — same log()
@@ -6457,7 +6463,10 @@ mod tests {
         let a = ValueItem::Blob((Arc::from(&b"x"[..]), 1));
         let b = ValueItem::Blob((Arc::from(&b"y"[..]), 1));
         let result = std::panic::catch_unwind(|| a.cmp(&b));
-        assert!(result.is_ok(), "comparing two Blob ValueItems must never panic");
+        assert!(
+            result.is_ok(),
+            "comparing two Blob ValueItems must never panic"
+        );
     }
 
     // STORE_AUDIT.md T12: into_id() disarms Transaction::drop's default
@@ -6526,7 +6535,7 @@ mod tests {
     // 20,000 iterations on a first run.
     #[test]
     fn test_audit_t14_concurrent_find_never_observes_a_committed_row_as_missing_during_relocation()
-     {
+    {
         let db = TestDB::create_with_page_size("audit_t14_probe.db", 1024).unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
 
@@ -7025,8 +7034,7 @@ mod tests {
     // truncated — reproducing the exact "dropped but not yet checkpointed"
     // crash window.
     #[test]
-    fn test_audit_t17_replay_survives_log_records_for_a_table_dropped_before_the_next_checkpoint()
-     {
+    fn test_audit_t17_replay_survives_log_records_for_a_table_dropped_before_the_next_checkpoint() {
         let (db, tid) = make_db_with_table();
         let t = db.begin().unwrap();
         db.insert(tid, row(1, b"v1"), &t).unwrap();

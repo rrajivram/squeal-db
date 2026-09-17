@@ -4,6 +4,7 @@ use rustyline::error::ReadlineError;
 use rustyline::{DefaultEditor, Result};
 use squeal_sql::conn::connection::{Connection, ConnectionManager};
 use squeal_sql::rslt::resultset::ResultType;
+use squeal_sql::source::QueryStats;
 use store::db::DBFile;
 use store::named_memfile::NamedMemFile;
 
@@ -16,13 +17,6 @@ enum Backend {
 }
 
 fn main() -> Result<()> {
-    // Held for main()'s entire body (RAII — see dhat's own docs): dropping
-    // this at the end of main is what actually flushes dhat-heap.json.
-    // Started before anything else runs so the very first allocation of
-    // the session is captured, not just whatever happens after this point.
-    #[cfg(feature = "dhat-heap")]
-    let _profiler = dhat::Profiler::new_heap();
-
     let db_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/Users/rajiv/dev/rust/squeal_db/test_data/squeal.db".to_string());
@@ -64,12 +58,6 @@ fn main() -> Result<()> {
             run_repl(rl, connect_or_create(&mgr, &db_path), &db_path)
         }
     };
-    // Under dhat-heap, store::alloc (which these stats read) is compiled
-    // out entirely — GLOBAL is dhat::Alloc there, not TrackingAllocator
-    // (see store/src/lib.rs) — and there's nothing to print here anyway:
-    // dhat writes its own dhat-heap.json when _profiler drops, at the end
-    // of this function.
-    #[cfg(not(feature = "dhat-heap"))]
     print_memory_stats();
     result
 }
@@ -80,7 +68,6 @@ fn main() -> Result<()> {
 // script into the REPL's stdin, then exiting) rather than mid-session,
 // since these are process-lifetime totals/peaks, not scoped to any one
 // statement.
-#[cfg(not(feature = "dhat-heap"))]
 fn print_memory_stats() {
     let stats = store::alloc::stats();
     println!();
@@ -137,6 +124,10 @@ where
     if rl.load_history(HISTORY_FILE).is_err() {
         println!("No previous history.");
     }
+    // Stats from the most recently executed StreamingResult, kept around
+    // so `!print stats` can be typed as a separate line after a query
+    // rather than needing to be bolted onto the query itself.
+    let mut last_stats: Option<Vec<(String, QueryStats)>> = None;
     loop {
         let readline = rl.readline("sql>> ");
         match readline {
@@ -149,7 +140,13 @@ where
                     break;
                 }
                 rl.add_history_entry(line)?;
-                run(&conn, line);
+                if let Some(command) = line.strip_prefix('!') {
+                    run_custom_command(command.trim(), &last_stats);
+                    continue;
+                }
+                if let Some(stats) = run(&conn, line) {
+                    last_stats = Some(stats);
+                }
             }
             Err(ReadlineError::Interrupted) => {
                 println!("CTRL-C");
@@ -181,8 +178,10 @@ where
 // ;-separated statements) against `conn`'s current database/schema, and
 // prints every result it produced. Never propagates a SQL/store error
 // up to main() — a bad statement should end the REPL turn, not the
-// session.
-fn run<F>(conn: &Arc<Connection<F>>, sql: &str)
+// session. Returns the last StreamingResult's query stats seen along
+// the way (a statement can produce several results; whichever one ran
+// last "wins", same as what's left on screen).
+fn run<F>(conn: &Arc<Connection<F>>, sql: &str) -> Option<Vec<(String, QueryStats)>>
 where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
@@ -191,19 +190,22 @@ where
         Ok(s) => s,
         Err(e) => {
             println!("error: {e}");
-            return;
+            return None;
         }
     };
     if let Err(e) = stmt.execute() {
         println!("error: {e}");
-        return;
+        return None;
     }
 
+    let mut stats = None;
     let mut next = stmt.get_results();
     loop {
         match next {
             Ok(Some(mut r)) => {
-                print_result(&mut r);
+                if let Some(s) = print_result(&mut r) {
+                    stats = Some(s);
+                }
                 next = stmt.get_nextresult();
             }
             Ok(None) => break,
@@ -213,12 +215,19 @@ where
             }
         }
     }
+    stats
 }
 
-fn print_result(r: &mut ResultType) {
+fn print_result(r: &mut ResultType) -> Option<Vec<(String, QueryStats)>> {
     match r {
-        ResultType::ResultString(s) => println!("{s}"),
-        ResultType::Count(n) => println!("{n} row(s) affected"),
+        ResultType::ResultString(s) => {
+            println!("{s}");
+            None
+        }
+        ResultType::Count(n) => {
+            println!("{n} row(s) affected");
+            None
+        }
         ResultType::Result(rs) => {
             let mut table = comfy_table::Table::new();
             table.set_header(rs.columns().to_vec());
@@ -226,7 +235,8 @@ fn print_result(r: &mut ResultType) {
                 table.add_row(row);
             }
             println!("{table}");
-            println!("{}", rs.get_final_message())
+            println!("{}", rs.get_final_message());
+            None
         }
         ResultType::StreamingResult(stream) => {
             let mut table = comfy_table::Table::new();
@@ -243,6 +253,57 @@ fn print_result(r: &mut ResultType) {
             }
             println!("{table}");
             println!("{}", stream.get_final_message());
+            // Only available once the stream is fully drained (see the
+            // loop above) — Source::stats() reports totals accumulated
+            // during next(), so reading it any earlier would miss
+            // whatever work the remaining rows still had to do.
+            stream.get_query_stats()
+        }
+    }
+}
+
+// Dispatches a line that started with `!` (stripped of that prefix and
+// trimmed) as a REPL-only command rather than SQL. Kept as a flat match
+// rather than a registry/trait — there's a small, fixed number of these
+// and no shape yet that motivates more indirection.
+fn run_custom_command(command: &str, last_stats: &Option<Vec<(String, QueryStats)>>) {
+    match command {
+        "print stats" => print_query_stats(last_stats),
+        "reset stats" => reset_alloc_stats(),
+        "" => println!("empty command — try '!print stats' or '!reset stats'"),
+        other => {
+            println!("unrecognized command: {other:?} — try '!print stats' or '!reset stats'")
+        }
+    }
+}
+
+// Zeroes store::alloc's tracking-allocator counters (see its own doc
+// comment) — meant for isolating one statement's allocation footprint
+// from whatever came before it in the same session (e.g. bulk INSERTs
+// during test-data setup), by resetting right before running the
+// statement you actually want to measure and reading the numbers
+// print_memory_stats() dumps at exit.
+fn reset_alloc_stats() {
+    store::alloc::reset();
+    println!("allocator stats reset");
+}
+
+fn print_query_stats(stats: &Option<Vec<(String, QueryStats)>>) {
+    let Some(stats) = stats else {
+        println!("no query stats available yet — run a query first");
+        return;
+    };
+    for (name, query_stats) in stats {
+        let indent = "  ".repeat(query_stats.level());
+        println!("{indent}{name}");
+        let mut entries: Vec<_> = query_stats.stats().iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in entries {
+            if let Some(label) = key.strip_suffix("_ns") {
+                println!("{indent}  {label}: {:.3} ms", value / 1_000_000.0);
+            } else {
+                println!("{indent}  {key}: {value}");
+            }
         }
     }
 }

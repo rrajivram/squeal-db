@@ -1,10 +1,11 @@
 use std::{
     cmp::Ordering,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BinaryHeap, HashMap, VecDeque},
     fmt::Debug,
     iter,
     slice::Iter,
     sync::Arc,
+    time::Instant,
     vec::IntoIter,
 };
 
@@ -22,7 +23,7 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::memory::{MemReservation, QueryMemory},
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source, merge_stats},
 };
 
 #[derive(Debug, Clone)]
@@ -40,6 +41,16 @@ pub(crate) struct SortSource<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     mem: Arc<QueryMemory>,
     progress: Option<SortProgress<F>>,
+    // Cost of actually sorting: build_sort (the external-merge-sort
+    // path) or the CrateHeap top-K build (the limited path) — whichever
+    // one-time phase produced `progress`/`results`. Kept apart from
+    // next_time (below) since sorting is a one-shot cost, not something
+    // that scales with how many rows get pulled afterward.
+    sort_time: u128,
+    // Steady-state cost of yielding one already-sorted row (a Vec::pop
+    // or a SortProgress::next), summed across every call after the
+    // sort itself has finished.
+    next_time: u128,
 }
 
 #[derive(Debug)]
@@ -112,6 +123,8 @@ where
             db,
             mem,
             progress: None,
+            sort_time: 0,
+            next_time: 0,
         })
     }
 
@@ -169,6 +182,8 @@ where
             mem,
             limit: None,
             results: None,
+            sort_time: 0,
+            next_time: 0,
         })
     }
 
@@ -322,75 +337,63 @@ where
         let mut pages_per_run = 0;
         let mut total_count = 0;
         let mut mem_filled = false;
-        let mut heap = BinaryHeap::with_capacity(records_per_page);
+        // Every row belonging to the CURRENT (not yet closed) run, held
+        // whole until the run actually closes — a run has to be one
+        // single globally sorted sequence across however many pages it
+        // holds (merge_two/merge_runs read a run's pages strictly in
+        // page order and assume the whole thing is monotonic), so it
+        // can only be sorted correctly as one batch, right before being
+        // split into pages. Sorting and flushing one
+        // records_per_page-sized chunk at a time as it filled (the
+        // previous shape here) only ever guaranteed each individual
+        // PAGE was internally sorted — nothing kept page 2's rows >=
+        // page 1's, so any run spanning more than one page silently
+        // wasn't actually sorted as a whole, and every downstream GROUP
+        // BY/ORDER BY correctness guarantee broke the moment a run grew
+        // past one page (invisible in prior tests, which always forced
+        // a one-page-per-run budget).
+        let mut current_run: Vec<IndexKey> = vec![];
         let mem = self.mem.try_reserve(run.data_size() as usize)?;
         mems.push(mem);
         while let Some(r) = self.source.next()? {
             total_count += 1;
-            // Pushed unconditionally, before the fullness check below —
-            // checking heap.len() == records_per_page first and only
-            // pushing `r` in the else branch (the original shape here)
-            // silently drops the exact row that fills the heap on every
-            // single flush, since it never goes into the batch that gets
-            // serialized OR into the next heap.
-            heap.push(CrateItem {
-                key: r,
-                order: &self.sort_fields,
-            });
-            if heap.len() == records_per_page {
-                let data = heap.into_sorted_vec();
-                let data = to_allocvec(
-                    &data
-                        .into_iter()
-                        .map(|r: CrateItem<'_>| r.key)
-                        .collect::<Vec<_>>(),
-                )?;
-                assert!(data.len() <= run.data_size() as usize);
-                run.set_content(&data)?;
-                if mem_filled {
-                    // Counts the page whose content was just set above —
-                    // incrementing before comparing (rather than after,
-                    // the original order here) is what makes a run
-                    // actually close out at `pages_per_run` pages instead
-                    // of `pages_per_run + 1`: the old order always called
-                    // new_page() once unconditionally before the count
-                    // and the target could ever compare equal.
-                    page_count_in_run += 1;
-                    if page_count_in_run == pages_per_run {
-                        page_count_in_run = 0;
-                        runs.push(run);
-                        run = self.db.create_run()?;
-                    } else {
-                        run.new_page()?;
-                    }
-                } else {
-                    let new_mem = self.mem.try_reserve(run.data_size() as usize);
-                    if let Err(_e) = new_mem {
-                        mem_filled = true;
-                        // reached max buffers , create a new run
-                        runs.push(run);
-                        run = self.db.create_run()?;
-                        pages_per_run = mems.len();
-                        page_count_in_run = 0;
-                    } else {
-                        mems.push(new_mem.unwrap());
-                        run.new_page()?;
-                        page_count_in_run += 1;
-                    }
+            current_run.push(r);
+            if current_run.len() % records_per_page != 0 {
+                continue;
+            }
+            if mem_filled {
+                // Counts the page's worth just accumulated —
+                // incrementing before comparing (rather than after, the
+                // original order here) is what makes a run actually
+                // close out at `pages_per_run` pages instead of
+                // `pages_per_run + 1`.
+                page_count_in_run += 1;
+                if page_count_in_run == pages_per_run {
+                    page_count_in_run = 0;
+                    Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+                    runs.push(run);
+                    run = self.db.create_run()?;
                 }
-                heap = BinaryHeap::with_capacity(records_per_page);
+            } else {
+                let new_mem = self.mem.try_reserve(run.data_size() as usize);
+                if let Err(_e) = new_mem {
+                    mem_filled = true;
+                    // reached max buffers , create a new run
+                    pages_per_run = mems.len();
+                    page_count_in_run = 0;
+                    Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+                    runs.push(run);
+                    run = self.db.create_run()?;
+                } else {
+                    mems.push(new_mem.unwrap());
+                    page_count_in_run += 1;
+                }
             }
         }
-        let data = to_allocvec(
-            &heap
-                .into_sorted_vec()
-                .into_iter()
-                .map(|r| r.key)
-                .collect::<Vec<_>>(),
-        )?;
-        assert!(data.len() <= run.data_size() as usize);
-        run.set_content(&data)?;
-        runs.push(run);
+        if !current_run.is_empty() {
+            Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+            runs.push(run);
+        }
 
         Ok(SortedRuns {
             runs,
@@ -398,6 +401,38 @@ where
             mem: mems,
             record_size,
         })
+    }
+
+    // Sorts every row accumulated for the run currently being built —
+    // as one whole batch, not per page, see build_initial_runs' own
+    // comment on why that distinction is load-bearing — and splits the
+    // result across `run`'s pages, records_per_page rows each. Drains
+    // `rows` so the caller's accumulator is ready to start the next
+    // run.
+    fn close_run(
+        sort_fields: &Vec<SortField>,
+        run: &mut Run<F>,
+        rows: &mut Vec<IndexKey>,
+        records_per_page: usize,
+    ) -> Result<(), SchemaError> {
+        let mut heap = BinaryHeap::with_capacity(rows.len());
+        for r in rows.drain(..) {
+            heap.push(CrateItem {
+                key: r,
+                order: sort_fields,
+            });
+        }
+        let sorted: Vec<IndexKey> = heap.into_sorted_vec().into_iter().map(|i| i.key).collect();
+        let chunks: Vec<&[IndexKey]> = sorted.chunks(records_per_page.max(1)).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let data = to_allocvec(&chunk.to_vec())?;
+            assert!(data.len() <= run.data_size() as usize);
+            run.set_content(&data)?;
+            if i + 1 < chunks.len() {
+                run.new_page()?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -430,14 +465,26 @@ where
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
+        // Timed per-phase, not as one Instant wrapping the whole call:
+        // this function tail-recurses into itself (twice, below) once a
+        // one-time phase (top-K build / external sort) hands off to the
+        // steady-state read phase. A single outer Instant spanning a
+        // recursive self.next() call would double-count that inner
+        // call's own already-recorded elapsed time, since the outer
+        // span's elapsed() is measured only after the inner call (and
+        // its own bookkeeping) has already returned.
         if let Some(results) = &mut self.results {
-            return Ok(results.pop().to_owned());
+            let start = Instant::now();
+            let out = results.pop().to_owned();
+            self.next_time += start.elapsed().as_nanos();
+            return Ok(out);
         }
         let mut limited = false;
         if let Some(_limit) = self.limit {
             limited = true;
         }
         if limited {
+            let start = Instant::now();
             let mut heap = CrateHeap::new(self);
             while let Some(rec) = self.source.next()? {
                 heap.push(CrateItem {
@@ -457,21 +504,37 @@ where
                 .collect::<Vec<_>>();
             sorted.reverse();
             self.results = Some(sorted);
+            self.sort_time += start.elapsed().as_nanos();
             self.next()
+        } else if let Some(progress) = &mut self.progress {
+            let start = Instant::now();
+            let out = progress.next();
+            self.next_time += start.elapsed().as_nanos();
+            out
         } else {
-            if let Some(progress) = &mut self.progress {
-                progress.next()
-            } else {
-                {
-                    self.progress = Some(self.build_sort()?);
-                }
-                self.next()
-            }
+            let start = Instant::now();
+            self.progress = Some(self.build_sort()?);
+            self.sort_time += start.elapsed().as_nanos();
+            self.next()
         }
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        let this_stats = vec![(
+            "SortSource".to_string(),
+            QueryStats {
+                stats: HashMap::from([
+                    ("sort_ns".into(), self.sort_time as f64),
+                    ("next_ns".into(), self.next_time as f64),
+                ]),
+                level: 0,
+            },
+        )];
+        Some(merge_stats(this_stats, self.source.stats()))
     }
 }
 
@@ -748,6 +811,8 @@ mod tests {
             db,
             mem: QueryMemory::new(1024),
             progress: None,
+            sort_time: 0,
+            next_time: 0,
         }
     }
 
@@ -830,6 +895,58 @@ mod tests {
         );
     }
 
+    // Regression test: build_initial_runs used to sort and flush one
+    // records_per_page-sized batch at a time, in a fresh BinaryHeap per
+    // page — so each individual PAGE came out internally sorted, but
+    // nothing kept page 2's rows >= page 1's, meaning a run spanning
+    // more than one page was NOT actually a single sorted sequence
+    // (merge_two/merge_runs assume it is). Every existing test above
+    // this one deliberately used a one-page-per-run memory budget
+    // (`probe_data_size()`, "a budget of exactly one page forces a new
+    // run on every flush"), which sidesteps the bug entirely — a run
+    // with exactly one page is trivially "sorted across its own
+    // pages". This test instead gives a run enough budget for several
+    // pages (`data_size * 4`), on a 2-column row sorted by its
+    // non-zero-index column (the actual GROUP BY key position for any
+    // query that isn't `SELECT` on a single-column table), and checks
+    // the full output is globally sorted — this is exactly the shape
+    // that silently fragmented GROUP BY into far more groups than
+    // actually existed once real query data grew past one page.
+    #[test]
+    fn test_a_run_spanning_multiple_pages_is_globally_sorted_not_just_page_locally() {
+        let data_size = probe_data_size();
+        let record_size = crate::datatype::DataType::Integer.size() * 2;
+        let records_per_page = data_size / record_size;
+        // Enough rows to span several multi-page runs (not just one),
+        // so both build_initial_runs' own per-run sort AND
+        // merge_runs/merge_two's cross-run merge get exercised.
+        let total_rows = records_per_page * 4 * 3;
+
+        let rows: Vec<Vec<ValueItem>> = (0..total_rows as i64)
+            .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i % 7)])
+            .collect();
+        let source: Box<dyn Source> = Box::new(VecSource::new(&["id", "cat"], rows));
+        let db = store::db::Db::<store::memfile::MemFile>::create("multi_page_run_test").unwrap();
+        // data_size * 4: enough reservable budget for a run to grow to
+        // several pages before memory forces a new one — the one thing
+        // every other unlimited-sort test above avoids.
+        let mem = QueryMemory::new(data_size * 4);
+        let mut sort = SortSource::with_fields(source, db, mem, &[1]).unwrap();
+        let out = drain(&mut sort);
+        assert_eq!(out.len(), total_rows);
+        let vals: Vec<i64> = out
+            .iter()
+            .map(|r| match &r[1] {
+                ValueItem::Integer(i) => *i,
+                _ => panic!("expected Integer"),
+            })
+            .collect();
+        assert!(
+            vals.is_sorted(),
+            "output must be globally sorted by column 1, not just sorted within each page"
+        );
+    }
+
     // ---- unlimited sort (no LIMIT clause): build_initial_runs, merge_runs,
     // merge_two, and the num_passes calculation that ties them together ----
 
@@ -850,6 +967,8 @@ mod tests {
             db,
             mem: QueryMemory::new(mem_limit),
             progress: None,
+            sort_time: 0,
+            next_time: 0,
         }
     }
 

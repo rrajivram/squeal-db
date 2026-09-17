@@ -749,7 +749,6 @@ mod tests {
     // recorded in BASELINE.md.
     #[test]
     #[ignore]
-    #[cfg(not(feature = "dhat-heap"))]
     fn alloc_proxy_table_scan_snapshot() {
         const ROWS: u64 = 2_000;
         const NOISE_TXNS: u64 = 100;

@@ -540,7 +540,6 @@ mod arclock_tests {
     // an asymptotic one.
     #[test]
     #[ignore]
-    #[cfg(not(feature = "dhat-heap"))]
     fn alloc_proxy_disjoint_keys_concurrent() {
         const THREADS: u64 = 8;
         const OPS_PER_THREAD: u64 = 2_000;

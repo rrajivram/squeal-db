@@ -717,4 +717,108 @@ mod tests {
             Some(b"page one slot zero".to_vec())
         );
     }
+
+    // Isolation test for a squeal-sql-level bug (HashedSource's
+    // bug_repro_rehash_past_272384_rows_loses_entries, in source/hash.rs):
+    // a hash table with 133 records/page loses entries once it grows to
+    // exactly 272384 = 133 * 2048 slots (2048 pages) — a suspiciously
+    // round page count to be where a hashing/capacity bug would show up.
+    // This checks Run/RunCursor alone, no hashing or capacity-doubling
+    // involved: can a plain sequential fill across a page chain that
+    // crosses exactly 2048 pages be read back completely, via the same
+    // cursor.next() page-chain walk (RunCursor::next_tuple) rehash's
+    // replay depends on?
+    #[test]
+    fn test_slotted_run_cursor_reads_back_every_slot_across_2048_pages() {
+        const RECORDS_PER_PAGE: u64 = 133;
+        const NUM_PAGES: usize = 2100;
+        let db = Db::<MemFile>::create("run_cursor_many_pages.db").unwrap();
+        let mut run = db.create_slotted_run().unwrap();
+        for page in 0..NUM_PAGES {
+            if page > 0 {
+                run.new_slotted_page().unwrap();
+            }
+            for slot in 0..RECORDS_PER_PAGE {
+                let value = (page as u64) * RECORDS_PER_PAGE + slot;
+                run.set_slot_at(page, slot, &value.to_le_bytes()).unwrap();
+            }
+        }
+        assert_eq!(run.page_count(), NUM_PAGES);
+
+        let mut cursor = run.cursor().unwrap();
+        let mut seen = Vec::new();
+        while let Some(t) = cursor.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen.push(u64::from_le_bytes(bytes));
+        }
+        let expected_total = NUM_PAGES as u64 * RECORDS_PER_PAGE;
+        assert_eq!(
+            seen.len() as u64,
+            expected_total,
+            "expected {expected_total} tuples, cursor yielded {}",
+            seen.len()
+        );
+        let expected: Vec<u64> = (0..expected_total).collect();
+        assert_eq!(
+            seen, expected,
+            "tuples must come back in write order, none lost or duplicated"
+        );
+    }
+
+    // Same as the sequential-fill version above, but writes in
+    // hash-scattered order instead of page-by-page — HashedSource's own
+    // insert_with_hash writes to `hash % capacity` (then linear-probes
+    // on collision), so pages fill in a scattered, non-sequential
+    // pattern, not front-to-back. Uses a multiplicative permutation
+    // (coprime multiplier over the full slot space, a full-period Weyl
+    // sequence) so every slot still gets exactly one write, just in
+    // scrambled order — closer to what the real bug's access pattern
+    // looks like than the sequential version.
+    #[test]
+    fn test_slotted_run_cursor_reads_back_every_slot_written_in_scattered_order() {
+        const RECORDS_PER_PAGE: u64 = 133;
+        const NUM_PAGES: usize = 2100;
+        const TOTAL_SLOTS: u64 = RECORDS_PER_PAGE * NUM_PAGES as u64;
+        // Coprime with TOTAL_SLOTS (279300 = 2^2*3*5^2*7^2*19; this is
+        // prime and shares no factor with it) so `(i * MULT) %
+        // TOTAL_SLOTS` visits every slot exactly once as i ranges over
+        // 0..TOTAL_SLOTS.
+        const MULT: u64 = 104729;
+
+        let db = Db::<MemFile>::create("run_cursor_scattered.db").unwrap();
+        let mut run = db.create_slotted_run().unwrap();
+        for _ in 1..NUM_PAGES {
+            run.new_slotted_page().unwrap();
+        }
+        assert_eq!(run.page_count(), NUM_PAGES);
+
+        for i in 0..TOTAL_SLOTS {
+            let target = (i * MULT) % TOTAL_SLOTS;
+            let page = (target / RECORDS_PER_PAGE) as usize;
+            let slot = target % RECORDS_PER_PAGE;
+            // Value is the slot's own target index, not `i` — lets the
+            // read-back check assert against a plain 0..TOTAL_SLOTS
+            // range regardless of write order.
+            run.set_slot_at(page, slot, &target.to_le_bytes()).unwrap();
+        }
+
+        let mut cursor = run.cursor().unwrap();
+        let mut seen = Vec::new();
+        while let Some(t) = cursor.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen.push(u64::from_le_bytes(bytes));
+        }
+        assert_eq!(
+            seen.len() as u64,
+            TOTAL_SLOTS,
+            "expected {TOTAL_SLOTS} tuples, cursor yielded {}",
+            seen.len()
+        );
+        seen.sort_unstable();
+        let expected: Vec<u64> = (0..TOTAL_SLOTS).collect();
+        assert_eq!(
+            seen, expected,
+            "every slot's value must be read back exactly once, none lost or duplicated"
+        );
+    }
 }

@@ -4,6 +4,7 @@ pub mod datatype;
 pub(crate) mod datetime;
 pub(crate) mod ds;
 pub mod error;
+pub mod optim;
 pub mod plan;
 pub mod rslt;
 pub mod schema_ops;

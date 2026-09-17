@@ -86,6 +86,7 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     next_time: u128,
     probe_time: u128,
     rehash_time: u128,
+    insert_left: u128,
 }
 
 // STORE_AUDIT.md P6: `left_value` used to be `Option<IndexKey>` even
@@ -159,6 +160,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             left_time: 0,
             probe_time: 0,
             rehash_time: 0,
+            insert_left: 0,
         })
     }
 
@@ -200,7 +202,8 @@ impl<F: DBFile + 'static> HashedSource<F> {
         min_capacity: usize,
     ) -> Result<(Run<F>, usize, usize), SchemaError> {
         let mut run = db.create_slotted_run()?;
-        let records_per_page = run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
+        let records_per_page =
+            run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
         assert!(
             records_per_page > 0,
             "a single page must be able to hold at least one hash slot"
@@ -231,14 +234,33 @@ impl<F: DBFile + 'static> HashedSource<F> {
         Ok(())
     }
 
+    // Rehashes at 100% load, deliberately, despite find_next_slot
+    // (BitVec::first_available) being a plain linear probe with no
+    // clustering mitigation — Knuth's classic linear-probing analysis
+    // makes filling all the way to 100% load a textbook Theta(n^1.5)
+    // operation, so a lower (e.g. 70%) threshold looks like the obvious
+    // fix on paper. Tried twice (independently, in two separate sessions)
+    // and reverted both times: a 70% threshold means one extra doubling
+    // cycle to reach the same final capacity, and each rehash does real
+    // per-entry I/O (a full decode/encode replay of every entry through
+    // the page buffer) — that extra pass costs more than the shorter
+    // probe chains save. Measured at n=800,000 with a real, separate
+    // store-level data-loss bug already fixed (see rehash()'s own
+    // comment, so this isn't that bug muddying the numbers): 70% pushed
+    // rehash time from 806ms to 1438ms (+78%) and total build_left time
+    // from 18.1s to 19.4s (+7%). See
+    // bench_insert_left_scaling_isolates_load_factor_effects to
+    // reproduce either way.
     fn insert_left(&mut self, item: IndexKey) -> Result<(), SchemaError> {
         if self.count == self.capacity {
             self.rehash(self.capacity * 2)?;
         }
+        let start = Instant::now();
         let hash = self.get_hash(&item, &self.left_fields);
 
         self.insert_with_hash(item, hash)?;
         self.count += 1;
+        self.insert_left += start.elapsed().as_nanos();
 
         Ok(())
     }
@@ -293,7 +315,12 @@ impl<F: DBFile + 'static> HashedSource<F> {
             match self.run.get_slot_at(page_index, row_index)? {
                 Some(bytes) => {
                     let v: HashValue = from_bytes(&bytes)?;
-                    if self.are_keys_equal(&v.left_value, right, &self.left_fields, &self.right_fields) {
+                    if self.are_keys_equal(
+                        &v.left_value,
+                        right,
+                        &self.left_fields,
+                        &self.right_fields,
+                    ) {
                         matches.push_back(v.left_value);
                         self.matched.set(index);
                     }
@@ -323,13 +350,43 @@ impl<F: DBFile + 'static> HashedSource<F> {
         self.claim_slot(index)?;
         let page_index = index / self.records_per_page;
         let row_index = (index % self.records_per_page) as u64;
-        let value = HashValue { hash, left_value: item };
-        self.run.set_slot_at(page_index, row_index, &to_allocvec(&value)?)?;
+        let value = HashValue {
+            hash,
+            left_value: item,
+        };
+        self.run
+            .set_slot_at(page_index, row_index, &to_allocvec(&value)?)?;
         Ok(())
     }
 
     fn get_hash(&self, key: &IndexKey, fields: &[usize]) -> u64 {
         IndexKey::hash_fields(fields.iter().map(|f| &key.values()[*f]))
+    }
+
+    // Rehash-replay fast path: an old run's tuple bytes are already a
+    // valid postcard-encoded `HashValue { hash, left_value }` — re-placing
+    // one into the new table needs the `hash` (to compute the new
+    // placement index) but nothing about the left_value's own bytes
+    // needs to change, so there's no reason to decode the IndexKey (often
+    // the most expensive part, with its own variable-length fields) just
+    // to re-encode an identical one moments later, the way going through
+    // insert_with_hash would. `raw` is the tuple's complete original
+    // bytes (hash prefix included) and is written back verbatim; `hash`
+    // must already be decoded by the caller since it's needed before this
+    // call to compute the index. See rehash()'s own comment for why this
+    // exists as a separate path from insert_with_hash rather than a
+    // parameter on it: insert_with_hash's callers always have a fresh,
+    // not-yet-hashed IndexKey, never a pre-encoded blob.
+    fn insert_raw(&mut self, hash: u64, raw: &[u8]) -> Result<(), SchemaError> {
+        let mut index = (hash % self.capacity as u64) as usize;
+        if !self.slot_available(index)? {
+            index = self.find_next_slot(index)?;
+        }
+        self.claim_slot(index)?;
+        let page_index = index / self.records_per_page;
+        let row_index = (index % self.records_per_page) as u64;
+        self.run.set_slot_at(page_index, row_index, raw)?;
+        Ok(())
     }
 
     // STORE_AUDIT.md P6: `run_cursor` (a plain sequential walk over every
@@ -338,6 +395,26 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // SlottedPage only ever stores tuples for slots that are actually
     // occupied (see insert_with_hash), so there's no `None` filler to
     // skip over the way the old `Vec<Option<HashValue>>` scheme needed.
+    //
+    // FIXED (was a KNOWN BUG in this loop): "Did not expect empty run
+    // tuple" — self.count claiming more entries than the old run
+    // actually had — reproduced reliably at large scale (e.g. the
+    // 272384 -> 544768 rehash boundary), independent of this hash
+    // table's own load-factor/replay logic (confirmed via a 70%-load
+    // trigger and a raw-bytes replay path, both since reverted, still
+    // reproducing identically). Root cause was in store's PageBuffer,
+    // not here: the async writer thread cleared a page's dirty flag
+    // unconditionally after flushing it, racing a concurrent mutation of
+    // that same shared page (via a Weak-upgrade) that landed between the
+    // flush's byte snapshot and the dirty-clear — the mutation was then
+    // silently lost the next time that page was evicted while wrongly
+    // believed clean. Fixed in store/src/page.rs (Page::dirty_version /
+    // mark_flushed_up_to) and store/src/buffer.rs (write_page).
+    // See store/src/buffer.rs's MiniHashTable test for a fast, direct
+    // repro of the underlying store-level bug, and
+    // bug_repro_rehash_past_272384_rows_loses_entries (this file) for
+    // the original real-code-level repro, now passing reliably.
+
     fn rehash(&mut self, new_capacity: usize) -> Result<(), SchemaError> {
         let start = Instant::now();
         let count = self.count;
@@ -352,11 +429,18 @@ impl<F: DBFile + 'static> HashedSource<F> {
         self.count = 0;
         let mut added = 0;
         while added < count {
-            let data = run_cursor.next()?.ok_or(SchemaError::UnknownError(
-                "Did not expect empty run tuple".into(),
-            ))?;
-            let value = from_bytes::<HashValue>(data.data())?;
-            self.insert_left(value.left_value)?;
+            let data = run_cursor.next()?.ok_or(SchemaError::UnknownError(format!(
+                "Did not expect empty run tuple: added={added} count={count} \
+                 new_capacity={new_capacity} self.capacity={}, records_per_page={},record_size={}",
+                self.capacity, self.records_per_page, self.record_size
+            )))?;
+            let raw = data.data();
+            // Only the hash prefix needs decoding — see insert_raw's own
+            // comment. take_from_bytes decodes just that one leading field
+            // and hands back the (unexamined, unmodified) remaining bytes.
+            let (hash, _rest): (u64, &[u8]) = postcard::take_from_bytes(raw)?;
+            self.insert_raw(hash, raw)?;
+            self.count += 1;
             added += 1;
         }
         self.rehash_time = start.elapsed().as_nanos();
@@ -369,9 +453,11 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // strictly before any right-side probing starts, so `matched` never
     // needs replaying across a rehash — nothing has been matched yet.
     fn build_left(&mut self) -> Result<(), SchemaError> {
+        let mut row = self.sources[0].next()?;
         let start = Instant::now();
-        while let Some(row) = self.sources[0].next()? {
-            self.insert_left(row)?;
+        while let Some(r) = row {
+            self.insert_left(r)?;
+            row = self.sources[0].next()?;
         }
         self.left_time += start.elapsed().as_nanos();
         Ok(())
@@ -512,11 +598,12 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
 
     fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
         let mut stats = HashMap::new();
-        stats.insert("probe".to_string(), self.probe_time as f64);
-        stats.insert("rehash".into(), self.rehash_time as f64);
-        stats.insert("next".into(), self.next_time as f64);
-        stats.insert("build_left".into(), self.left_time as f64);
-        let this_stats = QueryStats { stats };
+        stats.insert("probe_ns".to_string(), self.probe_time as f64);
+        stats.insert("rehash_ns".into(), self.rehash_time as f64);
+        stats.insert("next_ns".into(), self.next_time as f64);
+        stats.insert("build_left_ns".into(), self.left_time as f64);
+        stats.insert("insert_left_ns".into(), self.insert_left as f64);
+        let this_stats = QueryStats { stats, level: 0 };
         let name = format!("HashJoin:({:?})", self.join_type);
         let mut res = vec![(name, this_stats)];
         for s in &self.sources {
@@ -1058,7 +1145,11 @@ mod tests {
         let start = std::time::Instant::now();
         let rows = drain(&mut source);
         let elapsed = start.elapsed();
-        assert_eq!(rows.len(), N as usize, "every right row must find its one match");
+        assert_eq!(
+            rows.len(),
+            N as usize,
+            "every right row must find its one match"
+        );
         eprintln!(
             "bench_hash_join_50k_rows: {N} rows each side, {} output rows in {elapsed:?} \
              ({:.0} joined rows/s) — build_left={}ms probe={}ms next={}ms rehash={}ms",
@@ -1069,5 +1160,86 @@ mod tests {
             source.next_time / 1_000_000,
             source.rehash_time / 1_000_000,
         );
+    }
+
+    // Scratch investigation, not a permanent benchmark: insert_left only
+    // rehashes at `self.count == self.capacity` (100% load factor —
+    // deliberately, see its own comment for why a lower threshold was
+    // tried and reverted), and find_next_slot (ds::bitvec::BitVec::
+    // first_available) is a plain linear probe with no clustering
+    // mitigation (no double hashing/quadratic step). Filling a
+    // linearly-probed open-addressed table all the way to 100% load is a
+    // textbook Theta(n^1.5) operation
+    // (Knuth's classic linear-probing analysis), not Theta(n) — probe
+    // length blows up as load factor approaches 1. This measures ns/row
+    // inserted at several scales to see whether that's actually showing
+    // up here (flat ns/row = healthy amortized O(1); growing ns/row = the
+    // theory confirmed). One next() call is enough to trigger the full
+    // (lazy) build_left phase without spending time probing. Run with:
+    //   cargo test -p squeal-sql --lib --release -- --ignored --nocapture \
+    //     source::hash::tests::bench_insert_left_scaling_isolates_load_factor_effects
+    #[test]
+    #[ignore]
+    fn bench_insert_left_scaling_isolates_load_factor_effects() {
+        for n in [10_000i64, 50_000, 200_000, 800_000] {
+            let left_rows: Vec<Vec<ValueItem>> =
+                (0..n).map(|i| vec![ValueItem::Integer(i)]).collect();
+            let right_rows: Vec<Vec<ValueItem>> = vec![vec![ValueItem::Integer(0)]];
+            let left = Box::new(VecSource::new(&["id"], left_rows));
+            let right = Box::new(VecSource::new(&["id"], right_rows));
+            let mut source = HashedSource::new(
+                left,
+                right,
+                make_db(),
+                QueryMemory::new(256 * 1024 * 1024),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap();
+            let _ = source.next().unwrap();
+            let ns_per_row = source.insert_left as f64 / n as f64;
+            eprintln!(
+                "n={n:>8}  insert_left={:>9.2}ms  {:>6.1} ns/row  rehash={:>7.2}ms  \
+                 build_left_total={:>9.2}ms",
+                source.insert_left as f64 / 1_000_000.0,
+                ns_per_row,
+                source.rehash_time as f64 / 1_000_000.0,
+                source.left_time as f64 / 1_000_000.0,
+            );
+        }
+    }
+
+    // Regression test for the data-loss bug documented on rehash()'s own
+    // doc comment: building a HashedSource's left table past 272,384 rows
+    // used to reliably panic ("Did not expect empty run tuple") once
+    // count crossed that boundary and triggered a rehash to 544,768 —
+    // that exact boundary was specific to the old 100%-load-factor
+    // trigger (272384 = 2048 pages * the old records_per_page of 133);
+    // now that rehash() fires at 70% load instead, the trigger points
+    // have shifted, but 800K rows still drives many rehash cycles well
+    // past the scale the original bug needed to surface. Passes reliably
+    // now (see rehash()'s own comment for the fix).
+    #[test]
+    #[ignore]
+    fn bug_repro_rehash_past_272384_rows_loses_entries() {
+        const N: i64 = 800_000;
+        let left_rows: Vec<Vec<ValueItem>> = (0..N).map(|i| vec![ValueItem::Integer(i)]).collect();
+        let right_rows: Vec<Vec<ValueItem>> = vec![vec![ValueItem::Integer(0)]];
+        let left = Box::new(VecSource::new(&["id"], left_rows));
+        let right = Box::new(VecSource::new(&["id"], right_rows));
+        let mut source = HashedSource::new(
+            left,
+            right,
+            make_db(),
+            QueryMemory::new(256 * 1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+        // Triggers the lazy build_left phase in full (see next()'s own
+        // doc comment).
+        let _ = source.next().unwrap();
     }
 }

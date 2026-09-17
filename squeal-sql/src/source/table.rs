@@ -1,4 +1,4 @@
-use std::{fmt::Debug, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use postcard::from_bytes;
 use store::{
@@ -10,7 +10,7 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source},
     table::{SqlTable, VersionedRow},
 };
 
@@ -18,6 +18,7 @@ pub struct TableSource<F: DBFile> {
     cursor: TableCursor<F>,
     table: Arc<SqlTable>,
     fields: Arc<[ProjectableField]>,
+    next_time: u128,
 }
 
 impl<F> TableSource<F>
@@ -52,6 +53,7 @@ where
             cursor,
             table,
             fields,
+            next_time: 0,
         })
     }
 }
@@ -62,10 +64,14 @@ where
     F: DBFile<Item = F>,
 {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        let start = Instant::now();
         if let Some(tuple) = self.cursor.next()? {
             let row = from_bytes::<VersionedRow>(tuple.data())?;
-            Ok(Some(self.table.reproject(&row)?))
+            let out = self.table.reproject(&row)?;
+            self.next_time += start.elapsed().as_nanos();
+            Ok(Some(out))
         } else {
+            self.next_time += start.elapsed().as_nanos();
             Ok(None)
         }
     }
@@ -76,6 +82,16 @@ where
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         Ok(self.cursor.reset()?)
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        Some(vec![(
+            format!("TableScan:{}", self.table.name),
+            QueryStats {
+                stats: HashMap::from([("next_ns".into(), self.next_time as f64)]),
+                level: 0,
+            },
+        )])
     }
 }
 

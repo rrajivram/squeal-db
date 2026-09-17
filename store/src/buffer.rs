@@ -308,9 +308,9 @@ where
             &*(self.self_file.read()),
             self.header.page_size,
             self.header.first_page_offset,
-        )?;
-        page.set_dirty(false)?;
-        Ok(())
+        )
+        // write_page itself marks the page flushed (conditionally — see
+        // Page::mark_flushed_up_to) on success now.
     }
 
     // Does NOT write `page` to disk itself, despite the name (kept for the
@@ -648,9 +648,7 @@ where
                     .read()
                     .iter()
                     .filter_map(|(page_num, entry)| match entry {
-                        PageEntry::Strong(arc) if arc.is_dirty() => {
-                            Some((*page_num, arc.clone()))
-                        }
+                        PageEntry::Strong(arc) if arc.is_dirty() => Some((*page_num, arc.clone())),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -1311,7 +1309,8 @@ fn writer<F: DBFile>(
                 // whose lsn exactly EQUALS the current watermark has its
                 // protecting redo record already durable — safe to flush
                 // now, not stuck waiting for something strictly newer.
-                || pending[i].page.lsn_id()? <= clock.last_written() {
+                || pending[i].page.lsn_id()? <= clock.last_written()
+            {
                 match write_page(
                     pending[i].page_num,
                     &pending[i].page,
@@ -1320,8 +1319,8 @@ fn writer<F: DBFile>(
                     header.first_page_offset,
                 ) {
                     Ok(()) => {
-                        let m = pending.swap_remove(i);
-                        m.page.set_dirty(false)?;
+                        pending.swap_remove(i);
+                        // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
                         // Don't advance i: swap_remove pulled a new element
                         // into this position.
                     }
@@ -1394,7 +1393,7 @@ fn writer<F: DBFile>(
                             header.page_size,
                             header.first_page_offset,
                         )?;
-                        m.page.set_dirty(false)?;
+                        // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
                     }
                     // A checkpoint's entire point is "everything up to here is
                     // durable" — the redo/undo logs get truncated right after
@@ -1423,7 +1422,7 @@ fn writer<F: DBFile>(
                         header.page_size,
                         header.first_page_offset,
                     )?;
-                    m.page.set_dirty(false)?;
+                    // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
                 }
                 // Same rationale as Checkpoint above: close() truncates the
                 // WAL right after this returns, so this is the last point
@@ -1448,7 +1447,9 @@ fn writer<F: DBFile>(
                         header.page_size,
                         header.first_page_offset,
                     ) {
-                        Ok(()) => msg.page.set_dirty(false)?,
+                        Ok(()) => {
+                            // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
+                        }
                         Err(StoreError::PageTransientlyInconsistent(pid)) => {
                             bump_transient_retries(&mut msg, pid)?;
                             // Defer instead of retrying inline — same
@@ -1556,6 +1557,12 @@ fn write_page(
     page_size: DBSizeType,
     first_offset: DBSizeType,
 ) -> Result<(), StoreError> {
+    // Captured *before* the byte snapshot below, and handed to
+    // mark_flushed_up_to at the end instead of an unconditional
+    // set_dirty(false) — see that method's own comment for the data-loss
+    // race this closes (a concurrent mutation of this same shared Arc
+    // landing between the snapshot taken here and dirty being cleared).
+    let observed_version = page.dirty_version();
     // One atomic read of header+data together (see Page::to_bytes_snapshot's
     // own comment), not three separate top-level calls (header(),
     // to_data_bytes(), to_bytes()) the way this used to be written. Each of
@@ -1602,7 +1609,8 @@ fn write_page(
         loop {
             let cur_offset = page_offset(cur_page_id, page_size, first_offset);
             let mut cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
-            let chunk_len = (cur_header.page_data_size as usize).min(data.len().saturating_sub(start));
+            let chunk_len =
+                (cur_header.page_data_size as usize).min(data.len().saturating_sub(start));
             let mut chunk = vec![0u8; cur_header.page_data_size as usize];
             if chunk_len > 0 {
                 chunk[..chunk_len].copy_from_slice(&data[start..start + chunk_len]);
@@ -1659,6 +1667,7 @@ fn write_page(
         pwrite_all(file, &bytes, start_offset)?;
     }
 
+    page.mark_flushed_up_to(observed_version);
     Ok(())
 }
 
@@ -1775,8 +1784,10 @@ mod tests {
     use postcard::from_bytes;
 
     use super::{BufMsg, Evicted, PageEntry, WriteMsg};
+    use crate::cursor::Cursor;
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
+    use crate::run::Run;
     use crate::page::{PAGE_OVERHEAD, Page, PageId};
     use crate::tuple::{DBIdType, Tuple};
     use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
@@ -1829,6 +1840,504 @@ mod tests {
         )
         .unwrap();
         (buf, page_counter)
+    }
+
+    // Isolation test for a squeal-sql-level bug (HashedSource's
+    // bug_repro_rehash_past_272384_rows_loses_entries, in squeal-sql's
+    // source/hash.rs): building a large hash table loses entries, and
+    // both observed failure boundaries were exact multiples of 1024 —
+    // suspicious, since `max_entries` (this buffer's resident-page cap
+    // before eviction) is hardcoded to 1024 in Db::create_core_db. This
+    // forces the same "page count exceeds max_entries" condition at a
+    // tiny, fast scale (4 resident slots, 50 pages) to check whether
+    // eviction itself is where a write goes missing.
+    #[test]
+    fn test_run_survives_eviction_when_page_count_exceeds_max_entries() {
+        use crate::cursor::Cursor;
+        let (buf, _counter) = make_buffer(0, 20);
+        let mut run = crate::run::Run::create_slotted(Arc::new(buf)).unwrap();
+        const NUM_PAGES: usize = 50;
+        for page in 0..NUM_PAGES {
+            if page > 0 {
+                run.new_slotted_page().unwrap();
+            }
+            let value = page as u64;
+            run.set_slot_at(page, 0, &value.to_le_bytes()).unwrap();
+        }
+
+        let mut cursor = run.cursor().unwrap();
+        let mut seen = Vec::new();
+        while let Some(t) = cursor.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen.push(u64::from_le_bytes(bytes));
+        }
+        assert_eq!(
+            seen.len(),
+            NUM_PAGES,
+            "expected {NUM_PAGES} tuples, cursor yielded {}",
+            seen.len()
+        );
+        assert_eq!(seen, (0..NUM_PAGES as u64).collect::<Vec<_>>());
+    }
+
+    // Closer to HashedSource::rehash's actual access pattern than the
+    // single-run test above: TWO runs alive at once, sharing the same
+    // small buffer pool — a cursor over run A stays live and gets read
+    // from (`cursor.next()`) WHILE run B is separately allocated and
+    // written to, exactly like rehash() keeps `run_cursor` (over the
+    // old run) alive across the entire replay loop that builds the new
+    // run. Twice the page count competing for the same max_entries
+    // resident slots means twice the eviction pressure, and read+write
+    // interleaving that the single-run test never exercises.
+    #[test]
+    fn test_run_to_run_copy_survives_eviction_when_both_runs_share_a_small_buffer() {
+        use crate::cursor::Cursor;
+        let (buf, _counter) = make_buffer(0, 20);
+        let buf = Arc::new(buf);
+        let mut run_a = crate::run::Run::create_slotted(buf.clone()).unwrap();
+        const NUM_PAGES: usize = 50;
+        for page in 0..NUM_PAGES {
+            if page > 0 {
+                run_a.new_slotted_page().unwrap();
+            }
+            let value = page as u64;
+            run_a.set_slot_at(page, 0, &value.to_le_bytes()).unwrap();
+        }
+
+        // run_a's cursor is created and stays alive across the ENTIRE
+        // copy into run_b below — mirrors rehash()'s
+        // `let mut run_cursor = self.run.cursor()?;` followed by
+        // building the new run while still reading through it.
+        let mut cursor_a = run_a.cursor().unwrap();
+        let mut run_b = crate::run::Run::create_slotted(buf).unwrap();
+        let mut copied = Vec::new();
+        let mut page_b = 0usize;
+        while let Some(t) = cursor_a.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            if page_b > 0 {
+                run_b.new_slotted_page().unwrap();
+            }
+            run_b.set_slot_at(page_b, 0, &bytes).unwrap();
+            copied.push(u64::from_le_bytes(bytes));
+            page_b += 1;
+        }
+        assert_eq!(
+            copied.len(),
+            NUM_PAGES,
+            "expected to copy {NUM_PAGES} tuples out of run_a, got {}",
+            copied.len()
+        );
+        assert_eq!(copied, (0..NUM_PAGES as u64).collect::<Vec<_>>());
+
+        // Independently verify run_b itself holds everything that was
+        // just written to it, via a fresh cursor.
+        let mut cursor_b = run_b.cursor().unwrap();
+        let mut seen_b = Vec::new();
+        while let Some(t) = cursor_b.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen_b.push(u64::from_le_bytes(bytes));
+        }
+        assert_eq!(
+            seen_b.len(),
+            NUM_PAGES,
+            "expected {NUM_PAGES} tuples in run_b, cursor yielded {}",
+            seen_b.len()
+        );
+        assert_eq!(seen_b, (0..NUM_PAGES as u64).collect::<Vec<_>>());
+    }
+
+    // One more step closer to the real bug than the single A->B copy
+    // above: a CHAIN of doubling generations (10 -> 20 -> 40 -> ... ->
+    // 320 pages), each one copying the previous generation's content
+    // into a fresh, bigger run while the old run's cursor stays live —
+    // exactly HashedSource's own repeated-rehash-and-grow pattern
+    // (insert_left doubles capacity every time the table fills, and the
+    // real bug needed AT LEAST two such doublings — crossing 1024
+    // pages, then 2048 — to manifest, not just one).
+    #[test]
+    fn test_chained_doubling_generations_survive_repeated_eviction() {
+        use crate::cursor::Cursor;
+        // 1, not 0: reserves PageId(0) the same way a real Db does (see
+        // Db::create_system_tables — page 0 is the permanent "system"
+        // table, never freed). PageId::is_valid_next_page() treats 0 as
+        // the sentinel for "no next page" (self.0 != 0) — if a Run page
+        // ever legitimately points at page 0 as its NEXT page (not just
+        // as the sentinel value happening to equal a real page's id),
+        // the chain walk can't tell the two apart and silently truncates
+        // right there. A from-0 counter (the bug in this test's own
+        // setup, not real Db behavior) lets page 0 get freed and reused
+        // as an ordinary mid-chain Run page — exactly triggering that
+        // ambiguity.
+        let (buf, _counter) = make_buffer(1, 20);
+        let buf = Arc::new(buf);
+
+        let mut run = crate::run::Run::create_slotted(buf.clone()).unwrap();
+        let mut page_count = 1usize;
+        run.set_slot_at(0, 0, &0u64.to_le_bytes()).unwrap();
+
+        for _gen in 0..6 {
+            let next_page_count = page_count * 2;
+            let mut cursor = run.cursor().unwrap();
+            let mut next_run = crate::run::Run::create_slotted(buf.clone()).unwrap();
+            let mut copied = Vec::new();
+            let mut page = 0usize;
+            while let Some(t) = cursor.next().unwrap() {
+                let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+                if page > 0 {
+                    next_run.new_slotted_page().unwrap();
+                }
+                next_run.set_slot_at(page, 0, &bytes).unwrap();
+                copied.push(u64::from_le_bytes(bytes));
+                page += 1;
+            }
+            assert_eq!(
+                copied,
+                (0..page_count as u64).collect::<Vec<_>>(),
+                "generation growing to {next_page_count} pages lost entries during replay \
+                 (started with {page_count})"
+            );
+            // Pad the new (bigger) run out to next_page_count pages,
+            // continuing the value sequence — matches how a real
+            // rehash's new capacity is bigger than what it just
+            // replayed, with more real inserts landing after it.
+            for extra in page_count..next_page_count {
+                next_run.new_slotted_page().unwrap();
+                next_run
+                    .set_slot_at(extra, 0, &(extra as u64).to_le_bytes())
+                    .unwrap();
+            }
+            run = next_run;
+            page_count = next_page_count;
+        }
+
+        let mut final_cursor = run.cursor().unwrap();
+        let mut seen = Vec::new();
+        while let Some(t) = final_cursor.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen.push(u64::from_le_bytes(bytes));
+        }
+        assert_eq!(
+            seen.len(),
+            page_count,
+            "expected {page_count} tuples in the final generation, cursor yielded {}",
+            seen.len()
+        );
+        assert_eq!(seen, (0..page_count as u64).collect::<Vec<_>>());
+    }
+
+    // Same chain as above, except every prior generation's Run is kept
+    // alive (pushed into `_kept`, never dropped) instead of being
+    // replaced by `run = next_run`. If dropping an old generation frees
+    // its pages back for a LATER generation's alloc_slotted_page() to
+    // reuse, and a stale still-pending write for the freed PageId later
+    // fires and clobbers whatever the new occupant wrote — a PageId-
+    // reuse race with the async writer's pending queue — keeping every
+    // generation alive (nothing ever freed, no PageId ever reused)
+    // should make the loss disappear even though everything else about
+    // the access pattern is identical.
+    #[test]
+    fn test_chained_doubling_generations_survive_repeated_eviction_when_old_runs_kept_alive() {
+        use crate::cursor::Cursor;
+        // Scaled up to match the real-world repro's own confirmed
+        // parameters (HashedSource's rehash chain, max_entries=128 —
+        // "fails after the 8th rehash every time" — vs. max_entries=4096,
+        // where the same chain "works every time"). 1, not 0: reserves
+        // PageId(0) the way a real Db does (see the other chained test's
+        // own comment on why).
+        let (buf, _counter) = make_buffer(1, 128);
+        let buf = Arc::new(buf);
+
+        let mut run = crate::run::Run::create_slotted(buf.clone()).unwrap();
+        let mut page_count = 1usize;
+        run.set_slot_at(0, 0, &0u64.to_le_bytes()).unwrap();
+        let mut kept = vec![];
+
+        for _gen in 0..12 {
+            let next_page_count = page_count * 2;
+            let mut cursor = run.cursor().unwrap();
+            let mut next_run = crate::run::Run::create_slotted(buf.clone()).unwrap();
+            let mut copied = Vec::new();
+            let mut page = 0usize;
+            while let Some(t) = cursor.next().unwrap() {
+                let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+                if page > 0 {
+                    next_run.new_slotted_page().unwrap();
+                }
+                next_run.set_slot_at(page, 0, &bytes).unwrap();
+                copied.push(u64::from_le_bytes(bytes));
+                page += 1;
+            }
+            assert_eq!(
+                copied,
+                (0..page_count as u64).collect::<Vec<_>>(),
+                "generation growing to {next_page_count} pages lost entries during replay \
+                 (started with {page_count}) EVEN WITH every prior generation kept alive"
+            );
+            for extra in page_count..next_page_count {
+                next_run.new_slotted_page().unwrap();
+                next_run
+                    .set_slot_at(extra, 0, &(extra as u64).to_le_bytes())
+                    .unwrap();
+            }
+            kept.push(run);
+            run = next_run;
+            page_count = next_page_count;
+        }
+
+        let mut final_cursor = run.cursor().unwrap();
+        let mut seen = Vec::new();
+        while let Some(t) = final_cursor.next().unwrap() {
+            let bytes: [u8; 8] = t.data().try_into().expect("8-byte u64 tuple");
+            seen.push(u64::from_le_bytes(bytes));
+        }
+        assert_eq!(
+            seen.len(),
+            page_count,
+            "expected {page_count} tuples in the final generation, cursor yielded {}",
+            seen.len()
+        );
+        assert_eq!(seen, (0..page_count as u64).collect::<Vec<_>>());
+    }
+
+    // A minimal open-addressing hash table built directly on Run, using
+    // the SAME mechanics as squeal-sql's HashedSource (hash.rs):
+    // multiple slots per page (every earlier test in this file used
+    // exactly 1 slot/page — untested territory), real hash%capacity
+    // placement with linear-probe collision resolution (not sequential
+    // or an arbitrary permutation), and rehash-on-full doubling
+    // capacity, replaying the old table's contents into a new one via a
+    // live cursor over the old run while the new run is built — this is
+    // the closest store-level analog yet to the real repro
+    // (bug_repro_rehash_past_272384_rows_loses_entries in squeal-sql's
+    // source/hash.rs), scaled to match its confirmed failing
+    // parameters (max_entries=128, "fails after the 8th rehash").
+    #[derive(Debug, Clone, Copy)]
+    struct InsertRecord {
+        generation: usize,
+        page_id: PageId,
+        page_idx: usize,
+        slot: u64,
+        // How many slots on THIS specific page_id had already been
+        // filled before this one, within the current generation (0 =
+        // first slot written to that page). Reset per generation since
+        // page_id itself is fresh each rehash.
+        fill_order_on_page: usize,
+        pages_in_run_at_insert: usize,
+    }
+
+    struct MiniHashTable {
+        run: Run<MemFile>,
+        buf: Arc<PageBuffer<MemFile>>,
+        records_per_page: usize,
+        capacity: usize,
+        occupied: Vec<bool>,
+        count: usize,
+        generation: usize,
+        // Per-page_id fill counter, reset at the start of each
+        // generation (new pages always start this history fresh, since
+        // no PageId is ever reused across generations while reuse-
+        // related mechanics remain in their normal, non-patched state).
+        page_fill_counts: std::collections::HashMap<PageId, usize>,
+        // Latest known insert site for every key ever inserted —
+        // overwritten on replay, so a key present in the final table
+        // shows its CURRENT location, and a key that went missing shows
+        // the LAST location it was ever actually written to before
+        // vanishing.
+        history: std::collections::HashMap<u64, InsertRecord>,
+    }
+
+    impl MiniHashTable {
+        fn new(buf: Arc<PageBuffer<MemFile>>, records_per_page: usize) -> Self {
+            let run = crate::run::Run::create_slotted(buf.clone()).unwrap();
+            Self {
+                run,
+                buf,
+                records_per_page,
+                capacity: records_per_page,
+                occupied: vec![false; records_per_page],
+                count: 0,
+                generation: 0,
+                page_fill_counts: std::collections::HashMap::new(),
+                history: std::collections::HashMap::new(),
+            }
+        }
+
+        // FNV-1a-ish — cheap, decent distribution, deterministic.
+        fn hash(key: u64) -> u64 {
+            let mut h = 0xcbf29ce484222325u64;
+            for byte in key.to_le_bytes() {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        }
+
+        fn insert(&mut self, key: u64) {
+            if self.count == self.capacity {
+                self.rehash(self.capacity * 2);
+            }
+            let mut idx = (Self::hash(key) % self.capacity as u64) as usize;
+            while self.occupied[idx] {
+                idx = (idx + 1) % self.capacity;
+            }
+            self.occupied[idx] = true;
+            self.count += 1;
+            let page_idx = idx / self.records_per_page;
+            let slot = (idx % self.records_per_page) as u64;
+            let page_id = self.run.page_ids()[page_idx];
+            let fill_order_on_page = *self.page_fill_counts.get(&page_id).unwrap_or(&0);
+            self.page_fill_counts.insert(page_id, fill_order_on_page + 1);
+            self.history.insert(
+                key,
+                InsertRecord {
+                    generation: self.generation,
+                    page_id,
+                    page_idx,
+                    slot,
+                    fill_order_on_page,
+                    pages_in_run_at_insert: self.run.page_ids().len(),
+                },
+            );
+            self.run.set_slot_at(page_idx, slot, &key.to_le_bytes()).unwrap();
+        }
+
+        fn rehash(&mut self, new_capacity: usize) {
+            self.generation += 1;
+            self.page_fill_counts.clear();
+            let count = self.count;
+            let mut cursor = self.run.cursor().unwrap();
+            let new_pages = new_capacity.div_ceil(self.records_per_page);
+            let mut new_run = crate::run::Run::create_slotted(self.buf.clone()).unwrap();
+            for _ in 1..new_pages {
+                new_run.new_slotted_page().unwrap();
+            }
+            self.run = new_run;
+            self.capacity = new_capacity;
+            self.occupied = vec![false; new_capacity];
+            self.count = 0;
+            let mut added = 0;
+            // Drains whatever the old run's cursor actually has, rather
+            // than enforcing `count` strictly and panicking on a short
+            // read (the earlier version of this test) — lets the WHOLE
+            // run continue to completion even if entries go missing
+            // somewhere, so the final all_keys()/dedup check at the end
+            // can report exactly which key(s) are gone, instead of
+            // stopping at the first symptom.
+            while let Some(t) = cursor.next().unwrap() {
+                let bytes: [u8; 8] = t.data().try_into().unwrap();
+                self.insert(u64::from_le_bytes(bytes));
+                added += 1;
+            }
+            if added != count {
+                eprintln!(
+                    "rehash({new_capacity}): old run yielded {added} tuples, expected {count} \
+                     ({} missing)",
+                    count as i64 - added as i64
+                );
+            }
+        }
+
+        fn all_keys(&self) -> Vec<u64> {
+            let mut cursor = self.run.cursor().unwrap();
+            let mut out = vec![];
+            while let Some(t) = cursor.next().unwrap() {
+                let bytes: [u8; 8] = t.data().try_into().unwrap();
+                out.push(u64::from_le_bytes(bytes));
+            }
+            out
+        }
+    }
+
+    // Regression test for a real, previously-mysterious data-loss bug: the
+    // async writer thread used to clear a page's dirty flag unconditionally
+    // after flushing it, racing a concurrent mutation of that same shared
+    // page (via a Weak-upgrade) landing between the flush's byte snapshot
+    // and the dirty-clear — the mutation was then silently lost the next
+    // time that page was evicted while wrongly believed clean. Fixed via
+    // Page::dirty_version/mark_flushed_up_to (page.rs, two independent
+    // monotonic counters — see mark_flushed_up_to's own comment for why a
+    // single boolean, even guarded by a version check, still wasn't safe)
+    // and write_page (this file). Before the fix this failed reliably
+    // (13-18 of 50000 keys missing) at max_entries=128; passes reliably now.
+    #[test]
+    fn test_mini_hash_table_survives_repeated_rehash_under_eviction_pressure() {
+        // Matches the real repro's confirmed parameters: works reliably
+        // at max_entries=4096, failed after the 8th rehash at
+        // max_entries=128 (records_per_page=133 there; 8 here, since
+        // this test's own record size is fixed/tiny — the page COUNT
+        // trajectory across rehashes is what needs to match, not the
+        // exact records_per_page value).
+        const MAX_ENTRIES: usize = 128;
+        const RECORDS_PER_PAGE: usize = 8;
+        const TOTAL_KEYS: u64 = 50_000; // comfortably past rehash 8 (2048+ capacity)
+
+        let (buf, _counter) = make_buffer(1, MAX_ENTRIES);
+        let buf = Arc::new(buf);
+        let mut table = MiniHashTable::new(buf, RECORDS_PER_PAGE);
+        for key in 0..TOTAL_KEYS {
+            table.insert(key);
+        }
+        if table.count as u64 != TOTAL_KEYS {
+            eprintln!(
+                "table.count={} (self-corrects after each rehash — see its own replay loop) \
+                 vs {TOTAL_KEYS} keys actually inserted",
+                table.count
+            );
+        }
+
+        let mut seen = table.all_keys();
+        if seen.len() as u64 != TOTAL_KEYS {
+            let mut present: Vec<u64> = seen.clone();
+            present.sort_unstable();
+            present.dedup();
+            let present_set: std::collections::HashSet<u64> = present.iter().copied().collect();
+            let missing: Vec<u64> = (0..TOTAL_KEYS).filter(|k| !present_set.contains(k)).collect();
+            eprintln!("=== {} missing keys — last recorded insert site for each ===", missing.len());
+            for key in &missing {
+                match table.history.get(key) {
+                    Some(r) => eprintln!(
+                        "key={key} gen={} page_id={:?} page_idx={} slot={} \
+                         fill_order_on_page={} pages_in_run_at_insert={}",
+                        r.generation,
+                        r.page_id,
+                        r.page_idx,
+                        r.slot,
+                        r.fill_order_on_page,
+                        r.pages_in_run_at_insert
+                    ),
+                    None => eprintln!("key={key} — NO history entry at all (never inserted?!)"),
+                }
+            }
+            // Cross-check: do missing keys cluster on the same page_id
+            // (several slots on ONE physical page all silently lost) or
+            // spread across many different, unrelated pages?
+            let mut by_page: std::collections::HashMap<PageId, Vec<u64>> =
+                std::collections::HashMap::new();
+            for key in &missing {
+                if let Some(r) = table.history.get(key) {
+                    by_page.entry(r.page_id).or_default().push(*key);
+                }
+            }
+            eprintln!("=== missing keys grouped by page_id ===");
+            for (page_id, keys) in &by_page {
+                eprintln!("  page_id={page_id:?}: {} missing key(s): {keys:?}", keys.len());
+            }
+        }
+        assert_eq!(
+            seen.len() as u64,
+            TOTAL_KEYS,
+            "expected {TOTAL_KEYS} keys, found {} — {} missing",
+            seen.len(),
+            TOTAL_KEYS as i64 - seen.len() as i64
+        );
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len() as u64,
+            TOTAL_KEYS,
+            "duplicates present — {} unique keys out of {TOTAL_KEYS}",
+            seen.len()
+        );
     }
 
     // Like make_buffer but with a configurable page_size and a MemFile clone that shares
@@ -2265,7 +2774,12 @@ mod tests {
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
-            from_disk.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            from_disk
+                .get(DBIdType::Int(1))
+                .unwrap()
+                .unwrap()
+                .data
+                .to_vec(),
             b"hello"
         );
 
@@ -2320,8 +2834,12 @@ mod tests {
             Evicted::Exhausted => panic!("expected a victim to be evicted"),
         }
 
-        let is_strong =
-            |id: PageId| matches!(buf.shard_for(&id).read().get(&id), Some(PageEntry::Strong(_)));
+        let is_strong = |id: PageId| {
+            matches!(
+                buf.shard_for(&id).read().get(&id),
+                Some(PageEntry::Strong(_))
+            )
+        };
         assert!(
             is_strong(id_a),
             "the referenced page must be given a second chance, not evicted"
@@ -2362,7 +2880,12 @@ mod tests {
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
-            from_disk.get(DBIdType::Int(1)).unwrap().unwrap().data.to_vec(),
+            from_disk
+                .get(DBIdType::Int(1))
+                .unwrap()
+                .unwrap()
+                .data
+                .to_vec(),
             b"world"
         );
 

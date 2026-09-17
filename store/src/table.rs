@@ -10,7 +10,7 @@ pub enum TableType {
     Index,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct TableIdType(DBSizeType);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

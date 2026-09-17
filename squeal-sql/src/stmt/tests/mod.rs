@@ -368,6 +368,173 @@ fn test_execute_select_group_by_collapses_rows_sharing_a_group_key() {
 }
 
 #[test]
+fn test_execute_select_group_by_collapses_correctly_at_a_scale_spanning_multiple_pages() {
+    // Regression test: GROUP BY silently fragmented into far more
+    // groups than actually existed once the sort behind it (SortSource,
+    // via GroupSource -> SortSource::with_fields in logical.rs) had
+    // enough rows for a single run to span more than one page —
+    // build_initial_runs used to sort and flush one page's worth at a
+    // time, in a fresh heap per page, so each PAGE came out internally
+    // sorted but consecutive pages within the same run were never
+    // ordered relative to each other. Invisible at the tiny scale of
+    // test_execute_select_group_by_collapses_rows_sharing_a_group_key
+    // above (3 rows never even fills one page); reproduces reliably
+    // once row count actually forces multiple pages, well within
+    // DEFAULT_QUERY_MEMORY_LIMIT's real 64 MiB budget (single run, no
+    // run-to-run merge needed — this is purely about ordering within
+    // one run).
+    const N: i64 = 5_000;
+    const NUM_CATEGORIES: i64 = 5;
+    let c = conn();
+    run(
+        &c,
+        "create table t (id integer not null, cat integer, primary key(id))",
+    )
+    .unwrap();
+    let mut ins = c
+        .clone()
+        .create_prepared_statement("insert into t values (?, ?)")
+        .unwrap();
+    for i in 0..N {
+        ins.set_field(0, ValueItem::Integer(i)).unwrap();
+        ins.set_field(1, ValueItem::Integer(i % NUM_CATEGORIES))
+            .unwrap();
+        ins.execute().unwrap();
+    }
+
+    let mut stmt = c
+        .create_statement("select cat, count(*) from t group by cat")
+        .unwrap();
+    stmt.execute().unwrap();
+    let (_, mut rows) = take_streaming_result(&mut stmt, 0);
+    rows.sort();
+    assert_eq!(
+        rows.len(),
+        NUM_CATEGORIES as usize,
+        "expected exactly one group per distinct category, not one per accidental page boundary"
+    );
+    for (cat, row) in rows.into_iter().enumerate() {
+        assert_eq!(
+            row,
+            vec![
+                ValueItem::Integer(cat as i64),
+                ValueItem::Integer(N / NUM_CATEGORIES)
+            ],
+            "every row for category {cat} must have collapsed into one group"
+        );
+    }
+}
+
+// Empirical answer to "which Source is the biggest laggard": runs a
+// realistic JOIN through the real planner (TableSource x2 ->
+// HashedSource -> UnionJoin -> Projection, the same tree logical.rs
+// actually builds for this SQL shape — not a synthetic VecSource-only
+// rig like HashedSource's own bench_hash_join_50k_rows), then reads
+// QueryStats off the drained StreamingResult and prints each Source's
+// own share of the total.
+//
+// No GROUP BY here on purpose, to keep this benchmark focused on
+// HashedSource/UnionJoin/Projection specifically. (A join+group-by
+// version of this benchmark is what originally surfaced a real,
+// separate SortSource bug — a run spanning more than one page wasn't
+// actually globally sorted, only page-locally, so GroupSource silently
+// over-fragmented into far more groups than actually existed. Now
+// fixed — see build_initial_runs/close_run in source/sort.rs and the
+// regression tests
+// test_a_run_spanning_multiple_pages_is_globally_sorted_not_just_page_locally
+// (sort.rs) and
+// test_execute_select_group_by_collapses_correctly_at_a_scale_spanning_multiple_pages
+// (this file).)
+//
+// Ignored (manual-only, prints to stderr) — run with:
+//     cargo test -p squeal-sql --release -- --ignored --nocapture \
+//         stmt::tests::bench_full_pipeline_join_50k_rows
+#[test]
+#[ignore]
+fn bench_full_pipeline_join_50k_rows() {
+    const N: i64 = 50_000;
+
+    let c = conn();
+    run(
+        &c,
+        "create table t1 (id integer not null, cat integer, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "create table t2 (id integer not null, val integer, primary key(id))",
+    )
+    .unwrap();
+
+    // Prepared + reused (not a fresh `run(&c, "insert into ...")` string
+    // per row) so SQL parsing overhead isn't what this benchmark ends up
+    // measuring — only the actual table-write cost.
+    let mut ins1 = c
+        .clone()
+        .create_prepared_statement("insert into t1 values (?, ?)")
+        .unwrap();
+    let mut ins2 = c
+        .clone()
+        .create_prepared_statement("insert into t2 values (?, ?)")
+        .unwrap();
+    let insert_start = std::time::Instant::now();
+    for i in 0..N {
+        ins1.set_field(0, ValueItem::Integer(i)).unwrap();
+        ins1.set_field(1, ValueItem::Integer(i % 5)).unwrap();
+        ins1.execute().unwrap();
+
+        ins2.set_field(0, ValueItem::Integer(i)).unwrap();
+        ins2.set_field(1, ValueItem::Integer(i * 3)).unwrap();
+        ins2.execute().unwrap();
+    }
+    let insert_elapsed = insert_start.elapsed();
+
+    let mut stmt = c
+        .create_statement("select t1.id, t1.cat, t2.val from t1 join t2 on t1.id = t2.id")
+        .unwrap();
+    stmt.execute().unwrap();
+
+    let query_start = std::time::Instant::now();
+    let result = stmt
+        .results
+        .get_mut(0)
+        .and_then(Option::take)
+        .expect("query must produce a result");
+    let ResultType::StreamingResult(mut stream) = result else {
+        panic!("expected a StreamingResult");
+    };
+    let mut rows = vec![];
+    while let Some(row) = stream.next_result_as_strings().unwrap() {
+        rows.push(row);
+    }
+    let query_elapsed = query_start.elapsed();
+    assert_eq!(rows.len(), N as usize, "every row must find its one match");
+
+    let stats = stream
+        .get_query_stats()
+        .expect("a join query must report stats at every level");
+
+    eprintln!(
+        "\nbench_full_pipeline_join_50k_rows: inserted {N} rows into each of 2 tables in \
+         {insert_elapsed:?}; query returned {} rows in {query_elapsed:?}\n\
+         per-Source breakdown (indented by pipeline depth):",
+        rows.len()
+    );
+    for (name, s) in &stats {
+        let indent = "  ".repeat(s.level());
+        let mut entries: Vec<(String, f64)> =
+            s.stats().iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let breakdown = entries
+            .iter()
+            .map(|(k, v)| format!("{k}={:.2}ms", v / 1_000_000.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("{indent}{name}: {breakdown}");
+    }
+}
+
+#[test]
 fn test_execute_select_bare_aggregate_with_no_group_by_collapses_to_one_row() {
     // Regression test: a bare aggregate with no GROUP BY clause at all
     // (an implicit single group over the whole table) used to return one

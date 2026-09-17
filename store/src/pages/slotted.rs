@@ -36,14 +36,21 @@
 // access cost dominates completely and swamps the real, genuine win on
 // load/flush cost this type does deliver.
 //
-// A viable path back to making this the default would be decoding only the
-// `id` field during binary search (it's `Tuple`'s first declared struct
-// field, and postcard serializes struct fields in declaration order, so it's
-// self-delimiting at the front of each candidate's bytes) instead of the
-// whole `Tuple` — not attempted here. Kept in the tree, registered in
-// `PageContentRegistry` (`content.rs`'s `SLOTTED_TUPLE` kind), and covered by
-// its own full test suite below as a preserved, working design exploration —
-// just not the active choice `Page::new` reaches for.
+// UPDATE: the id-only-decode path sketched above IS now implemented —
+// see `decode_id_at`'s own doc comment for the fix and the dhat-profiled
+// numbers that motivated it (found via HashedSource, this type's one
+// real consumer today, not via any change to Page::new's default). It
+// measurably helps there (~1.87x wall-clock, ~775MB less allocated on a
+// synthetic 4-way-join benchmark) but that's a build-once/probe-many
+// access pattern, not the repeated-arbitrary-get pattern
+// `bench_repeated_get_on_an_already_loaded_page` measured above — this
+// has NOT been re-benchmarked against that specific 22x regression, so
+// it's not evidence the regression is fixed or that `Page::new`'s
+// default choice should be revisited. Kept in the tree, registered in
+// `PageContentRegistry` (`content.rs`'s `SLOTTED_TUPLE` kind), and
+// covered by its own full test suite below as a preserved, working
+// design exploration — just not the active choice `Page::new` reaches
+// for.
 //
 // ## On-disk layout (the buffer this struct owns and returns verbatim from
 // `to_bytes()`)
@@ -102,13 +109,17 @@
 // ## Complexity
 //
 // `add`/`replace`/`remove`/`get`/`contains`/`successor` are all O(log N)
-// *tuple decodes* (binary search over the slot directory, decoding the
-// candidate at each comparison step — there's no way to avoid this without
-// a fixed-width, universally order-preserving key encoding, which
-// `DBIdType::Rec`'s structural `Ord` rules out, see the design doc) plus an
-// O(N) but cheap *byte* memmove of the slot directory (not tuple decodes) to
-// open/close the gap. `to_bytes()` for the common "nothing changed since
-// load" case is a plain `Vec<u8>` clone — no per-tuple work at all.
+// *id-only decodes* (binary search over the slot directory, decoding just
+// the candidate's `id` field at each comparison step via `decode_id_at` —
+// there's no way to avoid decoding entirely without a fixed-width,
+// universally order-preserving key encoding, which `DBIdType::Rec`'s
+// structural `Ord` rules out, see the design doc) plus exactly one *full*
+// tuple decode once the target slot is actually found (`get`/`replace`/
+// `remove`/`successor` all need the real payload, not just its id), plus
+// an O(N) but cheap *byte* memmove of the slot directory (not tuple
+// decodes) to open/close the gap. `to_bytes()` for the common "nothing
+// changed since load" case is a plain `Vec<u8>` clone — no per-tuple work
+// at all.
 
 use postcard::{from_bytes, to_allocvec};
 
@@ -287,10 +298,33 @@ impl SlottedPage {
         Ok(from_bytes::<Tuple>(bytes)?)
     }
 
+    // PERF (revert this whole function + its two call sites below back to
+    // `decode_at(idx)?.id` if measurement ever says otherwise): `id` is
+    // `Tuple`'s first declared struct field, and postcard serializes
+    // struct fields in declaration order with no field-name framing, so
+    // it's self-delimiting at the front of every candidate's byte range —
+    // `from_bytes::<DBIdType>` reads exactly as many bytes as the id
+    // needs and silently ignores the rest (see postcard::from_bytes' own
+    // doc comment: "the unused portion, if any, is not returned"), never
+    // touching `txn_id`/`pre_lsn`/`flags`/the `data: Arc<[u8]>` payload.
+    // This file's own top comment named this exact gap as the reason
+    // SlottedPage lost a 22x repeated-access microbenchmark to
+    // AnyTuplePage and got reverted as Page::new's default: every binary-
+    // search comparison step was fully decoding (and heap-allocating) a
+    // candidate's entire payload just to compare one field. Confirmed via
+    // dhat profiling of a 4-way HashedSource join: `SlottedPage::bound`'s
+    // full-tuple decode was ~27% of every join/hash/sort-attributable
+    // allocation in that run, all of it wasted on the `data` field these
+    // comparisons never look at.
+    fn decode_id_at(&self, idx: usize) -> Result<DBIdType, StoreError> {
+        let e = self.slot(idx);
+        let bytes = &self.buf[e.offset as usize..e.offset as usize + e.len as usize];
+        Ok(from_bytes::<DBIdType>(bytes)?)
+    }
+
     // First index in [0, slot_count) whose decoded id is NOT Less than
     // `id` (i.e. >= id), or slot_count if every entry is < id. O(log N)
-    // tuple decodes, one per comparison step — see this file's own top
-    // comment on why a decode is unavoidable here.
+    // id-only decodes, one per comparison step.
     fn lower_bound(&self, id: &DBIdType) -> Result<usize, StoreError> {
         self.bound(id, false)
     }
@@ -306,8 +340,8 @@ impl SlottedPage {
         let mut hi = self.slot_count();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let cand = self.decode_at(mid)?;
-            let ord = cand.id.cmp(id);
+            let cand_id = self.decode_id_at(mid)?;
+            let ord = cand_id.cmp(id);
             let go_right = if strict_greater {
                 ord != std::cmp::Ordering::Greater
             } else {
@@ -329,7 +363,7 @@ impl SlottedPage {
     // searches.
     fn find_exact_in(&self, id: &DBIdType, lo: usize, hi: usize) -> Result<Option<usize>, StoreError> {
         for idx in lo..hi {
-            if self.decode_at(idx)?.id == *id {
+            if self.decode_id_at(idx)? == *id {
                 return Ok(Some(idx));
             }
         }
@@ -609,8 +643,10 @@ impl PageTuple for SlottedPage {
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
         // Unused externally — see AnyTuplePage::keys' own matching note.
+        // decode_id_at, not decode_at: only `.id` is read here either way
+        // (see decode_id_at's own doc comment).
         (0..self.slot_count())
-            .map(|idx| Ok(self.decode_at(idx)?.id.hashed()))
+            .map(|idx| Ok(self.decode_id_at(idx)?.hashed()))
             .collect()
     }
 

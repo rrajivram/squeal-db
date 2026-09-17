@@ -1,4 +1,4 @@
-use std::{fmt::Debug, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Instant};
 
 use sql_parser::expr::BinaryOp;
 use store::{
@@ -9,7 +9,7 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::{eval::EvalExpr, memory::QueryMemory},
-    source::{ProjectableField, Source, hash::HashedSource},
+    source::{ProjectableField, QueryStats, Source, hash::HashedSource, merge_stats},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +34,7 @@ pub(crate) struct UnionJoin {
     // digit works when counting past 9. `None` before the first `next()`
     // call, and again once every combination has been produced.
     current: Option<Vec<IndexKey>>,
+    time_spent: u128,
 }
 
 // Hash-join wrapper: resolves `on_expr` down to the equi-join field
@@ -200,6 +201,7 @@ impl UnionJoin {
             sources,
             fields: Arc::from(fields.as_slice()),
             current: None,
+            time_spent: 0,
         })
     }
 
@@ -218,6 +220,7 @@ impl Source for UnionJoin {
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        let start = Instant::now();
         if self.current.is_none() {
             // First call: seed one row from every source. A source with
             // no rows at all makes the whole cross product empty — a
@@ -227,7 +230,10 @@ impl Source for UnionJoin {
             for s in &mut self.sources {
                 match s.next()? {
                     Some(row) => rows.push(row),
-                    None => return Ok(None),
+                    None => {
+                        self.time_spent += start.elapsed().as_nanos();
+                        return Ok(None);
+                    }
                 }
             }
             // Zero sources (a `SELECT` with no FROM at all) is the one
@@ -237,6 +243,7 @@ impl Source for UnionJoin {
             // produce exactly one output row.
             let combined = Self::combine(&rows)?;
             self.current = Some(rows);
+            self.time_spent += start.elapsed().as_nanos();
             return Ok(Some(combined));
         }
 
@@ -248,6 +255,7 @@ impl Source for UnionJoin {
         loop {
             if i == 0 {
                 self.current = None;
+                self.time_spent += start.elapsed().as_nanos();
                 return Ok(None);
             }
             i -= 1;
@@ -269,7 +277,9 @@ impl Source for UnionJoin {
                 }
             }
         }
-        Ok(Some(Self::combine(self.current.as_ref().unwrap())?))
+        let out = Self::combine(self.current.as_ref().unwrap())?;
+        self.time_spent += start.elapsed().as_nanos();
+        Ok(Some(out))
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
@@ -278,6 +288,28 @@ impl Source for UnionJoin {
         }
         self.current = None;
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        let mut res = vec![(
+            "UnionJoin".to_string(),
+            QueryStats {
+                stats: HashMap::from([("time_ns".into(), self.time_spent as f64)]),
+                level: 0,
+            },
+        )];
+        // Every source's own subtree folds in as a sibling, one level
+        // deeper than this UnionJoin's own entry — including the common
+        // single-source case (a query with no comma-joined FROM list
+        // still passes through exactly one UnionJoin), so the indent
+        // consistently reflects that this node really does sit in the
+        // pipeline, doing real (if usually small) row-combining work,
+        // same convention HashedSource uses for its own left/right
+        // children.
+        for s in &self.sources {
+            res = merge_stats(res, s.stats());
+        }
+        Some(res)
     }
 }
 

@@ -62,6 +62,7 @@ impl Source for AggregatingSource {
         let time_spent = self.time_spent as f64;
         let this_query = QueryStats {
             stats: HashMap::from([("time_ns".into(), time_spent)]),
+            level: 0,
         };
         let this_stats = vec![("AggegatingSource".to_string(), this_query)];
         Some(merge_stats(this_stats, self.source.stats()))

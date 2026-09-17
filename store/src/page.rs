@@ -4,7 +4,7 @@
  */
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU16},
+    atomic::{AtomicBool, AtomicU16, AtomicU64},
 };
 
 use parking_lot::RwLock;
@@ -248,7 +248,14 @@ pub(crate) struct Page {
     // See PageInner's own comment for why data, page_used_size, has_overflow,
     // and next_page are bundled behind one lock instead of separate fields.
     inner: RwLock<PageInner>,
-    dirty: AtomicBool,
+    // Dirtiness is *derived* (dirty_version != flushed_version), not a
+    // standalone flag — see is_dirty()/mark_flushed_up_to's own comments
+    // for why a plain AtomicBool cleared by the flush path is unsafe: two
+    // independent monotonic counters can't suffer the same
+    // check-then-clobber race a shared boolean can, no matter how the
+    // reads/writes on either side interleave.
+    dirty_version: AtomicU64,
+    flushed_version: AtomicU64,
     page_data_size: DBSizeType,
     record_size: Option<usize>,
     // Which PageContentRegistry kind built `inner.data` — set once at
@@ -373,7 +380,8 @@ impl Page {
                 high_key: None,
                 overflow_page_count: 0,
             }),
-            dirty: AtomicBool::new(true),
+            dirty_version: AtomicU64::new(1),
+            flushed_version: AtomicU64::new(0),
             page_data_size: ds,
             record_size,
             content_kind,
@@ -455,8 +463,12 @@ impl Page {
         PageId(self.inner.read().next_page)
     }
 
+    // Derived, not a standalone flag: "dirty" means "something changed
+    // (dirty_version) since the last content actually confirmed durable
+    // (flushed_version)" — see mark_flushed_up_to's own comment for why.
     pub(crate) fn is_dirty(&self) -> bool {
-        self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+        self.dirty_version.load(std::sync::atomic::Ordering::Relaxed)
+            != self.flushed_version.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn set_next_page(&self, next_page: PageId) -> Result<(), StoreError> {
@@ -489,9 +501,20 @@ impl Page {
     }
 
     pub(crate) fn set_dirty(&self, dirty: bool) -> Result<(), StoreError> {
-        self.dirty
-            .store(dirty, std::sync::atomic::Ordering::Relaxed);
-        if dirty {
+        if !dirty {
+            // Force-clean, unconditionally, as of right now — only ever used
+            // by tests today. Production code marks a page clean exclusively
+            // through mark_flushed_up_to (see its own comment for why this
+            // unconditional form is unsafe on the real flush path).
+            self.flushed_version.store(
+                self.dirty_version.load(std::sync::atomic::Ordering::Relaxed),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return Ok(());
+        }
+        {
+            self.dirty_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Stamp with this database's flush watermark, so the writer defers
             // this page until the watermark advances past it (WAL: the change's
             // redo record becomes durable first). `None` only for a page a buffer
@@ -512,6 +535,53 @@ impl Page {
             }
         }
         Ok(())
+    }
+
+    // Captured by a flusher *before* it takes the byte snapshot it's about
+    // to write, then handed back to mark_flushed_up_to once that write
+    // succeeds — see that method's own comment for why this two-counter
+    // handshake exists instead of a plain set_dirty(false) after a write.
+    pub(crate) fn dirty_version(&self) -> u64 {
+        self.dirty_version.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // A page's flush path (buffer.rs's write_page) is not synchronized
+    // against a concurrent mutation of the same page: the Arc it flushes
+    // is the same live, shared allocation the cache (or an in-flight
+    // Weak-upgrade) can still be mutating after the byte snapshot being
+    // written was taken but before the flush gets here to mark the page
+    // clean.
+    //
+    // An earlier version of this fix used a single AtomicBool `dirty`
+    // cleared via a "clear-if-unchanged" compare-then-store: read
+    // dirty_version, and only `dirty.store(false)` if it still matched a
+    // version captured before the snapshot. That closed the wide race
+    // (a mutation completing well before the belated clear) but not a
+    // narrower one — set_dirty(true) itself did `dirty.store(true)` then
+    // `dirty_version.fetch_add(1)` as two separate steps, so a flush's
+    // version-check-then-clear could still land *between* those two
+    // steps: it would see the not-yet-bumped version (still matching),
+    // then overwrite the mutation's just-stored `dirty=true` back to
+    // false before the version bump ever landed. Same data loss, just a
+    // much narrower window (confirmed empirically: failure rate dropped
+    // from ~15/50000 keys to ~2/50000, not zero).
+    //
+    // Two independent monotonic counters instead of a boolean removes the
+    // race entirely rather than narrowing it: dirty_version only moves
+    // forward (via set_dirty(true)'s plain fetch_add — nothing to
+    // interleave with, one atomic op), and flushed_version only moves
+    // forward to a value that was read strictly *before* the snapshot it
+    // corresponds to (so any mutation racing the flush necessarily bumps
+    // dirty_version to something higher than what this call is about to
+    // publish). There is no shared flag for the two sides to
+    // simultaneously read-then-clobber.
+    //
+    // fetch_max, not store: flushes of the same page can finish out of
+    // order (e.g. a retried write racing a fresh one); this must never
+    // move flushed_version backward.
+    pub(crate) fn mark_flushed_up_to(&self, observed_version: u64) {
+        self.flushed_version
+            .fetch_max(observed_version, std::sync::atomic::Ordering::Relaxed);
     }
 
     // STORE_AUDIT.md T2: set_dirty above stamps a page from the CURRENT
@@ -813,7 +883,8 @@ impl Page {
                 high_key: header.high_key,
                 overflow_page_count: 0,
             }),
-            dirty: AtomicBool::new(false),
+            dirty_version: AtomicU64::new(0),
+            flushed_version: AtomicU64::new(0),
             page_data_size: header.page_data_size,
             record_size: header.record_size,
             content_kind: header.content_kind,
@@ -941,7 +1012,8 @@ impl From<PageDto> for Page {
                 high_key: value.high_key,
                 overflow_page_count: 0,
             }),
-            dirty: AtomicBool::new(false),
+            dirty_version: AtomicU64::new(0),
+            flushed_version: AtomicU64::new(0),
             page_data_size: value.page_data_size,
             record_size: value.record_size,
             content_kind: value.content_kind,
@@ -1003,7 +1075,12 @@ impl Clone for Page {
                 high_key: inner.high_key.clone(),
                 overflow_page_count: inner.overflow_page_count,
             }),
-            dirty: AtomicBool::new(self.dirty.load(std::sync::atomic::Ordering::Relaxed)),
+            dirty_version: AtomicU64::new(
+                self.dirty_version.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            flushed_version: AtomicU64::new(
+                self.flushed_version.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             page_data_size: self.page_data_size,
             record_size: self.record_size,
             content_kind: self.content_kind,

@@ -1,10 +1,13 @@
-use crate::source::Source;
+use std::{collections::HashMap, time::Instant};
+
+use crate::source::{QueryStats, Source, merge_stats};
 
 #[derive(Debug)]
 pub(crate) struct Limit {
     source: Box<dyn Source>,
     limit: usize,
     yielded: usize,
+    time_spent: u128,
 }
 
 impl Limit {
@@ -13,6 +16,7 @@ impl Limit {
             source,
             limit,
             yielded: 0,
+            time_spent: 0,
         }
     }
 }
@@ -23,18 +27,32 @@ impl Source for Limit {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
-        if self.yielded < self.limit {
+        let start = Instant::now();
+        let result = if self.yielded < self.limit {
             self.yielded += 1;
             self.source.as_mut().next()
         } else {
             Ok(None)
-        }
+        };
+        self.time_spent += start.elapsed().as_nanos();
+        result
     }
 
     fn reset(&mut self) -> Result<(), crate::error::SchemaError> {
         self.source.reset()?;
         self.yielded = 0;
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        let this_stats = vec![(
+            "Limit".to_string(),
+            QueryStats {
+                stats: HashMap::from([("time_ns".into(), self.time_spent as f64)]),
+                level: 0,
+            },
+        )];
+        Some(merge_stats(this_stats, self.source.stats()))
     }
 }
 

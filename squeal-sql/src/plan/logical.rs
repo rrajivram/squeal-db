@@ -402,11 +402,25 @@ where
             }
             sources.push(combined);
         }
-        let union = UnionJoin::new(sources)?;
-        let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
-            Box::new(WhereSource::new(Box::new(union), wh_expr)?)
+        // UnionJoin only does real work (cross-producting) when there's
+        // more than one top-level FROM item to combine — a comma-joined
+        // list (`FROM a, b`) or, degenerately, no FROM at all (`SELECT
+        // 1+2`, sources empty). The overwhelmingly common case is
+        // exactly one top-level item (every query using only proper
+        // JOIN...ON clauses, however many, still folds into a single
+        // `combined` chain above) — there, UnionJoin would just
+        // re-flatten that one source's own row into a fresh IndexKey on
+        // every call for no reason, so skip it and use the sole chain
+        // directly instead of wrapping it.
+        let union: Box<dyn Source> = if let [_] = sources.as_slice() {
+            sources.pop().unwrap()
         } else {
-            Box::new(union)
+            Box::new(UnionJoin::new(sources)?)
+        };
+        let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
+            Box::new(WhereSource::new(union, wh_expr)?)
+        } else {
+            union
         };
 
         // A GROUP BY (or a bare aggregate with no GROUP BY at all, i.e.

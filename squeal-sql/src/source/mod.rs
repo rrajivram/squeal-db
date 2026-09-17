@@ -13,6 +13,8 @@ pub mod proj;
 pub(crate) mod run;
 pub mod sort;
 pub mod table;
+#[cfg(test)]
+mod tests;
 pub mod where_source;
 
 #[allow(unused)]
@@ -28,6 +30,30 @@ pub struct ProjectableField {
 #[derive(Debug, Clone, Default)]
 pub struct QueryStats {
     stats: HashMap<String, f64>,
+    // How deeply nested this entry is in the Source pipeline that
+    // produced it — 0 for whichever Source's own stats() call is the
+    // root of a given Vec<(String, QueryStats)> (every stats() impl
+    // below constructs its OWN entry at level 0; merge_stats is what
+    // bumps a child's entries by one level as they're folded into a
+    // parent's list, on the way back up). A pretty-printer (see
+    // squeal-cli) indents by this to show the pipeline's actual
+    // wrapping structure — a flat Vec on its own has no way to tell
+    // "this ran inside that" from "this ran alongside that."
+    level: usize,
+}
+
+impl QueryStats {
+    pub fn level(&self) -> usize {
+        self.level
+    }
+
+    /// This entry's own stat values, keyed by name — e.g. `"probe_ns"`.
+    /// A `_ns` suffix (by convention, not enforced) means nanoseconds,
+    /// for callers (like squeal-cli's pretty-printer) that want to
+    /// render times more readably than a raw f64 count.
+    pub fn stats(&self) -> &HashMap<String, f64> {
+        &self.stats
+    }
 }
 
 pub trait Source: Debug {
@@ -39,12 +65,28 @@ pub trait Source: Debug {
     }
 }
 
+// Folds a child Source's own stats() result into `this_stats` (the
+// caller's own entry/entries so far), bumping every one of the child's
+// levels by exactly 1 relative to that child's OWN root (level 0) —
+// not relative to whatever's already accumulated in `this_stats`. That
+// distinction matters for a Source with more than one child (e.g.
+// HashedSource merging its left AND right sources in turn, via two
+// separate merge_stats calls against the same growing `res`): each
+// child's root must land at the SAME level (a sibling of the other
+// child), not progressively deeper just because it was merged in
+// second. Bumping strictly off the incoming Vec's own levels — never
+// off `this_stats`'s current contents — gives exactly that.
 fn merge_stats(
     this_stats: Vec<(String, QueryStats)>,
     that: Option<Vec<(String, QueryStats)>>,
 ) -> Vec<(String, QueryStats)> {
     let mut this_stats = this_stats;
-    this_stats.extend(that.unwrap_or(vec![]));
+    if let Some(that) = that {
+        this_stats.extend(that.into_iter().map(|(name, mut stats)| {
+            stats.level += 1;
+            (name, stats)
+        }));
+    }
     this_stats
 }
 

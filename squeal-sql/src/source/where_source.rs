@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::ValueItem;
 
 use crate::{
     error::SchemaError,
     plan::eval::EvalExpr,
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source, merge_stats},
     table::Field,
 };
 
@@ -14,6 +14,7 @@ pub(crate) struct WhereSource {
     source: Box<dyn Source>,
     expr: EvalExpr,
     field: Arc<Field>,
+    time_spent: u128,
 }
 
 impl WhereSource {
@@ -27,6 +28,7 @@ impl WhereSource {
                 false,
                 None,
             )?),
+            time_spent: 0,
         })
     }
 }
@@ -37,12 +39,14 @@ impl Source for WhereSource {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
+        let start = Instant::now();
         while let Some(res) = self.source.next()? {
             let mut slice = vec![res];
             let should_output = self.expr.eval(&slice, 0)?;
             match should_output {
                 ValueItem::Boolean(b) => {
                     if b {
+                        self.time_spent += start.elapsed().as_nanos();
                         return Ok(Some(slice.remove(0)));
                     } else {
                         continue;
@@ -55,12 +59,24 @@ impl Source for WhereSource {
                 }
             }
         }
+        self.time_spent += start.elapsed().as_nanos();
         Ok(None)
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.source.reset()?;
         Ok(())
+    }
+
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        let this_stats = vec![(
+            "WhereSource".to_string(),
+            QueryStats {
+                stats: HashMap::from([("time_ns".into(), self.time_spent as f64)]),
+                level: 0,
+            },
+        )];
+        Some(merge_stats(this_stats, self.source.stats()))
     }
 }
 

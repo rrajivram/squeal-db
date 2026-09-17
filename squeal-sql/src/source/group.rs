@@ -185,6 +185,7 @@ impl Source for GroupSource {
                 ("eval_ns".to_string(), self.eval_time as f64),
                 ("time_ns".into(), self.time_spent as f64),
             ]),
+            level: 0,
         };
         Some(merge_stats(
             vec![("GroupSource".into(), query_stats)],

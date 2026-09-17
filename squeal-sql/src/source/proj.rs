@@ -1,11 +1,11 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::IndexKey;
 
 use crate::{
     error::SchemaError,
     plan::eval::EvalExpr,
-    source::{ProjectableField, Source},
+    source::{ProjectableField, QueryStats, Source, merge_stats},
     table::Field,
 };
 
@@ -16,11 +16,18 @@ use crate::{
 pub(crate) struct Projection {
     source: Box<dyn Source>,
     fields: Vec<ProjectableField>,
+    time_spent: u128,
+    eval_time: u128,
 }
 
 impl Projection {
     pub(crate) fn new(source: Box<dyn Source>, fields: Vec<ProjectableField>) -> Self {
-        Self { source, fields }
+        Self {
+            source,
+            fields,
+            time_spent: 0,
+            eval_time: 0,
+        }
     }
 }
 
@@ -30,19 +37,43 @@ impl Source for Projection {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
+        let start = Instant::now();
         if let Some(res) = self.source.next()? {
+            self.time_spent += start.elapsed().as_nanos();
             let mut out = vec![];
             let res = &[res];
+            let eval_start = Instant::now();
             for (i, f) in self.fields.iter_mut().enumerate() {
                 out.push(f.expr.eval(res, i)?);
             }
+            self.eval_time += eval_start.elapsed().as_nanos();
             return Ok(Some(IndexKey::new_from_owned(out)?));
         }
+        self.time_spent += start.elapsed().as_nanos();
         Ok(None)
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.source.reset()
+    }
+
+    // Sits at the top of nearly every SELECT's Source tree — without
+    // its own entry here, the trait default (`None`) would silently
+    // swallow every child's stats for any query with an explicit
+    // column list, and eval() cost (the one thing Projection actually
+    // does per row) would go unmeasured entirely.
+    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        let this_stats = vec![(
+            "Projection".to_string(),
+            QueryStats {
+                stats: HashMap::from([
+                    ("time_ns".into(), self.time_spent as f64),
+                    ("eval_time_ns".into(), self.eval_time as f64),
+                ]),
+                level: 0,
+            },
+        )];
+        Some(merge_stats(this_stats, self.source.stats()))
     }
 }
 
