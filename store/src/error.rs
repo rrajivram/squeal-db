@@ -22,8 +22,23 @@ pub enum StoreError {
     BadRowNumber(DBSizeType),
     #[error("No space in page")]
     PageCapacityError,
-    #[error("Lock contention.")]
-    LockContentionError,
+    // TXN_SIMPLIFICATION_PLAN.md phase 5: a page lock was requested out of
+    // order (Index pages before Data pages; at most one Data page at a
+    // time). Returned BEFORE waiting, so an ordering bug fails at the site
+    // that made it, in production, and can never become a hang.
+    #[error("page lock order violation: {0}")]
+    LockOrderViolation(String),
+    // Phase 5: a page lock wait exceeded the configured `lock_timeout`. A
+    // legitimate hold is microseconds, so this is a reported bug (a
+    // critical section that blocks, or a thread that died holding a guard),
+    // not a retryable condition — the message names the holder.
+    #[error("page lock timeout: {0}")]
+    LockTimeout(String),
+    // Phase 5: the engine refused further writes after a failed abort could
+    // not be completed within its retry budget. Reads continue; recovery is
+    // a restart (WAL replay).
+    #[error("engine degraded, writes refused: {0}")]
+    EngineDegraded(String),
     #[error("Duplicate key {0}")]
     DuplicateKey(DBIdType),
     #[error("Key not found {0}")]
@@ -54,6 +69,12 @@ pub enum StoreError {
     // KeyNotFound/WriteConflict on the operation itself.
     #[error("transaction is no longer active (already committed or rolled back)")]
     TransactionAlreadyFinished,
+    /// Phase 7: the engine aborted this (long-lived) transaction because
+    /// keeping its snapshot alive exceeded a retention cap — retained WAL
+    /// bytes or version records (`Db::set_snapshot_limits`). The message
+    /// names which cap and the transaction.
+    #[error("snapshot too old: {0}")]
+    SnapshotTooOld(String),
     #[error("Table name max length is {0}, got {1}")]
     TableNameInvalid(usize, usize),
     // STORE_AUDIT.md S7: the whole `__system.` namespace is reserved for
@@ -72,8 +93,6 @@ pub enum StoreError {
     TupleTooLarge(DBSizeType, usize),
     #[error("run page index {0} out of range (run has {1} page(s))")]
     RunPageIndexOutOfRange(usize, usize),
-    #[error("Undo log error : {0}")]
-    UndoLogError(String),
     #[error("Table not found : {0}")]
     TableNotFound(String),
     // The writer thread caught a page's live Arc mid-transition: a foreground

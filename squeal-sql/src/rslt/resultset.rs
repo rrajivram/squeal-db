@@ -22,6 +22,10 @@ pub struct StreamingResultSet {
     start: Instant,
     begin: Box<dyn Source>,
     count: usize,
+    // The statement's own read transaction (phase 7), alive exactly as
+    // long as the client holds this result; dropped (rolled back — it
+    // wrote nothing) with it. None inside an explicit BEGIN block.
+    txn: Option<store::txn::Transaction>,
 }
 
 impl StreamingResultSet {
@@ -30,7 +34,13 @@ impl StreamingResultSet {
             begin,
             start,
             count: 0,
+            txn: None,
         }
+    }
+
+    pub(crate) fn owning_transaction(mut self, txn: Option<store::txn::Transaction>) -> Self {
+        self.txn = txn;
+        self
     }
 
     pub fn get_final_message(&self) -> String {

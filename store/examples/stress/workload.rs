@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use store::db::{DBFile, Db};
 use store::error::StoreError;
@@ -112,8 +112,8 @@ fn record_err(stats: &Stats, kind: OpKind, e: &StoreError) {
         StoreError::DuplicateKey(_) => c
             .duplicate_key
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        StoreError::LockContentionError => c
-            .lock_contention
+        StoreError::LockTimeout(_) | StoreError::LockOrderViolation(_) => c
+            .lock_timeouts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         _ => c
             .other_error
@@ -121,44 +121,26 @@ fn record_err(stats: &Stats, kind: OpKind, e: &StoreError) {
     };
 }
 
-/// Runs `f` (one db operation), retrying on LockContentionError with a short
-/// randomized backoff up to `cfg.max_lock_retries` times. Returns the final
-/// Result and records timing/outcome into `stats`.
+/// Runs `f` (one db operation) exactly once and records timing/outcome into
+/// `stats`. Nothing is retried: since phase 5 the engine has no transient
+/// lock failure — a `LockTimeout` is a bug report, and the run fails on it.
 fn run_op<T>(
     stats: &Stats,
-    cfg: &Config,
-    rng: &mut Rng,
     kind: OpKind,
     mut f: impl FnMut() -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
     let start = Instant::now();
-    let mut attempt = 0;
-    loop {
-        match f() {
-            Ok(v) => {
-                stats.record_latency(start.elapsed());
-                counters_for(stats, kind)
-                    .success
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(v);
-            }
-            Err(StoreError::LockContentionError) if attempt < cfg.max_lock_retries => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_micros(100 + rng.next_range(400)));
-                continue;
-            }
-            Err(e) => {
-                stats.record_latency(start.elapsed());
-                if matches!(e, StoreError::LockContentionError) {
-                    stats
-                        .dropped_after_retry_exhaustion
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                record_err(stats, kind, &e);
-                return Err(e);
-            }
+    let r = f();
+    stats.record_latency(start.elapsed());
+    match &r {
+        Ok(_) => {
+            counters_for(stats, kind)
+                .success
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        Err(e) => record_err(stats, kind, e),
     }
+    r
 }
 
 pub fn run_worker<F>(
@@ -193,6 +175,7 @@ where
         let batch_size = 1 + rng.next_range(cfg.max_ops_per_txn as u64) as u32;
         let mut pending: Vec<(PrivateKey, Option<Vec<u8>>)> = Vec::new();
         let mut batch_trace: Vec<(PrivateKey, OpKind, bool)> = Vec::new();
+        let mut reads = ReadSet::new();
 
         for _ in 0..batch_size {
             let table_idx = rng.next_range(tables.len() as u64) as usize;
@@ -210,7 +193,8 @@ where
                 hot_seq += 1;
                 let salt = rng.next_u64() as u32;
                 apply_hot_op(
-                    &db, &txn, &cfg, &stats, &mut rng, tid, key, kind, thread_idx, hot_seq, salt,
+                    &db, &txn, &stats, tid, key, kind, thread_idx, hot_seq, salt,
+                    &mut reads,
                 );
             } else {
                 let key = private_base + rng.next_range(cfg.private_keys.max(1));
@@ -232,7 +216,7 @@ where
                 *seq += 1;
                 let seq_val = *seq;
                 let new_value = apply_private_op(
-                    &db, &txn, &cfg, &stats, &mut rng, tid, key, kind, thread_idx, seq_val,
+                    &db, &txn, &stats, tid, key, kind, thread_idx, seq_val,
                 );
                 batch_trace.push((pkey, kind, new_value.is_some()));
                 if let Some(outcome) = new_value {
@@ -294,9 +278,7 @@ where
 fn apply_private_op<F>(
     db: &Db<F>,
     txn: &store::txn::Transaction,
-    cfg: &Config,
     stats: &Stats,
-    rng: &mut Rng,
     tid: TableIdType,
     key: u64,
     kind: OpKind,
@@ -310,24 +292,24 @@ where
     match kind {
         OpKind::Insert => {
             let data = encode_private(thread_idx, key, seq);
-            let r = run_op(stats, cfg, rng, kind, || {
+            let r = run_op(stats, kind, || {
                 db.insert(tid, Tuple::new(key, &data), txn)
             });
             r.ok().map(|_| Some(data))
         }
         OpKind::Update => {
             let data = encode_private(thread_idx, key, seq);
-            let r = run_op(stats, cfg, rng, kind, || {
+            let r = run_op(stats, kind, || {
                 db.update(tid, Tuple::new(key, &data), txn)
             });
             r.ok().map(|_| Some(data))
         }
         OpKind::Remove => {
-            let r = run_op(stats, cfg, rng, kind, || db.remove(tid, id.clone(), txn));
+            let r = run_op(stats, kind, || db.remove(tid, id.clone(), txn));
             r.ok().map(|_| None)
         }
         OpKind::Find => {
-            let _ = run_op(stats, cfg, rng, kind, || db.find(tid, id.clone(), txn));
+            let _ = run_op(stats, kind, || db.find(tid, id.clone(), txn));
             None
         }
     }
@@ -337,15 +319,14 @@ where
 fn apply_hot_op<F>(
     db: &Db<F>,
     txn: &store::txn::Transaction,
-    cfg: &Config,
     stats: &Stats,
-    rng: &mut Rng,
     tid: TableIdType,
     key: u64,
     kind: OpKind,
     thread_idx: usize,
     seq: u64,
     salt: u32,
+    reads: &mut ReadSet,
 ) where
     F: DBFile<Item = F> + Sync + 'static,
 {
@@ -353,22 +334,97 @@ fn apply_hot_op<F>(
     match kind {
         OpKind::Insert => {
             let data = encode_hot(thread_idx, key, seq, salt);
-            let _ = run_op(stats, cfg, rng, kind, || {
-                db.insert(tid, Tuple::new(key, &data), txn)
-            });
+            let r = run_op(stats, kind, || db.insert(tid, Tuple::new(key, &data), txn));
+            reads.note(format!("insert t{tid} k{key} -> {}", r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| format!("{e:?}"))));
+            if r.is_ok() {
+                reads.wrote(tid, key, Some(data));
+            }
         }
         OpKind::Update => {
             let data = encode_hot(thread_idx, key, seq, salt);
-            let _ = run_op(stats, cfg, rng, kind, || {
-                db.update(tid, Tuple::new(key, &data), txn)
-            });
+            let r = run_op(stats, kind, || db.update(tid, Tuple::new(key, &data), txn));
+            reads.note(format!("update t{tid} k{key} -> {}", r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| format!("{e:?}"))));
+            if r.is_ok() {
+                reads.wrote(tid, key, Some(data));
+            }
         }
         OpKind::Remove => {
-            let _ = run_op(stats, cfg, rng, kind, || db.remove(tid, id.clone(), txn));
+            let r = run_op(stats, kind, || db.remove(tid, id.clone(), txn));
+            reads.note(format!("remove t{tid} k{key} -> {}", r.as_ref().map(|_| "ok".to_string()).unwrap_or_else(|e| format!("{e:?}"))));
+            if r.is_ok() {
+                reads.wrote(tid, key, None);
+            }
         }
         OpKind::Find => {
-            let _ = run_op(stats, cfg, rng, kind, || db.find(tid, id.clone(), txn));
+            let r = run_op(stats, kind, || db.find(tid, id.clone(), txn));
+            reads.note(format!("find t{tid} k{key} -> {}", match &r {
+                Ok(Some(t)) => String::from_utf8_lossy(t.data()).into_owned(),
+                Ok(None) => "None".into(),
+                Err(e) => format!("{e:?}"),
+            }));
+            if let Ok(v) = r
+                && let Err(msg) = reads.observe(tid, key, v.map(|t| t.data().to_vec()))
+            {
+                stats
+                    .isolation_violations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                eprintln!(
+                    "ISOLATION VIOLATION (thread {thread_idx}, txn {}): {msg}\n  trace: {}",
+                    txn.id(),
+                    reads.trace()
+                );
+            }
         }
+    }
+}
+
+/// TXN_SIMPLIFICATION_PLAN.md phase 0: snapshot-isolation check on hot keys.
+/// Within one transaction, reading the same key twice with no own write in
+/// between must return the same value (repeatable read), regardless of
+/// what other threads commit meanwhile. Each violation is counted in
+/// `stats.isolation_violations` and fails the run.
+pub struct ReadSet {
+    seen: HashMap<(TableIdType, u64), Option<Vec<u8>>>,
+    /// Every op this transaction ran on a hot key, in order, for diagnosis.
+    trace: Vec<String>,
+}
+
+impl ReadSet {
+    pub fn new() -> Self {
+        Self {
+            seen: HashMap::new(),
+            trace: Vec::new(),
+        }
+    }
+
+    pub fn note(&mut self, line: String) {
+        self.trace.push(line);
+    }
+
+    pub fn trace(&self) -> String {
+        self.trace.join(" | ")
+    }
+
+    /// Record a read; Err(description) on a repeatable-read violation.
+    pub fn observe(&mut self, tid: TableIdType, key: u64, value: Option<Vec<u8>>) -> Result<(), String> {
+        match self.seen.get(&(tid, key)) {
+            Some(prev) if *prev != value => Err(format!(
+                "key {key} in table {tid}: first read {:?}, later read {:?}",
+                prev.as_ref().map(|v| String::from_utf8_lossy(v).into_owned()),
+                value.as_ref().map(|v| String::from_utf8_lossy(v).into_owned())
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.seen.insert((tid, key), value);
+                Ok(())
+            }
+        }
+    }
+
+    /// This transaction wrote the key itself; later reads legitimately
+    /// differ, so the expectation moves to what was written.
+    pub fn wrote(&mut self, tid: TableIdType, key: u64, value: Option<Vec<u8>>) {
+        self.seen.insert((tid, key), value);
     }
 }
 

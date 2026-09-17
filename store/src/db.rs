@@ -1,5 +1,6 @@
 #![allow(private_bounds)]
 use crate::buffer::PageBuffer;
+use crate::logger::{Segment, list_segments, segment_path, segment_prefix};
 use crate::constant::FIRST_USER_PAGE;
 use crate::constant::FREE_PAGE_TABLE_PAGE;
 use crate::constant::GENERATOR_TABLE_PAGE;
@@ -12,7 +13,7 @@ use crate::cursor::RangeCursor;
 use crate::cursor::TableCursor;
 use crate::error::StoreError;
 use crate::generator::Generator;
-use crate::logger::LogHeader;
+use crate::logger::ScannedLog;
 use crate::logger::LogRecord;
 use crate::logger::Logger;
 use crate::logger::LsnId;
@@ -21,6 +22,7 @@ use crate::logger::Record;
 use crate::logger::read_and_validate_log_header;
 use crate::logger::scan_log;
 use crate::logger::write_log_header;
+use crate::maintenance::Maintenance;
 use crate::memfile::MemFile;
 use crate::page::Page;
 use crate::page::PageId;
@@ -29,16 +31,20 @@ use crate::table::Table;
 use crate::table::TableIdType;
 use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
+use crate::tables::bplustree::Decision;
+use crate::tables::bplustree::Written;
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
 use crate::txn::ConflictPolicy;
 use crate::txn::Transaction;
 use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
+use crate::txn::TxnSink;
+use crate::version::Tombstone;
+use crate::version::VersionStore;
 use crate::utils::shardedmap::ShardedMap;
 use log::LevelFilter;
 use log::info;
-use memmap::MmapOptions;
 use parking_lot::ArcRwLockReadGuard;
 use parking_lot::RawRwLock;
 use parking_lot::RwLock;
@@ -70,7 +76,43 @@ const DEFAULT_PAGE_SIZE: DBSizeType = 16 * 1024;
 // persisted — purely a runtime memory/throughput knob, safe to pick freshly
 // on every open. Matches PageBuffer's existing page-cache size (max_entries)
 // as a reasonable default order of magnitude.
-const DEFAULT_MAX_PENDING_WRITES: usize = 1024;
+// How often the maintenance thread runs a pass when nothing wakes it.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+// WAL growth that triggers a checkpoint (checked by the maintenance thread).
+const CHECKPOINT_LOG_BYTES: u64 = 16 * 1024 * 1024;
+// Phase 5: how many times the maintenance thread retries an abort whose
+// revert failed before the engine goes Degraded.
+const ABORT_RETRY_BUDGET: u32 = 3;
+// Phase 6: dirty pages reach disk only at a checkpoint, so the cache also
+// checkpoints once this many are waiting (bounds memory between
+// checkpoints independently of WAL growth).
+const CHECKPOINT_DIRTY_PAGES: usize = 4096;
+// Phase 7: what a long-lived transaction may pin before the engine aborts
+// it with SnapshotTooOld (see `Db::set_snapshot_limits`).
+const DEFAULT_MAX_RETAINED_WAL_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_MAX_VERSION_RECORDS: usize = 1_000_000;
+
+/// How `Db::commit_with` waits for durability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// Return only once the Commit record is fsynced (the default, and
+    /// what `Db::commit` does).
+    Sync,
+    /// Return as soon as the Commit record is queued. The transaction is
+    /// committed for every reader at once, and becomes durable with the
+    /// next log sync — a crash before that loses it, and only it and any
+    /// later commit. For bulk loads that re-run on failure.
+    Async,
+}
+
+/// Phase 7 caps on what a long-lived transaction may pin. Either one
+/// exceeded makes the maintenance thread abort the oldest active
+/// transaction with `SnapshotTooOld`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotLimits {
+    pub max_retained_wal_bytes: u64,
+    pub max_version_records: usize,
+}
 
 pub type FileDB = Db<File>;
 pub struct Meta {
@@ -103,6 +145,20 @@ pub trait Opener: Any {
     /// Positioned write — see `pread`. Returns bytes actually written (same
     /// partial-transfer contract as `Write::write`).
     fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize>;
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 6: the WAL is a set of segment files
+    // next to the database file (`<name>.wal.<n>`). The engine manages them
+    // through whichever backend `F` is, from a handle it already holds — a
+    // real file's siblings live in its directory, an in-memory file's in
+    // the namespace it was created in — so tests and the crash harness
+    // never touch the real filesystem.
+
+    /// Opens `path` in the same namespace as `self`.
+    fn open_sibling(&self, path: &str, op: OpenOptions) -> std::io::Result<Self::Item>;
+    /// Every path in `self`'s namespace that starts with `prefix`, any order.
+    fn list_siblings(&self, prefix: &str) -> std::io::Result<Vec<String>>;
+    /// Removes `path` from `self`'s namespace; a missing path is not an error.
+    fn remove_sibling(&self, path: &str) -> std::io::Result<()>;
 }
 
 // Opener<Item = Self>, not just Opener: every real implementor (MemFile,
@@ -147,7 +203,7 @@ impl<T> DBFile for T where
 // race that double-buffering primarily exists to survive; the double-slot
 // mechanism would be belt-and-suspenders on top of that, not something
 // closing a live bug, so it's deferred (see audit-progress.md).
-const HEADER_FORMAT_VERSION: u32 = 1;
+const HEADER_FORMAT_VERSION: u32 = 3;
 const MIN_PAGE_SIZE: DBSizeType = 4 * 1024;
 const MAX_PAGE_SIZE: DBSizeType = 1024 * 1024;
 
@@ -163,6 +219,19 @@ pub(crate) struct Header {
     #[serde(with = "postcard::fixint::le")]
     pub(crate) page_size: DBSizeType,
     pub(crate) last_checkpoint: u128,
+    // TXN_SIMPLIFICATION_PLAN.md phase 1: the clock's next value as of the
+    // last checkpoint/close — the floor the single counter (LSNs AND
+    // transaction ids) is seeded from on reopen, so no number below it is
+    // ever reissued even if the log has been truncated to nothing.
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) counter: u64,
+    // Phase 6/7: the retention floor of the last completed checkpoint. Every
+    // record below it belongs to a transaction that finished before that
+    // checkpoint's capture, whose pages that checkpoint wrote — so recovery
+    // skips such records even if a retained segment still holds them (a
+    // segment is kept whole while anything in it is at or above a floor).
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) checkpoint_lsn: u64,
     // Always the last field: computed over every OTHER field's bytes (see
     // checksum_input) and patched in via seal() right before a write —
     // never meaningful to read until seal() has run.
@@ -186,6 +255,8 @@ impl Header {
         v.extend_from_slice(&self.page_count.to_le_bytes());
         v.extend_from_slice(&self.page_size.to_le_bytes());
         v.extend_from_slice(&self.last_checkpoint.to_le_bytes());
+        v.extend_from_slice(&self.counter.to_le_bytes());
+        v.extend_from_slice(&self.checkpoint_lsn.to_le_bytes());
         v
     }
 
@@ -262,34 +333,14 @@ pub struct Db<F: DBFile + 'static> {
     tx_mgr: Arc<TransactionManager>,
     buffer: Arc<PageBuffer<F>>,
     last_checkpoint: AtomicU128, // Store the actual checkopint so it can be mutated
-    // STORE_AUDIT.md T6: physical tombstone reclamation must not run while
-    // some OTHER still-active transaction's snapshot predates this commit —
-    // otherwise that reader's find() hits a genuinely absent row instead of
-    // falling back through find_visible_to to the pre-delete version, since
-    // there's no physical tuple left to start that walk from. Mirrors
-    // Logger's pending_undo_discards/discard_or_defer_undo pattern exactly,
-    // just for the tree-level reclaim step instead of the in-memory undo
-    // trail (which is a separate concern already handled correctly).
-    // TransactionId here is the remover's own id — NOT derivable from
-    // Record::tuple, which (for a Del undo record) holds the PRE-image
-    // (whoever owned the row before this remove), not the remover. Must be
-    // carried explicitly.
-    pending_tombstone_reclaims: RwLock<Vec<(HashSet<TransactionId>, TransactionId, Record)>>,
-    // STORE_AUDIT.md T3: quiesced checkpoint. checkpoint() takes the write
-    // side for its whole run, blocking any new transaction from becoming
-    // active (begin_with_conflict_policy takes the read side, but only
-    // around its own final tx_mgr.begin call — see that method's comment
-    // for why not any earlier) — so the set of in-flight transactions can
-    // only shrink once a checkpoint starts, never grow, and checkpoint()
-    // can safely wait for it to reach empty before flushing+truncating.
-    // Without this, checkpoint() (auto-triggered from begin() whenever the
-    // log exceeds 16 MiB, not just on an explicit call) could flush a page
-    // an active or merely-abandoned-but-not-yet-reverted transaction had
-    // written, then truncate the only record of that transaction ever
-    // having existed — after a crash, a fresh session finds no trace of it
-    // in either transaction set and (see TransactionManager::is_committed)
-    // concludes it must have committed.
-    checkpoint_gate: RwLock<()>,
+    // TXN_SIMPLIFICATION_PLAN.md phase 3: every version a reader or a
+    // rollback can still need, with retention decided by the horizon alone
+    // (see version.rs). Replaces the three "defer until readers are gone"
+    // queues that used to live across Logger and Db.
+    versions: VersionStore,
+    // The one background thread (see maintenance.rs): abort retries, vacuum,
+    // checkpoint-by-log-growth.
+    pub(crate) maintenance: Maintenance,
     // STORE_AUDIT.md T17: drop_table frees a table's pages back to the free
     // list while some other in-flight insert/update/remove/find against
     // that same table may still be reading/writing through those exact
@@ -311,6 +362,103 @@ pub struct Db<F: DBFile + 'static> {
     // STORE_AUDIT.md P2 survey: sharded (ShardedMap), same treatment as
     // ArcLock — see table_guard's own comment.
     table_locks: ShardedMap<TableIdType, Arc<RwLock<()>>>,
+    // Held for the whole of checkpoint() (in addition to checkpoint_gate)
+    // so a crash-simulation snapshot (Db<MemFile>::synced_snapshot) can
+    // observe the data file and the log at one instant relative to a
+    // checkpoint's sync-then-truncate sequence — a real power cut is one
+    // instant across both files; two separate snapshot reads racing a
+    // checkpoint could otherwise capture a data file from before its sync
+    // and a log from after its truncation, a state no real crash produces.
+    snapshot_mutex: parking_lot::Mutex<()>,
+    // Phase 6: checkpoints are serialized (the maintenance thread and
+    // explicit calls); they never wait for a transaction.
+    checkpoint_mutex: parking_lot::Mutex<()>,
+    // Phase 5: once an abort's revert has failed ABORT_RETRY_BUDGET times,
+    // the engine refuses writes (reads continue) rather than spinning on a
+    // transaction it cannot finish; `Some(reason)` names it.
+    degraded: RwLock<Option<String>>,
+    abort_attempts: parking_lot::Mutex<HashMap<TransactionId, u32>>,
+    lock_timeouts: std::sync::atomic::AtomicU64,
+    // Phase 7: retention caps, the transactions the maintenance thread
+    // aborted for exceeding them (with the reason their owner will be
+    // told), and how many times that happened.
+    snapshot_limits: RwLock<SnapshotLimits>,
+    forced_aborts: parking_lot::Mutex<HashMap<TransactionId, String>>,
+    snapshot_too_old_aborts: std::sync::atomic::AtomicU64,
+    // Records recovery replayed at open (those at or above the persisted
+    // floor); 0 for a freshly created database.
+    recovered_records: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    fail_reverts: std::sync::atomic::AtomicBool,
+}
+
+/// A point-in-time snapshot of the engine's internal bookkeeping — what an
+/// operator (or a test) needs to answer "what is it doing and what is it
+/// holding on to" without a debugger. Every field is a cheap read of
+/// existing state; nothing here takes a lock for longer than a lookup.
+/// TXN_SIMPLIFICATION_PLAN.md phase 0.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DbStats {
+    /// Transactions begun and not yet committed/rolled back.
+    pub active_transactions: usize,
+    /// Transactions abandoned (guard dropped) whose writes are not yet
+    /// physically reverted.
+    pub aborting_transactions: usize,
+    /// Numeric id of the oldest active transaction, if any — the reader
+    /// that pins the most history.
+    pub oldest_active: Option<u64>,
+    /// Committed transactions still remembered because some active reader
+    /// began before they committed.
+    pub committed_retained: usize,
+    /// In-memory version records currently retained.
+    pub version_records: usize,
+    /// Committed transactions whose records the horizon has not yet released.
+    pub committed_awaiting_vacuum: usize,
+    /// Committed deletes whose tombstone row has not yet been purged.
+    pub tombstones_awaiting_purge: usize,
+    /// Maintenance thread counters.
+    pub maintenance_passes: u64,
+    pub tombstones_purged: u64,
+    pub abort_retries: u64,
+    pub maintenance_errors: u64,
+    pub maintenance_last_error: Option<String>,
+    /// Bytes appended to the current WAL segment (a checkpoint rolls it).
+    pub wal_segment_bytes: u64,
+    /// Phase 6: WAL segments on disk — retained ones plus the current one.
+    /// More than one after a checkpoint means a transaction that began
+    /// before the older ones is still in flight.
+    pub wal_segments: usize,
+    /// Phase 5: page-lock waits that exceeded `lock_timeout` (each one a
+    /// reported bug, never retried).
+    pub lock_timeouts: u64,
+    /// Phase 5: `Some(reason)` once the engine refuses writes.
+    pub degraded: Option<String>,
+    /// Phase 7: bytes across every WAL segment on disk — what long-lived
+    /// transactions are pinning, capped by `SnapshotLimits`.
+    pub wal_retained_bytes: u64,
+    /// Phase 7: transactions aborted with `SnapshotTooOld`.
+    pub snapshot_too_old_aborts: u64,
+    /// Log records recovery replayed when this database was opened.
+    pub recovered_records: usize,
+    /// Bytes currently in the WAL file (header included).
+    pub log_bytes: u64,
+    /// Page writes the writer thread is holding back.
+    /// Pages cache-resident right now.
+    pub cached_pages: usize,
+    /// Total pages the database file has (as tracked live, not the header).
+    pub page_count: u64,
+    /// Tables currently loaded.
+    pub tables: usize,
+}
+
+/// What `Db::open_segments` hands back: the runner's starting state and
+/// every record recovery must replay.
+struct OpenedWal<F> {
+    current_file: F,
+    current: Segment,
+    older: Vec<Segment>,
+    header_bytes: Vec<u8>,
+    records: Vec<LogRecord>,
 }
 
 struct NeededObjects<F: DBFile + 'static> {
@@ -350,39 +498,18 @@ where
         name: S,
         page_size: DBSizeType,
     ) -> Result<Arc<Self>, StoreError> {
-        Self::create_with_limits(name, page_size, DEFAULT_MAX_PENDING_WRITES)
-    }
-
-    // Like create_with_page_size, but also controls how many dirty pages the
-    // writer thread will hold in memory awaiting durable redo before blocking
-    // callers (see PageBuffer's writer/DEFAULT_MAX_PENDING_WRITES). Lower this
-    // for a small page_size on a memory-constrained machine; the default is
-    // tuned for the normal (16 KiB) page size.
-    pub fn create_with_limits<S: AsRef<str>>(
-        name: S,
-        page_size: DBSizeType,
-        max_pending_writes: usize,
-    ) -> Result<Arc<Self>, StoreError> {
-        let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_pending_writes)?;
+        let sf = Self::create_core_db(name.as_ref().to_string(), page_size)?;
+        sf.generator.attach_logger(sf.logger.clone());
         sf.create_system_tables()?;
-        Ok(Arc::new(sf))
+        let db = Arc::new(sf);
+        db.maintenance.start(&db);
+        Ok(db)
     }
 
     pub fn open_using<S: AsRef<str>>(
         name: S,
         file: F,
         log_file: F,
-    ) -> Result<Arc<Self>, StoreError> {
-        Self::open_using_with_limits(name, file, log_file, DEFAULT_MAX_PENDING_WRITES)
-    }
-
-    // Like open_using, but also controls the writer thread's pending-write
-    // cap — see create_with_limits.
-    pub fn open_using_with_limits<S: AsRef<str>>(
-        name: S,
-        file: F,
-        log_file: F,
-        max_pending_writes: usize,
     ) -> Result<Arc<Self>, StoreError> {
         let mut bytes = vec![0u8; size_of::<Header>()];
         let mut file = file;
@@ -399,14 +526,18 @@ where
         // page_size before it drove every later page-offset calculation.
         header.validate()?;
         let header = Arc::new(header);
-        let mut log_file = log_file;
-        // T4_S2_WAL_DESIGN.md §2: validated BEFORE any lock is taken, so a
-        // wrongly-paired log file (wrong database, wrong WAL version, wrong
-        // page size) is refused with zero side effects — nothing gets
-        // locked, nothing gets recovered against it.
-        let log_header_bytes = read_and_validate_log_header(&mut log_file, header.page_size)?;
+        // Phase 6: `log_file` is the handle through which the WAL segments
+        // are found (its namespace: the directory for a real file). Every
+        // segment's header is validated BEFORE any lock is taken, so a
+        // wrongly-paired log (wrong database, WAL version, page size) is
+        // refused with zero side effects.
+        let mut wal = Self::open_segments(name.as_ref(), &log_file, header.page_size)?;
+        // One comparison decides what recovery replays: a record below the
+        // last checkpoint's floor is already on disk (see Header).
+        let floor = header.checkpoint_lsn;
+        let mut records = std::mem::take(&mut wal.records);
+        records.retain(|r| r.lsn.0 >= floor);
         file.do_lock()?;
-        log_file.do_lock()?;
         let gens = Arc::new(Generator::new());
         // STORE_AUDIT.md T5 follow-up: the audit's own recommendation
         // ("derive page_count from file length instead of trusting the
@@ -434,12 +565,10 @@ where
         let page_count = Arc::new(AtomicU64::new(header.page_count));
         let nm = Self::setup_needed_modules(
             header.clone(),
-            gens.clone(),
             page_count.clone(),
             file.do_clone()?,
-            log_file.do_clone()?,
-            log_header_bytes,
-            max_pending_writes,
+            name.as_ref().to_string(),
+            wal,
         )?;
         let sf = Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
@@ -460,10 +589,29 @@ where
             logger: nm.logger,
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
-            pending_tombstone_reclaims: RwLock::new(Vec::new()),
-            checkpoint_gate: RwLock::new(()),
+            versions: VersionStore::new(),
+            maintenance: Maintenance::new(MAINTENANCE_INTERVAL),
             table_locks: ShardedMap::new(16),
+            snapshot_mutex: parking_lot::Mutex::new(()),
+            checkpoint_mutex: parking_lot::Mutex::new(()),
+            degraded: RwLock::new(None),
+            abort_attempts: parking_lot::Mutex::new(HashMap::new()),
+            lock_timeouts: std::sync::atomic::AtomicU64::new(0),
+            snapshot_limits: RwLock::new(SnapshotLimits {
+                max_retained_wal_bytes: DEFAULT_MAX_RETAINED_WAL_BYTES,
+                max_version_records: DEFAULT_MAX_VERSION_RECORDS,
+            }),
+            forced_aborts: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
+            recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_reverts: std::sync::atomic::AtomicBool::new(false),
         };
+        // TXN_SIMPLIFICATION_PLAN.md phase 1: seed the one counter from the
+        // header's persisted floor before anything mints a number; replay
+        // raises it further past whatever the log contains.
+        sf.logger.clock().seed(sf.header.counter);
+        sf.generator.attach_logger(sf.logger.clone());
         sf.load_system_tables()?;
         // STORE_AUDIT.md T16: reconcile the just-loaded (possibly stale)
         // free list against what's actually reachable, before replay can
@@ -472,8 +620,97 @@ where
         // (replay's own insert_if_needed/alloc_page calls must never see a
         // free list that still lists a live page as available).
         sf.reconcile_free_list()?;
-        sf.load_logs()?;
-        Ok(Arc::new(sf))
+        let count = sf.process_log(records)?;
+        info!("{count} log record(s) replayed (floor {floor})");
+        sf.recovered_records
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+        let db = Arc::new(sf);
+        db.maintenance.start(&db);
+        Ok(db)
+    }
+
+    /// Phase 6: finds, validates and scans every WAL segment next to the
+    /// database, oldest first, through `handle`'s namespace. No segment at
+    /// all means a fresh log: segment 1 is created. Returns the records of
+    /// every segment concatenated in order (recovery replays them as one
+    /// log) plus what the runner needs to continue appending.
+    fn open_segments(name: &str, handle: &F, page_size: DBSizeType) -> Result<OpenedWal<F>, StoreError> {
+        let segs = list_segments(handle, name)?;
+        if segs.is_empty() {
+            let path = segment_path(name, 1);
+            let opts = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .clone();
+            let mut f = handle.open_sibling(&path, opts)?;
+            let header_bytes = write_log_header(&mut f, page_size)?;
+            f.do_sync()?;
+            return Ok(OpenedWal {
+                current_file: f,
+                current: Segment {
+                    n: 1,
+                    path,
+                    max_lsn: 0,
+                    bytes: header_bytes.len() as u64,
+                },
+                older: Vec::new(),
+                header_bytes,
+                records: Vec::new(),
+            });
+        }
+        let opts = OpenOptions::new().read(true).write(true).clone();
+        let mut records = Vec::new();
+        let mut scanned = Vec::with_capacity(segs.len());
+        let mut last_file = None;
+        for (n, path) in segs {
+            let mut f = handle.open_sibling(&path, opts.clone())?;
+            let header_bytes = read_and_validate_log_header(&mut f, page_size)?;
+            let mut bytes = Vec::new();
+            f.seek(SeekFrom::Start(header_bytes.len() as u64))?;
+            f.read_to_end(&mut bytes)?;
+            // The torn-tail rule applies to every segment: only the last
+            // can have one (a roll syncs a segment before opening the
+            // next), and a clean segment simply has no tail to drop.
+            let scan = scan_log(&bytes)?;
+            let max_lsn = scan.records.iter().map(|r| r.lsn.0).max().unwrap_or(0);
+            let size = (header_bytes.len() + bytes.len()) as u64;
+            records.extend(scan.records);
+            scanned.push(Segment {
+                n,
+                path,
+                max_lsn,
+                bytes: size,
+            });
+            last_file = Some(f);
+        }
+        drop(last_file);
+        // Never append to a recovered segment: a crash may have left a torn
+        // tail at its end, and records appended after that point would be
+        // unreadable (the scan stops at the tear). A fresh segment costs one
+        // file, deleted at the first checkpoint that passes it.
+        let next_n = scanned.last().map(|s| s.n + 1).unwrap_or(1);
+        let path = segment_path(name, next_n);
+        let opts = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .clone();
+        let mut f = handle.open_sibling(&path, opts)?;
+        let header_bytes = write_log_header(&mut f, page_size)?;
+        f.do_sync()?;
+        Ok(OpenedWal {
+            current_file: f,
+            current: Segment {
+                n: next_n,
+                path,
+                max_lsn: 0,
+                bytes: header_bytes.len() as u64,
+            },
+            older: scanned,
+            header_bytes,
+            records,
+        })
     }
 
     // STORE_AUDIT.md T16: the persisted free list is only ever written at
@@ -538,19 +775,23 @@ where
     }
 
     pub fn open<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
-        let lf_name = name.as_ref().to_string() + ".wal";
         let f = OpenOptions::new()
             .create(false)
             .read(true)
             .write(true)
             .clone();
         let f = F::open(f, name.as_ref())?;
-        let log_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .clone();
-        let log_file = F::open(log_file, lf_name)?;
+        // Phase 6: the WAL is `<name>.wal.<n>` segments. Hand open_using the
+        // newest as its namespace handle; with none (a database whose log
+        // was removed), the data file itself serves — open_using then
+        // starts segment 1 next to it.
+        let log_file = match list_segments(&f, name.as_ref())?.pop() {
+            Some((_, path)) => f.open_sibling(
+                &path,
+                OpenOptions::new().read(true).write(true).clone(),
+            )?,
+            None => f.do_clone()?,
+        };
         Self::open_using(name, f, log_file)
     }
 
@@ -565,6 +806,9 @@ where
     // errors instead of panicking if some other clone (e.g. a TableCursor,
     // or another thread) is still holding a reference.
     pub fn close(self: Arc<Self>) -> Result<(F, F), StoreError> {
+        // Stop the maintenance thread first: it holds a Weak<Db> and upgrades
+        // it for each pass, which would defeat try_unwrap below.
+        self.maintenance.stop();
         let db = Arc::try_unwrap(self).map_err(|_| {
             StoreError::UnknownError(
                 "Db::close: other Arc<Db> references still exist (e.g. a live TableCursor or \
@@ -572,15 +816,18 @@ where
                     .into(),
             )
         })?;
-        // Revert any still-aborting transactions before persisting: the aborting
-        // set is in-memory only, so an un-reverted aborted row would reappear as
-        // committed after reopen (its txn no longer being in any set).
-        db.drain_aborting();
-        db.write_system_tables()?;
-        let mut hdr = (*db.header).clone();
-        hdr.page_count = db.page_count();
-        let ts = timestamp();
-        hdr.last_checkpoint = ts;
+        // Finish any abort whose revert failed earlier (the maintenance thread
+        // would have retried it): an un-reverted aborted row would reappear as
+        // committed after reopen.
+        for id in db.tx_mgr.aborting_ids() {
+            db.finish_abort(id)?;
+        }
+        // No transaction is in flight (every guard holds an Arc<Db>, and we
+        // just proved ours is the last), so this checkpoint's retention
+        // floor is the counter itself: every page is flushed, the header is
+        // durable, and every older segment is deleted. What remains is one
+        // empty segment — a reopen replays nothing.
+        db.checkpoint()?;
         // Each BPlusTree in tables holds Arc<PageBuffer>, Arc<Logger>, and
         // Arc<TransactionManager>. Drop them before Arc::into_inner so the
         // reference counts reach 1 and into_inner succeeds.
@@ -590,140 +837,187 @@ where
             tables,
             file,
             log_file,
+            generator,
+            name,
             ..
         } = db;
         drop(tables);
+        // The generator (shared with callers via get_generator) holds an
+        // Arc<Logger> for sequence logging; release it so the logger can be
+        // uniquely owned and shut down below.
+        generator.detach_logger();
         let buffer = Arc::into_inner(buffer).unwrap();
-        hdr.seal();
-        buffer.write_header(hdr)?;
         buffer.shutdown()?;
         // Unwrapping here as the expectation is there is only this thread accessing logger
         let logger = Arc::into_inner(logger).unwrap();
-        // A clean close is, by definition, a point where everything is
-        // durable (buffer.shutdown() just flushed every remaining pending
-        // page write) — exactly the condition checkpoint() truncates the
-        // logs under. Without this, close()+reopen never truncates at all
-        // (only an explicit checkpoint() does), so every such cycle
-        // accumulates the *entire* history of redo/undo records instead of
-        // just what's new — replay then has to reprocess everything from
-        // the very first write on every single reopen. That's wasteful on
-        // its own, but for Mod operations specifically it's also
-        // incorrect: replaying superseded intermediate updates (not just
-        // the latest one) repeatedly tears down and rebuilds the
-        // overflow-page chain for content that never needed to change,
-        // and each such rebuild can land on a different set of pages than
-        // the original run did — confirmed via
-        // test_free_pages_do_not_accumulate_across_multiple_close_reopen_cycles.
-        logger.checkpoint(ts)?;
+        let current = logger.current_segment();
         logger.shutdown()?;
-        Ok((file, log_file))
+        // Hand back a handle to the live (current) segment, not the one we
+        // were opened with — that one may have been deleted since.
+        let log = log_file.open_sibling(
+            &segment_path(&name, current),
+            OpenOptions::new().read(true).write(true).clone(),
+        )?;
+        Ok((file, log))
     }
 
     pub fn page_count(&self) -> DBSizeType {
         self.page_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Structural dump of one table (index leaves, then the data chain) —
+    /// see `BPlusTree::debug_dump`. Diagnostics only.
+    pub fn debug_dump_table(&self, tid: TableIdType) -> Result<Vec<String>, StoreError> {
+        self.table_by_id(tid)?.debug_dump()
+    }
+
+    /// See `DbStats`. Safe to call from any thread at any time.
+    pub fn stats(&self) -> DbStats {
+        let m = &self.maintenance.stats;
+        DbStats {
+            active_transactions: self.tx_mgr.active_count(),
+            aborting_transactions: self.tx_mgr.aborting_count(),
+            oldest_active: self.tx_mgr.oldest_active(),
+            committed_retained: self.tx_mgr.committed_retained(),
+            version_records: self.versions.records_len(),
+            committed_awaiting_vacuum: self.versions.committed_pending(),
+            tombstones_awaiting_purge: self.versions.tombstones_pending(),
+            maintenance_passes: m.passes.load(std::sync::atomic::Ordering::Relaxed),
+            tombstones_purged: m.tombstones_purged.load(std::sync::atomic::Ordering::Relaxed),
+            abort_retries: m.abort_retries.load(std::sync::atomic::Ordering::Relaxed),
+            maintenance_errors: m.errors.load(std::sync::atomic::Ordering::Relaxed),
+            maintenance_last_error: m.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            wal_segment_bytes: self.logger.segment_bytes(),
+            wal_segments: self.logger.segments(),
+            lock_timeouts: self.lock_timeouts.load(std::sync::atomic::Ordering::Relaxed),
+            degraded: self.degraded.read().clone(),
+            wal_retained_bytes: self.logger.retained_wal_bytes(),
+            recovered_records: self
+                .recovered_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            snapshot_too_old_aborts: self
+                .snapshot_too_old_aborts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            log_bytes: self.log_file.get_metadata().map(|m| m.len).unwrap_or(0),
+            cached_pages: self.buffer.cached_pages(),
+            page_count: self.page_count(),
+            tables: self.tables.read().len(),
+        }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Phase 5: how long a page-lock wait may take before it is reported as
+    /// a bug (`LockTimeout`). Default 1 s — a legitimate hold is
+    /// microseconds, so this is a detector with a thousandfold margin, not
+    /// a contention tunable.
+    pub fn set_lock_timeout(&self, timeout: std::time::Duration) {
+        self.buffer.set_lock_timeout(timeout);
+    }
+
+    /// Phase 7: caps on what a long-lived transaction may pin (retained WAL
+    /// bytes, version records). Past either, the maintenance thread aborts
+    /// the oldest active transaction; its owner's next call fails with
+    /// `SnapshotTooOld`.
+    pub fn set_snapshot_limits(&self, limits: SnapshotLimits) {
+        *self.snapshot_limits.write() = limits;
+    }
+
+    pub fn snapshot_limits(&self) -> SnapshotLimits {
+        *self.snapshot_limits.read()
+    }
+
+    fn refuse_if_degraded(&self) -> Result<(), StoreError> {
+        match &*self.degraded.read() {
+            Some(reason) => Err(StoreError::EngineDegraded(reason.clone())),
+            None => Ok(()),
+        }
+    }
+
+    fn enter_degraded(&self, reason: String) {
+        log::error!("engine degraded: {reason}");
+        let mut d = self.degraded.write();
+        if d.is_none() {
+            *d = Some(reason);
+        }
+    }
+
+    /// TXN_SIMPLIFICATION_PLAN.md phase 6: a fuzzy checkpoint. It never
+    /// waits for a transaction. Five steps, in this order:
+    ///
+    /// 0. With tree writers excluded (microseconds: they never wait on a
+    ///    transaction), persist the system pages and read `floor` =
+    ///    min(the counter's next value, the oldest Active or Aborting
+    ///    transaction's id) — the counter read FIRST. A transaction that
+    ///    begins after that read has an id above the floor, and every LSN
+    ///    a transaction mints is above its own id, so every record the log
+    ///    must keep (anything an unfinished transaction wrote) is at or
+    ///    above the floor by construction; with no write in flight, there
+    ///    is nothing else.
+    /// 1. Still excluded, capture a copy of every dirty page — one
+    ///    consistent instant of the whole tree, so no page on disk ever
+    ///    points at one that is not.
+    /// 2. Sync the log: every captured mutation's record was queued before
+    ///    its page was published, so all of them are durable now (the WAL
+    ///    rule). Then write the captured pages and fsync the data file.
+    /// 3. Write the header (`page_count`, `counter`) and fsync it.
+    /// 4. Roll the log to a new segment.
+    /// 5. Delete every older segment whose highest LSN is below the floor.
+    ///
+    /// Why a record below the floor is never needed again: its transaction
+    /// finished before step 0 (else the floor would be at or below that
+    /// transaction's id), so its page was published before step 0 and
+    /// flushed in step 2 — no redo — and a finished transaction needs no
+    /// undo. An unfinished transaction's pages may reach disk in step 2;
+    /// the records that undo them are above the floor and stay. A long-
+    /// lived transaction therefore costs retained segments (`stats()`),
+    /// never a stalled checkpoint.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
-        // STORE_AUDIT.md T3: quiesced checkpoint. Take the write side of
-        // checkpoint_gate for this whole call — blocks any NEW transaction
-        // from becoming active (begin_with_conflict_policy takes the read
-        // side around its own tx_mgr.begin call), so the set of in-flight
-        // transactions can only shrink from here, never grow. Then wait for
-        // that set (both `active` and `aborting` — see the wait helper's
-        // own comment on why both) to actually reach empty before touching
-        // any page or the log, so nothing this flush+truncate does can ever
-        // discard the only record of a write that hasn't committed yet.
-        let _gate = self.checkpoint_gate.write();
-        self.wait_for_no_in_flight_transactions()?;
-        // Must happen before the log truncate below, and really before
-        // anything else here: write_system_tables() persists the
-        // generator's current sequences (including the transaction-id
-        // one) to GENERATOR_TABLE_PAGE. That's the *only* place this state
-        // is durable — close() is the only other caller — so without this,
-        // a reopen after checkpoint-but-no-close restores a stale
-        // transaction-id sequence (whatever it was at table creation) and
-        // can mint a "new" transaction that numerically collides with an
-        // old, already-committed one (see TransactionId's PartialEq/Hash
-        // and TransactionManager::advance_past). Called first so its own
-        // page write is queued before, and thus flushed synchronously by,
-        // buffer.checkpoint() below rather than left pending.
-        self.write_system_tables()?;
-        self.buffer.checkpoint()?;
+        let _one_at_a_time = self.checkpoint_mutex.lock();
+        let (floor, captured) = {
+            let _no_writers = self.buffer.exclude_writers();
+            // Floor first: a Sequence record minted after this read stays
+            // above the floor (replayed), and one minted before it is in
+            // the generator page written next.
+            let floor = self.retention_floor();
+            // The catalog and the generator's sequences live only on their
+            // pinned pages; written here so they belong to the same instant.
+            self.write_system_tables()?;
+            (floor, self.buffer.capture_dirty_pages()?)
+        };
+        self.logger.sync()?;
+        // The crash harness snapshots the data file and the segments at one
+        // instant; the data fsync and the segment deletion below must look
+        // like one instant to it as well (see synced_snapshot).
+        let _snapshot_guard = self.snapshot_mutex.lock();
+        self.buffer.write_captured(captured)?;
         let mut hdr = (*self.header).clone();
         hdr.page_count = self.page_count();
         let ts = timestamp();
         hdr.last_checkpoint = ts;
-        // STORE_AUDIT.md T5: write_header_synced (not write_header) — waits
-        // for the header write to be physically written AND fsynced before
-        // returning, so the log truncation right below can never run ahead
-        // of it. Without this, a crash between the (fire-and-forget) header
-        // write landing in the writer thread's channel and the log actually
-        // being truncated could truncate first, leaving a stale header
-        // (wrong page_count/last_checkpoint) paired with an already-empty
-        // log on reopen.
+        hdr.counter = self.logger.clock().next_value();
+        hdr.checkpoint_lsn = floor;
+        // STORE_AUDIT.md T5: synced, so the segment deletion right below
+        // can never run ahead of the header that accounts for the flush.
         hdr.seal();
         self.buffer.write_header_synced(hdr)?;
-        self.logger.checkpoint(ts)?;
+        self.logger.roll(floor)?;
         self.last_checkpoint
             .store(ts, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
-    // STORE_AUDIT.md T3: blocks until no transaction is active or merely
-    // abandoned-and-not-yet-reverted. Actively drains `aborting` itself
-    // (not just polls) — drain_aborting() normally only ever runs from
-    // begin(), which is blocked by checkpoint_gate's write side for as
-    // long as this call is in progress, so nothing else would ever make
-    // that set shrink otherwise, livelocking. No timeout: an indefinite
-    // wait is the accepted tradeoff of a quiesced checkpoint (see
-    // PHASE4_CHECKPOINT_DESIGN.md's own note on why — a long-lived reader
-    // or forgotten transaction blocking a checkpoint is a known, deferred
-    // limitation, not something this fix newly introduces).
-    fn wait_for_no_in_flight_transactions(&self) -> Result<(), StoreError> {
-        loop {
-            self.drain_aborting();
-            let active = self.tx_mgr.get_active_transactions()?;
-            if active.is_empty() && self.tx_mgr.aborting_ids().is_empty() {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+    /// Step 0 of `checkpoint`: the LSN below which no log record is needed
+    /// once this checkpoint completes. Counter first, then the table (see
+    /// `checkpoint` on why the order matters).
+    fn retention_floor(&self) -> u64 {
+        let counter = self.logger.clock().next_value();
+        match self.tx_mgr.oldest_in_flight() {
+            Some(id) => id.min(counter),
+            None => counter,
         }
-    }
-
-    fn load_logs(&self) -> Result<usize, StoreError> {
-        // Skip the LogHeader (already read and validated separately, by
-        // create_core_db/open_using, before this ever runs) — process_log
-        // must only ever see the framed-record region after it, or it
-        // misreads the header's own bytes as a bogus first frame.
-        let header_len = LogHeader::encoded_len();
-        // mmap-ing a zero-length file errors ("memory map must have a
-        // non-zero length") rather than yielding an empty mapping. In
-        // practice the log file is never zero-length by the time this
-        // runs: create_core_db/open_using already wrote or validated its
-        // LogHeader before load_logs is ever called. Guarded anyway, since
-        // nothing here should assume it.
-        let count = if let Some(log_file) = self.log_file.as_any().downcast_ref::<File>() {
-            let len = log_file.metadata()?.len() as usize;
-            if len > header_len {
-                let map = unsafe { MmapOptions::new().map(log_file)? };
-                self.process_log(&map[header_len..])?
-            } else {
-                0
-            }
-        } else if let Some(log_file) = self.log_file.as_any().downcast_ref::<MemFile>() {
-            let data = log_file.data();
-            if data.len() > header_len {
-                self.process_log(&data[header_len..])?
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-
-        println!("{count} log record(s) found");
-
-        Ok(count)
     }
 
     // Replaces the old two-file process_redo/process_undo with one
@@ -737,47 +1031,56 @@ where
     // mmap/MemFile bytes directly since the header was already read and
     // validated separately (by create_core_db/open_using), never mixed
     // into the same scan as the framed records.
-    fn process_log(&self, buffer: &[u8]) -> Result<usize, StoreError> {
-        let scanned = scan_log(buffer)?;
+    fn process_log(&self, records: Vec<LogRecord>) -> Result<usize, StoreError> {
+        let scanned = ScannedLog { records };
         let count = scanned.records.len();
 
         // --- Pass 1: analysis ---
         let mut committed: HashSet<TransactionId> = HashSet::new();
         let mut by_txn: HashMap<TransactionId, Vec<&LogRecord>> = HashMap::new();
         let mut max_lsn: Option<u64> = None;
-        // STORE_AUDIT.md T11: highest ts seen across every TransactionId
-        // this log mentions — used below to reconcile the ts sequence
-        // against the log, not just whatever was persisted as of the last
-        // checkpoint. See TransactionManager::advance_ts_past's own
-        // comment.
-        let mut max_ts: u128 = 0;
+        let bump = |v: u64, max_lsn: &mut Option<u64>| {
+            *max_lsn = Some(max_lsn.map_or(v, |m| m.max(v)));
+        };
         for record in &scanned.records {
-            max_lsn = Some(match max_lsn {
-                Some(m) if m >= record.lsn.0 => m,
-                _ => record.lsn.0,
-            });
+            bump(record.lsn.0, &mut max_lsn);
             match &record.operation {
                 Operation::Add { txn, .. }
                 | Operation::Mod { txn, .. }
                 | Operation::Del { txn, .. } => {
-                    max_ts = max_ts.max(txn.ts());
-                    by_txn.entry(txn.clone()).or_default().push(record);
+                    // Ids come from the same counter as LSNs (phase 1); fold
+                    // them in so the seed covers every number ever issued.
+                    bump(txn.0, &mut max_lsn);
+                    by_txn.entry(*txn).or_default().push(record);
                 }
-                Operation::Commit(t, _ts) => {
-                    max_ts = max_ts.max(t.ts());
-                    committed.insert(t.clone());
+                Operation::Commit(t) => {
+                    bump(t.0, &mut max_lsn);
+                    committed.insert(*t);
                 }
-                // Dropped the old code's separate `rollback` HashSet here —
-                // it was built (in both process_redo and process_undo) and
-                // never actually consulted afterward in either one. "not in
-                // `committed`" below already covers an explicit rollback
-                // exactly the same as a never-committed abandoned txn.
-                Operation::Rollback(t, _ts) => {
-                    max_ts = max_ts.max(t.ts());
+                // "not in `committed`" below already covers an explicit
+                // rollback exactly the same as a never-committed abandoned
+                // txn.
+                Operation::Rollback(t) => {
+                    bump(t.0, &mut max_lsn);
+                }
+                Operation::Purge { txn, .. } => {
+                    bump(txn.0, &mut max_lsn);
+                }
+                // Sequences are not transactional: applied in log order,
+                // last record per name wins (see generator.rs).
+                Operation::Sequence {
+                    name,
+                    high_water,
+                    dropped,
+                } => {
+                    if *dropped {
+                        self.generator.remove_unlogged(name)?;
+                    } else {
+                        self.generator.ensure_at_least(name, *high_water)?;
+                    }
                 }
             }
         }
-        self.tx_mgr.advance_ts_past(max_ts)?;
 
         // --- Pass 2: redo — every record for a COMMITTED txn, in the log's
         // own (LSN-ascending) order.
@@ -813,7 +1116,7 @@ where
             match &record.operation {
                 Operation::Add { post, .. } => {
                     if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
-                        table.insert_if_needed(&post.tuple, txn.clone())?;
+                        table.insert_if_needed(&post.tuple)?;
                     }
                 }
                 Operation::Mod { post, .. } => {
@@ -821,33 +1124,63 @@ where
                         table.update_if_needed(post.tuple.clone())?;
                     }
                 }
-                Operation::Del { pre, .. } => {
+                // Phase 3: a delete's redo re-tombstones the row in place
+                // (physical removal is Purge's job), so a later record in
+                // this same suffix that builds on the tombstone — an insert
+                // over it — still finds it.
+                Operation::Del { txn, pre } => {
                     if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
-                        table.remove(pre.tuple.id.clone())?;
+                        let mut t = pre.tuple.clone();
+                        t.set_txn_id(*txn);
+                        t.set_pre_lsn(record.lsn);
+                        t.tombstone();
+                        table.update_if_needed(t)?;
+                    }
+                }
+                Operation::Purge { txn, table_id, key } => {
+                    if let Some(table) = self.table_by_id_or_dropped(*table_id)? {
+                        Self::purge_if_still_tombstone(
+                            &table,
+                            key.clone(),
+                            *txn,
+                            self.logger.next_lsn(),
+                        )?;
                     }
                 }
                 _ => {}
             }
         }
 
-        // --- Pass 3: undo — every record for a txn that never committed ---
-        for (txn, ops) in &by_txn {
+        // --- Pass 3: undo — every record for a txn that never committed, in
+        // REVERSE log order (phase 3): a transaction's own chain restores
+        // step by step, each record's pre-image being the version just
+        // before it.
+        for record in scanned.records.iter().rev() {
+            let txn = match &record.operation {
+                Operation::Add { txn, .. }
+                | Operation::Mod { txn, .. }
+                | Operation::Del { txn, .. } => txn,
+                _ => continue,
+            };
             if committed.contains(txn) {
                 continue;
             }
-            let ops: Vec<Operation> = ops.iter().map(|r| r.operation.clone()).collect();
-            self.revert_undo_ops(&ops, txn)?;
+            self.revert_one(&record.operation, txn)?;
         }
+        let _ = &by_txn;
 
         if let Some(lsn) = max_lsn {
-            let lsn = LsnId(lsn);
-            self.logger.clock().mark_written(lsn);
-            // See LsnClock::advance_counter_past's own doc comment: without
-            // this, the counter restarts at 0 on reopen, and the first new
-            // write's redo record landing regresses the watermark this just
-            // set right back down.
-            self.logger.clock().advance_counter_past(lsn);
+            self.logger.clock().advance_counter_past(LsnId(lsn));
         }
+        // Every page write replay just made re-applies a record that is
+        // already durable, but the tree stamped those pages with freshly
+        // minted LSNs that no record will ever carry. Declare everything
+        // minted so far durable, or those pages would sit in the writer's
+        // deferred set until some unrelated later record landed — and a
+        // read-only session after recovery would eventually block on
+        // backpressure with nothing to wait for.
+        let clock = self.logger.clock();
+        clock.mark_written(LsnId(clock.next_value().saturating_sub(1)));
         Ok(count)
     }
 
@@ -855,357 +1188,296 @@ where
     /// (`ConflictPolicy::ContinueOnConflict` — a `WriteConflict` fails just
     /// the conflicting operation, leaving the transaction open). Use
     /// `begin_with_conflict_policy` for `AbortOnConflict` behavior.
-    pub fn begin(&self) -> Result<Transaction, StoreError> {
+    pub fn begin(self: &Arc<Self>) -> Result<Transaction, StoreError> {
         self.begin_with_conflict_policy(ConflictPolicy::ContinueOnConflict)
     }
 
     /// Like `begin`, but lets the caller choose how a `WriteConflict` on any
     /// operation within this transaction is handled — see `ConflictPolicy`'s
     /// own doc comment.
+    ///
+    /// TXN_SIMPLIFICATION_PLAN.md phase 3: one counter increment and one map
+    /// insert. No cleanup, no log-size check — the maintenance thread owns
+    /// both.
     pub fn begin_with_conflict_policy(
-        &self,
+        self: &Arc<Self>,
         policy: ConflictPolicy,
     ) -> Result<Transaction, StoreError> {
-        // Reclaim any transactions abandoned via Transaction::drop (parked in
-        // `aborting`) before starting new work: they are already invisible, this
-        // physically reverts them so their rows don't linger and a re-insert of
-        // the same key finds it free. The reverts are conditional (see
-        // revert_txn_writes), so this is safe even if another thread is making
-        // forward progress on the same keys.
-        self.drain_aborting();
-        // Same opportunistic-cleanup pattern for committed transactions whose
-        // undo trail commit() had to defer (see Logger::discard_or_defer_undo)
-        // because some reader's snapshot might still have needed it. Cheap
-        // no-op when nothing is pending.
-        self.logger
-            .drain_ready_undo_discards(&self.tx_mgr.get_active_transactions()?);
-        // Same opportunistic-cleanup pattern for tombstones commit() had to
-        // defer reclaiming (see the waiters comment there and
-        // pending_tombstone_reclaims's own doc comment) because some
-        // reader's snapshot might still have needed the pre-delete version.
-        self.drain_ready_tombstone_reclaims(&self.tx_mgr.get_active_transactions()?);
-        if self.log_file.get_metadata()?.len > 16 * 1024 * 1024 {
-            self.checkpoint()?;
-        }
-        // STORE_AUDIT.md T3: acquired fresh here, AFTER the auto-checkpoint
-        // call above (never around it — checkpoint() takes checkpoint_gate's
-        // WRITE side, so holding the read side across that call would
-        // self-deadlock), and held only long enough to register the new
-        // transaction. This is what makes checkpoint()'s own wait
-        // meaningful: no transaction can become active while a checkpoint
-        // holds the write side, so the in-flight set it's waiting to drain
-        // can only shrink, never grow, once it starts waiting.
-        let _gate = self.checkpoint_gate.read();
-        self.tx_mgr.begin(policy)
+        let id = self.tx_mgr.create_transaction(policy)?;
+        Ok(Transaction::new(id, Arc::clone(self) as Arc<dyn TxnSink>))
     }
 
     pub fn commit(&self, txn: Transaction) -> Result<(), StoreError> {
+        self.commit_with(txn, Durability::Sync)
+    }
+
+    /// `commit` with a choice of durability wait — see `Durability`.
+    pub fn commit_with(&self, txn: Transaction, durability: Durability) -> Result<(), StoreError> {
         // Detach the id before doing any fallible work below. If that work
-        // fails partway, returning the `?` here must NOT fall back to
-        // `Transaction::drop`'s default rollback — see `Transaction::into_id`.
-        // The transaction simply stays active (and correctly invisible) until
-        // a retried commit completes successfully.
-        let id = txn.into_id();
-        // AbortOnConflict may already have rolled this transaction back
-        // entirely (see update_checked_with_retry) — without this check,
-        // tx_mgr.commit's active-set removal below would be a silent no-op
-        // for an id that's already gone, and this would incorrectly report
-        // success for a transaction that was actually rolled back.
+        // fails partway, returning `?` must NOT trigger the guard's abort —
+        // the transaction simply stays active (and invisible) until a retried
+        // commit completes.
+        self.commit_id_with(txn.into_id(), durability)
+    }
+
+    fn commit_id(&self, id: TransactionId) -> Result<(), StoreError> {
+        self.commit_id_with(id, Durability::Sync)
+    }
+
+    /// The commit path (proposal §3.7): one append, one state flip, wake
+    /// vacuum, wait for durability. No tree work.
+    fn commit_id_with(&self, id: TransactionId, durability: Durability) -> Result<(), StoreError> {
+        self.refuse_if_degraded()?;
+        // AbortOnConflict may already have aborted this transaction; a
+        // commit of a finished id must not report success.
         self.require_active(&id)?;
-        // Capture the tombstoned rows to reclaim BEFORE writing the commit
-        // marker: logging a Commit op discards this txn's undo records (see
-        // Logger::log's Rollback/Commit-adjacent discard path), so we must
-        // read them first.
-        let del_records: Vec<Record> = self
-            .logger
-            .get_undo_operations(id.clone())?
-            .into_iter()
-            .filter_map(|o| match o {
-                Operation::Del { pre, .. } => Some(pre),
-                _ => None,
-            })
-            .collect();
-        // Commit point FIRST — make the transaction atomically committed before
-        // touching the tree. The physical reclamation of tombstoned rows below
-        // is best-effort cleanup (find() already treats a committed tombstone as
-        // absent), so it must not run *before* the commit: doing so let commit
-        // remove rows and then return Err from a later step, leaving the caller
-        // unable to tell "fully failed" from "partially applied" — which diverged
-        // the caller's state from the DB's (a committed remove the caller thought
-        // had failed).
-        let op = Operation::Commit(id.clone(), timestamp());
-        // STORE_AUDIT.md T1: captured so this function can wait on it being
-        // durable before returning — see the wait_until_durable call at the
-        // very end of this function for why it happens THERE, not here
-        // (immediately, matching the audit's own suggested ordering would
-        // reopen the exact race STORE_AUDIT.md T14 already closed).
-        let commit_lsn = self.logger.log_new(op)?;
-        // Mark committed BEFORE deciding whether id's undo trail can be
-        // dropped now or must wait — not after. STORE_AUDIT.md T14
-        // follow-up: with the old ordering (decide-then-commit), there was
-        // a window, between "no one else is active, discard the undo trail
-        // now" and tx_mgr.commit actually flipping id to committed, where a
-        // concurrent walker's is_committed(id) check still said false (so
-        // it tried to walk PAST id for a pre-image) but id's undo trail was
-        // ALREADY gone (so the walk hit MissingUndoRecord) — and, critically,
-        // find_visible_to's own fallback for that case (find_last_committed)
-        // re-walks the exact same, already-discarded chain and hits the
-        // identical dead end, so it doesn't rescue this specific case the
-        // way it rescues the one its own comment describes. CONFIRMED via
-        // direct concurrent repro: a fresh reader beginning and finding a
-        // row immediately after a racing commit landed exactly in this
-        // window, incorrectly reporting a committed, existing row as
-        // missing. Committing first closes the window: by the time any
-        // walker could see id's undo trail discarded, is_committed(id) is
-        // already true, so it never needs to walk past id at all.
-        //
-        // Safe to reorder: still_active's computation (get_active_transactions,
-        // then explicitly removing id) doesn't depend on whether tx_mgr.commit
-        // has already removed id from the active set — the result is
-        // identical either way.
-        self.tx_mgr.commit(id.clone())?;
-        // Decide whether id's undo trail can be dropped now or must wait for
-        // every currently-active transaction that might have it in its own
-        // snapshot to finish first — see Logger::discard_or_defer_undo.
-        let mut still_active = self.tx_mgr.get_active_transactions()?;
-        still_active.remove(&id);
-        // STORE_AUDIT.md T6: any transaction still active at this exact
-        // commit point might have begun (captured its snapshot) before this
-        // delete, and find_visible_to's fallback for such a reader depends
-        // on a physical tuple still being present in the tree to walk the
-        // undo chain from. Physically reclaiming it now — like the old
-        // unconditional loop below did — pulls that tuple out from under
-        // any such reader, so find() sees a flat "gone" instead of falling
-        // back to the pre-delete version. Gate physical reclaim on the same
-        // waiter set discard_or_defer_undo already computes for exactly
-        // this reason, just for the tree-level row instead of the in-memory
-        // undo trail.
-        let waiters = still_active.clone();
-        self.logger.discard_or_defer_undo(id.clone(), still_active);
-
-        // Best-effort tombstone reclamation. Errors here do not un-commit the
-        // transaction: find() already treats a committed tombstone as absent,
-        // so a caller never sees the removed row regardless of whether this
-        // physical cleanup below ever runs.
-        //
-        // But it's not purely cosmetic either: tombstoning (Db::remove) only
-        // flips a flag via table.update — it never touches the index — so
-        // until this reclaim actually completes, the index entry is still
-        // live and a future insert of the same key hits a real, permanent
-        // DuplicateKey (there is no other pass that ever revisits this row).
-        // find() and remove() must therefore be retried TOGETHER as one unit,
-        // not just remove() alone: table.find() below walks the index/data
-        // pages the same way any other read does and can itself return
-        // LockContentionError under write contention. The old code let that
-        // specific failure through an `if let Ok(...)` unchecked, silently
-        // skipping the reclaim entirely on the very first contention hit on
-        // find() — permanently orphaning the index entry, since there's no
-        // later pass to retry it. Retrying the whole find+remove sequence is
-        // safe to repeat: find is a pure read, and remove (since the earlier
-        // fix) tolerates the data already being gone from a prior attempt.
-        //
-        // If some other transaction is still active right now, it might
-        // still need the pre-delete version (see the waiters comment
-        // above) — defer physical reclaim for those records instead of
-        // running it immediately; drain_ready_tombstone_reclaims (called
-        // opportunistically from begin(), alongside the equivalent undo-
-        // trail drain) finishes the job once every such waiter is gone.
-        if waiters.is_empty() {
-            self.reclaim_tombstones(del_records, id.clone());
-        } else {
-            self.pending_tombstone_reclaims.write().extend(
-                del_records
-                    .into_iter()
-                    .map(|r| (waiters.clone(), id.clone(), r)),
-            );
+        let commit_lsn = self.logger.log_new(Operation::Commit(id))?;
+        // THE commit point for every other thread. Versions are never
+        // discarded here — retention is the horizon's decision — so there
+        // is no window where a walker sees "not committed" and "pre-image
+        // gone" at once (the race STORE_AUDIT.md T14 was about).
+        self.tx_mgr.commit(id, commit_lsn.0)?;
+        self.versions.mark_committed(id, commit_lsn.0);
+        self.maintenance.wake();
+        // STORE_AUDIT.md T1: don't report success until the record is
+        // fsynced. Last, so is_committed flips promptly regardless of how
+        // long the fsync takes.
+        if durability == Durability::Sync {
+            crate::buffer::debug_assert_no_page_locks_held("waiting for commit durability");
+            self.logger.wait_until_durable(commit_lsn);
         }
-        // STORE_AUDIT.md T1: don't tell the caller this commit succeeded
-        // until its own Commit record is actually durable (fsynced), not
-        // just queued for the log runner. Deliberately last, not right
-        // after logging: is_committed(id) must flip true (via tx_mgr.commit
-        // above) and the tombstone-reclaim decision must happen promptly,
-        // unaffected by however long this wait takes — delaying THOSE would
-        // reopen the exact race STORE_AUDIT.md T14 already closed (a
-        // concurrent walker could observe id as neither committed nor
-        // aborting for the whole duration of a real fsync instead of a few
-        // instructions). Only this function's own return to ITS caller
-        // waits; every other thread sees id as committed immediately, same
-        // as before this fix. Group commit is preserved: this blocks on the
-        // SAME per-batch watermark the log runner already advances, so
-        // concurrent committers waiting on lsns in one batch all wake
-        // together, not one fsync per commit.
-        self.logger.wait_until_durable(commit_lsn);
         Ok(())
-    }
-
-    #[allow(clippy::unnecessary_map_or, clippy::collapsible_if)]
-    fn reclaim_tombstones(&self, del_records: Vec<Record>, id: TransactionId) {
-        for r in del_records {
-            if let Ok(table) = self.table_by_id(r.table_id) {
-                let _ = retry_on_contention(|| {
-                    if let Some(tuple) = table.find(r.tuple.id.clone())? {
-                        if tuple.is_tombstoned() && tuple.is_same_txn(id.clone()) {
-                            table.remove(tuple.id.clone())?;
-                        }
-                    }
-                    Ok(())
-                });
-            }
-        }
-    }
-
-    /// Opportunistic maintenance for tombstone reclaims deferred by
-    /// commit() (see the waiters comment there and
-    /// `pending_tombstone_reclaims`'s own doc comment) — called alongside
-    /// drain_aborting/drain_ready_undo_discards, e.g. at Db::begin(). For
-    /// each deferred record, drops from its waiter set any transaction
-    /// that's since finished (no longer in `currently_active`); once a
-    /// record's waiter set is empty — nothing that could still need the
-    /// pre-delete version remains active — it's actually reclaimed.
-    fn drain_ready_tombstone_reclaims(&self, currently_active: &HashSet<TransactionId>) {
-        let mut pending = self.pending_tombstone_reclaims.write();
-        if pending.is_empty() {
-            return;
-        }
-        let mut still_pending = Vec::with_capacity(pending.len());
-        let mut ready: HashMap<TransactionId, Vec<Record>> = HashMap::new();
-        for (waiters, owner, record) in pending.drain(..) {
-            let remaining: HashSet<TransactionId> = waiters
-                .into_iter()
-                .filter(|w| currently_active.contains(w))
-                .collect();
-            if remaining.is_empty() {
-                ready.entry(owner).or_default().push(record);
-            } else {
-                still_pending.push((remaining, owner, record));
-            }
-        }
-        *pending = still_pending;
-        drop(pending);
-        for (id, records) in ready {
-            self.reclaim_tombstones(records, id);
-        }
     }
 
     pub fn rollback(&self, txn: Transaction) -> Result<(), StoreError> {
-        // See the comment in `commit` above — `into_id` prevents Drop's default
-        // rollback so this is the single place the txn changes state.
-        let id = txn.into_id();
-        self.rollback_by_id(&id)
+        self.abort(txn.into_id())
     }
 
-    // The actual work of rollback(), keyed off a borrowed TransactionId
-    // rather than an owned Transaction guard — needed by
-    // update_checked_with_retry's AbortOnConflict path, which only ever has
-    // `&TransactionId` (the caller's own Transaction guard is borrowed, not
-    // owned, by insert/update/remove). Calling this twice for the same id
-    // (e.g. this fires here, and the caller's own Transaction guard later
-    // still gets an explicit db.rollback or a Drop-triggered one) is safe:
-    // revert_txn_writes' per-row ownership checks make every step a no-op
-    // once the first pass already reverted it, and finish_rolled_back /
-    // logging a second Rollback marker for an already-gone id are harmless.
-    fn rollback_by_id(&self, id: &TransactionId) -> Result<(), StoreError> {
-        // Revert while the txn is STILL ACTIVE. Active transactions are invisible
-        // (is_committed == false) and are never scanned by drain_aborting, so the
-        // owner reverts its own writes with zero cross-thread interference — no
-        // other thread can observe or reclaim this txn mid-revert. Only once the
-        // writes are physically undone do we retire it from the active set.
-        // Revert BEFORE the Rollback marker, which discards the undo records.
-        //
-        // STORE_AUDIT.md T12: if revert_txn_writes fails partway (e.g. a
-        // table one of its undo ops targets was dropped mid-flight), the
-        // old code just propagated the error via `?` here, leaving `id`
-        // stuck in `active` forever — invisible to everyone, but with no
-        // path back to a resolved state, since drain_aborting only ever
-        // scans `aborting`. Move it there instead of leaving it stranded:
-        // revert_aborted (via drain_aborting, run opportunistically from
-        // begin()) retries the exact same conditional, tolerant reverts
-        // later, which succeeds once whatever failed stops failing (or is
-        // a permanent no-op if the row's already gone some other way).
-        if let Err(e) = self.revert_txn_writes(id) {
-            self.tx_mgr.abort(id.clone())?;
-            return Err(e);
+    /// THE abort path (proposal §3.7) — explicit rollback, a dropped guard,
+    /// `AbortOnConflict`, and (later) snapshot-too-old all come here.
+    /// Flips the transaction to Aborting (invisible from this instant),
+    /// reverts its writes in reverse log order, logs, forgets its versions,
+    /// and removes it. If the revert fails (I/O, corruption) the transaction
+    /// stays Aborting and the maintenance thread retries.
+    pub(crate) fn abort(&self, id: TransactionId) -> Result<(), StoreError> {
+        match self.tx_mgr.abort(id) {
+            Ok(()) => {}
+            // Already finished — most commonly AbortOnConflict already took
+            // it down and the caller's own ROLLBACK follows. A harmless
+            // no-op, as in every SQL engine; never a second revert.
+            Err(StoreError::TransactionAlreadyFinished) => {
+                self.forced_aborts.lock().remove(&id);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         }
-        let op = Operation::Rollback(id.clone(), timestamp());
-        self.logger.log_new(op)?;
-        self.tx_mgr.finish_rolled_back(id.clone());
+        let res = self.finish_abort(id);
+        if res.is_err() {
+            self.maintenance.wake();
+        }
+        res
+    }
+
+    /// The second half of `abort`, also what the maintenance thread retries.
+    fn finish_abort(&self, id: TransactionId) -> Result<(), StoreError> {
+        self.revert(id)?;
+        self.logger.log_new(Operation::Rollback(id))?;
+        self.versions.discard(&id);
+        self.tx_mgr.abort_complete(&id);
         Ok(())
     }
 
-    /// Physically revert `id`'s writes by replaying its undo log. Each op is
-    /// applied *conditionally* — only if the row still belongs to `id` at the
-    /// moment of the write, checked under the data-page lock
-    /// (update_if_txn / remove_if_txn) — so a concurrent forward write to the
-    /// same key by another transaction is never clobbered. Performs no
-    /// transaction-set or undo-log bookkeeping; callers do that.
-    fn revert_txn_writes(&self, id: &TransactionId) -> Result<(), StoreError> {
-        let ops = self.logger.get_undo_operations(id.clone())?;
-        self.revert_undo_ops(&ops, id)
+    /// Physically revert `id`'s writes, newest first. Each step is
+    /// conditional (update_if_txn / remove_if_txn: only if the row still
+    /// belongs to `id`), so nothing another transaction has since written is
+    /// ever clobbered.
+    fn revert(&self, id: TransactionId) -> Result<(), StoreError> {
+        #[cfg(test)]
+        if self.fail_reverts.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(StoreError::UnknownError("test: revert failure injected".into()));
+        }
+        for op in self.versions.ops_of(&id).iter().rev() {
+            self.revert_one(op, &id)?;
+        }
+        Ok(())
     }
 
-    fn revert_undo_ops(&self, ops: &Vec<Operation>, id: &TransactionId) -> Result<(), StoreError> {
-        for o in ops {
-            match o {
-                Operation::Add { post, .. } => {
-                    // STORE_AUDIT.md T17: table_by_id_or_dropped, not
-                    // table_by_id — the table this op targeted may have
-                    // been dropped since (replay, or a live rollback
-                    // racing a drop_table between this txn's own write and
-                    // its abort/rollback). Nothing to revert against a
-                    // table that no longer exists; that IS the converged
-                    // state either way.
-                    if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
-                        retry_on_contention(|| table.remove_if_txn(post.tuple.id.clone(), id))?;
+    fn revert_one(&self, op: &Operation, id: &TransactionId) -> Result<(), StoreError> {
+        match op {
+            Operation::Add { post, .. } => {
+                // STORE_AUDIT.md T17: the table may have been dropped since;
+                // nothing to revert against a table that no longer exists.
+                if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
+                    table.remove_if_txn(post.tuple.id.clone(), id)?;
+                }
+            }
+            Operation::Del { pre, .. } | Operation::Mod { pre, .. } => {
+                if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
+                    table.update_if_txn(pre.tuple.clone(), id)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One maintenance pass (proposal §3.6), run by the maintenance thread:
+    /// retry aborts whose revert failed, vacuum by the horizon, purge the
+    /// tombstones vacuum released, checkpoint if the log has grown enough.
+    pub(crate) fn maintenance_pass(&self) -> Result<(), StoreError> {
+        let stats = &self.maintenance.stats;
+        for id in self.tx_mgr.aborting_ids() {
+            match self.finish_abort(id) {
+                Ok(()) => {
+                    stats
+                        .abort_retries
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.abort_attempts.lock().remove(&id);
+                }
+                Err(e) => {
+                    stats.record_error(&format!("retrying abort of {id}: {e}"));
+                    let attempts = {
+                        let mut a = self.abort_attempts.lock();
+                        let n = a.entry(id).or_insert(0);
+                        *n += 1;
+                        *n
+                    };
+                    if attempts >= ABORT_RETRY_BUDGET {
+                        self.enter_degraded(format!(
+                            "abort of {id} failed {attempts} times (last: {e}); its rows stay \
+                             invisible and writes are refused until restart"
+                        ));
                     }
                 }
-                Operation::Del { pre, .. } => {
-                    if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
-                        retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
-                    }
-                }
-                // pre: None is a "redo-only" Mod (see Operation::Mod's own
-                // doc comment) — the own-insert-then-update chain, where
-                // the original Add's own revert (above) already removes
-                // the row entirely. Reverting a real pre-image here too
-                // would re-materialize a row the Add's revert just removed.
-                Operation::Mod { pre: Some(pre), .. } => {
-                    if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
-                        retry_on_contention(|| table.update_if_txn(pre.tuple.clone(), id))?;
-                    }
-                }
-                Operation::Mod { pre: None, .. } => {}
-                _ => {}
             }
         }
+        let horizon = self.tx_mgr.oldest_active();
+        self.tx_mgr.prune_committed();
+        let v = self.versions.vacuum(horizon);
+        if v.transactions_forgotten > 0 || !v.tombstones.is_empty() {
+            stats
+                .vacuums_with_work
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .transactions_forgotten
+                .fetch_add(v.transactions_forgotten as u64, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .records_discarded
+                .fetch_add(v.records_discarded as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !v.tombstones.is_empty() {
+            let mut retry = Vec::new();
+            for t in v.tombstones {
+                match self.purge(&t) {
+                    Ok(()) => {
+                        stats
+                            .tombstones_purged
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        stats.record_error(&format!("purging {:?}: {e}", t.key));
+                        retry.push(t);
+                    }
+                }
+            }
+            self.versions.requeue_tombstones(retry);
+        }
+        if self.logger.segment_bytes() > CHECKPOINT_LOG_BYTES
+            || self.buffer.dirty_pages() > CHECKPOINT_DIRTY_PAGES
+        {
+            self.checkpoint()?;
+            stats
+                .checkpoints
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.enforce_snapshot_limits()?;
+        Ok(())
+    }
+
+    /// Phase 7: when what long-lived transactions pin exceeds a cap, abort
+    /// the oldest active transaction (one per pass) with a reason its
+    /// owner sees on its next call, then checkpoint so the space is
+    /// actually released.
+    fn enforce_snapshot_limits(&self) -> Result<(), StoreError> {
+        let limits = self.snapshot_limits();
+        let wal = self.logger.retained_wal_bytes();
+        let records = self.versions.records_len();
+        let over = if wal > limits.max_retained_wal_bytes {
+            Some(format!(
+                "retained WAL {wal} bytes exceeds the cap of {} bytes",
+                limits.max_retained_wal_bytes
+            ))
+        } else if records > limits.max_version_records {
+            Some(format!(
+                "{records} retained version records exceed the cap of {}",
+                limits.max_version_records
+            ))
+        } else {
+            None
+        };
+        let Some(why) = over else { return Ok(()) };
+        let Some(oldest) = self.tx_mgr.oldest_active() else { return Ok(()) };
+        let id = TransactionId(oldest);
+        let reason = format!("transaction {id} aborted by the engine: {why}");
+        log::warn!("{reason}");
+        self.forced_aborts.lock().insert(id, reason);
+        self.abort(id)?;
+        self.snapshot_too_old_aborts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.checkpoint()
+    }
+
+    /// Remove a committed tombstone's row and index entry, if it is still
+    /// that transaction's tombstone (a later insert may have brought the key
+    /// back to life). Logged first — under the same leaf lock as the removal
+    /// — so recovery converges either way.
+    fn purge(&self, t: &Tombstone) -> Result<(), StoreError> {
+        let Some(table) = self.table_by_id_or_dropped(t.table_id)? else {
+            return Ok(());
+        };
+        let key = t.key.clone();
+        let txn = t.txn;
+        let table_id = t.table_id;
+        table.write_version(key.clone(), self.logger.next_lsn(), |cur| {
+            let purge = match cur {
+                Some(c) => c.is_tombstoned() && c.is_same_txn(txn),
+                // An entry with no row behind it is never valid: finish it.
+                None => true,
+            };
+            if !purge {
+                return Ok(Decision::Skip);
+            }
+            self.logger.log_new(Operation::Purge {
+                txn,
+                table_id,
+                key: key.clone(),
+            })?;
+            Ok(Decision::Delete)
+        })?;
+        Ok(())
+    }
+
+    // Purge redo: remove the row only if it is still `txn`'s tombstone; a
+    // dangling index entry with no row behind it is removed either way.
+    fn purge_if_still_tombstone(
+        table: &BPlusTree<F>,
+        key: DBIdType,
+        txn: TransactionId,
+        lsn: LsnId,
+    ) -> Result<(), StoreError> {
+        table.write_version(key, lsn, |cur| {
+            Ok(match cur {
+                Some(c) if c.is_tombstoned() && c.is_same_txn(txn) => Decision::Delete,
+                Some(_) => Decision::Skip,
+                None => Decision::Delete,
+            })
+        })?;
         Ok(())
     }
 
     pub(crate) fn get_last_checkpoint(&self) -> u128 {
         self.last_checkpoint
             .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Reclaim a transaction parked in `aborting` — one abandoned via
-    /// Transaction::drop, which has no table access to revert itself. Reverts its
-    /// writes, drops its undo records, then finishes the abort. Safe to run
-    /// concurrently with the owner's forward progress (and with another drainer)
-    /// thanks to the conditional reverts in revert_txn_writes.
-    fn revert_aborted(&self, id: &TransactionId) -> Result<(), StoreError> {
-        self.revert_txn_writes(id)?;
-        self.logger.discard_undo(id);
-        self.tx_mgr.abort_complete(id);
-        Ok(())
-    }
-
-    /// Best-effort reclamation of transactions parked in `aborting` by
-    /// Transaction::drop. Only *dropped* txns land there — a Db-level rollback
-    /// reverts itself while active and never enters this set — so under healthy
-    /// operation this is empty and the loop is a no-op. A revert that errors is
-    /// simply retried on the next drain (the txn stays invisible meanwhile).
-    pub(crate) fn drain_aborting(&self) {
-        for id in self.tx_mgr.aborting_ids() {
-            let _ = self.revert_aborted(&id);
-        }
     }
 
     pub(crate) fn table_by_id(&self, id: TableIdType) -> Result<Arc<BPlusTree<F>>, StoreError> {
@@ -1294,22 +1566,49 @@ where
         let tx_id = txn.id();
         self.require_active(&tx_id)?;
         let mut tuple = tuple;
-        tuple.set_txn_id(tx_id.clone());
-        // STORE_AUDIT.md T2: mint the lsn BEFORE mutating, not after — see
-        // BPlusTree::insert_at_lsn's own comment. The page(s) this write
-        // touches get stamped with this exact lsn; logging under the same
-        // value afterward (log, not log_new, which would mint a DIFFERENT
-        // one) is what makes the writer's flush gate actually correct.
-        let lsn = self.logger.next_lsn();
-        // STORE_AUDIT.md T17: guard held for the whole call, not just this
-        // lookup — see table_by_id_guarded's own comment.
+        tuple.set_txn_id(tx_id);
+        tuple.set_pre_lsn_none();
+        tuple.clear_tombstone();
+        // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(id)?;
-        let page_id = table.insert_at_lsn(tuple.clone(), tx_id.clone(), lsn)?;
-        let op = Operation::Add {
-            txn: tx_id,
-            post: Record::new(id, tuple, Some(page_id)),
-        };
-        self.logger.log(lsn, op)?;
+        // STORE_AUDIT.md T2: minted BEFORE mutating; the pages this write
+        // touches, the version record, and the WAL record all carry it.
+        let lsn = self.logger.next_lsn();
+        let key = tuple.id.clone();
+        self.write_with_policy(&table, key.clone(), lsn, &tx_id, |current| {
+            match current {
+                None => {
+                    let op = Operation::Add {
+                        txn: tx_id,
+                        post: Record::new(id, tuple.clone(), None),
+                    };
+                    self.versions.insert(lsn, op.clone());
+                    self.logger.log(lsn, op)?;
+                    Ok(Decision::Insert(tuple.clone()))
+                }
+                // Phase 3: a tombstone visible to this transaction is free
+                // to reuse — a new version over it, logged as a Mod whose
+                // pre-image is the tombstone (an older reader still
+                // resolves to "deleted"; a rollback restores the tombstone).
+                Some(current) if current.is_tombstoned() => {
+                    self.check_write_conflict(current, &tx_id)?;
+                    let mut revived = current.clone();
+                    revived.set_txn_id(tx_id);
+                    revived.set_pre_lsn(lsn);
+                    revived.set_data(&tuple.data);
+                    revived.clear_tombstone();
+                    let op = Operation::Mod {
+                        txn: tx_id,
+                        pre: Record::new(id, current.clone(), None),
+                        post: Record::new(id, revived.clone(), None),
+                    };
+                    self.versions.insert(lsn, op.clone());
+                    self.logger.log(lsn, op)?;
+                    Ok(Decision::Replace(revived))
+                }
+                Some(_) => Err(StoreError::DuplicateKey(key.clone())),
+            }
+        })?;
         Ok(())
     }
 
@@ -1320,13 +1619,16 @@ where
         txn: &Transaction,
     ) -> Result<Option<Tuple>, StoreError> {
         let txn_id = txn.id();
+        // A finished transaction no longer pins its snapshot (vacuum may
+        // have reclaimed what it could see), so it may not read: the error
+        // says why it finished (SnapshotTooOld, or already finished).
+        self.require_active(&txn_id)?;
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let tuple = table.find(id.clone())?;
         if let Some(tuple) = tuple {
-            let reader_snapshot = self.snapshot_of(&txn_id);
             let visible = self
-                .find_visible_to(&tuple, &txn_id, &reader_snapshot)?
+                .find_visible_to(&tuple, &txn_id)?
                 .map(|t| t.into_owned());
             // A committed tombstone means the key was removed — it must be
             // invisible even if its physical row hasn't been reclaimed yet.
@@ -1353,81 +1655,41 @@ where
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let id = new_tuple.id.clone();
-        // build/before_write both run under table.update_checked's own
-        // page lock, atomically with the physical write — see that
-        // method's doc comment for why that matters (closes a TOCTOU gap
-        // a separate find()-then-update() pair used to leave open).
-        let build = |current: &Tuple| {
+        let lsn = self.logger.next_lsn();
+        self.write_with_policy(&table, id.clone(), lsn, &txn, |current| {
+            let current = current.ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
             self.check_write_conflict(current, &txn)?;
-            // STORE_AUDIT.md T9: a row this SAME transaction inserted has
-            // no *committed* ancestor at all (pre_lsn is None from the
-            // insert onward — see Tuple::set_pre_lsn's own callers), so
-            // find_last_committed below would otherwise return None and
-            // this whole call would incorrectly fail with KeyNotFound.
-            // There is nothing to resolve here: keep pre_lsn at None (so a
-            // LATER own-update in the same chain is recognized the same
-            // way, and so concurrent readers' find_visible_to still
-            // correctly treats this row as having no ancestor — i.e. not
-            // existing yet, per its own phantom-insert protection) and
-            // just revise the data in place. The original insert's own
-            // undo entry (Operation::Add) already fully reverts this row
-            // (by removing it) on rollback; before_write below still logs
-            // this write (redo needs to know about it), just as a
-            // "redo-only" Mod (`pre: None`) that undo replay skips — see
-            // Operation::Mod's own doc comment.
-            if current.txn_id.as_ref() == Some(&txn) && current.pre_lsn.is_none() {
-                let mut updated = current.clone();
-                updated.set_data(&new_tuple.data);
-                return Ok((current.clone(), updated));
+            // Phase 3: the pre-image is the version being replaced — a
+            // committed ancestor for a first write, or this transaction's
+            // own previous version (undo replays in reverse).
+            let old_tuple = if current.txn_id == Some(txn) {
+                current.clone()
+            } else {
+                self.find_last_committed(current)?
+                    .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
+                    .into_owned()
+            };
+            // A tombstone is "not there": find() reports it absent, so
+            // update() must too.
+            if old_tuple.is_tombstoned() {
+                return Err(StoreError::KeyNotFound(id.clone()));
             }
-            // old_tuple is the pre-update, already-committed version. It's
-            // kept (with its original txn_id) as the undo record's content,
-            // so a rollback restores the exact prior state and concurrent
-            // readers can walk the undo chain back to a value that's
-            // actually visible.
-            let old_tuple = self
-                .find_last_committed(current)?
-                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
-                .into_owned();
             let mut updated = old_tuple.clone();
-            updated.set_txn_id(txn.clone());
-            // Mint the lsn now (not just log a fresh one in before_write):
-            // updated's own pre_lsn field must point at the EXACT record
-            // before_write is about to log below, so a concurrent reader
-            // resolving this tuple's pre_lsn later finds the matching
-            // record already recorded (see next_lsn's own doc comment).
-            updated.set_pre_lsn(self.logger.next_lsn());
+            updated.set_txn_id(txn);
+            updated.set_pre_lsn(lsn);
             updated.set_data(&new_tuple.data);
-            Ok((old_tuple, updated))
-        };
-        // Log must be written BEFORE the tree is mutated: once `updated`
-        // (carrying pre_lsn) lands in the tree, a concurrent reader on
-        // another thread can observe it immediately and try to resolve
-        // that pre_lsn via find_last_committed. If the record doesn't
-        // exist yet, that lookup panics (find_record returns None where
-        // the code expects Some).
-        let before_write = |old_tuple: &Tuple, updated: &Tuple| {
-            // See build's own comment: revising this transaction's own
-            // fresh insert has no real pre-image to restore on rollback —
-            // the original Add's undo entry already covers full rollback
-            // (removal) — but redo still needs this write recorded, so a
-            // record is always logged here, just with `pre: None` in that
-            // case (mint a fresh lsn for it, since build() didn't need to
-            // pre-announce one via updated.pre_lsn).
-            let lsn = updated.pre_lsn.unwrap_or_else(|| self.logger.next_lsn());
-            let pre = updated
-                .pre_lsn
-                .is_some()
-                .then(|| Record::new(tid, old_tuple.clone(), None));
+            // Version record first, then the WAL, then (in write_version)
+            // the page: a concurrent reader that sees `updated` can always
+            // resolve its pre_lsn.
             let op = Operation::Mod {
-                txn: txn.clone(),
-                pre,
+                txn,
+                pre: Record::new(tid, old_tuple, None),
                 post: Record::new(tid, updated.clone(), None),
             };
+            self.versions.insert(lsn, op.clone());
             self.logger.log(lsn, op)?;
-            Ok(lsn)
-        };
-        self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)?;
+            Ok(Decision::Replace(updated))
+        })?;
         Ok(())
     }
 
@@ -1441,110 +1703,68 @@ where
         self.require_active(&txn)?;
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
-        let build = |current: &Tuple| {
+        let lsn = self.logger.next_lsn();
+        match self.write_with_policy(&table, id.clone(), lsn, &txn, |current| {
+            let current = current.ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
             self.check_write_conflict(current, &txn)?;
-            // STORE_AUDIT.md T9 — see update()'s matching comment: a row
-            // this SAME transaction inserted has no committed ancestor at
-            // all, so find_last_committed below would otherwise fail with
-            // KeyNotFound. Tombstone it in place, keeping pre_lsn at None;
-            // the original insert's own undo entry already fully reverts
-            // this row (by removing it) on rollback.
-            if current.txn_id.as_ref() == Some(&txn) && current.pre_lsn.is_none() {
-                let mut tombstoned = current.clone();
-                tombstoned.tombstone();
-                return Ok((current.clone(), tombstoned));
-            }
-            // old_tuple is the pre-remove, already-committed (non-tombstoned)
-            // version, kept as the undo record's content so a rollback
-            // restores the row exactly (including clearing the tombstone
-            // flag) and concurrent readers see it instead of the in-flight
-            // tombstone.
-            let old_tuple = self
-                .find_last_committed(current)?
-                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
-                .into_owned();
-            let mut tombstoned = old_tuple.clone();
-            tombstoned.set_txn_id(txn.clone());
-            tombstoned.tombstone();
-            // Mint the lsn now — see update()'s matching comment: this
-            // tombstone's own pre_lsn must point at the EXACT Del record
-            // before_write is about to log below, so a concurrent reader
-            // resolving it later (find_visible_to, walking back to the
-            // pre-delete version) finds the matching record already there.
-            tombstoned.set_pre_lsn(self.logger.next_lsn());
-            Ok((old_tuple, tombstoned))
-        };
-        // Same ordering requirement as update(): log before the
-        // tombstoned tuple becomes visible in the tree, so a concurrent
-        // reader can never observe a pre_lsn that doesn't resolve yet.
-        //
-        // Unlike update()'s Mod record, this Del record's `pre` is always
-        // present, even for the own-fresh-insert case above where
-        // `tombstoned.pre_lsn` stays None: Db::commit's tombstone-reclaim
-        // pass finds rows to physically clean up (and their index entries)
-        // by scanning the log specifically for Operation::Del records (see
-        // del_records there), not by inspecting pre_lsn. Skipping it here
-        // left an own-insert-then-remove-then-commit tombstone's index
-        // entry permanently orphaned, causing a real, permanent DuplicateKey
-        // on any later insert of the same key (STORE_AUDIT.md T9 follow-up).
-        // Replaying this Del's undo on rollback (restoring `old_tuple`,
-        // still owned by `txn`) is safe regardless of order relative to the
-        // original insert's own Add-undo, which removes the row outright —
-        // whichever runs second finds the row already in the state it
-        // expects or already gone, both tolerated by update_if_txn /
-        // remove_if_txn.
-        let before_write = |old_tuple: &Tuple, tombstoned: &Tuple| {
-            // See build's own comment: the own-fresh-insert case (pre_lsn
-            // stays None on the tombstone) still needs a real lsn to log
-            // this Del record under — mint one fresh, since build() didn't
-            // pre-announce one via tombstoned.pre_lsn in that case.
-            let lsn = tombstoned.pre_lsn.unwrap_or_else(|| self.logger.next_lsn());
-            let op = Operation::Del {
-                txn: txn.clone(),
-                pre: Record::new(tid, old_tuple.clone(), None),
+            let old_tuple = if current.txn_id == Some(txn) {
+                current.clone()
+            } else {
+                self.find_last_committed(current)?
+                    .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?
+                    .into_owned()
             };
+            // Removing an already-removed row is KeyNotFound, not a second
+            // tombstone.
+            if old_tuple.is_tombstoned() {
+                return Err(StoreError::KeyNotFound(id.clone()));
+            }
+            let mut tombstoned = old_tuple.clone();
+            tombstoned.set_txn_id(txn);
+            tombstoned.tombstone();
+            tombstoned.set_pre_lsn(lsn);
+            let op = Operation::Del {
+                txn,
+                pre: Record::new(tid, old_tuple, None),
+            };
+            self.versions.insert(lsn, op.clone());
             self.logger.log(lsn, op)?;
-            Ok(lsn)
-        };
-        self.update_checked_with_retry(&table, id.clone(), &txn, build, before_write)
+            Ok(Decision::Replace(tombstoned))
+        })? {
+            Written::Replaced(old) => Ok(old),
+            _ => Err(StoreError::KeyNotFound(id)),
+        }
     }
 
-    // Runs table.update_checked with one opportunistic retry: if the first
-    // attempt hits a WriteConflict, the row's current writer might be a
-    // merely *dropped* (not explicitly db.rollback()'d) transaction sitting
-    // in `aborting`, undrained — drain_aborting only ever runs from
-    // begin(), so a caller that only ever calls update()/remove() directly
-    // (never begins a fresh, throwaway transaction elsewhere) would
-    // otherwise spin forever on a conflict that's already logically
-    // resolved. One drain-and-retry costs nothing when there was nothing
-    // to drain: a conflict against a genuinely still-active writer fails
-    // again, identically, on the retry.
-    fn update_checked_with_retry(
+    // One write through the tree's single primitive, with the transaction's
+    // ConflictPolicy applied to a WriteConflict: AbortOnConflict takes the
+    // whole transaction down through the single abort path.
+    fn write_with_policy(
         &self,
         table: &BPlusTree<F>,
         id: DBIdType,
+        lsn: LsnId,
         txn: &TransactionId,
-        build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
-        before_write: impl Fn(&Tuple, &Tuple) -> Result<LsnId, StoreError>,
-    ) -> Result<Tuple, StoreError> {
-        let result = match table.update_checked(id.clone(), &build, &before_write) {
-            Err(StoreError::WriteConflict(_)) => {
-                self.drain_aborting();
-                table.update_checked(id.clone(), build, before_write)
+        decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
+    ) -> Result<Written, StoreError> {
+        self.refuse_if_degraded()?;
+        let result = table.write_version(id, lsn, decide);
+        match &result {
+            Err(StoreError::WriteConflict(key))
+                if self.tx_mgr.conflict_policy(txn) == ConflictPolicy::AbortOnConflict =>
+            {
+                self.abort(*txn)?;
+                return Err(StoreError::WriteConflictTransactionAborted(key.clone()));
             }
-            other => other,
-        };
-        // AbortOnConflict: a conflict that survives the opportunistic
-        // drain-and-retry above takes down the WHOLE transaction, not just
-        // this operation — matching a SQL engine's `ignore_errors = false`.
-        // ContinueOnConflict (the default) leaves the transaction open, so
-        // the caller can retry or move on, exactly as before ConflictPolicy
-        // existed.
-        if let Err(StoreError::WriteConflict(key)) = &result
-            && self.tx_mgr.conflict_policy(txn) == ConflictPolicy::AbortOnConflict
-        {
-            self.rollback_by_id(txn)?;
-            return Err(StoreError::WriteConflictTransactionAborted(key.clone()));
+            // Phase 5: a lock-order violation or a lock timeout is a bug
+            // signal, not a retryable condition. The transaction is taken
+            // down through the single abort path; nothing retries.
+            Err(StoreError::LockTimeout(_)) | Err(StoreError::LockOrderViolation(_)) => {
+                self.lock_timeouts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = self.abort(*txn);
+            }
+            _ => {}
         }
         result
     }
@@ -1558,9 +1778,12 @@ where
     // nothing commits it) or, worse, have `commit()` report success for a
     // transaction that was actually rolled back — `tx_mgr.commit` removing
     // a non-member from its active set is a silent no-op, not an error.
-    fn require_active(&self, txn: &TransactionId) -> Result<(), StoreError> {
+    pub(crate) fn require_active(&self, txn: &TransactionId) -> Result<(), StoreError> {
         if self.tx_mgr.is_transaction_active(txn) {
             Ok(())
+        } else if let Some(reason) = self.forced_aborts.lock().remove(txn) {
+            // Phase 7: the engine took this transaction down; say why, once.
+            Err(StoreError::SnapshotTooOld(reason))
         } else {
             Err(StoreError::TransactionAlreadyFinished)
         }
@@ -1591,6 +1814,7 @@ where
         tid: TableIdType,
         txn: &Transaction,
     ) -> Result<TableCursor<F>, StoreError> {
+        self.require_active(&txn.id())?;
         TableCursor::new(Arc::clone(self), tid, Some(txn.id()))
     }
 
@@ -1632,7 +1856,7 @@ where
         tuple: &'a Tuple,
         is_visible: impl Fn(&TransactionId) -> bool,
     ) -> Result<Visibility<'a>, StoreError> {
-        if let Some(txn) = tuple.txn_id.clone() {
+        if let Some(txn) = tuple.txn_id {
             if is_visible(&txn) {
                 Ok(Visibility::Found(Cow::Borrowed(tuple)))
             } else {
@@ -1651,12 +1875,12 @@ where
                     // be discarded concurrently once its rows are reverted. If we
                     // can't walk further, treat the row as ambiguous rather than
                     // panicking or silently asserting it has no ancestor.
-                    let Some(op) = self.logger.find_record(pre_lsn) else {
+                    let Some(op) = self.versions.find(pre_lsn) else {
                         return Ok(Visibility::MissingUndoRecord);
                     };
                     let next_tuple = match op {
                         Operation::Add { post, .. } => post.tuple,
-                        Operation::Mod { pre: Some(pre), .. } => pre.tuple,
+                        Operation::Mod { pre, .. } => pre.tuple,
                         Operation::Del { pre, .. } => pre.tuple,
                         // A record without a usable pre-image (a "redo-only"
                         // Mod, or a Commit/Rollback marker) should never be
@@ -1665,7 +1889,7 @@ where
                         // Add/Del/Mod to a tuple unconditionally).
                         _ => return Ok(Visibility::MissingUndoRecord),
                     };
-                    let Some(next_txn) = next_tuple.txn_id.clone() else {
+                    let Some(next_txn) = next_tuple.txn_id else {
                         return Ok(Visibility::NoAncestor);
                     };
                     if is_visible(&next_txn) {
@@ -1722,20 +1946,10 @@ where
     fn check_write_conflict(&self, current: &Tuple, txn: &TransactionId) -> Result<(), StoreError> {
         let writer = current
             .txn_id
-            .clone()
             .expect("tuple returned by table.find() must carry a txn_id");
-        if &writer == txn {
-            return Ok(());
-        }
-        let was_active_when_txn_began = self
-            .tx_mgr
-            .snapshot(txn)
-            .map(|s| s.contains(&writer))
-            .unwrap_or(false);
-        if self.tx_mgr.is_transaction_active(&writer)
-            || was_active_when_txn_began
-            || writer.ts() >= txn.ts()
-        {
+        // TXN_SIMPLIFICATION_PLAN.md phase 2: the whole rule lives in
+        // TransactionManager::conflicts (first-committer-wins).
+        if self.tx_mgr.conflicts(&writer, txn) {
             return Err(StoreError::WriteConflict(current.id.clone()));
         }
         Ok(())
@@ -1763,114 +1977,33 @@ where
     }
 
     // Snapshot-isolated visibility for reads (Db::find, TableCursor,
-    // RangeCursor): a version is visible to `reader` only if its writer
-    // committed strictly *before* `reader` began — not just "is committed
-    // right now" — OR the writer *is* `reader` itself (read-your-own-writes:
-    // a transaction must see its own not-yet-committed inserts/updates, the
-    // same way a fresh INSERT's Tuple carries no undo_id, so without this
-    // check `resolve_visible` has nothing to walk back to and reports the
-    // row as simply missing — confirmed the hard way: `Db::find` called
-    // with the very transaction that wrote the row returned `None` before
-    // this check existed). A writer that was still active when `reader`
-    // began (in `reader`'s captured snapshot set) stays invisible for
-    // `reader`'s entire lifetime even once it commits, and a writer that
-    // didn't even exist yet when `reader` began is excluded the same way,
-    // since `reader`'s snapshot — captured once, at begin() — couldn't have
-    // recorded it either way. Together these two checks are what makes a
-    // transaction's reads internally consistent (repeatable read):
-    // re-reading the same row twice within one transaction can no longer
-    // observe a concurrent commit that landed in between.
-    //
-    // This was previously dead scaffolding: TransactionManager captured a
-    // snapshot at every begin() and exposed it via
-    // TransactionManager::snapshot(), but nothing in the read path ever
-    // consulted it — every read used find_last_committed's live, "as of
-    // right now" check instead, regardless of when the reading transaction
-    // itself began.
-    //
-    // Making this actually hold also needed Logger::discard_or_defer_undo:
-    // without it, a commit discarded its entire undo trail immediately, so
-    // the pre-image needed to keep honoring an older reader's snapshot was
-    // gone by the time this function went looking for it — see the
-    // fallback below, which is now a rare defensive backstop for a narrow
-    // race (a new reader beginning in between this commit's active-set
-    // snapshot and the commit actually taking effect) rather than the
-    // common path.
-    // STORE_AUDIT.md P7: resolves and clones `reader`'s snapshot exactly
-    // once. Callers that only need it for a single find_visible_to call
-    // (Db::find) get the same cost as before; callers driving a multi-row
-    // scan (TableCursor, RangeCursor) call this ONCE at construction and
-    // reuse the result for every row instead of re-resolving (and
-    // re-cloning) it on every call — see find_visible_to's own comment.
-    // Full TransactionId (id + ts), not just the numeric id — see
-    // TransactionInner's own PartialEq comment on why the numeric id alone
-    // isn't a safe identity across a reopen.
-    pub(crate) fn snapshot_of(&self, reader: &TransactionId) -> HashSet<TransactionId> {
-        self.tx_mgr
-            .snapshot(reader)
-            .map(|s| s.clone())
-            .unwrap_or_default()
-    }
-
-    // STORE_AUDIT.md P7: `reader_snapshot` is a caller-supplied reference,
-    // not resolved (and cloned!) inside this function on every call. A
-    // reader's snapshot is captured once at `begin()` and never changes for
-    // the rest of that transaction's lifetime (see TransactionManager::
-    // begin's own comment) — so a scan calling this once per row candidate
-    // (TableCursor::next, RangeCursor::next) can resolve it ONCE, up front,
-    // and pass the same `&HashSet` to every call instead of an M-rows x
-    // N-concurrent-txns amount of repeat cloning. Db::find (a single lookup,
-    // not a per-row loop) resolves its own one-off snapshot immediately
-    // before calling this, so callers are the same either way for that case.
+    // RangeCursor). TXN_SIMPLIFICATION_PLAN.md phase 2: the whole rule lives
+    // in TransactionManager::is_visible — a version is visible iff its
+    // writer is the reader, or committed before the reader began
+    // (commit_ts < reader.id). No per-reader snapshot set exists anymore.
     pub(crate) fn find_visible_to<'a>(
         &self,
         tuple: &'a Tuple,
         reader: &TransactionId,
-        reader_snapshot: &HashSet<TransactionId>,
     ) -> Result<Option<Cow<'a, Tuple>>, StoreError> {
-        let reader_ts = reader.ts();
-        match self.resolve_visible(tuple, |txn| {
-            txn == reader
-                || (self.tx_mgr.is_committed(txn)
-                    && txn.ts() < reader_ts
-                    && !reader_snapshot.contains(txn))
-        })? {
+        match self.resolve_visible(tuple, |txn| self.tx_mgr.is_visible(txn, reader))? {
             Visibility::Found(t) => Ok(Some(t)),
             // A genuine dead end — this version has no ancestor at all, so
-            // there is nothing to fall back to. Critically, this is also
-            // exactly what a phantom row looks like: a fresh INSERT by a
-            // writer that isn't visible to `reader` (began at/after reader,
-            // or was in reader's own snapshot) has undo_id == None, so the
-            // walk above hits this case on its very first step. Must NOT
-            // fall through to find_last_committed below — that used to
-            // unhide exactly this case, making a row inserted and
-            // committed by someone else after `reader` began visible to
-            // `reader` anyway. Confirmed via direct repro before this
-            // distinction existed (see store's db.rs test
-            // test_find_does_not_see_a_row_inserted_and_committed_by_another_txn_after_this_txn_began).
+            // there is nothing to fall back to. This is also exactly what a
+            // phantom row looks like: a fresh INSERT by a writer that isn't
+            // visible to `reader` has pre_lsn == None, so the walk hits this
+            // on its first step. Must NOT fall through to
+            // find_last_committed below.
             Visibility::NoAncestor => Ok(None),
-            // Unlike NoAncestor, an ancestor genuinely existed here — we
-            // just lost track of it (a discarded undo record). Falling
-            // back to the latest committed version instead of hiding a row
-            // that genuinely, currently exists is safe in THIS case only.
-            // In the common case discard_or_defer_undo already keeps the
-            // needed pre-image around for exactly as long as `reader`
-            // could still be asking, so this path is rarely taken — but it
-            // can still be reached by a narrow race: Db::commit captures
-            // its "who's still active" waiter set with a plain (non-atomic,
-            // w.r.t. TransactionManager's own locks) read before actually
-            // committing, so a brand new reader beginning in that exact
-            // window wouldn't be counted as a waiter, and could see its
-            // undo trail discarded immediately if no one else was active
-            // at that moment. Confirmed the hard way that this fallback
-            // matters: an earlier version of this function returned None
-            // unconditionally here (before discard_or_defer_undo existed),
-            // which made Db::find incorrectly report a real, committed,
-            // currently-existing row as missing after a concurrent commit.
-            // The guarantee this preserves: a row that exists, is
-            // committed, AND has a genuine (if untraceable) ancestor is
-            // never reported as absent.
-            Visibility::MissingUndoRecord => self.find_last_committed(tuple),
+            // Phase 3: retention is the horizon's rule (proposal §3.6), so a
+            // version a live reader can still need is never gone. Reaching
+            // this is an invariant violation, reported as such — not papered
+            // over with the latest committed version.
+            Visibility::MissingUndoRecord => Err(StoreError::Corruption(format!(
+                "version record missing for pre_lsn of {:?} (reader {reader}, oldest active {:?})",
+                tuple.id,
+                self.tx_mgr.oldest_active()
+            ))),
         }
     }
 
@@ -1895,6 +2028,7 @@ where
         name: String,
         index_entry_size: DBSizeType,
     ) -> Result<TableIdType, StoreError> {
+        let _writer = self.buffer.writer_permit();
         let table_id = {
             self.validate_table_name(&name)?;
             let mut tables = self.tables.write();
@@ -1965,6 +2099,7 @@ where
     /// just-created, not-yet-published table after a failed CREATE TABLE,
     /// can't already have a live scan against it).
     pub fn drop_table<S: AsRef<str>>(&self, name: S) -> Result<(), StoreError> {
+        let _writer = self.buffer.writer_permit();
         let name = name.as_ref();
         let id = self
             .tables
@@ -1996,15 +2131,13 @@ where
 
     fn setup_needed_modules(
         header: Arc<Header>,
-        gens: Arc<Generator>,
         page_counter: Arc<AtomicU64>,
         file: F,
-        log_file: F,
-        log_header_bytes: Vec<u8>,
-        max_pending_writes: usize,
+        name: String,
+        wal: OpenedWal<F>,
     ) -> Result<NeededObjects<F>, StoreError> {
         let mut logger = Logger::new();
-        logger.set_db(log_file, log_header_bytes)?;
+        logger.set_db(wal.current_file, name, wal.current, wal.older, wal.header_bytes)?;
         // Buffer shares the logger's WAL clock, so page-flush deferral and redo
         // LSNs are scoped to this one database (not a process global).
         let clock = logger.clock();
@@ -2018,24 +2151,18 @@ where
             file,
             header,
             8192,
-            clock,
-            max_pending_writes,
+            clock.clone(),
             content_registry,
         )?);
         let nm = NeededObjects {
             buffer,
             logger: Arc::new(logger),
-            txn_mgr: Arc::new(TransactionManager::new(gens, TransactionId::default())?),
+            txn_mgr: Arc::new(TransactionManager::new(clock)),
         };
         Ok(nm)
     }
 
-    fn create_core_db(
-        name: String,
-        page_size: DBSizeType,
-        max_pending_writes: usize,
-    ) -> Result<Self, StoreError> {
-        let lf_name = name.to_string() + ".wal";
+    fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
         // STORE_AUDIT.md S4: create(true) opens-or-creates, so Db::create
         // on an already-existing path silently reopened it, then
         // unconditionally overwrote its header with page_count=0 and
@@ -2052,14 +2179,9 @@ where
             .write(true)
             .clone();
         let mut f = F::open(f, &name)?;
-        let log_file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .clone();
-        let mut log_file = F::open(log_file, lf_name)?;
         f.do_lock()?;
-        log_file.do_lock()?;
+        // Phase 6: the first WAL segment, next to the data file.
+        let wal = Self::open_segments(&name, &f, page_size)?;
         let mut header = Header {
             magic: MAGIC,
             format_version: HEADER_FORMAT_VERSION,
@@ -2067,29 +2189,25 @@ where
             page_count: 0,
             page_size,
             last_checkpoint: timestamp(),
+            counter: 1,
+            checkpoint_lsn: 0,
             header_checksum: 0,
         };
         header.seal();
         let bytes = to_allocvec(&header)?;
         f.write_all(&bytes)?;
-        // T4_S2_WAL_DESIGN.md §2: written synchronously right alongside the
-        // main file's own header, before anything (including the log
-        // runner thread, spawned by setup_needed_modules below) ever
-        // touches the log file.
-        let log_header_bytes = write_log_header(&mut log_file, page_size)?;
         let header = Arc::new(header);
         let gens = Generator::new();
         gens.create_generator(SYSTEM_TABLE_NAME, None)?;
         let gens = Arc::new(gens);
         let page_count = Arc::new(AtomicU64::new(0));
+        let log_file = wal.current_file.do_clone()?;
         let nm = Self::setup_needed_modules(
             header.clone(),
-            gens.clone(),
             page_count.clone(),
             f.do_clone()?,
-            log_file.do_clone()?,
-            log_header_bytes,
-            max_pending_writes,
+            name.clone(),
+            wal,
         )?;
 
         Ok(Self {
@@ -2104,9 +2222,23 @@ where
             logger: nm.logger,
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
-            pending_tombstone_reclaims: RwLock::new(Vec::new()),
-            checkpoint_gate: RwLock::new(()),
+            versions: VersionStore::new(),
+            maintenance: Maintenance::new(MAINTENANCE_INTERVAL),
             table_locks: ShardedMap::new(16),
+            snapshot_mutex: parking_lot::Mutex::new(()),
+            checkpoint_mutex: parking_lot::Mutex::new(()),
+            degraded: RwLock::new(None),
+            abort_attempts: parking_lot::Mutex::new(HashMap::new()),
+            lock_timeouts: std::sync::atomic::AtomicU64::new(0),
+            snapshot_limits: RwLock::new(SnapshotLimits {
+                max_retained_wal_bytes: DEFAULT_MAX_RETAINED_WAL_BYTES,
+                max_version_records: DEFAULT_MAX_VERSION_RECORDS,
+            }),
+            forced_aborts: parking_lot::Mutex::new(HashMap::new()),
+            snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
+            recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_reverts: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2197,7 +2329,6 @@ where
     }
 
     pub fn delete<S: AsRef<str>>(name: S) -> Result<(), StoreError> {
-        let lf_name = name.as_ref().to_string() + ".wal";
         // STORE_AUDIT.md S5: locking is otherwise only ever checked on the
         // way IN (create/open take an exclusive advisory lock) — delete()
         // never checked it at all, so it could unlink a live, in-use
@@ -2210,52 +2341,60 @@ where
         // owns it right now. A path that doesn't exist yet fails this
         // open with NotFound, same as remove_file below would have — not
         // a new failure mode, just surfaced one step earlier.
-        for path in [name.as_ref(), lf_name.as_str()] {
-            let opts = OpenOptions::new().read(true).write(true).clone();
-            let f = F::open(opts, path)?;
-            f.do_lock().map_err(|_| {
-                StoreError::UnknownError(format!(
-                    "refusing to delete {path}: still open/locked elsewhere"
-                ))
-            })?;
-        }
+        let opts = OpenOptions::new().read(true).write(true).clone();
+        let f = F::open(opts, name.as_ref())?;
+        f.do_lock().map_err(|_| {
+            StoreError::UnknownError(format!(
+                "refusing to delete {}: still open/locked elsewhere",
+                name.as_ref()
+            ))
+        })?;
+        let segments = list_segments(&f, name.as_ref())?;
+        drop(f);
         remove_file(name.as_ref())?;
-        remove_file(lf_name)?;
+        let handle = F::open(OpenOptions::new().read(true).clone(), name.as_ref());
+        for (_, path) in segments {
+            match &handle {
+                Ok(h) => h.remove_sibling(&path)?,
+                Err(_) => remove_file(&path)?,
+            }
+        }
         Ok(())
     }
 }
 
-/// Retries `f` on `LockContentionError` with a short linear backoff. Used by
-/// `Db::commit`/`Db::rollback`'s per-record cleanup loops (those calls race
-/// against the same per-page locks every other concurrent operation uses, and
-/// under load a single transient lock timeout shouldn't abort the whole
-/// commit/rollback — see `Transaction::into_id`) and by
-/// `BPlusTree::insert`'s failure-cleanup path (undoing a data-page write after
-/// a failed index insert must not itself be allowed to fail from ordinary
-/// contention — that would leave the write permanently orphaned instead of
-/// rolled back).
-pub(crate) fn retry_on_contention<T>(
-    mut f: impl FnMut() -> Result<T, StoreError>,
-) -> Result<T, StoreError> {
-    let mut attempt = 0u32;
-    loop {
-        match f() {
-            // 16 attempts with a 300us/attempt linear backoff (was 8 at
-            // 100us/attempt): each attempt already spends up to 5ms inside
-            // the page lock's own wait (see PageBuffer::get_page_mut), so the
-            // old budget's ~3.6ms of total backoff was negligible next to
-            // realistic OS scheduling jitter under real load — a lock
-            // holder preempted mid-critical-section for even one scheduling
-            // quantum could exhaust every retry here despite never being
-            // near a genuine deadlock. Confirmed as a real (not just
-            // theoretical) contributor to a hard-to-reproduce flake in
-            // Db::commit's tombstone reclaim.
-            Err(StoreError::LockContentionError) if attempt < 16 => {
-                attempt += 1;
-                std::thread::sleep(std::time::Duration::from_micros(300 * attempt as u64));
-            }
-            other => return other,
+impl<F: DBFile + 'static> TxnSink for Db<F>
+where
+    F: DBFile<Item = F>,
+{
+    fn commit_id(&self, id: TransactionId) -> Result<(), StoreError> {
+        Db::commit_id(self, id)
+    }
+
+    fn abort_id(&self, id: TransactionId) -> Result<(), StoreError> {
+        Db::abort(self, id)
+    }
+}
+
+impl Db<MemFile> {
+    /// What the "disk" would hold if the power were cut right now: a new,
+    /// independent pair of `(data file, log file)` containing exactly the
+    /// bytes that some `do_sync` has published — nothing written since. The
+    /// data file is captured first, then the log, so the log is never older
+    /// than the data it protects (a log that is newer is harmless: recovery
+    /// re-applies its records idempotently; a log that is older could leave
+    /// a flushed page without the record that explains it). Feed the result
+    /// to `open_using` to simulate recovery. See `crash_harness`.
+    pub fn synced_snapshot(&self) -> (MemFile, MemFile) {
+        let _not_during_a_checkpoint = self.snapshot_mutex.lock();
+        let data = self.file.synced_snapshot();
+        // Phase 6: the log is a set of segments; the returned handle is a
+        // namespace holding every segment's synced bytes under its name.
+        let disk = MemFile::new();
+        for (path, bytes) in self.log_file.synced_siblings(&segment_prefix(&self.name)) {
+            disk.add_sibling_from_bytes(&path, bytes);
         }
+        (data, disk)
     }
 }
 
@@ -2327,19 +2466,59 @@ mod tests {
         (db.file.do_clone().unwrap(), db.log_file.do_clone().unwrap())
     }
 
-    // Passive record count (unlike Db::load_logs, which actually replays):
-    // skips the LogHeader, then walks framed records off the raw bytes via
-    // the same scan_log recovery uses.
-    fn count_log_records(file: &MemFile) -> usize {
-        let data = file.data();
+    // Every WAL segment visible from `file`'s namespace, oldest first, as
+    // (path, live bytes). Phase 6: the log is `<name>.wal.<n>` segments, and
+    // a handle taken at create time may be to a segment a checkpoint has
+    // since deleted — so tests go through the namespace, never one handle.
+    fn wal_segments_of(file: &MemFile) -> Vec<(String, Vec<u8>)> {
+        let mut paths: Vec<(u64, String)> = file
+            .list_siblings("")
+            .unwrap()
+            .into_iter()
+            .filter_map(|p| {
+                let (_, n) = p.rsplit_once(".wal.")?;
+                n.parse::<u64>().ok().map(|n| (n, p.clone()))
+            })
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|(_, p)| {
+                let f = file.open_sibling(&p, std::fs::OpenOptions::new().clone()).unwrap();
+                (p, f.data())
+            })
+            .collect()
+    }
+
+    // The newest segment's (path, bytes) — what a test that wants to tamper
+    // with "the end of the log" works on.
+    fn current_segment(db: &TestDB) -> (String, Vec<u8>) {
+        wal_segments_of(&db.log_file).pop().expect("a database always has a current segment")
+    }
+
+    fn count_records_in_segment(data: &[u8]) -> usize {
         let header_len = LogHeader::encoded_len();
         if data.len() < header_len {
             return 0;
         }
+        // Transactional records only: Sequence records (phase 1) are engine
+        // bookkeeping and are not what these tests count.
         crate::logger::scan_log(&data[header_len..])
             .unwrap()
             .records
-            .len()
+            .iter()
+            .filter(|r| !matches!(r.operation, crate::logger::Operation::Sequence { .. }))
+            .count()
+    }
+
+    // Passive record count across every retained segment (unlike replay):
+    // skips each LogHeader, then walks framed records off the raw bytes via
+    // the same scan_log recovery uses.
+    fn count_log_records(file: &MemFile) -> usize {
+        wal_segments_of(file)
+            .iter()
+            .map(|(_, data)| count_records_in_segment(data))
+            .sum()
     }
 
     // log()'s send() over a bounded channel only guarantees the *previous*
@@ -2394,7 +2573,10 @@ mod tests {
         let mut hdr = (*db.header).clone();
         hdr.page_count = db.page_count();
         hdr.seal();
-        db.buffer.write_header(hdr).unwrap();
+        // Synced: PageBuffer::checkpoint no longer goes through the writer
+        // thread, so a fire-and-forget header write could still be queued
+        // when the caller snapshots the file.
+        db.buffer.write_header_synced(hdr).unwrap();
         db.buffer.checkpoint().unwrap();
     }
 
@@ -3519,52 +3701,6 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::WriteConflict(_))),
             "must be a write conflict, not KeyNotFound or a silent success: {result:?}"
-        );
-    }
-
-    // Pins down check_write_conflict's tie-breaking behavior
-    // (`writer.ts() >= txn.ts()`) directly and deterministically, using
-    // TransactionId::for_test to force a ts collision — a real wall-clock
-    // collision between two distinct transactions is rare and can't be
-    // forced from outside txn.rs otherwise. Calls check_write_conflict
-    // directly (rather than via update()) so this isolates exactly the
-    // comparison being tested, independent of tx_mgr's active/snapshot
-    // state (both TransactionIds here are synthetic and were never
-    // actually begin()'d).
-    #[test]
-    fn test_check_write_conflict_treats_a_colliding_timestamp_as_conflicting() {
-        let (db, tid) = make_db_with_table();
-        let txn0 = db.begin().unwrap();
-        db.insert(tid, row(1, b"v0"), &txn0).unwrap();
-        db.commit(txn0).unwrap();
-
-        let reader = TransactionId::for_test(9002, 500);
-
-        // Exact tie: writer's ts equals reader's ts. Must conflict — the
-        // conservative choice, since we can't prove the writer actually
-        // finished before the reader began at this resolution.
-        let tied_writer = TransactionId::for_test(9001, 500);
-        let mut current = row(1, b"from_tied_writer");
-        current.set_txn_id(tied_writer);
-        assert!(
-            matches!(
-                db.check_write_conflict(&current, &reader),
-                Err(StoreError::WriteConflict(_))
-            ),
-            "a colliding ts must be treated as concurrent/conflicting, not as \"writer began \
-             before me\""
-        );
-
-        // Contrast: a writer with a strictly EARLIER ts (no tie) in the
-        // same "tx_mgr has never heard of it" state must NOT conflict —
-        // confirms the case above is specifically about the tie, not just
-        // "any unrecognized writer automatically conflicts".
-        let earlier_writer = TransactionId::for_test(9003, 100);
-        let mut current2 = row(1, b"from_earlier_writer");
-        current2.set_txn_id(earlier_writer);
-        assert!(
-            db.check_write_conflict(&current2, &reader).is_ok(),
-            "a writer with a strictly earlier, non-colliding ts must not conflict"
         );
     }
 
@@ -5160,8 +5296,11 @@ mod tests {
         let db_4k = TestDB::create_with_page_size("mismatch_4k.db", 4096).unwrap();
         let db_8k = TestDB::create_with_page_size("mismatch_8k.db", 8192).unwrap();
 
-        let (_, log_file_from_8k) = crash_clone(&db_8k);
+        let (_, log_bytes_from_8k) = current_segment(&db_8k);
         let (main_file_4k, _) = crash_clone(&db_4k);
+        // The 8k database's segment, presented under the 4k database's name.
+        let log_file_from_8k = MemFile::new();
+        log_file_from_8k.add_sibling_from_bytes("mismatch_4k.db.wal.1", log_bytes_from_8k);
 
         let err = match TestDB::open_using("mismatch_4k.db", main_file_4k, log_file_from_8k) {
             Err(e) => e,
@@ -5191,14 +5330,14 @@ mod tests {
         wait_for_durable_logs(&db, 4);
         sync_header_without_truncating_logs(&db);
 
-        let (main_file, log_file) = crash_clone(&db);
-        let mut torn_bytes = log_file.data();
+        let (main_file, _) = crash_clone(&db);
+        let (segment_path, mut torn_bytes) = current_segment(&db);
         // Truncate off the last few bytes — landing mid-payload of the
         // last complete record (transaction 2's Commit marker), simulating
         // a crash partway through its write_all.
         torn_bytes.truncate(torn_bytes.len() - 3);
         let torn_log_file = MemFile::new();
-        torn_log_file.pwrite(&torn_bytes, 0).unwrap();
+        torn_log_file.add_sibling_from_bytes(&segment_path, torn_bytes);
 
         let db2 = TestDB::open_using("txn_test.db", main_file, torn_log_file)
             .expect("a torn tail must not fail Db::open");
@@ -5231,8 +5370,8 @@ mod tests {
         wait_for_durable_logs(&db, 4);
         sync_header_without_truncating_logs(&db);
 
-        let (main_file, log_file) = crash_clone(&db);
-        let mut corrupted = log_file.data();
+        let (main_file, _) = crash_clone(&db);
+        let (segment_path, mut corrupted) = current_segment(&db);
         // Flip a byte inside the FIRST record's payload (right after the
         // header + one frame's worth of length/checksum prefix) — leaves
         // the rest of the file (including the second record) intact and
@@ -5241,7 +5380,7 @@ mod tests {
         let flip_at = header_len + 9; // a few bytes into record 1's payload
         corrupted[flip_at] ^= 0xFF;
         let corrupted_log_file = MemFile::new();
-        corrupted_log_file.pwrite(&corrupted, 0).unwrap();
+        corrupted_log_file.add_sibling_from_bytes(&segment_path, corrupted);
 
         let err = match TestDB::open_using("txn_test.db", main_file, corrupted_log_file) {
             Err(e) => e,
@@ -5289,24 +5428,20 @@ mod tests {
     // clones of the same fd share a cursor). Skips the LogHeader, then
     // walks framed records the same way count_log_records (MemFile
     // version) does.
-    fn count_log_records_at_path(path: &str) -> usize {
-        let data = std::fs::read(path).unwrap_or_default();
-        let header_len = LogHeader::encoded_len();
-        if data.len() < header_len {
-            return 0;
-        }
-        crate::logger::scan_log(&data[header_len..])
-            .unwrap()
-            .records
-            .len()
+    // Records across every on-disk segment of a file-backed database.
+    fn count_log_records_on_disk(db_name: &str) -> usize {
+        crate::memfile::list_files_with_prefix(&format!("{db_name}.wal."))
+            .unwrap_or_default()
+            .iter()
+            .map(|p| count_records_in_segment(&std::fs::read(p).unwrap_or_default()))
+            .sum()
     }
 
     // See wait_for_durable_logs (MemFile version) — same log()
     // send()-doesn't-imply-written race applies to the File backend too.
     fn wait_for_durable_logs_file(db_name: &str, expected: usize) {
-        let log_path = format!("{db_name}.wal");
         for _ in 0..1000 {
-            if count_log_records_at_path(&log_path) == expected {
+            if count_log_records_on_disk(db_name) == expected {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
@@ -5582,32 +5717,29 @@ mod tests {
     fn test_checkpoint_keeps_log_bounded_across_many_rounds() {
         let (db, tid) = make_db_with_table();
 
-        // checkpoint()'s truncate is fire-and-forget (Logger::checkpoint
-        // just enqueues it) — poll briefly for it to actually land before
-        // checking the file's size, or this races the runner thread and
-        // can observe a stale, pre-truncate length.
-        let header_len = LogHeader::encoded_len() as u64;
-        fn wait_for_log_to_settle(db: &TestDB, header_len: u64) {
-            let mut tries = 0;
-            while db.log_file.get_metadata().unwrap().len > header_len && tries < 200 {
-                thread::sleep(Duration::from_millis(1));
-                tries += 1;
-            }
-        }
-
+        // Phase 6: a checkpoint rolls to a fresh segment and, with nothing
+        // in flight, deletes every older one — synchronously, so no polling.
+        let header_len = LogHeader::encoded_len();
         for round in 0..20u64 {
             let t = db.begin().unwrap();
             db.insert(tid, row(round, b"v"), &t).unwrap();
             db.commit(t).unwrap();
             db.checkpoint().unwrap();
-            wait_for_log_to_settle(&db, header_len);
 
+            let segments = wal_segments_of(&db.log_file);
             assert_eq!(
-                db.log_file.get_metadata().unwrap().len,
-                header_len,
-                "round {round}: the log must be truncated down to just its header once its \
-                 checkpoint settles — it must not accumulate round over round"
+                segments.len(),
+                1,
+                "round {round}: nothing in flight, so only the fresh segment may remain: {:?}",
+                segments.iter().map(|(p, b)| (p.clone(), b.len())).collect::<Vec<_>>()
             );
+            assert_eq!(
+                segments[0].1.len(),
+                header_len,
+                "round {round}: the fresh segment holds just its header — the log must not \
+                 accumulate round over round"
+            );
+            assert_eq!(db.stats().wal_segments, 1);
         }
     }
 
@@ -5821,7 +5953,7 @@ mod tests {
         // exactly as it happens in practice, rather than bypassing whatever
         // get_page_mut actually returns for a page whose on-disk bytes are a
         // raw overflow-chunk slice, not a standalone serialized Page.
-        let mut handle = db2.buffer.get_page_mut(reused_id).unwrap();
+        let mut handle = db2.buffer.get_page_mut(reused_id, crate::buffer::LockLevel::Data).unwrap();
         Arc::make_mut(&mut handle.page)
             .add_tuple(Tuple::new(42, b"fresh-after-reuse"))
             .unwrap();
@@ -5926,9 +6058,7 @@ mod tests {
                 for i in 0..ROWS_PER_THREAD {
                     let key = thread_idx * ROWS_PER_THREAD + i;
                     let t = db.begin().unwrap();
-                    super::retry_on_contention(|| {
-                        db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
-                    })
+                    db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
                     .unwrap();
                     db.commit(t).unwrap();
                 }
@@ -5953,6 +6083,620 @@ mod tests {
             }
         }
         drop(t);
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 0, found by the crash harness's scan
+    // check: BPlusTree::write_data released the tail page's lock between
+    // "no successor" and "link my new page", so two writers extending the
+    // data chain at once could both link a new page to the same tail; the
+    // second link overwrote the first, orphaning a page that already held
+    // rows and that the index already pointed at. find() saw those rows;
+    // table_scan never did. Small page + wide rows + many threads makes
+    // tail extension frequent enough to hit the race reliably.
+    #[test]
+    fn test_concurrent_inserts_extending_the_data_chain_are_all_reachable_by_scan() {
+        const THREADS: u64 = 8;
+        const ROWS_PER_THREAD: u64 = 200;
+        let db = TestDB::create_with_page_size("chain_race.db", 4096).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            handles.push(thread::spawn(move || {
+                for i in 0..ROWS_PER_THREAD {
+                    let key = thread_idx * ROWS_PER_THREAD + i;
+                    let t = db.begin().unwrap();
+                    db.insert(tid, row(key, &[7u8; 200]), &t)
+                        .unwrap();
+                    db.commit(t).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = db.table_scan(tid).unwrap();
+        while let Some(t) = cursor.next().unwrap() {
+            let DBIdType::Int(k) = t.id else { panic!() };
+            assert!(seen.insert(k), "key {k} scanned twice");
+        }
+        assert_eq!(
+            seen.len() as u64,
+            THREADS * ROWS_PER_THREAD,
+            "scan reached {} of {} committed rows — a data page fell off the chain",
+            seen.len(),
+            THREADS * ROWS_PER_THREAD
+        );
+    }
+
+    // A MemFile whose fsync on the WAL can be held open by a test — the
+    // fault-injection seam STORE_AUDIT.md's Phase 0 asked for, in its
+    // smallest useful form. Opened by name like NamedMemFile would be, but
+    // every open shares one process-wide gate (Opener::open is static), so
+    // tests using it must not run concurrently with each other: they take
+    // GATED_SYNC_TEST_LOCK.
+    #[derive(Debug, Clone)]
+    struct GatedSyncFile {
+        inner: MemFile,
+        is_wal: bool,
+    }
+
+    static WAL_SYNC_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static GATED_SYNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    impl Opener for GatedSyncFile {
+        type Item = GatedSyncFile;
+        fn open<P: AsRef<std::path::Path>>(op: std::fs::OpenOptions, p: P) -> std::io::Result<Self> {
+            Ok(Self {
+                inner: MemFile::open(op, &p)?,
+                is_wal: p.as_ref().to_string_lossy().contains(".wal"),
+            })
+        }
+        fn open_sibling(&self, path: &str, op: std::fs::OpenOptions) -> std::io::Result<Self> {
+            Ok(Self {
+                inner: self.inner.open_sibling(path, op)?,
+                is_wal: path.contains(".wal"),
+            })
+        }
+        fn list_siblings(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+            self.inner.list_siblings(prefix)
+        }
+        fn remove_sibling(&self, path: &str) -> std::io::Result<()> {
+            self.inner.remove_sibling(path)
+        }
+        fn truncate(&mut self) -> std::io::Result<()> {
+            self.inner.truncate()
+        }
+        fn do_sync(&mut self) -> std::io::Result<()> {
+            if self.is_wal {
+                while WAL_SYNC_BLOCKED.load(std::sync::atomic::Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            self.inner.do_sync()
+        }
+        fn do_clone(&self) -> std::io::Result<Self> {
+            Ok(self.clone())
+        }
+        fn get_metadata(&self) -> std::io::Result<crate::db::Meta> {
+            self.inner.get_metadata()
+        }
+        fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+            self.inner.pread(buf, offset)
+        }
+        fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+            self.inner.pwrite(buf, offset)
+        }
+    }
+    impl std::io::Write for GatedSyncFile {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+    impl std::io::Read for GatedSyncFile {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+    impl std::io::Seek for GatedSyncFile {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    // Phase 1 found (via the crash harness) that a committing transaction
+    // leaves the active set before its Commit record is durable. Phase 6's
+    // fuzzy checkpoint never waits for transactions, so it must be safe in
+    // exactly that state: it syncs the log first (step 1), and the data
+    // file must not be checkpointed ahead of the record — so while the WAL
+    // sync is held open, the checkpoint is held open with it, and the
+    // committed row survives a crash taken after both complete.
+    #[test]
+    fn test_checkpoint_syncs_the_log_before_flushing_a_committing_transaction() {
+        let _serial = GATED_SYNC_TEST_LOCK.lock().unwrap();
+        WAL_SYNC_BLOCKED.store(false, std::sync::atomic::Ordering::Release);
+        let db = Db::<GatedSyncFile>::create("gated_sync.db").unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        db.checkpoint().unwrap();
+
+        WAL_SYNC_BLOCKED.store(true, std::sync::atomic::Ordering::Release);
+        let committing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let committer = {
+            let db = Arc::clone(&db);
+            let committing = Arc::clone(&committing);
+            thread::spawn(move || {
+                let t = db.begin().unwrap();
+                db.insert(tid, row(1, b"v"), &t).unwrap();
+                committing.store(true, std::sync::atomic::Ordering::Release);
+                db.commit(t).unwrap(); // blocks: WAL sync is held open
+            })
+        };
+        // Wait until the transaction has written and then left the active
+        // set — the state the old quiesce mistook for "nothing in flight".
+        for _ in 0..5000 {
+            if committing.load(std::sync::atomic::Ordering::Acquire) && db.stats().active_transactions == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(committing.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(db.stats().active_transactions, 0, "the committer must have flipped state: {:?}", db.stats());
+        assert!(!committer.is_finished(), "commit must still be waiting on the blocked sync");
+
+        let checkpointer = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || db.checkpoint().unwrap())
+        };
+        thread::sleep(Duration::from_millis(150));
+        assert!(
+            !checkpointer.is_finished(),
+            "checkpoint must not complete while the log it depends on cannot be synced"
+        );
+
+        WAL_SYNC_BLOCKED.store(false, std::sync::atomic::Ordering::Release);
+        committer.join().unwrap();
+        checkpointer.join().unwrap();
+        // The checkpoint deleted every segment below its floor; the row is
+        // on disk (flushed) or in the retained log — either way, present.
+        if db.stats().wal_segments != 1 {
+            for (path, bytes) in wal_segments_of(&db.log_file.inner) {
+                eprintln!("segment {path}:");
+                for line in crate::logger::describe_wal(&bytes) {
+                    eprintln!("  {line}");
+                }
+            }
+            eprintln!("stats: {:?}", db.stats());
+        }
+        assert_eq!(db.stats().wal_segments, 1, "nothing was in flight at the floor");
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, id(1), &t).unwrap().is_some());
+        db.rollback(t).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db = Db::<GatedSyncFile>::open_using("gated_sync.db", f, l).unwrap();
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, id(1), &t).unwrap().is_some(), "durable across reopen");
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 4: an insert onto a committed, not-
+    // yet-purged tombstone is a new version over it (no DuplicateKey from
+    // the still-present index entry), committing and rolling back like any
+    // other write — with vacuum held off so the tombstone is really there.
+    #[test]
+    fn test_insert_over_a_committed_tombstone_is_a_new_version() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(3, b"first"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.remove(tid, id(3), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(db.stats().tombstones_awaiting_purge, 1);
+
+        // Rolled back: the tombstone comes back, the key stays absent.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(3, b"rolled back"), &t).unwrap();
+        assert_eq!(db.find(tid, id(3), &t).unwrap().unwrap().data.to_vec(), b"rolled back");
+        db.rollback(t).unwrap();
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, id(3), &t).unwrap().is_none());
+        db.rollback(t).unwrap();
+
+        // Committed: the key is back, with the new value, and an older
+        // reader still sees it as deleted.
+        let older = db.begin().unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(3, b"second"), &t).unwrap();
+        db.commit(t).unwrap();
+        assert!(db.find(tid, id(3), &older).unwrap().is_none(), "older reader: still deleted");
+        let t = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(3), &t).unwrap().unwrap().data.to_vec(), b"second");
+        // A second insert of a live key is a duplicate.
+        assert!(matches!(
+            db.insert(tid, row(3, b"third"), &t),
+            Err(StoreError::DuplicateKey(_))
+        ));
+        db.rollback(older).unwrap();
+        db.rollback(t).unwrap();
+        // And once vacuum runs, nothing about the row's history is retained.
+        db.maintenance.set_paused(false);
+        for _ in 0..500 {
+            if db.stats().version_records == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(db.stats().version_records, 0);
+        let t = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(3), &t).unwrap().unwrap().data.to_vec(), b"second");
+    }
+
+    // An insert over a tombstone that another transaction wrote but has not
+    // committed is a write conflict (first-committer-wins), not a duplicate
+    // and not a silent success.
+    #[test]
+    fn test_insert_over_an_uncommitted_tombstone_from_another_txn_conflicts() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(4, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+        let remover = db.begin().unwrap();
+        db.remove(tid, id(4), &remover).unwrap();
+        let t = db.begin().unwrap();
+        let r = db.insert(tid, row(4, b"v1"), &t);
+        assert!(matches!(r, Err(StoreError::WriteConflict(_))), "got {r:?}");
+        db.rollback(remover).unwrap();
+        // The remover rolled back: the row is live again → duplicate.
+        assert!(matches!(
+            db.insert(tid, row(4, b"v1"), &t),
+            Err(StoreError::DuplicateKey(_))
+        ));
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 3: a dropped guard is fully aborted
+    // inline — by the time `drop` returns, the write is physically reverted,
+    // the versions are gone, and nothing is parked for later.
+    #[test]
+    fn test_a_dropped_guard_is_fully_reverted_before_drop_returns() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true); // nothing else may clean up for us
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+        {
+            let t = db.begin().unwrap();
+            db.update(tid, row(1, b"dropped"), &t).unwrap();
+            db.insert(tid, row(2, b"dropped"), &t).unwrap();
+            assert_eq!(db.stats().version_records, 3);
+            // dropped here
+        }
+        let s = db.stats();
+        assert_eq!(s.aborting_transactions, 0, "nothing parked");
+        assert_eq!(s.active_transactions, 0);
+        assert_eq!(s.version_records, 1, "only the committed insert's record remains");
+        let t = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(), b"v0");
+        assert!(db.find(tid, id(2), &t).unwrap().is_none());
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 3: the horizon rule. A reader that
+    // began before a commit can still walk to the pre-image no matter how
+    // many vacuum passes run, and once the reader is gone the records go.
+    #[test]
+    fn test_vacuum_never_reclaims_a_version_a_live_reader_can_reach() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+        let reader = db.begin().unwrap();
+        // Many commits after the reader began, each a new version of row 1.
+        for i in 1..=20u64 {
+            let t = db.begin().unwrap();
+            db.update(tid, row(1, format!("v{i}").as_bytes()), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        // Give the maintenance thread every chance to be wrong.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            db.find(tid, id(1), &reader).unwrap().unwrap().data.to_vec(),
+            b"v0",
+            "the reader's snapshot must survive 20 commits and any number of vacuum passes"
+        );
+        assert!(db.stats().version_records >= 20, "the chain is retained while the reader lives");
+        db.rollback(reader).unwrap();
+        for _ in 0..500 {
+            if db.stats().version_records == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let s = db.stats();
+        assert_eq!(s.version_records, 0, "nothing needs the chain once the reader is gone: {s:?}");
+        assert_eq!(s.committed_retained, 0);
+        assert_eq!(s.committed_awaiting_vacuum, 0);
+    }
+
+    // After every transaction has ended, the maintenance thread brings every
+    // queue to zero on its own: no foreground call is needed.
+    #[test]
+    fn test_stats_report_zero_pending_work_after_quiescence() {
+        let (db, tid) = make_db_with_table();
+        for k in 0..10u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(k, b"v"), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        for k in 0..5u64 {
+            let t = db.begin().unwrap();
+            db.remove(tid, id(k), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        {
+            let t = db.begin().unwrap();
+            db.update(tid, row(7, b"abandoned"), &t).unwrap();
+        }
+        for _ in 0..500 {
+            let s = db.stats();
+            if s.version_records == 0 && s.tombstones_awaiting_purge == 0 && s.committed_retained == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let s = db.stats();
+        assert_eq!(s.active_transactions, 0);
+        assert_eq!(s.aborting_transactions, 0);
+        assert_eq!(s.version_records, 0, "{s:?}");
+        assert_eq!(s.committed_retained, 0, "{s:?}");
+        assert_eq!(s.committed_awaiting_vacuum, 0, "{s:?}");
+        assert_eq!(s.tombstones_awaiting_purge, 0, "{s:?}");
+        assert_eq!(s.tombstones_purged, 5);
+        assert_eq!(s.maintenance_errors, 0, "{s:?}");
+        // The purged keys are physically gone and reinsertable; the rest intact.
+        let t = db.begin().unwrap();
+        for k in 0..5u64 {
+            assert!(db.find(tid, id(k), &t).unwrap().is_none());
+        }
+        for k in 5..10u64 {
+            assert!(db.find(tid, id(k), &t).unwrap().is_some());
+        }
+        db.insert(tid, row(0, b"again"), &t).unwrap();
+        db.commit(t).unwrap();
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 1: transaction ids and LSNs come from
+    // one counter, seeded on reopen from max(header.counter, highest number
+    // in the log) + 1. After a crash (no clean close, so the header's floor
+    // is stale), every id and LSN issued by the new session must still be
+    // above everything the old session issued that left a trace.
+    #[test]
+    fn test_reopen_after_crash_seeds_the_counter_above_every_id_and_lsn_in_the_log() {
+        let (db, tid) = make_db_with_table();
+        db.checkpoint().unwrap();
+        let mut highest = 0u64;
+        for i in 0..5u64 {
+            let t = db.begin().unwrap();
+            highest = highest.max(t.id().id_num());
+            db.insert(tid, row(i, b"x"), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        // The last commit's record is durable (commit waits), so its LSN is
+        // in the log and is above every id issued.
+        let (data, log) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let t = db.begin().unwrap();
+        assert!(
+            t.id().id_num() > highest,
+            "new id {} must exceed every pre-crash id (highest {highest})",
+            t.id().id_num()
+        );
+        // And the same holds for the numbers a clean close persists.
+        db.rollback(t).unwrap();
+        let (f, l) = db.close().unwrap();
+        let db = TestDB::open_using("txn_test.db", f, l).unwrap();
+        let t = db.begin().unwrap();
+        assert!(t.id().id_num() > highest);
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 1 (proposal §3.11): a named sequence
+    // logs a high-water mark before handing out the first value of each
+    // chunk, so a crash after committed writes that used sequence values
+    // never hands those values out again — the SQL layer's row ids for
+    // tables without a primary key depend on this. Before, sequences were
+    // persisted only at checkpoint and a crash reissued already-used ids.
+    #[test]
+    fn test_sequence_values_are_never_reissued_after_a_crash() {
+        let (db, tid) = make_db_with_table();
+        db.get_generator().create_generator("rowid", Some(0)).unwrap();
+        db.checkpoint().unwrap();
+        // Cross a chunk boundary (32) so more than one high-water record is
+        // involved, and commit rows keyed by the values.
+        let mut used = Vec::new();
+        for _ in 0..40 {
+            let k = db.get_generator().gen_key("rowid").unwrap();
+            let t = db.begin().unwrap();
+            db.insert(tid, row(k, b"r"), &t).unwrap();
+            db.commit(t).unwrap();
+            used.push(k);
+        }
+        let (data, log) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let next = db.get_generator().gen_key("rowid").unwrap();
+        assert!(
+            next > *used.iter().max().unwrap(),
+            "sequence handed out {next} again after a crash; {} was already committed",
+            used.iter().max().unwrap()
+        );
+        // The rows keyed by the old values are all there, and inserting under
+        // the new value works (no DuplicateKey).
+        let t = db.begin().unwrap();
+        for k in &used {
+            assert!(db.find(tid, id(*k), &t).unwrap().is_some());
+        }
+        db.insert(tid, row(next, b"r"), &t).unwrap();
+        db.commit(t).unwrap();
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 1, found by the crash harness: a
+    // checkpoint syncs the data file, then asks the log runner to truncate,
+    // and that truncation is its own later sync. A crash in between leaves
+    // the log holding records from BEFORE the checkpoint. Replaying a Mod
+    // for a key that a later, already-checkpointed delete reclaimed used to
+    // fail recovery with KeyNotFound. Built deterministically: the log
+    // snapshot is taken before the second checkpoint, the data snapshot
+    // after it.
+    #[test]
+    fn test_recovery_tolerates_a_log_older_than_the_checkpoint() {
+        let (db, tid) = make_db_with_table();
+        // Vacuum held off so the purge lands exactly where this test wants it.
+        db.maintenance.set_paused(true);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(7, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+        // Checkpoint #1 truncates the Add away.
+        db.checkpoint().unwrap();
+        let t = db.begin().unwrap();
+        db.update(tid, row(7, b"v1"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.remove(tid, id(7), &t).unwrap();
+        db.commit(t).unwrap();
+        // Wait for checkpoint #1's async truncate and both new records
+        // (Mod, Commit, Del, Commit) to be the whole log, then keep that
+        // pre-checkpoint log.
+        wait_for_durable_logs(&db, 4);
+        let (_, stale_log) = db.synced_snapshot();
+        // Let vacuum purge the tombstone, then checkpoint #2: the data file
+        // no longer has key 7 at all.
+        db.maintenance.set_paused(false);
+        for _ in 0..500 {
+            if db.stats().tombstones_awaiting_purge == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(db.stats().tombstones_awaiting_purge, 0);
+        db.checkpoint().unwrap();
+        let (data, _) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, stale_log)
+            .expect("a log older than the checkpoint must replay as a no-op, not fail");
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, id(7), &t).unwrap().is_none());
+    }
+
+    // A sequence created after the last checkpoint (e.g. by CREATE TABLE)
+    // must exist after a crash, and one dropped after it must not.
+    #[test]
+    fn test_sequence_creation_and_removal_survive_a_crash() {
+        let (db, _tid) = make_db_with_table();
+        db.get_generator().create_generator("doomed", Some(0)).unwrap();
+        db.checkpoint().unwrap();
+        db.get_generator().create_generator("fresh", Some(100)).unwrap();
+        db.get_generator().remove_generator("doomed").unwrap();
+        // Force the sequence records to be durable: a commit waits on
+        // everything logged before it.
+        let t = db.begin().unwrap();
+        db.commit(t).unwrap();
+        let (data, log) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, log).unwrap();
+        assert_eq!(db.get_generator().gen_key("fresh").unwrap(), 100);
+        assert!(matches!(
+            db.get_generator().gen_key("doomed"),
+            Err(StoreError::MissingKey(_))
+        ));
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 0, found by the stress harness's
+    // repeatable-read check: update()/remove() on a committed-but-unreclaimed
+    // tombstone used to succeed, producing a NEW version that still carried
+    // the tombstone flag — so the writer's own subsequent find() returned
+    // None for a row it had just "updated".
+    #[test]
+    fn test_update_and_remove_on_a_committed_unreclaimed_tombstone_are_key_not_found() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(5, b"v0"), &t).unwrap();
+        db.commit(t).unwrap();
+        // A concurrent reader keeps the tombstone from being purged (its
+        // commit_ts is above the reader's id, so the horizon holds it).
+        let reader = db.begin().unwrap();
+        let t = db.begin().unwrap();
+        db.remove(tid, id(5), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(db.stats().tombstones_awaiting_purge, 1);
+
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, id(5), &t).unwrap().is_none());
+        assert!(matches!(
+            db.update(tid, row(5, b"v1"), &t),
+            Err(StoreError::KeyNotFound(_))
+        ));
+        assert!(matches!(db.remove(tid, id(5), &t), Err(StoreError::KeyNotFound(_))));
+        // Still absent for this transaction after the failed writes.
+        assert!(db.find(tid, id(5), &t).unwrap().is_none());
+        db.rollback(t).unwrap();
+        db.rollback(reader).unwrap();
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 0, found by the crash harness: a
+    // committed delete's tombstone is physically reclaimed later, and that
+    // reclaim is not logged. Checkpoint with the tombstone still present,
+    // reclaim it, insert the same key again and commit, crash: replay found
+    // the checkpoint's tombstone under the key and skipped the Add as
+    // "already exists", so the committed reinsert read back as absent.
+    #[test]
+    fn test_replay_applies_a_committed_insert_over_a_checkpointed_tombstone() {
+        let (db, tid) = make_db_with_table();
+        // Hold vacuum off so the tombstone is still physically present when
+        // the checkpoint runs (phase 3: purging is the maintenance thread's).
+        db.maintenance.set_paused(true);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(7, b"first"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.remove(tid, id(7), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(db.stats().tombstones_awaiting_purge, 1);
+        // Checkpoint persists the tombstone.
+        db.checkpoint().unwrap();
+        // Now let vacuum purge it (row and index entry go away; the purge is
+        // logged), then reinsert the key as a plain Add.
+        db.maintenance.set_paused(false);
+        for _ in 0..500 {
+            if db.stats().tombstones_awaiting_purge == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(db.stats().tombstones_awaiting_purge, 0);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(7, b"second"), &t).unwrap();
+        db.commit(t).unwrap();
+        // Power cut: the data file is exactly the checkpoint (tombstone
+        // present); the log has the reinsert.
+        let (data, log) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let t = db.begin().unwrap();
+        let found = db.find(tid, id(7), &t).unwrap();
+        assert_eq!(
+            found.map(|x| x.data.to_vec()),
+            Some(b"second".to_vec()),
+            "the committed reinsert must survive recovery over the checkpointed tombstone"
+        );
     }
 
     // Regression test for todo.txt [16]: a non-root leaf (or, separately, a
@@ -5987,9 +6731,7 @@ mod tests {
                     // disjoint parts of the tree.
                     let key = i * THREADS + thread_idx;
                     let t = db.begin().unwrap();
-                    super::retry_on_contention(|| {
-                        db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
-                    })
+                    db.insert(tid, row(key, format!("v{key}").as_bytes()), &t)
                     .unwrap();
                     db.commit(t).unwrap();
                 }
@@ -6055,14 +6797,12 @@ mod tests {
                         let key = thread_idx * KEYS_PER_THREAD + i;
                         let value = format!("v{key}-{cycle}");
                         let t = db.begin().unwrap();
-                        super::retry_on_contention(|| {
-                            db.insert(tid, row(key, value.as_bytes()), &t)
-                        })
+                        db.insert(tid, row(key, value.as_bytes()), &t)
                         .unwrap();
                         db.commit(t).unwrap();
 
                         let t = db.begin().unwrap();
-                        super::retry_on_contention(|| db.remove(tid, id(key), &t)).unwrap();
+                        db.remove(tid, id(key), &t).unwrap();
                         db.commit(t).unwrap();
                     }
                 }
@@ -6125,9 +6865,7 @@ mod tests {
                             let key = thread_idx * KEYS_PER_THREAD + i;
                             let value = format!("v{key}-{cycle}");
                             let Ok(t) = db.begin() else { continue };
-                            if super::retry_on_contention(|| {
-                                db.insert(tid, row(key, value.as_bytes()), &t)
-                            })
+                            if db.insert(tid, row(key, value.as_bytes()), &t)
                             .is_err()
                             {
                                 continue;
@@ -6137,7 +6875,7 @@ mod tests {
                             }
 
                             let Ok(t) = db.begin() else { continue };
-                            if super::retry_on_contention(|| db.remove(tid, id(key), &t)).is_err() {
+                            if db.remove(tid, id(key), &t).is_err() {
                                 continue;
                             }
                             let _ = db.commit(t);
@@ -6769,17 +7507,24 @@ mod tests {
         );
     }
 
-    // Proves the gate actually blocks/waits rather than the fix merely
-    // happening to handle the already-resolved (dropped) case above:
-    // a transaction genuinely still active (mid-work, on another thread)
-    // must delay checkpoint() until it finishes, and its write — since it
-    // DOES go on to commit — must survive.
+    // Phase 6 replaces STORE_AUDIT.md T3's quiesce: a checkpoint never waits
+    // for a transaction. With one genuinely still active (mid-work, on
+    // another thread) the checkpoint completes, its records are retained
+    // (an extra segment), a crash right then reverts its flushed write,
+    // and once it commits and the next checkpoint runs the retention drops
+    // back to one segment with the write intact.
     #[test]
-    fn test_audit_t3_checkpoint_waits_for_a_still_active_transaction() {
+    fn test_checkpoint_does_not_wait_for_a_still_active_transaction() {
         let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true); // only our checkpoints
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"committed-before"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 1);
+
         let started = Arc::new(std::sync::Barrier::new(2));
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
         let db_w = db.clone();
         let started_w = started.clone();
         let release_w = release.clone();
@@ -6787,37 +7532,44 @@ mod tests {
             let t = db_w.begin().unwrap();
             db_w.insert(tid, row(9, b"in-flight"), &t).unwrap();
             started_w.wait();
-            // Hold the transaction open until the main thread has had a
-            // real chance to observe checkpoint() still blocked.
             while !release_w.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             db_w.commit(t).unwrap();
         });
-
         started.wait();
-        // The writer's transaction is active right now. Run checkpoint()
-        // on its own thread and confirm it does NOT complete while that's
-        // still true.
-        let db_c = db.clone();
-        let checkpointer = thread::spawn(move || db_c.checkpoint());
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(
-            !checkpointer.is_finished(),
-            "checkpoint() must wait for a still-active transaction to finish, not run \
-             (and truncate the log) while it's mid-write"
+
+        // The writer's transaction is active right now: the checkpoint
+        // must complete anyway, promptly.
+        let start = std::time::Instant::now();
+        db.checkpoint().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(2), "checkpoint waited on a transaction");
+        assert!(!writer.is_finished());
+        assert_eq!(
+            db.stats().wal_segments,
+            2,
+            "the active transaction's records live in the older segment, which is retained"
         );
+
+        // A crash here: its page may have been flushed, but its records
+        // were kept, so recovery reverts it and keeps the committed row.
+        let (data, log) = db.synced_snapshot();
+        let crashed = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let r = crashed.begin().unwrap();
+        assert_eq!(crashed.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"committed-before");
+        assert!(crashed.find(tid, id(9), &r).unwrap().is_none(), "uncommitted at the cut");
+        drop(r);
+        drop(crashed);
 
         release.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
-        checkpointer.join().unwrap().unwrap();
-
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 1, "nothing in flight: only the fresh segment");
         let reader = db.begin().unwrap();
         assert_eq!(
             db.find(tid, id(9), &reader).unwrap().unwrap().data.to_vec(),
             b"in-flight",
-            "the transaction's write legitimately committed once checkpoint's wait let it \
-             finish — it must still be there, not discarded"
+            "the transaction's write committed after the checkpoint — it must still be there"
         );
     }
 
@@ -7183,5 +7935,438 @@ mod tests {
             matches!(result, Err(StoreError::Corruption(_))),
             "expected StoreError::Corruption, got {result:?}"
         );
+    }
+
+    // ---- Phase 5: early failure instead of hangs ----
+
+    // A lock timeout inside a write is a bug report, not a retryable
+    // condition: the write fails with LockTimeout, the transaction is taken
+    // down through the one abort path, the engine counts it, and nothing
+    // retries. Once the holder lets go, the engine is fully usable again.
+    #[test]
+    fn test_lock_timeout_aborts_the_transaction_and_is_counted() {
+        use crate::buffer::LockLevel::Index;
+        let (db, tid) = make_db_with_table();
+        db.set_lock_timeout(Duration::from_millis(50));
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"a"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // Another thread sits on the table's index root, which every write
+        // must lock.
+        let root = db.table_by_id(tid).unwrap().table.first_index_page;
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                let h = db.buffer.get_page_mut(root, Index).unwrap();
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(h);
+            })
+        };
+        held_rx.recv().unwrap();
+
+        let t = db.begin().unwrap();
+        let start = std::time::Instant::now();
+        let r = db.update(tid, row(1, b"b"), &t);
+        assert!(matches!(r, Err(StoreError::LockTimeout(_))), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(1), "must not wait past the timeout");
+        assert_eq!(db.stats().lock_timeouts, 1);
+        // The transaction is gone: its commit cannot report success.
+        assert!(db.commit(t).is_err());
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // Nothing lingers: the row is untouched and new writes go through.
+        let t = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(), b"a");
+        db.update(tid, row(1, b"c"), &t).unwrap();
+        db.commit(t).unwrap();
+        assert_eq!(db.stats().lock_timeouts, 1);
+        assert!(db.stats().degraded.is_none());
+    }
+
+    // An abort whose revert keeps failing is not retried forever: after the
+    // budget the engine goes Degraded — writes and commits are refused with
+    // the reason, reads continue, and the failed transaction's rows stay
+    // invisible (it is Aborting, never Committed).
+    #[test]
+    fn test_repeated_abort_failure_degrades_engine_instead_of_spinning() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true); // we drive the retries by hand
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"a"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, b"dirty"), &t).unwrap();
+        db.fail_reverts.store(true, std::sync::atomic::Ordering::Release);
+        assert!(db.rollback(t).is_err(), "the injected revert failure surfaces");
+        assert!(db.stats().degraded.is_none(), "one failure is not degradation");
+        assert_eq!(db.stats().aborting_transactions, 1);
+
+        for attempt in 1..super::ABORT_RETRY_BUDGET {
+            db.maintenance_pass().unwrap();
+            assert!(
+                db.stats().degraded.is_none(),
+                "attempt {attempt} of {} must not degrade yet",
+                super::ABORT_RETRY_BUDGET
+            );
+        }
+        db.maintenance_pass().unwrap();
+        let reason = db.stats().degraded.expect("degraded after the retry budget");
+        assert!(reason.contains("abort of"), "{reason}");
+        assert!(reason.contains("revert failure injected"), "{reason}");
+
+        // Writes and commits are refused, naming the reason.
+        let t = db.begin().unwrap();
+        match db.insert(tid, row(2, b"b"), &t) {
+            Err(StoreError::EngineDegraded(r)) => assert_eq!(r, reason),
+            other => panic!("expected EngineDegraded, got {other:?}"),
+        }
+        // Reads continue, and the aborting transaction's write is invisible.
+        assert_eq!(db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(), b"a");
+        assert!(matches!(db.commit(t), Err(StoreError::EngineDegraded(_))));
+        // Degradation is sticky: a later successful retry does not lift it.
+        db.fail_reverts.store(false, std::sync::atomic::Ordering::Release);
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().aborting_transactions, 0);
+        assert!(db.stats().degraded.is_some());
+    }
+
+    // Extending a table's data chain allocates the new page with no page
+    // lock held, re-locks the tail and re-checks it. Many writers filling
+    // one chain concurrently must neither orphan a page (phase 0) nor leak
+    // one: every allocated page is reachable from the chain or back on the
+    // free list.
+    #[test]
+    fn test_concurrent_chain_extension_neither_orphans_nor_leaks_pages() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        // Pages the engine owns outside this table (header, catalog, ...):
+        // whatever is neither reachable from the table nor free right now.
+        let unaccounted = |db: &TestDB| -> u64 {
+            let reachable = db.table_by_id(tid).unwrap().reachable_pages().unwrap().len() as u64;
+            let free = db.buffer.get_free_pages().len() as u64;
+            db.buffer.page_count_val() - reachable - free
+        };
+        let unaccounted_before = unaccounted(&db);
+        const THREADS: usize = 8;
+        const ROWS: usize = 150;
+        let payload = vec![7u8; 300];
+        let mut handles = Vec::new();
+        for thread_idx in 0..THREADS {
+            let db = Arc::clone(&db);
+            let payload = payload.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..ROWS {
+                    let key = (thread_idx * ROWS + i) as u64;
+                    let t = db.begin().unwrap();
+                    db.insert(tid, row(key, &payload), &t).unwrap();
+                    db.commit(t).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let mut cursor = db.table_scan(tid).unwrap();
+        let mut scanned = 0;
+        while cursor.next().unwrap().is_some() {
+            scanned += 1;
+        }
+        drop(cursor);
+        assert_eq!(scanned, THREADS * ROWS, "every committed row is on the chain");
+        let t = db.begin().unwrap();
+        for key in 0..(THREADS * ROWS) as u64 {
+            assert!(db.find(tid, id(key), &t).unwrap().is_some(), "key {key} via the index");
+        }
+        db.rollback(t).unwrap();
+        assert_eq!(db.stats().lock_timeouts, 0);
+        // Page accounting closes: every page allocated during the run is
+        // either reachable from the table or back on the free list.
+        assert_eq!(
+            unaccounted(&db),
+            unaccounted_before,
+            "a page allocated during the run is neither reachable nor free: leaked by a lost extension race"
+        );
+    }
+
+    // ---- Phase 6: segmented WAL, fuzzy checkpoint ----
+
+    // The retention floor counts an Aborting transaction (one whose revert
+    // keeps failing) exactly like an Active one: its records stay until it
+    // is finished, and go at the next checkpoint after that.
+    #[test]
+    fn test_retention_keeps_segments_for_an_aborting_transaction() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"a"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 1);
+
+        let t = db.begin().unwrap();
+        db.update(tid, row(1, b"dirty"), &t).unwrap();
+        db.fail_reverts.store(true, std::sync::atomic::Ordering::Release);
+        assert!(db.rollback(t).is_err());
+        assert_eq!(db.stats().aborting_transactions, 1);
+        db.checkpoint().unwrap();
+        assert_eq!(
+            db.stats().wal_segments,
+            2,
+            "an aborting transaction's records must outlive the checkpoint"
+        );
+        // A crash now: the flushed dirty page is undone from the retained log.
+        let (data, log) = db.synced_snapshot();
+        let crashed = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let r = crashed.begin().unwrap();
+        assert_eq!(crashed.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"a");
+        drop(r);
+        drop(crashed);
+
+        db.fail_reverts.store(false, std::sync::atomic::Ordering::Release);
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().aborting_transactions, 0);
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 1, "finished: nothing pins the older segment");
+        let r = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"a");
+    }
+
+    // A long-lived transaction pins every segment since it began; commits
+    // keep landing in newer segments; a crash replays all of them, in order
+    // (later versions win), and the pinned transaction itself is undone.
+    #[test]
+    fn test_recovery_replays_every_retained_segment_in_order() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        let pin = db.begin().unwrap();
+        db.insert(tid, row(100, b"pinned-uncommitted"), &pin).unwrap();
+        for round in 0..3u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(round, format!("v{round}").as_bytes()), &t).unwrap();
+            if round == 0 {
+                db.insert(tid, row(50, b"r0"), &t).unwrap();
+            } else {
+                db.update(tid, row(50, format!("r{round}").as_bytes()), &t).unwrap();
+            }
+            db.commit(t).unwrap();
+            db.checkpoint().unwrap();
+            assert_eq!(
+                db.stats().wal_segments,
+                round as usize + 2,
+                "the pinned transaction keeps every segment since it began"
+            );
+        }
+        let (data, log) = db.synced_snapshot();
+        assert_eq!(log.list_siblings("txn_test.db.wal.").unwrap().len(), 4);
+        let crashed = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let r = crashed.begin().unwrap();
+        for round in 0..3u64 {
+            assert_eq!(
+                crashed.find(tid, id(round), &r).unwrap().unwrap().data.to_vec(),
+                format!("v{round}").as_bytes(),
+                "row from segment {}", round + 1
+            );
+        }
+        assert_eq!(crashed.find(tid, id(50), &r).unwrap().unwrap().data.to_vec(), b"r2", "last version wins");
+        assert!(crashed.find(tid, id(100), &r).unwrap().is_none(), "never committed");
+        drop(r);
+        drop(crashed);
+
+        db.rollback(pin).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 1);
+    }
+
+    // Db::open on a real filesystem finds the segments by name.
+    #[test]
+    fn test_file_backed_open_finds_segments_by_name() {
+        let db_name = temp_db_path("segments");
+        FileDB::delete(&db_name).unwrap_or_default();
+        let db = FileDB::create(&db_name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"one"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.close().unwrap();
+        let segments = crate::memfile::list_files_with_prefix(&format!("{db_name}.wal.")).unwrap();
+        assert_eq!(segments.len(), 1, "close leaves exactly one (empty) segment: {segments:?}");
+        let db = FileDB::open(&db_name).unwrap();
+        let t = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(), b"one");
+        drop(t);
+        db.close().unwrap();
+        FileDB::delete(&db_name).unwrap();
+        assert!(crate::memfile::list_files_with_prefix(&format!("{db_name}.wal.")).unwrap().is_empty());
+    }
+
+    // ---- Phase 7: caps and follow-ups ----
+
+    // Durability::Async returns before the fsync; the commit is visible at
+    // once and durable by the next sync, so a synced snapshot taken after a
+    // later Sync commit contains it.
+    #[test]
+    fn test_async_commit_is_visible_at_once_and_durable_after_the_next_sync() {
+        let (db, tid) = make_db_with_table();
+        db.checkpoint().unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"async"), &t).unwrap();
+        db.commit_with(t, super::Durability::Async).unwrap();
+        let r = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"async");
+        db.rollback(r).unwrap();
+        // A later Sync commit drags the earlier record to disk with it.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(2, b"sync"), &t).unwrap();
+        db.commit(t).unwrap();
+        let (data, log) = db.synced_snapshot();
+        let crashed = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let r = crashed.begin().unwrap();
+        assert_eq!(crashed.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"async");
+        assert_eq!(crashed.find(tid, id(2), &r).unwrap().unwrap().data.to_vec(), b"sync");
+    }
+
+    // A transaction pinning more retained WAL than the cap allows is aborted
+    // by the maintenance thread; its owner learns why on the next call, the
+    // space is released, and everything else is unaffected.
+    #[test]
+    fn test_snapshot_too_old_on_retained_wal_bytes() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        db.set_snapshot_limits(super::SnapshotLimits {
+            max_retained_wal_bytes: u64::MAX,
+            max_version_records: usize::MAX,
+        });
+        let pin = db.begin().unwrap();
+        for i in 0..20u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, &[7u8; 200]), &t).unwrap();
+            db.commit(t).unwrap();
+            db.checkpoint().unwrap();
+        }
+        assert!(db.stats().wal_segments >= 2, "the pin retains segments");
+        let retained = db.stats().wal_retained_bytes;
+        assert!(retained > 1000);
+        // Under the cap: nothing happens.
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 0);
+        assert!(db.find(tid, id(0), &pin).unwrap().is_none(), "pin still sees its snapshot");
+
+        db.set_snapshot_limits(super::SnapshotLimits {
+            max_retained_wal_bytes: retained / 2,
+            max_version_records: usize::MAX,
+        });
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 1);
+        match db.find(tid, id(0), &pin) {
+            Err(StoreError::SnapshotTooOld(reason)) => {
+                assert!(reason.contains("retained WAL"), "{reason}");
+                assert!(reason.contains(&format!("{}", pin.id())), "{reason}");
+            }
+            other => panic!("expected SnapshotTooOld, got {other:?}"),
+        }
+        // Said once; afterwards it is just a finished transaction.
+        assert!(matches!(db.find(tid, id(0), &pin), Err(StoreError::TransactionAlreadyFinished)));
+        db.rollback(pin).unwrap();
+        assert_eq!(db.stats().wal_segments, 1, "the pinned segments went with it");
+        assert!(db.stats().wal_retained_bytes < retained);
+        let r = db.begin().unwrap();
+        assert_eq!(db.find(tid, id(19), &r).unwrap().unwrap().data.len(), 200);
+    }
+
+    #[test]
+    fn test_snapshot_too_old_on_version_records() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        db.set_snapshot_limits(super::SnapshotLimits {
+            max_retained_wal_bytes: u64::MAX,
+            max_version_records: 10,
+        });
+        let pin = db.begin().unwrap();
+        for i in 0..20u64 {
+            let t = db.begin().unwrap();
+            db.insert(tid, row(i, b"v"), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        assert!(db.stats().version_records > 10, "the pin keeps versions alive");
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 1);
+        assert!(matches!(db.commit(pin), Err(StoreError::SnapshotTooOld(_))));
+        db.maintenance_pass().unwrap();
+        assert!(db.stats().version_records <= 10, "vacuum reclaimed once the pin was gone");
+    }
+
+    // Recovery replays only records at or above the floor the last
+    // checkpoint persisted, even when a retained segment still holds older
+    // ones (kept because something later in it is above the floor).
+    #[test]
+    fn test_recovery_skips_records_below_the_persisted_floor() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"before-the-pin"), &t).unwrap();
+        db.commit(t).unwrap();
+        let pin = db.begin().unwrap(); // floor for the next checkpoint
+        let t = db.begin().unwrap();
+        db.insert(tid, row(2, b"after-the-pin"), &t).unwrap();
+        db.commit(t).unwrap();
+        db.checkpoint().unwrap();
+        assert_eq!(db.stats().wal_segments, 2, "row 2's records keep the segment, row 1's ride along");
+        let total: usize = wal_segments_of(&db.log_file)
+            .iter()
+            .map(|(_, b)| count_records_in_segment(b))
+            .sum();
+        assert!(total >= 4, "both transactions' records are on disk: {total}");
+        let floor = read_raw_header(&db).checkpoint_lsn;
+        assert_eq!(floor, pin.id().id_num());
+
+        let (data, log) = db.synced_snapshot();
+        let crashed = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let replayed = crashed.stats().recovered_records;
+        assert!(replayed < total, "records below the floor ({floor}) are not replayed: {replayed} of {total}");
+        assert!(replayed >= 2, "row 2's Add and Commit are above the floor");
+        let r = crashed.begin().unwrap();
+        assert_eq!(crashed.find(tid, id(1), &r).unwrap().unwrap().data.to_vec(), b"before-the-pin");
+        assert_eq!(crashed.find(tid, id(2), &r).unwrap().unwrap().data.to_vec(), b"after-the-pin");
+        drop(r);
+        drop(crashed);
+        db.rollback(pin).unwrap();
+    }
+
+    // Reopening never appends to a recovered segment (its tail may be torn);
+    // the next records land in a fresh one and a checkpoint retires the old.
+    #[test]
+    fn test_reopen_starts_a_fresh_segment_and_a_torn_tail_never_hides_later_records() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"one"), &t).unwrap();
+        db.commit(t).unwrap();
+        wait_for_durable_logs(&db, 2);
+        sync_header_without_truncating_logs(&db);
+        let (main_file, _) = crash_clone(&db);
+        let (segment_path, mut torn) = current_segment(&db);
+        torn.truncate(torn.len() - 3); // tears row 1's Commit
+        let disk = MemFile::new();
+        disk.add_sibling_from_bytes(&segment_path, torn);
+
+        let db2 = TestDB::open_using("txn_test.db", main_file, disk).unwrap();
+        assert_eq!(db2.stats().wal_segments, 2, "the recovered segment plus a fresh one");
+        let t = db2.begin().unwrap();
+        assert!(db2.find(tid, id(1), &t).unwrap().is_none(), "torn commit: not committed");
+        db2.insert(tid, row(2, b"two"), &t).unwrap();
+        db2.commit(t).unwrap();
+        wait_for_durable_logs(&db2, 2 + 1); // row 1's Add survives the tear; row 2's Add + Commit are new
+        // A second crash: row 2's records must be readable — they are in the
+        // fresh segment, not behind the torn frame.
+        let (data, log) = db2.synced_snapshot();
+        let db3 = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let r = db3.begin().unwrap();
+        assert_eq!(db3.find(tid, id(2), &r).unwrap().unwrap().data.to_vec(), b"two");
+        assert!(db3.find(tid, id(1), &r).unwrap().is_none());
     }
 }

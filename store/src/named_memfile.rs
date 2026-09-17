@@ -40,17 +40,16 @@ pub struct NamedMemFile {
 }
 
 impl NamedMemFile {
-    /// Drops `name`'s entry (and its `.wal` sibling, mirroring
-    /// `Db::create_core_db`'s own file layout — a single WAL file, per
-    /// T4_S2_WAL_DESIGN.md, replacing the old separate `.undo`/`.redo`
-    /// pair) from the registry, if present. Call this directly rather than
-    /// through `Db::<NamedMemFile>::delete` — that method is hardcoded to
-    /// the real filesystem regardless of `F`, so it can't target this
-    /// registry.
+    /// Drops `name`'s entry and every WAL segment of it (`name.wal.<n>`,
+    /// mirroring `Db::create_core_db`'s file layout) from the registry, if
+    /// present. Call this directly rather than through
+    /// `Db::<NamedMemFile>::delete` — that method is hardcoded to the real
+    /// filesystem regardless of `F`, so it can't target this registry.
     pub fn delete(name: &str) {
         let mut reg = REGISTRY.lock().unwrap();
         reg.remove(name);
-        reg.remove(&format!("{name}.wal"));
+        let prefix = format!("{name}.wal");
+        reg.retain(|k, _| !k.starts_with(&prefix));
     }
 }
 
@@ -62,6 +61,25 @@ impl Opener for NamedMemFile {
         let mut reg = REGISTRY.lock().unwrap();
         let data = reg.entry(name).or_default().clone();
         Ok(NamedMemFile { data, seek_pos: 0 })
+    }
+
+    fn open_sibling(&self, path: &str, op: OpenOptions) -> std::io::Result<NamedMemFile> {
+        Self::open(op, path)
+    }
+
+    fn list_siblings(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        Ok(REGISTRY
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
+
+    fn remove_sibling(&self, path: &str) -> std::io::Result<()> {
+        REGISTRY.lock().unwrap().remove(path);
+        Ok(())
     }
 
     fn do_sync(&mut self) -> std::io::Result<()> {

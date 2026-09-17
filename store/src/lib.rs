@@ -23,7 +23,8 @@ mod constant;
 pub mod db;
 pub mod error;
 pub mod generator;
-mod logger;
+mod maintenance;
+pub mod logger;
 pub mod memfile;
 pub mod named_memfile;
 
@@ -49,6 +50,7 @@ pub mod named_memfile;
 //  insert into table ([id][blob])
 //  select from table [id[]]
 //  delete from table [id[]]
+pub mod crash_harness;
 pub mod cursor;
 mod page;
 pub mod pages;
@@ -57,5 +59,6 @@ pub mod table;
 pub mod tables;
 pub mod tuple;
 pub mod txn;
+mod version;
 mod utils;
 pub mod valueitem;

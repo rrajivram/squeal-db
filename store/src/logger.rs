@@ -1,55 +1,45 @@
 use std::{
-    collections::HashSet,
     io::SeekFrom,
     mem::size_of,
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use crossbeam::channel::{Receiver, Sender, bounded};
 use log::error;
-use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    constant::timestamp,
     db::{DBFile, DBSizeType},
     error::StoreError,
     page::{PageId, fnv1a_32},
     table::TableIdType,
-    tuple::Tuple,
+    tuple::{DBIdType, Tuple},
     txn::TransactionId,
-    utils::shardedmap::ShardedMap,
 };
 
-/// Per-database write-ahead-log clock. Was two process-global statics, which
-/// meant every `Db` (and every test) in the process shared one LSN counter and
-/// one flush watermark — leaking write-ordering state across databases (flaky
-/// close/reopen in the test suite; a latent corruption bug for >1 live `Db`).
-/// One clock per `Logger`, shared with the `PageBuffer` (and its writer thread)
-/// that the same `Db` owns, so the WAL deferral is scoped to a single database.
+/// Per-database clock: the ONE source of every ordered number in the engine
+/// (TXN_SIMPLIFICATION_PLAN.md phase 1) — record LSNs, transaction ids, and
+/// (from phase 2) commit timestamps all come from `counter`. `last_written`
+/// is the durable watermark: every LSN at or below it has been fsynced.
+///
+/// `counter` starts at 1 and `last_written` at 0, so "nothing durable yet" is
+/// the plain value 0 and an unlogged page (LSN 0) is always flushable — no
+/// sentinel value anywhere.
 #[derive(Debug)]
 pub(crate) struct LsnClock {
-    /// Monotonic source of redo LSNs.
+    /// Next number to hand out.
     counter: AtomicU64,
-    /// Highest redo LSN durably written — the flush watermark. Starts very high
-    /// so freshly created pages (stamped from it) are written promptly until the
-    /// first redo record lands and pulls the watermark down to a real value.
+    /// Highest LSN durably written.
     last_written: AtomicU64,
     // STORE_AUDIT.md T1: lets a caller (Db::commit) block until a specific
-    // lsn has actually become durable, instead of returning as soon as its
-    // record is merely queued. `last_written` above is the source of truth
-    // ("has it happened yet") — this pair exists purely so a waiter can
-    // sleep instead of spin-polling that atomic, and be woken promptly when
-    // it changes. `Mutex<()>` guards nothing on its own; the atomic is
-    // still what's actually checked. See `wait_until_durable`/`mark_written`
-    // for the standard mutex+condvar pairing this relies on for correctness
-    // (no missed-wakeup window between checking the atomic and starting to
-    // wait) and why the wait loop is timeout-bounded regardless (belt and
-    // suspenders — even a hypothetical missed notify just costs one extra
-    // loop iteration, never a permanent hang).
+    // lsn has actually become durable. `last_written` is the source of
+    // truth; this pair exists so a waiter can sleep instead of spinning.
     durable_mutex: std::sync::Mutex<()>,
     durable_condvar: std::sync::Condvar,
 }
@@ -57,8 +47,8 @@ pub(crate) struct LsnClock {
 impl Default for LsnClock {
     fn default() -> Self {
         Self {
-            counter: AtomicU64::new(0),
-            last_written: AtomicU64::new(u64::MAX),
+            counter: AtomicU64::new(1),
+            last_written: AtomicU64::new(0),
             durable_mutex: std::sync::Mutex::new(()),
             durable_condvar: std::sync::Condvar::new(),
         }
@@ -73,38 +63,30 @@ impl LsnClock {
         )
     }
 
+    /// The next number that `next_lsn` would hand out — persisted in the
+    /// header at checkpoint/close as the floor to seed from on reopen.
+    pub(crate) fn next_value(&self) -> u64 {
+        self.counter.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn last_written(&self) -> LsnId {
         LsnId(self.last_written.load(std::sync::atomic::Ordering::Relaxed))
     }
 
-    /// Advance the watermark as the log runner persists records. Holds
-    /// `durable_mutex` around the store (not just around the notify) —
-    /// this is the standard mutex+condvar pairing: a waiter always checks
-    /// the atomic and starts waiting while holding the SAME mutex (see
-    /// `wait_until_durable`), so this store can never land in the narrow
-    /// window between a waiter's check and its wait call, which is
-    /// precisely the window a plain unlocked notify_all could miss.
+    /// Advance the durable watermark (monotonic) and wake waiters. Holds
+    /// `durable_mutex` around the store so a waiter's check-then-wait can't
+    /// miss it.
     pub(crate) fn mark_written(&self, lsn: LsnId) {
         let _guard = self.durable_mutex.lock().unwrap();
         self.last_written
-            .store(lsn.0, std::sync::atomic::Ordering::Relaxed);
+            .fetch_max(lsn.0, std::sync::atomic::Ordering::AcqRel);
         self.durable_condvar.notify_all();
     }
 
-    /// STORE_AUDIT.md T1: blocks until `lsn` is durable (i.e. until some
-    /// `mark_written` call reports a value >= `lsn`), so `Db::commit` can
-    /// actually wait for its own commit record to be fsynced instead of
-    /// returning as soon as it's merely queued for the log runner. Group
-    /// commit is preserved exactly as-is: this only waits on the SAME
-    /// `last_written` watermark the runner already advances once per
-    /// batch, so N concurrent committers waiting on lsns within one batch
-    /// all wake from the SAME `notify_all` — nothing here changes how
-    /// often the runner actually syncs.
-    ///
-    /// Timeout-bounded (`wait_timeout` in a loop, not a plain `wait`) as a
-    /// second, independent safety net beyond the mutex+condvar pairing
-    /// itself: even a hypothetical missed wakeup just costs one extra
-    /// 50ms loop iteration before rechecking, never a permanent hang.
+    /// STORE_AUDIT.md T1: blocks until `lsn` is durable. Group commit is
+    /// preserved: this waits on the same per-batch watermark the runner
+    /// advances, so every committer in a batch wakes from one notify.
+    /// Timeout-bounded as a belt-and-suspenders against a missed wakeup.
     pub(crate) fn wait_until_durable(&self, lsn: LsnId) {
         if self.is_durable(lsn) {
             return;
@@ -119,35 +101,25 @@ impl LsnClock {
         }
     }
 
-    // `last_written() >= lsn` alone is wrong here: last_written starts at
-    // the u64::MAX cold-start sentinel ("nothing tracked yet"), which is
-    // deliberately >= any real lsn so a freshly-dirtied page's flush gate
-    // (see Page::set_dirty's own comment) doesn't defer forever waiting
-    // for a watermark that hasn't started moving yet. That's the right
-    // call for gating a page flush (nothing to protect it FROM yet, so
-    // let it through) but the wrong one here — the sentinel means no
-    // `mark_written` has ever actually run, i.e. nothing is durable, the
-    // exact opposite of what `>=` would otherwise conclude. Confirmed via
-    // a real failure, not just reasoning: an early version of this method
-    // used the bare `last_written() >= lsn` comparison and
-    // `test_audit_t1_commit_does_not_return_before_its_own_record_is_durable`
-    // failed with 0 records found — wait_until_durable returned instantly,
-    // never actually waiting, on the very first commit of a fresh Db.
     fn is_durable(&self, lsn: LsnId) -> bool {
-        let w = self.last_written.load(std::sync::atomic::Ordering::Relaxed);
-        w != u64::MAX && w >= lsn.0
+        self.last_written.load(std::sync::atomic::Ordering::Relaxed) >= lsn.0
     }
 
-    /// Ensure `next_lsn()` never mints a value <= `lsn`. Used by replay
-    /// (`process_log`) once it has scanned the prior session's log and
-    /// found the highest LSN it contains — without this, a freshly reopened
-    /// session's counter restarts at 0 and the first new write's own record
-    /// landing would regress the watermark this just set right back down
-    /// (see `mark_written`'s own comment, and
-    /// `test_lsn_watermark_does_not_regress_after_new_writes_post_reopen`).
+    /// Ensure `next_lsn()` never mints a value <= `lsn`. Used by replay once
+    /// it has scanned the prior session's log.
     pub(crate) fn advance_counter_past(&self, lsn: LsnId) {
         self.counter
             .fetch_max(lsn.0 + 1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Seed from a persisted floor (the header's `counter`, written at the
+    /// last checkpoint/close): nothing below it can still be in flight, so
+    /// it is both the next value to hand out and the durable watermark.
+    pub(crate) fn seed(&self, next: u64) {
+        let next = next.max(1);
+        self.counter
+            .fetch_max(next, std::sync::atomic::Ordering::AcqRel);
+        self.mark_written(LsnId(next - 1));
     }
 }
 
@@ -184,7 +156,7 @@ pub(crate) const LOG_MAGIC: [u8; 4] = [0x53, 0x71, 0x57, 0x4c];
 /// checked for an EXACT match on open (not `<=`): a version this build
 /// doesn't recognize is exactly the "don't guess" case, not something to
 /// silently tolerate.
-pub(crate) const CURRENT_LOG_VERSION: u16 = 1;
+pub(crate) const CURRENT_LOG_VERSION: u16 = 2;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub(crate) struct LogHeader {
@@ -381,6 +353,114 @@ pub(crate) fn scan_log(buf: &[u8]) -> Result<ScannedLog, StoreError> {
     Ok(ScannedLog { records })
 }
 
+/// Byte length of the WAL's `LogHeader` — so a tool can slice a WAL file
+/// into header and record region without knowing the header's layout.
+pub fn header_len() -> usize {
+    LogHeader::encoded_len()
+}
+
+/// Human-readable dump of a whole WAL file's bytes (header included) — one
+/// line per record, plus the header and the scan verdict. For the
+/// `wal_dump` example and for reading a recovery failure without a
+/// debugger. Never touches a `Db`; pure bytes in, strings out.
+pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let header_len = LogHeader::encoded_len();
+    if bytes.len() < header_len {
+        out.push(format!(
+            "file is {} byte(s), shorter than the {header_len}-byte LogHeader",
+            bytes.len()
+        ));
+        return out;
+    }
+    match from_bytes::<LogHeader>(&bytes[..header_len]) {
+        Ok(h) => out.push(format!(
+            "LogHeader magic={:?} version={} page_size={} (magic {}, version {})",
+            h.magic,
+            h.version,
+            h.page_size,
+            if h.magic == LOG_MAGIC { "ok" } else { "MISMATCH" },
+            if h.version == CURRENT_LOG_VERSION { "ok" } else { "MISMATCH" },
+        )),
+        Err(e) => out.push(format!("LogHeader undecodable: {e}")),
+    }
+    let body = &bytes[header_len..];
+    let scanned = match scan_log(body) {
+        Ok(s) => s,
+        Err(e) => {
+            out.push(format!("scan: {e}"));
+            return out;
+        }
+    };
+    let mut consumed = 0usize;
+    for r in &scanned.records {
+        let line = match &r.operation {
+            Operation::Add { txn, post } => format!(
+                "lsn={} ADD    txn={} table={} key={} page={:?}",
+                r.lsn.0, txn.id_num(), post.table_id, post.tuple.id, post.data_page
+            ),
+            Operation::Mod { txn, pre, post } => format!(
+                "lsn={} MOD    txn={} table={} key={} pre_txn={}{}",
+                r.lsn.0,
+                txn.id_num(),
+                post.table_id,
+                post.tuple.id,
+                pre.tuple.txn_id.map(|t| t.id_num()).unwrap_or(0),
+                if pre.tuple.is_tombstoned() { "(tombstone)" } else { "" }
+            ),
+            Operation::Del { txn, pre } => format!(
+                "lsn={} DEL    txn={} table={} key={}",
+                r.lsn.0, txn.id_num(), pre.table_id, pre.tuple.id
+            ),
+            Operation::Commit(t) => format!("lsn={} COMMIT txn={}", r.lsn.0, t.id_num()),
+            Operation::Rollback(t) => format!("lsn={} ABORT  txn={}", r.lsn.0, t.id_num()),
+            Operation::Purge { txn, table_id, key } => format!(
+                "lsn={} PURGE  txn={} table={} key={}",
+                r.lsn.0,
+                txn.id_num(),
+                table_id,
+                key
+            ),
+            Operation::Sequence { name, high_water, dropped } => format!(
+                "lsn={} SEQ    {name} {}",
+                r.lsn.0,
+                if *dropped { "dropped".to_string() } else { format!("high_water={high_water}") }
+            ),
+        };
+        out.push(line);
+        consumed += 1;
+    }
+    out.push(format!(
+        "{consumed} record(s); {} byte(s) of record data; {} trailing byte(s) not part of a complete record",
+        body.len(),
+        trailing_unscanned_bytes(body)
+    ));
+    out
+}
+
+// How many bytes at the end of `body` were NOT consumed as complete, valid
+// frames — the torn tail, if any. Re-walks the frames the same way scan_log
+// does, stopping where it would.
+fn trailing_unscanned_bytes(body: &[u8]) -> usize {
+    let mut pos = 0usize;
+    loop {
+        if body.len() - pos < FRAME_HEADER_LEN {
+            break;
+        }
+        let len = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+        let checksum = u32::from_le_bytes(body[pos + 4..pos + 8].try_into().unwrap());
+        let payload_start = pos + FRAME_HEADER_LEN;
+        if body.len() - payload_start < len {
+            break;
+        }
+        if fnv1a_32(&body[payload_start..payload_start + len]) != checksum {
+            break;
+        }
+        pos = payload_start + len;
+    }
+    body.len() - pos
+}
+
 // ---------------------------------------------------------------------------
 // Unified operation / log record (T4_S2_WAL_DESIGN.md §4-5)
 // ---------------------------------------------------------------------------
@@ -392,14 +472,58 @@ pub(crate) struct LogRecord {
 }
 
 /// Channel message to the single log runner thread. Only `Record` variants
-/// are ever framed/written to disk — `ShutDown`/`Checkpoint` are pure
-/// in-memory control signals, exactly as they were under the old split
-/// redo/undo design.
+/// are ever framed/written to disk; the rest are control signals.
 #[derive(Debug, Clone)]
 pub(crate) enum LogMsg {
     Record(LogRecord),
     ShutDown,
-    Checkpoint(u128),
+    /// Reply once everything queued before this message is durable.
+    Sync(Sender<()>),
+    /// Phase 6: start a new segment, then delete every older segment whose
+    /// highest LSN is below `floor` (see `Db::checkpoint`).
+    Roll {
+        floor: u64,
+        reply: Sender<Result<(), StoreError>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// WAL segments (TXN_SIMPLIFICATION_PLAN.md phase 6)
+// ---------------------------------------------------------------------------
+
+/// One WAL segment file, `<name>.wal.<n>`. `max_lsn` is the highest LSN
+/// appended to it (0 for none) — the only fact segment deletion needs.
+#[derive(Debug, Clone)]
+pub(crate) struct Segment {
+    pub(crate) n: u64,
+    pub(crate) path: String,
+    pub(crate) max_lsn: u64,
+    /// File size, for the retained-bytes accounting (phase 7's cap).
+    pub(crate) bytes: u64,
+}
+
+pub(crate) fn segment_prefix(name: &str) -> String {
+    format!("{name}.wal.")
+}
+
+pub(crate) fn segment_path(name: &str, n: u64) -> String {
+    format!("{name}.wal.{n}")
+}
+
+pub(crate) fn segment_number(prefix: &str, path: &str) -> Option<u64> {
+    path.strip_prefix(prefix)?.parse().ok()
+}
+
+/// The database's segments as `handle`'s namespace lists them, oldest first.
+pub(crate) fn list_segments<F: DBFile>(handle: &F, name: &str) -> Result<Vec<(u64, String)>, StoreError> {
+    let prefix = segment_prefix(name);
+    let mut segs: Vec<(u64, String)> = handle
+        .list_siblings(&prefix)?
+        .into_iter()
+        .filter_map(|p| segment_number(&prefix, &p).map(|n| (n, p)))
+        .collect();
+    segs.sort();
+    Ok(segs)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -408,39 +532,48 @@ pub(crate) enum Operation {
         txn: TransactionId,
         post: Record,
     },
-    // `pre: None` marks a "redo-only" Mod — logged so replay reconstructs
-    // this write, but contributing nothing to undo replay. The one case
-    // this arises: a transaction revising a row it inserted itself within
-    // the SAME transaction (see `Db::update`'s `build` closure) — the
-    // original `Add`'s own undo already fully reverts the row (by removing
-    // it), so a second, per-update pre-image would be not just redundant
-    // but actively WRONG to replay during rollback: reverting it would
-    // re-materialize a row the Add's own revert is also removing in the
-    // same pass. `pre: Some(_)` is the common case (an ordinary update to
-    // an already-committed row) and always contributes to undo replay.
+    /// `pre` is always the version this write replaced — including a
+    /// transaction's own earlier version (phase 3: undo replays in reverse
+    /// LSN order, so an own-chain restores step by step), and a visible
+    /// tombstone that an insert brought back to life.
     Mod {
         txn: TransactionId,
-        pre: Option<Record>,
+        pre: Record,
         post: Record,
     },
-    // Unlike Mod, Del's `pre` is never skipped, even for the analogous
-    // own-insert-then-remove case — STORE_AUDIT.md T9's follow-up finding:
-    // `Db::commit`'s tombstone-reclaim pass finds rows to physically clean
-    // up by scanning for `Operation::Del` records specifically, not by
-    // inspecting the tuple's own `pre_lsn` — so skipping this log entry
-    // permanently orphans the index entry.
+    /// Redo re-tombstones the row in place (never a physical removal —
+    /// that is `Purge`'s job), so a later record in the same log suffix
+    /// that builds on the tombstone still finds it.
     Del {
         txn: TransactionId,
         pre: Record,
     },
-    Commit(TransactionId, u128),
-    Rollback(TransactionId, u128),
+    Commit(TransactionId),
+    Rollback(TransactionId),
+    // TXN_SIMPLIFICATION_PLAN.md phase 1 (§3.11 of the proposal): a named
+    // sequence's chunk high-water mark, its creation (`high_water` = start),
+    // or its removal (`dropped`). Not transactional.
+    Sequence {
+        name: String,
+        high_water: u64,
+        dropped: bool,
+    },
+    /// Phase 3: vacuum physically removed the tombstone row for `key` (and
+    /// its index entry) that `txn` committed. Logged before the removal so
+    /// a crash mid-purge (or a checkpoint that caught half of it) replays
+    /// to a consistent state: redo removes the row if it is still that
+    /// transaction's tombstone, and removes a dangling index entry either
+    /// way.
+    Purge {
+        txn: TransactionId,
+        table_id: TableIdType,
+        key: DBIdType,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Record {
     pub(crate) table_id: TableIdType,
-    pub(crate) timestamp: u128,
     pub(crate) tuple: Tuple,
     pub(crate) data_page: Option<PageId>,
 }
@@ -454,7 +587,6 @@ impl Record {
         Self {
             table_id,
             tuple,
-            timestamp: timestamp(),
             data_page,
         }
     }
@@ -466,11 +598,11 @@ impl Operation {
     }
 
     pub(crate) fn new_commit(tx_id: TransactionId) -> Self {
-        Self::Commit(tx_id, timestamp())
+        Self::Commit(tx_id)
     }
 
     pub(crate) fn new_rollback(tx_id: TransactionId) -> Self {
-        Self::Rollback(tx_id, timestamp())
+        Self::Rollback(tx_id)
     }
 }
 
@@ -482,27 +614,16 @@ impl Operation {
 pub(crate) struct Logger {
     log_handle: Option<JoinHandle<Result<(), StoreError>>>,
     log_tx: Option<Sender<LogMsg>>,
-    // Global, keyed by LSN — replaces the old per-transaction `Vec<Operation>`
-    // (and its positional `UndoId` index, which wrapped at 65,536 entries;
-    // STORE_AUDIT.md T10). An LSN is minted once, globally, by
-    // `LsnClock::next_lsn`, and never reused within a session, so a lookup
-    // by LSN can never alias a different transaction's — or a different
-    // row's — entry the way a wrapped positional index could.
-    records: ShardedMap<LsnId, Operation>,
-    // Which LSNs belong to which transaction — for revert (rollback replays
-    // exactly its own txn's ops) and for cleanup (discarding a finished
-    // txn's records means removing its LSNs from both maps).
-    by_txn: ShardedMap<TransactionId, Vec<LsnId>>,
-    // Committed transactions whose undo trail can't be discarded YET —
-    // mirrors TransactionManager's aborting/drain_aborting pattern: don't
-    // clean up immediately if doing so could pull a still-open reader's
-    // snapshot out from under it, park the obligation and let a later,
-    // opportunistic drain (Db::begin, alongside drain_aborting) finish the
-    // job once every transaction that captured this one in its snapshot
-    // has itself finished. See Db::commit's discard_or_defer_undo call site
-    // and drain_ready_undo_discards's own comment for the full mechanism.
-    pending_undo_discards: RwLock<Vec<(TransactionId, HashSet<TransactionId>)>>,
     clock: Arc<LsnClock>,
+    // Bytes the runner has appended to the current segment — what the
+    // maintenance thread reads to decide when to checkpoint (and roll).
+    segment_bytes: Arc<AtomicU64>,
+    // Phase 6: how many segments exist (retained + current) and the current
+    // segment's number, kept by the runner for stats and for close().
+    segment_count: Arc<AtomicUsize>,
+    current_segment: Arc<AtomicU64>,
+    // Bytes in every segment on disk (retained + current).
+    retained_bytes: Arc<AtomicU64>,
 }
 
 impl Logger {
@@ -511,11 +632,24 @@ impl Logger {
             ..Default::default()
         }
     }
+
+    /// A logger sharing an existing clock — what production does via
+    /// `Db::setup_needed_modules` (buffer, logger, and transaction manager
+    /// all read one clock) and what test fixtures must do too: a page
+    /// buffer gating flushes on a clock nobody else advances defers every
+    /// stamped page forever.
+    pub(crate) fn with_clock(clock: Arc<LsnClock>) -> Self {
+        Self {
+            clock,
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn new_with_lsn(lsn: LsnId) -> Self {
         Self {
             clock: Arc::new(LsnClock {
                 counter: AtomicU64::new(lsn.0 + 1),
-                last_written: AtomicU64::new(u64::MAX),
+                last_written: AtomicU64::new(0),
                 durable_mutex: std::sync::Mutex::new(()),
                 durable_condvar: std::sync::Condvar::new(),
             }),
@@ -523,86 +657,104 @@ impl Logger {
         }
     }
 
-    /// `log_header_bytes`: the exact bytes `Db::create_core_db`/`open_using`
-    /// already wrote-or-validated at the front of `file` — handed to the
-    /// runner so it can restore them verbatim after every checkpoint
-    /// truncate (see `log_runner`'s `Checkpoint` arm).
+    /// Starts the runner on `file`, the open handle to the `current`
+    /// segment, with `older` the retained segments before it (oldest
+    /// first). `log_header_bytes` is the exact header every segment starts
+    /// with, written to each new one on roll.
     pub(crate) fn set_db(
         &mut self,
         file: impl DBFile + 'static,
+        name: String,
+        current: Segment,
+        older: Vec<Segment>,
         log_header_bytes: Vec<u8>,
     ) -> Result<(), StoreError> {
         // Wide enough that group commit (see log_runner) has something real
-        // to batch under concurrent load, instead of bounded(1)'s "at most
-        // one message ever queued" — which structurally prevented batching,
-        // since a sender blocks until the runner dequeues the previous
-        // message before a second one can even land in the channel. This
-        // does trade away bounded(1)'s "near-synchronous" property (log()
-        // returning was previously a rough proxy for "the previous record
-        // is durable") — tests that need an actual durability guarantee use
-        // the explicit wait_for_durable_logs poll helper instead of relying
-        // on that timing coincidence.
+        // to batch under concurrent load.
         const LOG_CHANNEL_CAPACITY: usize = 256;
         let (tx, rx) = bounded(LOG_CHANNEL_CAPACITY);
         self.log_tx = Some(tx);
-
+        self.segment_count
+            .store(older.len() + 1, std::sync::atomic::Ordering::Relaxed);
+        self.current_segment
+            .store(current.n, std::sync::atomic::Ordering::Relaxed);
+        self.segment_bytes
+            .store(current.bytes, std::sync::atomic::Ordering::Relaxed);
+        let state = WalState {
+            file,
+            name,
+            current,
+            older,
+            header_bytes: log_header_bytes,
+            segment_bytes: self.segment_bytes.clone(),
+            segment_count: self.segment_count.clone(),
+            current_segment: self.current_segment.clone(),
+            retained_bytes: self.retained_bytes.clone(),
+        };
         let clock = self.clock.clone();
-        self.log_handle = Some(thread::spawn(move || {
-            log_runner(file, rx, clock, log_header_bytes)
-        }));
+        self.log_handle = Some(thread::spawn(move || log_runner(state, rx, clock)));
         Ok(())
     }
 
-    /// Shared handle to this database's LSN clock, for the `PageBuffer` (and
-    /// its writer thread) that stamp/compare page LSNs against the same
-    /// watermark.
+    /// Test fixture: a runner over one in-memory segment.
+    #[cfg(test)]
+    pub(crate) fn set_db_for_test(&mut self, file: impl DBFile + 'static) -> Result<(), StoreError> {
+        self.set_db(
+            file,
+            "test".into(),
+            Segment {
+                n: 1,
+                path: "test.wal.1".into(),
+                max_lsn: 0,
+                bytes: 0,
+            },
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Shared handle to this database's LSN clock.
     pub(crate) fn clock(&self) -> Arc<LsnClock> {
         self.clock.clone()
     }
 
-    /// Mints a fresh LSN without logging anything yet. `Db::update`/
-    /// `Db::remove`'s `build` closures call this to stamp the value onto a
-    /// tuple's own `pre_lsn` field BEFORE the corresponding record is
-    /// actually logged (which happens later, in `before_write`, still
-    /// before the tuple is physically written into the tree) — the tuple's
-    /// `pre_lsn` and the record `log()` is given afterward must be the
-    /// SAME lsn, which is why minting and logging are split into two steps
-    /// instead of one.
+    /// Bytes appended to the current segment.
+    pub(crate) fn segment_bytes(&self) -> u64 {
+        self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Segments on disk: the retained ones plus the current one.
+    pub(crate) fn segments(&self) -> usize {
+        self.segment_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn current_segment(&self) -> u64 {
+        self.current_segment
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Bytes across every segment on disk — what a long-lived transaction
+    /// costs (phase 7's cap).
+    pub(crate) fn retained_wal_bytes(&self) -> u64 {
+        self.retained_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Mints a fresh LSN without logging anything yet — the write path mints
+    /// before mutating (STORE_AUDIT.md T2) and logs under the same value.
     pub(crate) fn next_lsn(&self) -> LsnId {
         self.clock.next_lsn()
     }
 
-    /// STORE_AUDIT.md T1: blocks until `lsn` is durable — see
-    /// `LsnClock::wait_until_durable`'s own comment. `Db::commit` calls this
-    /// on the lsn its own Commit record was logged under, right before
-    /// finishing the commit, so a caller is never told a commit succeeded
-    /// before it's actually fsynced.
+    /// STORE_AUDIT.md T1: blocks until `lsn` is durable.
     pub(crate) fn wait_until_durable(&self, lsn: LsnId) {
         self.clock.wait_until_durable(lsn)
     }
 
-    /// Records `op` under the given (already-minted — see `next_lsn`) lsn:
-    /// tracks it in-memory for Add/Mod/Del (so a later rollback or MVCC walk
-    /// can find it), handles Rollback's immediate-discard special case, and
-    /// enqueues the framed record for the log runner thread. Replaces the
-    /// old split `log_redo`+`log_undo` pair with ONE call per operation.
+    /// Append `op` under the given (already-minted) lsn. The WAL is
+    /// append-only: it keeps no in-memory state (phase 3 — versions live in
+    /// `VersionStore`).
     pub(crate) fn log(&self, lsn: LsnId, op: Operation) -> Result<(), StoreError> {
-        match &op {
-            Operation::Add { txn, .. } | Operation::Mod { txn, .. } | Operation::Del { txn, .. } => {
-                self.records.insert(lsn, op.clone());
-                self.by_txn.with_entry_or_default(txn.clone(), |v| v.push(lsn));
-            }
-            // Rollback physically reverts the transaction's writes before
-            // this op is even logged (see Db::rollback_by_id) — nothing is
-            // ever left "owned" by a rolled-back transaction for a
-            // concurrent reader to need to walk back through, so its undo
-            // trail is always safe to drop immediately, unlike Commit's
-            // (see discard_or_defer_undo).
-            Operation::Rollback(id, _) => {
-                self.discard_txn_records(id);
-            }
-            _ => {}
-        }
         if let Some(tx) = &self.log_tx {
             tx.send(LogMsg::Record(LogRecord { lsn, operation: op }))
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
@@ -610,106 +762,34 @@ impl Logger {
         Ok(())
     }
 
-    /// Convenience for call sites that don't need the lsn ahead of time
-    /// (insert's fresh Add, and the Commit/Rollback markers) — mints and
-    /// logs in one step, returning the lsn assigned.
+    /// Mint and log in one step, returning the lsn assigned.
     pub(crate) fn log_new(&self, op: Operation) -> Result<LsnId, StoreError> {
         let lsn = self.next_lsn();
         self.log(lsn, op)?;
         Ok(lsn)
     }
 
-    fn discard_txn_records(&self, id: &TransactionId) {
-        if let Some(lsns) = self.by_txn.remove(id) {
-            for lsn in lsns {
-                self.records.remove(&lsn);
-            }
-        }
-    }
-
-    /// Drop a transaction's in-memory undo records. Called after its undo has
-    /// been fully replayed (abort reclamation) — a dropped/aborted txn logs no
-    /// Commit/Rollback op, so its records aren't cleaned by log()'s Rollback
-    /// branch above.
-    pub(crate) fn discard_undo(&self, id: &TransactionId) {
-        self.discard_txn_records(id);
-    }
-
-    /// Called by Db::commit right after logging a Commit op: decides
-    /// whether `id`'s undo trail can be dropped now or must wait. Mirrors
-    /// TransactionManager's aborting/drain_aborting pattern — `others` is
-    /// every OTHER transaction that's still active at this exact commit
-    /// point (captured once, here, not re-checked later): any one of them
-    /// might have `id` in its own snapshot (captured at ITS begin()), which
-    /// means `id`'s pre-commit state must stay reachable via undo-walk for
-    /// as long as that reader could still ask for it. If none are active,
-    /// this is the common (low-concurrency) case and the old immediate-
-    /// discard behavior applies unchanged.
-    pub(crate) fn discard_or_defer_undo(&self, id: TransactionId, others: HashSet<TransactionId>) {
-        if others.is_empty() {
-            self.discard_txn_records(&id);
-        } else {
-            self.pending_undo_discards.write().push((id, others));
-        }
-    }
-
-    /// Opportunistic maintenance for deferred undo discards (see
-    /// discard_or_defer_undo) — called alongside drain_aborting, e.g. at
-    /// Db::begin(). For each committed transaction whose discard was
-    /// deferred, drops from its waiter set any transaction that has since
-    /// finished (committed or aborted, so it's no longer in
-    /// `currently_active`); once a transaction's waiter set is empty —
-    /// nothing that could still need its pre-commit state remains active —
-    /// its undo trail is actually removed.
-    pub(crate) fn drain_ready_undo_discards(&self, currently_active: &HashSet<TransactionId>) {
-        let mut pending = self.pending_undo_discards.write();
-        if pending.is_empty() {
-            return;
-        }
-        let mut still_pending = Vec::with_capacity(pending.len());
-        for (id, waiters) in pending.drain(..) {
-            let remaining: HashSet<TransactionId> = waiters
-                .into_iter()
-                .filter(|w| currently_active.contains(w))
-                .collect();
-            if remaining.is_empty() {
-                self.discard_txn_records(&id);
-            } else {
-                still_pending.push((id, remaining));
-            }
-        }
-        *pending = still_pending;
-    }
-
-    pub(crate) fn get_undo_operations(
-        &self,
-        id: TransactionId,
-    ) -> Result<Vec<Operation>, StoreError> {
-        // A transaction that never wrote anything (e.g. read-only — only
-        // `find()` calls) has no entry here at all. That's not an error: it
-        // just means there's nothing to undo/cleanup. Db::commit/Db::rollback
-        // rely on this returning `Ok` so they can reach their final
-        // tx_mgr.commit/rollback call and actually deactivate the
-        // transaction — see Transaction::into_id.
-        let Some(lsns) = self.by_txn.get(&id) else {
-            return Ok(Vec::new());
-        };
-        Ok(lsns.iter().filter_map(|l| self.records.get(l)).collect())
-    }
-
-    /// Resolves a tuple's `pre_lsn` pointer to the operation that recorded
-    /// its pre-image — replaces the old, per-transaction-positional
-    /// `find_undo_tuple(TransactionId, UndoId)`. No `TransactionId` needed
-    /// at all: the record already carries its own txn, and an LSN is
-    /// globally unique so there's nothing to disambiguate by transaction.
-    pub(crate) fn find_record(&self, lsn: LsnId) -> Option<Operation> {
-        self.records.get(&lsn)
-    }
-
-    pub(crate) fn checkpoint(&self, ts: u128) -> Result<(), StoreError> {
+    /// Blocks until every record queued before this call is durable.
+    pub(crate) fn sync(&self) -> Result<(), StoreError> {
         if let Some(tx) = &self.log_tx {
-            tx.send(LogMsg::Checkpoint(ts))
+            let (reply, done) = bounded(1);
+            tx.send(LogMsg::Sync(reply))
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            done.recv()
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Phase 6: starts a new segment and deletes every older one whose
+    /// highest LSN is below `floor`. Blocks until done.
+    pub(crate) fn roll(&self, floor: u64) -> Result<(), StoreError> {
+        if let Some(tx) = &self.log_tx {
+            let (reply, done) = bounded(1);
+            tx.send(LogMsg::Roll { floor, reply })
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            done.recv()
+                .map_err(|e| StoreError::UnknownError(e.to_string()))??;
         }
         Ok(())
     }
@@ -775,13 +855,81 @@ const LOG_BATCH_LINGER: Duration = Duration::from_micros(200);
 /// it mid-`write_all`, handled by `scan_log`'s torn-tail rule on the next
 /// open. There is no longer a "redo landed, undo didn't" state to reach
 /// (STORE_AUDIT.md T4), because there's only one artifact.
-fn log_runner(
-    file: impl DBFile,
+/// Everything the runner owns about the segment files.
+struct WalState<F: DBFile> {
+    file: F,
+    name: String,
+    current: Segment,
+    older: Vec<Segment>,
+    header_bytes: Vec<u8>,
+    segment_bytes: Arc<AtomicU64>,
+    segment_count: Arc<AtomicUsize>,
+    current_segment: Arc<AtomicU64>,
+    retained_bytes: Arc<AtomicU64>,
+}
+
+impl<F: DBFile> WalState<F> {
+    fn publish_counts(&self) {
+        self.segment_count
+            .store(self.older.len() + 1, std::sync::atomic::Ordering::Relaxed);
+        self.current_segment
+            .store(self.current.n, std::sync::atomic::Ordering::Relaxed);
+        let older: u64 = self.older.iter().map(|s| s.bytes).sum();
+        self.retained_bytes.store(
+            older + self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Phase 6, steps 4 and 5 of `Db::checkpoint`: open `<name>.wal.<n+1>`
+    /// with a fresh header and make it current, then delete every older
+    /// segment whose highest LSN is below `floor`. The new segment is
+    /// durable before the old one stops being current, so a crash between
+    /// the two leaves at worst an extra empty segment.
+    fn roll(&mut self, floor: u64) -> Result<(), StoreError> {
+        let next = Segment {
+            n: self.current.n + 1,
+            path: segment_path(&self.name, self.current.n + 1),
+            max_lsn: 0,
+            bytes: self.header_bytes.len() as u64,
+        };
+        let opts = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .clone();
+        let mut f = self.file.open_sibling(&next.path, opts)?;
+        f.write_all(&self.header_bytes)?;
+        f.do_sync()?;
+        let mut previous = std::mem::replace(&mut self.current, next);
+        previous.bytes = self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        self.file = f;
+        self.older.push(previous);
+        self.segment_bytes
+            .store(self.current.bytes, std::sync::atomic::Ordering::Relaxed);
+        // One rule: a segment goes when nothing at or above the floor is in
+        // it. Oldest first, so a failure mid-way leaves a contiguous suffix.
+        let mut keep = Vec::with_capacity(self.older.len());
+        for seg in self.older.drain(..) {
+            if seg.max_lsn < floor {
+                self.file.remove_sibling(&seg.path)?;
+            } else {
+                keep.push(seg);
+            }
+        }
+        self.older = keep;
+        self.publish_counts();
+        Ok(())
+    }
+}
+
+fn log_runner<F: DBFile>(
+    state: WalState<F>,
     recv: Receiver<LogMsg>,
     clock: Arc<LsnClock>,
-    log_header_bytes: Vec<u8>,
 ) -> Result<(), StoreError> {
-    let mut file = file;
+    let mut st = state;
+    st.publish_counts();
     // STORE_AUDIT.md P10: whether the PREVIOUS batch actually had more than
     // one record in it — i.e. whether there was real concurrent load to
     // batch last time around. `LOG_BATCH_LINGER` exists purely to give
@@ -827,7 +975,7 @@ fn log_runner(
                 }
             };
             match msg {
-                LogMsg::ShutDown | LogMsg::Checkpoint(_) => {
+                LogMsg::ShutDown | LogMsg::Sync(_) | LogMsg::Roll { .. } => {
                     // Stop batching here — flush what's accumulated so far
                     // (preserving order: everything queued strictly before
                     // this message lands on disk first), then handle this
@@ -847,33 +995,29 @@ fn log_runner(
         }
         last_batch_had_concurrency = batch_record_count > 1;
         if !batch.is_empty() {
-            file.seek(SeekFrom::End(0))?;
-            file.write_all(&batch)?;
-            file.do_sync()?;
+            st.file.seek(SeekFrom::End(0))?;
+            st.file.write_all(&batch)?;
+            st.file.do_sync()?;
+            st.segment_bytes
+                .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // Only after the whole batch is durable — mark_written signals
             // "everything up to this lsn is safe to flush its page", which
             // must not be true before the bytes actually landed.
             if let Some(lsn) = highest_lsn {
+                st.current.max_lsn = st.current.max_lsn.max(lsn.0);
                 clock.mark_written(lsn);
             }
+            st.publish_counts();
         }
         match special {
             Some(LogMsg::ShutDown) => break,
-            Some(LogMsg::Checkpoint(_ts)) => {
-                // Truncating to zero would also erase the LogHeader written
-                // at file creation/validated at open — restore it
-                // immediately so the file always starts with a valid
-                // header, the same invariant Db::open's validation depends
-                // on (T4_S2_WAL_DESIGN.md §2). truncate() resets the file's
-                // LENGTH but not its seek cursor — write_all without an
-                // explicit seek first would resume writing wherever the
-                // cursor was left (the old end-of-file, now past the
-                // truncated length), padding the gap with zeros instead of
-                // landing the header at the actual start of the file.
-                file.truncate()?;
-                file.seek(SeekFrom::Start(0))?;
-                file.write_all(&log_header_bytes)?;
-                file.do_sync()?;
+            Some(LogMsg::Sync(reply)) => {
+                // Everything queued before this message went out in the
+                // batches above, each synced before its LSNs were marked.
+                let _ = reply.send(());
+            }
+            Some(LogMsg::Roll { floor, reply }) => {
+                let _ = reply.send(st.roll(floor));
             }
             _ => {}
         }
@@ -936,32 +1080,16 @@ mod tests {
         let logger = Logger::new();
         let txn_id = TransactionId::from(10);
         let mut tuple = Tuple::new(1, b"hello");
-        tuple.set_txn_id(txn_id.clone());
+        tuple.set_txn_id(txn_id);
         let record = Record::new(0.into(), tuple, None);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_new(op).is_ok());
     }
 
     #[test]
-    fn test_log_undo_indexes_by_operation_txn_not_tuple_txn_id() {
-        // log() indexes by the Operation's own txn id, not record.tuple.txn_id.
-        // This matters because Mod/Del undo records deliberately carry a
-        // pre-image tuple tagged with a *different* (older, committed) txn_id
-        // than the operation being logged. A tuple with no txn_id at all (as
-        // here) must therefore still log successfully.
-        let logger = Logger::new();
-        let txn_id = TransactionId::from(10);
-        let tuple = Tuple::new(1, b"hello"); // txn_id not set
-        let record = Record::new(0.into(), tuple, None);
-        let op = Operation::new_add(txn_id.clone(), record);
-        assert!(logger.log_new(op).is_ok());
-        assert_eq!(logger.get_undo_operations(txn_id).unwrap().len(), 1);
-    }
-
-    #[test]
     fn test_logger_with_memfile_shutdown() {
         let mut logger = Logger::new();
-        logger.set_db(MemFile::new(), Vec::new()).unwrap();
+        logger.set_db_for_test(MemFile::new()).unwrap();
         let txn_id = TransactionId::from(99);
         let op = Operation::new_commit(txn_id);
         logger.log_new(op).unwrap();
@@ -971,10 +1099,10 @@ mod tests {
     #[test]
     fn test_logger_undo_add_with_db() {
         let mut logger = Logger::new();
-        logger.set_db(MemFile::new(), Vec::new()).unwrap();
+        logger.set_db_for_test(MemFile::new()).unwrap();
         let txn_id = TransactionId::from(5);
         let mut tuple = Tuple::new(42, b"data");
-        tuple.set_txn_id(txn_id.clone());
+        tuple.set_txn_id(txn_id);
         let record = Record::new(0.into(), tuple, None);
         let op = Operation::new_add(txn_id, record);
         assert!(logger.log_new(op).is_ok());
@@ -990,7 +1118,7 @@ mod tests {
     #[test]
     fn test_audit_p10_an_isolated_write_skips_the_group_commit_linger() {
         let mut logger = Logger::new();
-        logger.set_db(MemFile::new(), Vec::new()).unwrap();
+        logger.set_db_for_test(MemFile::new()).unwrap();
 
         // First write: log_runner starts assuming concurrency (see
         // last_batch_had_concurrency's own comment in log_runner) so this
@@ -1006,12 +1134,20 @@ mod tests {
         // had exactly one record (no concurrency), this one should skip
         // the linger entirely instead of paying the full
         // super::LOG_BATCH_LINGER unconditionally.
-        let start = std::time::Instant::now();
-        let lsn2 = logger
-            .log_new(Operation::new_commit(TransactionId::from(2)))
-            .unwrap();
-        logger.wait_until_durable(lsn2);
-        let elapsed = start.elapsed();
+        // Best of several isolated writes: this is a magnitude check, and a
+        // single sample on a loaded machine (the whole suite runs in
+        // parallel) can be preempted for longer than the linger itself.
+        // The property under test — no linger is charged — makes the
+        // minimum the meaningful statistic.
+        let mut elapsed = std::time::Duration::MAX;
+        for i in 0..10u64 {
+            let start = std::time::Instant::now();
+            let lsn2 = logger
+                .log_new(Operation::new_commit(TransactionId::from(2 + i)))
+                .unwrap();
+            logger.wait_until_durable(lsn2);
+            elapsed = elapsed.min(start.elapsed());
+        }
         assert!(
             elapsed < super::LOG_BATCH_LINGER,
             "an isolated write (no concurrent sender) should skip the group-commit \
@@ -1034,10 +1170,10 @@ mod tests {
         let t = Tuple::new_with(
             crate::tuple::DBIdType::Int(1),
             b"hello",
-            Some(txn.clone()),
+            Some(txn),
             Some(pre_lsn),
         );
-        assert_eq!(t.txn_id, Some(txn.clone()));
+        assert_eq!(t.txn_id, Some(txn));
         assert_eq!(t.pre_lsn, Some(pre_lsn));
         assert_eq!(t.data.to_vec(), b"hello");
         let b = t.to();

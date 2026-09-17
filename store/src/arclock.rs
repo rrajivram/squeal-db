@@ -32,6 +32,51 @@ use parking_lot::{ArcReentrantMutexGuard, RawThreadId, ReentrantMutex, RwLock};
 pub struct ArcLockGuard<T: Sized + Clone + Debug> {
     value: T,
     guard: ArcReentrantMutexGuard<parking_lot::RawMutex, RawThreadId, ()>,
+    holder: Arc<Holder>,
+}
+
+/// Who holds a key right now, for the timeout diagnostic
+/// (TXN_SIMPLIFICATION_PLAN.md phase 5). Only the holding thread touches
+/// `depth`; the description is read by a timed-out waiter.
+#[derive(Debug, Default)]
+pub struct Holder {
+    depth: std::sync::atomic::AtomicU32,
+    since: parking_lot::Mutex<Option<(String, std::time::Instant)>>,
+}
+
+impl Holder {
+    fn acquired(&self) {
+        if self
+            .depth
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            == 0
+        {
+            let t = thread::current();
+            *self.since.lock() = Some((
+                format!("{:?} {}", t.id(), t.name().unwrap_or("")),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+
+    fn released(&self) {
+        if self
+            .depth
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            *self.since.lock() = None;
+        }
+    }
+
+    /// "held by <thread> for <duration>" or "not held" (a race with a
+    /// release is fine: this is a diagnostic).
+    pub fn describe(&self) -> String {
+        match &*self.since.lock() {
+            Some((who, since)) => format!("held by {who} for {:?}", since.elapsed()),
+            None => "not held (released while this waiter timed out)".to_string(),
+        }
+    }
 }
 
 impl<T> Deref for ArcLockGuard<T>
@@ -61,12 +106,20 @@ where
     T: Clone + Debug,
 {
     fn drop(&mut self) {
+        self.holder.released();
         trace!(
             "Thread {:?}: Dropped lock on {:?}",
             thread::current().id(),
             self.value
         );
     }
+}
+
+/// What a lock attempt can come back with.
+pub enum LockAttempt<T: Sized + Clone + Debug> {
+    Acquired(ArcLockGuard<T>),
+    /// Waited out the timeout; carries the holder's description.
+    TimedOut(String),
 }
 
 // STORE_AUDIT.md P2 follow-up: sharded the same way `buffer.rs`'s
@@ -92,11 +145,14 @@ where
 // own mutex across shards.
 const SHARD_COUNT: usize = 16;
 
+/// One shard: key → (its reentrant mutex, who holds it and since when).
+type Shard<T> = RwLock<HashMap<T, (Arc<ReentrantMutex<()>>, Arc<Holder>)>>;
+
 pub struct ArcLock<T>
 where
     T: Sized + Clone + Debug,
 {
-    shards: Arc<Vec<RwLock<HashMap<T, Arc<ReentrantMutex<()>>>>>>,
+    shards: Arc<Vec<Shard<T>>>,
 }
 
 impl<T> ArcLock<T>
@@ -109,7 +165,7 @@ where
         })
     }
 
-    fn shard_for(&self, val: &T) -> &RwLock<HashMap<T, Arc<ReentrantMutex<()>>>> {
+    fn shard_for(&self, val: &T) -> &Shard<T> {
         use std::hash::Hasher;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         val.hash(&mut hasher);
@@ -124,7 +180,7 @@ where
     // on one global write lock" problem: two threads locking two different,
     // already-seen keys now don't contend on each other at all, whether or
     // not they happen to land in the same shard.
-    fn get_or_create(&self, val: &T) -> Arc<ReentrantMutex<()>> {
+    fn get_or_create(&self, val: &T) -> (Arc<ReentrantMutex<()>>, Arc<Holder>) {
         let shard = self.shard_for(val);
         if let Some(existing) = shard.read().get(val) {
             return existing.clone();
@@ -132,7 +188,7 @@ where
         shard
             .write()
             .entry(val.clone())
-            .or_insert_with(|| Arc::new(ReentrantMutex::new(())))
+            .or_insert_with(|| (Arc::new(ReentrantMutex::new(())), Arc::new(Holder::default())))
             .clone()
     }
 
@@ -144,14 +200,29 @@ where
     // Honored for real now: a per-key ReentrantMutex's `try_lock_arc_for`
     // does a genuine bounded wait.
     pub fn lock(self: &Arc<Self>, val: T, timeout: u64) -> Option<ArcLockGuard<T>> {
-        let mutex = self.get_or_create(&val);
-        let guard = mutex.try_lock_arc_for(Duration::from_micros(timeout))?;
+        match self.lock_for(val, Duration::from_micros(timeout)) {
+            LockAttempt::Acquired(g) => Some(g),
+            LockAttempt::TimedOut(_) => None,
+        }
+    }
+
+    /// Like `lock`, but a timeout comes back with who held the key.
+    pub fn lock_for(self: &Arc<Self>, val: T, timeout: Duration) -> LockAttempt<T> {
+        let (mutex, holder) = self.get_or_create(&val);
+        let Some(guard) = mutex.try_lock_arc_for(timeout) else {
+            return LockAttempt::TimedOut(holder.describe());
+        };
+        holder.acquired();
         trace!(
             "Thread:{:?} : Locked on {:?}.",
             thread::current().id(),
             val
         );
-        Some(ArcLockGuard { value: val, guard })
+        LockAttempt::Acquired(ArcLockGuard {
+            value: val,
+            guard,
+            holder,
+        })
     }
 
     // Prunes map entries for keys nobody currently holds or is waiting on.
@@ -168,7 +239,7 @@ where
             let mut map = shard.write();
             let unused = map
                 .iter()
-                .filter(|&(_, v)| Arc::strong_count(v) == 1)
+                .filter(|&(_, (m, _))| Arc::strong_count(m) == 1)
                 .map(|(k, _)| k.clone())
                 .collect::<Vec<_>>();
             for u in unused {

@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::{
@@ -46,7 +45,7 @@ impl ScanTxn {
     fn id(&self) -> TransactionId {
         match self {
             ScanTxn::Owned(t) => t.id(),
-            ScanTxn::Borrowed(id) => id.clone(),
+            ScanTxn::Borrowed(id) => *id,
         }
     }
 }
@@ -57,14 +56,6 @@ pub struct TableCursor<F: DBFile + 'static> {
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: ScanTxn,
-    // STORE_AUDIT.md P7: resolved once at construction, not once per row.
-    // A reader's snapshot is captured at begin() and never changes for the
-    // rest of that transaction's life (see TransactionManager::begin's own
-    // comment) — the old code called Db::find_visible_to, which re-resolved
-    // AND cloned this same HashSet on every single row candidate, an M
-    // rows x N concurrent txns amount of allocation for a value that's
-    // identical on every call within one scan.
-    reader_snapshot: HashSet<TransactionId>,
 }
 
 pub struct RangeCursor<F: DBFile + 'static> {
@@ -83,8 +74,6 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
     done: bool,
-    // See TableCursor's identically-named field's own comment.
-    reader_snapshot: HashSet<TransactionId>,
 }
 
 impl<F: DBFile> TableCursor<F>
@@ -105,32 +94,37 @@ where
             .next_data_page(None)?
             .ok_or(StoreError::UnknownError("No data page found".into()))?;
         let current_iter = current_page.iter();
-        let reader_snapshot = db.snapshot_of(&transaction.id());
         Ok(Self {
             db,
             table,
             current_iter,
             current_page,
             transaction,
-            reader_snapshot,
         })
     }
 
     fn next_tuple(&mut self) -> Result<Option<Tuple>, StoreError> {
-        let n = self.current_iter.next();
-        if n.is_some() {
-            Ok(n)
-        } else {
+        // Loop, not a single step: a data page can be EMPTY (every row on it
+        // removed and reclaimed, or relocated away to the tail) while still
+        // sitting in the chain. Advancing exactly one page and returning
+        // whatever it yields ended the whole scan on the second consecutive
+        // empty page — a scan that returned zero rows from a table with
+        // hundreds, found by the crash harness's scan check
+        // (TXN_SIMPLIFICATION_PLAN.md phase 0).
+        loop {
+            if let Some(t) = self.current_iter.next() {
+                return Ok(Some(t));
+            }
             let new_page = self
                 .db
                 .table_by_id(self.table)?
                 .next_data_page(Some(Arc::clone(&self.current_page)))?;
-            if let Some(new_page) = new_page {
-                self.current_page = new_page;
-                self.current_iter = self.current_page.iter();
-                Ok(self.current_iter.next())
-            } else {
-                Ok(None)
+            match new_page {
+                Some(new_page) => {
+                    self.current_page = new_page;
+                    self.current_iter = self.current_page.iter();
+                }
+                None => return Ok(None),
             }
         }
     }
@@ -154,7 +148,6 @@ where
         // with KeyNotFound if `start` wasn't a real row).
         let current_leaf = db.table_by_id(table)?.find_leaf_page(&start)?;
         let current_iter = current_leaf.iter();
-        let reader_snapshot = db.snapshot_of(&transaction.id());
         Ok(Self {
             db,
             table,
@@ -164,7 +157,6 @@ where
             start,
             end,
             done: false,
-            reader_snapshot,
         })
     }
 
@@ -174,17 +166,19 @@ where
     // exhausted. Mirrors TableCursor::next_tuple's pattern, but over index
     // leaves instead of data pages.
     fn next_index_entry(&mut self, table: &BPlusTree<F>) -> Result<Option<Tuple>, StoreError> {
-        let n = self.current_iter.next();
-        if n.is_some() {
-            Ok(n)
-        } else {
-            let next_leaf = table.next_leaf_page(&self.current_leaf)?;
-            if let Some(next_leaf) = next_leaf {
-                self.current_leaf = next_leaf;
-                self.current_iter = self.current_leaf.iter();
-                Ok(self.current_iter.next())
-            } else {
-                Ok(None)
+        // Same loop as TableCursor::next_tuple, for the same reason: an
+        // index leaf whose every entry was removed is still in the leaf
+        // chain, and must be skipped rather than end the scan.
+        loop {
+            if let Some(t) = self.current_iter.next() {
+                return Ok(Some(t));
+            }
+            match table.next_leaf_page(&self.current_leaf)? {
+                Some(next_leaf) => {
+                    self.current_leaf = next_leaf;
+                    self.current_iter = self.current_leaf.iter();
+                }
+                None => return Ok(None),
             }
         }
     }
@@ -213,6 +207,8 @@ where
         }
         let table = self.db.table_by_id(self.table)?;
         let reader = self.transaction.id();
+        // See Db::find: a finished reader may not keep scanning.
+        self.db.require_active(&reader)?;
         loop {
             match self.next_index_entry(&table)? {
                 Some(entry) => {
@@ -239,10 +235,7 @@ where
                     let Some(tuple) = table.resolve_index_entry(&entry)? else {
                         continue;
                     };
-                    match self
-                        .db
-                        .find_visible_to(&tuple, &reader, &self.reader_snapshot)?
-                    {
+                    match self.db.find_visible_to(&tuple, &reader)? {
                         Some(committed) if !committed.is_tombstoned() => {
                             return Ok(Some(committed.into_owned()));
                         }
@@ -287,12 +280,11 @@ where
     //     it must be treated as absent, the same way Db::find does.
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
         let reader = self.transaction.id();
+        // See Db::find: a finished reader may not keep scanning.
+        self.db.require_active(&reader)?;
         loop {
             match self.next_tuple()? {
-                Some(t) => match self
-                    .db
-                    .find_visible_to(&t, &reader, &self.reader_snapshot)?
-                {
+                Some(t) => match self.db.find_visible_to(&t, &reader)? {
                     Some(committed) if !committed.is_tombstoned() => {
                         return Ok(Some(committed.into_owned()));
                     }
@@ -622,7 +614,7 @@ mod tests {
     // and leaking an active transaction with mem::forget) reproduces
     // exactly what's left behind once commit/reclaim's best-effort step
     // hasn't run yet — deterministically, without needing to race a
-    // second thread against retry_on_contention's timing.
+    // second thread's timing.
     #[test]
     fn test_scan_skips_tombstoned_and_uncommitted_rows() {
         let db = Db::<MemFile>::create("cursor_test.db").unwrap();
@@ -671,6 +663,38 @@ mod tests {
             vec![1, 3],
             "scan must skip the tombstoned key (2) and the uncommitted key (4)"
         );
+    }
+
+    // TXN_SIMPLIFICATION_PLAN.md phase 0: consecutive empty data pages in
+    // the chain (every row on them removed and reclaimed) used to end a
+    // table scan early. Small page so a handful of wide rows fill a page.
+    #[test]
+    fn test_table_scan_skips_consecutive_empty_data_pages() {
+        let db = Db::<MemFile>::create_with_page_size("scan_empty_pages", 4096).unwrap();
+        let tid = db.create_table("t".into()).unwrap();
+        let t = db.begin().unwrap();
+        for k in 0..60u64 {
+            db.insert(tid, Tuple::new(k, &[1u8; 300]), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        assert!(
+            db.page_count() > 6,
+            "expected several data pages, got page_count {}",
+            db.page_count()
+        );
+        // Remove the first 40 rows (they fill the first few pages in
+        // insertion order), commit, and let the next begin() reclaim them.
+        let t = db.begin().unwrap();
+        for k in 0..40u64 {
+            db.remove(tid, DBIdType::Int(k), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        drop(db.begin().unwrap());
+        let got = int_ids(&scan_all(&db, tid));
+        assert_eq!(got, (40..60u64).collect::<Vec<_>>());
+        // Range scans walk index leaves the same way.
+        let got = int_ids(&scan_range(&db, tid, DBIdType::Int(0), DBIdType::Int(100)));
+        assert_eq!(got, (40..60u64).collect::<Vec<_>>());
     }
 
     #[test]

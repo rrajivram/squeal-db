@@ -70,7 +70,7 @@ fn test_delete_clears_prior_state_for_that_name() {
 #[test]
 fn test_delete_also_clears_the_wal_sibling() {
     let name = "test_delete_also_clears_the_wal_sibling";
-    let wal = format!("{name}.wal");
+    let wal = format!("{name}.wal.1");
     NamedMemFile::delete(name);
 
     let mut f = open(&wal);

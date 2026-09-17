@@ -57,6 +57,8 @@ pub enum SchemaError {
     FieldNotFound(String),
     #[error("No schema selected on this connection")]
     NoSchemaSelected,
+    #[error("transaction aborted by the engine: {0}")]
+    SnapshotTooOld(String),
     #[error("A transaction is already active on this connection")]
     TransactionAlreadyActive,
     #[error("No active transaction on this connection")]
@@ -104,7 +106,6 @@ impl From<StoreError> for SchemaError {
             StoreError::BadRowNumber(_)
             | StoreError::PageCapacityError
             | StoreError::UnknownError(_)
-            | StoreError::UndoLogError(_)
             | StoreError::MissingKey(_)
             | StoreError::PageTransientlyInconsistent(_)
             | StoreError::UnknownPageContentKind(_)
@@ -117,7 +118,9 @@ impl From<StoreError> for SchemaError {
             | StoreError::LogCorruption(_)
             | StoreError::HeaderCorruption(_)
             | StoreError::Corruption(_)
-            | StoreError::LockContentionError => Self::InternalError(value),
+            | StoreError::LockTimeout(_)
+            | StoreError::LockOrderViolation(_)
+            | StoreError::EngineDegraded(_) => Self::InternalError(value),
             // Not internal — "this value is too big to fit in its
             // declared size" (a VARCHAR/BLOB literal longer than the
             // column's declared capacity, most commonly) is something
@@ -130,6 +133,7 @@ impl From<StoreError> for SchemaError {
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),
             StoreError::WriteConflict(dbid_type) => Self::WriteConflict(dbid_type),
+            StoreError::SnapshotTooOld(reason) => Self::SnapshotTooOld(reason),
             StoreError::WriteConflictTransactionAborted(dbid_type) => {
                 Self::WriteConflictTransactionAborted(dbid_type)
             }

@@ -51,6 +51,7 @@ where
     };
 
     let db: Arc<Db<F>> = Db::create(&db_name).expect("failed to create stress db");
+    db.set_lock_timeout(std::time::Duration::from_millis(cfg.lock_timeout_ms));
     let mut table_ids = Vec::with_capacity(cfg.tables);
     for i in 0..cfg.tables {
         table_ids.push(db.create_table(format!("stress_table_{i}")).unwrap());
@@ -95,6 +96,11 @@ where
     // sole owner) doesn't just fail with "still shared" — close() itself now
     // does the Arc::try_unwrap internally.
     drop(tables);
+    // Phase 5: a lock timeout is a bug in the engine, never a tunable, so the
+    // engine's own count must agree with the workers' and both must be zero.
+    let engine_stats = db.stats();
+    let engine_lock_timeouts = engine_stats.lock_timeouts;
+    let degraded = engine_stats.degraded.clone();
     println!("Calling close");
     db.close()
         .unwrap_or_else(|e| panic!("Db still has outstanding references after all workers joined: {e:?}"));
@@ -103,11 +109,27 @@ where
     }
 
     report::print_final_report(&cfg, &stats, &correctness);
-    correctness.passed() && !any_panicked
+    let isolation_ok = stats
+        .isolation_violations
+        .load(std::sync::atomic::Ordering::Relaxed)
+        == 0;
+    if !isolation_ok {
+        println!("RESULT: FAIL (repeatable-read violations on hot keys)");
+    }
+    let locks_ok = stats.lock_timeouts() == 0 && engine_lock_timeouts == 0 && degraded.is_none();
+    if !locks_ok {
+        println!(
+            "RESULT: FAIL (lock timeouts: workers={} engine={} degraded={:?})",
+            stats.lock_timeouts(),
+            engine_lock_timeouts,
+            degraded
+        );
+    }
+    correctness.passed() && !any_panicked && isolation_ok && locks_ok
 }
 
 fn verify_correctness<F>(
-    db: &Db<F>,
+    db: &Arc<Db<F>>,
     tables: &[TableIdType],
     cfg: &Config,
     stats: &Stats,

@@ -101,7 +101,6 @@ where
         shard.write().entry(key).or_insert_with(make).clone()
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
     }

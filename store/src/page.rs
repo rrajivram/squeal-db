@@ -2,10 +2,7 @@
  * Page is a logical construct. It does nbot care about actual disk page size ,  though it is bound by it. i.e. capacity =0
  * if HAS_Overflow is set, next_page will point to continuation. This contunation logic is fully handled by PageBuffer
  */
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU16, AtomicU64},
-};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
@@ -14,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::DBSizeType,
     error::StoreError,
-    logger::{LsnClock, LsnId},
+    logger::LsnId,
     pages::{
         PageTuple,
         anytuple::AnyTuplePage,
@@ -270,7 +267,6 @@ pub(crate) struct Page {
     // `set_dirty` stamps `lsn` from it (was a process-global before). `None` for
     // a page not yet adopted by a buffer (freshly deserialized, or a standalone
     // test page); such a page keeps its lsn and, being low, writes promptly.
-    lsn_clock: Option<Arc<LsnClock>>,
     flags: AtomicU16,
     // STORE_AUDIT.md P3: replaces the old accessed/saved/written AtomicU128
     // timestamps, none of which anything ever read back (confirmed via
@@ -386,7 +382,6 @@ impl Page {
             record_size,
             content_kind,
             lsn: RwLock::new(LsnId(0)),
-            lsn_clock: None,
             flags: AtomicU16::new(flags),
             referenced: AtomicBool::new(false),
         }
@@ -512,28 +507,14 @@ impl Page {
             );
             return Ok(());
         }
-        {
-            self.dirty_version
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Stamp with this database's flush watermark, so the writer defers
-            // this page until the watermark advances past it (WAL: the change's
-            // redo record becomes durable first). `None` only for a page a buffer
-            // hasn't adopted yet; it keeps its existing (low) lsn and writes
-            // promptly. Was a process-global read; now per-database.
-            if let Some(clock) = &self.lsn_clock {
-                let w = clock.last_written();
-                // Cold start: last_written is the u64::MAX sentinel ("nothing
-                // durable yet; treat as fully durable"). Stamping u64::MAX would
-                // defer this page FOREVER — the watermark only ever moves to real
-                // (smaller) redo lsns, so `page.lsn < last_written` can never
-                // become true, and the write lingers in the writer's `pending`
-                // until shutdown. If the page is freed and reused in the
-                // meantime, that stale write then clobbers the new occupant on
-                // the shutdown flush. Stamp low so a cold-dirtied page is written
-                // promptly instead of forever-deferred.
-                *self.lsn.write() = if w.0 == u64::MAX { LsnId(0) } else { w };
-            }
-        }
+        self.dirty_version
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // TXN_SIMPLIFICATION_PLAN.md phase 1: no LSN stamping here. A
+        // mutation that is part of a logged operation stamps its own LSN via
+        // stamp_lsn_at_least (write_locked_page_with_lsn); a mutation that
+        // isn't (page formatting at allocation, chain linking) keeps whatever
+        // LSN the page already carries, which the writer's gate
+        // (`page.lsn <= durable`) already allows through.
         Ok(())
     }
 
@@ -617,13 +598,6 @@ impl Page {
             *current = lsn;
         }
         Ok(())
-    }
-
-    /// Adopt a page into a database's WAL clock. Called by the PageBuffer for
-    /// every page it creates or loads, before the page is mutated; `set_dirty`
-    /// then stamps from this clock, and copy-on-write clones inherit it.
-    pub(crate) fn set_clock(&mut self, clock: Arc<LsnClock>) {
-        self.lsn_clock = Some(clock);
     }
 
     pub(crate) fn clear(&self) -> Result<(), StoreError> {
@@ -890,7 +864,6 @@ impl Page {
             content_kind: header.content_kind,
             flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(header.lsn),
-            lsn_clock: None,
             referenced: AtomicBool::new(false),
         })
     }
@@ -1019,7 +992,6 @@ impl From<PageDto> for Page {
             content_kind: value.content_kind,
             flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(value.lsn),
-            lsn_clock: None,
             referenced: AtomicBool::new(false),
         }
     }
@@ -1086,7 +1058,6 @@ impl Clone for Page {
             content_kind: self.content_kind,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(*self.lsn.read()),
-            lsn_clock: self.lsn_clock.clone(),
             referenced: AtomicBool::new(self.referenced.load(std::sync::atomic::Ordering::Relaxed)),
         }
     }

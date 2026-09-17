@@ -17,7 +17,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use store::db::{DBFile, Db};
-use store::error::StoreError;
 use store::tuple::{DBIdType, Tuple};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,7 +36,6 @@ struct Config {
     verify_every: u64,
     checkpoint_every: u64,
     seed: u64,
-    max_pending_writes: usize,
 }
 
 impl Default for Config {
@@ -52,7 +50,6 @@ impl Default for Config {
             verify_every: 1,
             checkpoint_every: 500_000,
             seed: 0xB0BA_CAFE_1234_5678,
-            max_pending_writes: 1024,
         }
     }
 }
@@ -101,11 +98,6 @@ impl Config {
                         next().parse().expect("--checkpoint-every must be a number")
                 }
                 "--seed" => cfg.seed = next().parse().expect("--seed must be a number"),
-                "--max-pending-writes" => {
-                    cfg.max_pending_writes = next()
-                        .parse()
-                        .expect("--max-pending-writes must be a number")
-                }
                 "-h" | "--help" => {
                     print_help();
                     std::process::exit(0);
@@ -141,10 +133,7 @@ fn print_help() {
          \x20\x20                        (default: 1)\n\
          \x20\x20--checkpoint-every <N>  checkpoint every N rows, 0 = never\n\
          \x20\x20                        (default: 500000)\n\
-         \x20\x20--seed <N>              PRNG seed for --random (default: fixed constant)\n\
-         \x20\x20--max-pending-writes <N> cap on dirty pages the writer thread holds in\n\
-         \x20\x20                        memory awaiting durable redo before blocking\n\
-         \x20\x20                        callers (default: 1024)\n"
+         \x20\x20--seed <N>              PRNG seed for --random (default: fixed constant)\n"
     );
 }
 
@@ -195,7 +184,7 @@ where
             .into_owned(),
     };
 
-    let db: Arc<Db<F>> = Db::create_with_limits(&db_name, cfg.page_size, cfg.max_pending_writes)
+    let db: Arc<Db<F>> = Db::create_with_page_size(&db_name, cfg.page_size)
         .expect("failed to create bulk-load db");
     let tid = db.create_table("bulk".to_string()).unwrap();
 
@@ -231,7 +220,7 @@ where
     for chunk in ids.chunks(cfg.batch_size.max(1) as usize) {
         let txn = db.begin().expect("begin");
         for &id in chunk {
-            retry_on_contention(|| db.insert(tid, Tuple::new(id, &value), &txn)).unwrap();
+            db.insert(tid, Tuple::new(id, &value), &txn).unwrap();
         }
         db.commit(txn).expect("commit");
         inserted += chunk.len() as u64;
@@ -274,7 +263,7 @@ where
     for &id in ids.iter().filter(|&&id| id % cfg.verify_every == 0) {
         checked += 1;
         let txn = db.begin().expect("begin for verify");
-        let found = retry_on_contention(|| db.find(tid, DBIdType::Int(id), &txn)).unwrap();
+        let found = db.find(tid, DBIdType::Int(id), &txn).unwrap();
         let _ = db.rollback(txn);
         match found {
             Some(t) if t.data().to_vec() == value => {}
@@ -310,18 +299,3 @@ where
     mismatches == 0
 }
 
-// Matches the retry pattern used throughout this codebase's own tests and
-// the `stress` example: LockContentionError is expected under any
-// concurrent access and is safe to retry; nothing else should be retried.
-fn retry_on_contention<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
-    let mut attempt = 0u32;
-    loop {
-        match f() {
-            Err(StoreError::LockContentionError) if attempt < 8 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_micros(100 * attempt as u64));
-            }
-            other => return other,
-        }
-    }
-}

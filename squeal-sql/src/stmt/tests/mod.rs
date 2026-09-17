@@ -2182,3 +2182,57 @@ mod join_tests {
         assert_eq!(rows, vec![vec![ValueItem::Integer(7777)]]);
     }
 }
+
+// Phase 7: outside an explicit BEGIN block a statement reads every table
+// under one transaction of its own — a join over two tables holds one
+// snapshot, not one per table — and that transaction lives exactly as long
+// as the client holds the streaming result.
+#[test]
+fn test_a_select_over_several_tables_holds_one_statement_transaction() {
+    let c = conn();
+    run(&c, "create table a (id integer not null, v integer, primary key(id))").unwrap();
+    run(&c, "create table b (id integer not null, w integer, primary key(id))").unwrap();
+    run(&c, "insert into a values (1, 10), (2, 20)").unwrap();
+    run(&c, "insert into b values (1, 100), (2, 200)").unwrap();
+    let db = c.database.read().db.clone();
+    assert_eq!(db.stats().active_transactions, 0);
+
+    let mut stmt = c
+        .clone()
+        .create_statement("select a.v, b.w from a join b on a.id = b.id")
+        .unwrap();
+    stmt.execute().unwrap();
+    let result = stmt.get_results().unwrap();
+    let Some(ResultType::StreamingResult(mut rs)) = result else {
+        panic!("expected a streaming result");
+    };
+    assert_eq!(
+        db.stats().active_transactions,
+        1,
+        "one statement transaction for both tables, alive while the result is held"
+    );
+    let mut rows = 0;
+    while rs.next_result().unwrap().is_some() {
+        rows += 1;
+    }
+    assert_eq!(rows, 2);
+    assert_eq!(db.stats().active_transactions, 1, "still held until the result is dropped");
+    drop(rs);
+    assert_eq!(db.stats().active_transactions, 0);
+
+    // Inside an explicit block the statement uses that block's transaction.
+    run(&c, "begin").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("select a.v, b.w from a join b on a.id = b.id")
+        .unwrap();
+    stmt.execute().unwrap();
+    let Some(ResultType::StreamingResult(rs)) = stmt.get_results().unwrap() else {
+        panic!("expected a streaming result");
+    };
+    assert_eq!(db.stats().active_transactions, 1, "the BEGIN block's transaction only");
+    drop(rs);
+    run(&c, "commit").unwrap();
+    assert_eq!(db.stats().active_transactions, 0);
+}
+

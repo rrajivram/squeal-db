@@ -154,12 +154,24 @@ impl Tuple {
         self.serialized_size = 0; // see set_txn_id
     }
 
+    /// A fresh insert has no ancestor.
+    pub fn set_pre_lsn_none(&mut self) {
+        self.pre_lsn = None;
+        self.serialized_size = 0;
+    }
+
     pub fn tombstone(&mut self) {
         self.flags |= 1 << TOMBSTONED
     }
 
     pub fn is_tombstoned(&self) -> bool {
         self.flags & 1 << TOMBSTONED != 0
+    }
+
+    /// The opposite of `tombstone()`: a fresh insert over a visible tombstone
+    /// reuses the row slot and must come back to life.
+    pub fn clear_tombstone(&mut self) {
+        self.flags &= !(1 << TOMBSTONED)
     }
 
     pub fn from(bytes: &[u8]) -> Result<Self, StoreError> {
@@ -298,7 +310,7 @@ mod tests {
         // not equal (identity includes ts, not just id) — reuse the same
         // instance instead of deriving a second one to compare against.
         let txn_id = TransactionId::from(99);
-        t.set_txn_id(txn_id.clone());
+        t.set_txn_id(txn_id);
         assert_eq!(t.txn_id, Some(txn_id));
         assert!(t.pre_lsn.is_none());
     }
@@ -328,7 +340,7 @@ mod tests {
         // See test_tuple_set_txn_id: reuse the same instance rather than
         // minting a second one, since identity now includes ts.
         let txn_id = TransactionId::from(1);
-        t.set_txn_id(txn_id.clone());
+        t.set_txn_id(txn_id);
         let b = t.to();
         let t2 = Tuple::from(&b).unwrap();
         assert_eq!(t2.id, DBIdType::Int(10));

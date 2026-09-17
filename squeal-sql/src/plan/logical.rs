@@ -12,7 +12,7 @@ use sql_parser::{
     utils::Seq,
     visitor::{Visit, Visitor},
 };
-use store::db::DBFile;
+use store::{db::DBFile, txn::Transaction};
 
 use crate::{
     conn::connection::{Connection, TableRef},
@@ -46,6 +46,9 @@ pub(crate) struct LogicalPlan<F: DBFile> {
     // through every step behind it down to the original leaf source.
     // None until the first add_step call.
     tail: Option<Box<dyn Source>>,
+    // The statement's own transaction (see QueryVisitor::stmt_txn), handed
+    // to the StreamingResultSet by execute().
+    stmt_txn: Option<Transaction>,
     // This query's own memory budget — separate from PageBuffer (a
     // shared, whole-database page cache every query reads through, not
     // something to partition per query). Handed out via `memory()` so a
@@ -112,7 +115,14 @@ where
 // the compiler — there's no inference ambiguity here the way there
 // would be for a method with no F-mentioning argument.
 trait OpenSource<F: DBFile + 'static> {
-    fn open_source(&self, conn: &Arc<Connection<F>>) -> Result<Box<dyn Source>, SchemaError>;
+    /// `txn`: the transaction every source of one statement reads under —
+    /// the connection's explicit BEGIN block, else the statement's own
+    /// (see QueryVisitor::stmt_txn). Only borrowed for the call.
+    fn open_source(
+        &self,
+        conn: &Arc<Connection<F>>,
+        txn: Option<&Transaction>,
+    ) -> Result<Box<dyn Source>, SchemaError>;
 }
 
 impl<F> OpenSource<F> for Arc<SqlTable>
@@ -120,11 +130,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn open_source(&self, conn: &Arc<Connection<F>>) -> Result<Box<dyn Source>, SchemaError> {
-        conn.with_current_txn::<Result<Box<dyn Source>, SchemaError>>(|txn| {
-            let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn)?;
-            Ok(Box::new(ts) as Box<dyn Source>)
-        })
+    fn open_source(
+        &self,
+        conn: &Arc<Connection<F>>,
+        txn: Option<&Transaction>,
+    ) -> Result<Box<dyn Source>, SchemaError> {
+        let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn)?;
+        Ok(Box::new(ts) as Box<dyn Source>)
     }
 }
 
@@ -137,7 +149,11 @@ where
     // table case above — a Run isn't MVCC-shared state (see RunCursor's
     // own doc comment), so there's nothing here that needs
     // `with_current_txn`.
-    fn open_source(&self, _conn: &Arc<Connection<F>>) -> Result<Box<dyn Source>, SchemaError> {
+    fn open_source(
+        &self,
+        _conn: &Arc<Connection<F>>,
+        _txn: Option<&Transaction>,
+    ) -> Result<Box<dyn Source>, SchemaError> {
         let guard = self.read();
         let cursor = guard.cursor()?;
         Ok(Box::new(RunSource::new(
@@ -174,10 +190,14 @@ where
         }
     }
 
-    fn open_source(&self, conn: &Arc<Connection<F>>) -> Result<Box<dyn Source>, SchemaError> {
+    fn open_source(
+        &self,
+        conn: &Arc<Connection<F>>,
+        txn: Option<&Transaction>,
+    ) -> Result<Box<dyn Source>, SchemaError> {
         match self {
-            TableRef::Real(_, t) => t.open_source(conn),
-            TableRef::Temp(_, t) => t.open_source(conn),
+            TableRef::Real(_, t) => t.open_source(conn, txn),
+            TableRef::Temp(_, t) => t.open_source(conn, txn),
             TableRef::Derived => todo!(),
         }
     }
@@ -227,6 +247,13 @@ struct QueryVisitor<F: DBFile> {
     limit: Option<usize>,
     order: Option<OrderByClause>,
     mem: Arc<QueryMemory>,
+    // TXN_SIMPLIFICATION_PLAN.md phase 7: outside an explicit BEGIN block,
+    // one transaction for the whole statement, so a multi-table SELECT
+    // reads every table at one snapshot (each TableCursor used to begin
+    // its own). Moves into the StreamingResultSet, which owns it for as
+    // long as the client holds the result; dropping it ends the
+    // transaction.
+    stmt_txn: Option<Transaction>,
 }
 
 struct SourceHolder {
@@ -327,8 +354,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn new(conn: Arc<Connection<F>>, mem: Arc<QueryMemory>) -> Self {
-        Self {
+    fn new(conn: Arc<Connection<F>>, mem: Arc<QueryMemory>) -> Result<Self, SchemaError> {
+        let stmt_txn = if conn.with_current_txn(|t| t.is_some()) {
+            None
+        } else {
+            Some(conn.database.read().begin()?)
+        };
+        Ok(Self {
             conn,
             steps: vec![],
             tables: Stack::new(),
@@ -336,7 +368,15 @@ where
             limit: None,
             order: None,
             mem,
-        }
+            stmt_txn,
+        })
+    }
+
+    /// Opens a FROM item under the statement's transaction: the explicit
+    /// block if one is open, else `stmt_txn`.
+    fn open(&self, item: &TableRef<F>) -> Result<Box<dyn Source>, SchemaError> {
+        self.conn
+            .with_current_txn(|explicit| item.open_source(&self.conn, explicit.or(self.stmt_txn.as_ref())))
     }
 
     fn handle_select(
@@ -388,9 +428,9 @@ where
         // back holding a string value from an unrelated table).
         let mut sources = vec![];
         for table in tables.iter() {
-            let mut combined = table.resolved.open_source(&self.conn)?;
+            let mut combined = self.open(&table.resolved)?;
             for j in &table.joins {
-                let relation = j.relation.resolved.open_source(&self.conn)?;
+                let relation = self.open(&j.relation.resolved)?;
                 combined = Box::new(JoinSource::new(
                     combined,
                     relation,
@@ -781,6 +821,7 @@ where
     pub(crate) fn with_memory_limit(conn: Arc<Connection<F>>, limit: usize) -> Self {
         Self {
             tail: None,
+            stmt_txn: None,
             mem: QueryMemory::new(limit),
             start: Instant::now(),
             _phanton: PhantomData,
@@ -790,12 +831,14 @@ where
     pub(crate) fn build(conn: Arc<Connection<F>>, query: &Query) -> Result<Self, SchemaError> {
         let start = Instant::now();
         let mem = QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT);
-        let mut visitor = QueryVisitor::new(conn.clone(), mem.clone());
+        let mut visitor = QueryVisitor::new(conn.clone(), mem.clone())?;
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);
         }
+        let stmt_txn = visitor.stmt_txn.take();
         let mut this = Self {
             tail: None,
+            stmt_txn,
             mem,
             start,
             _phanton: PhantomData,
@@ -825,7 +868,7 @@ where
             .tail
             .take()
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
-        Ok(StreamingResultSet::new(tail, self.start))
+        Ok(StreamingResultSet::new(tail, self.start).owning_transaction(self.stmt_txn.take()))
     }
 }
 

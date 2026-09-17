@@ -17,11 +17,10 @@ mod bench;
 mod config;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use store::cursor::Cursor;
 use store::db::{DBFile, Db};
-use store::error::StoreError;
 use store::tuple::{DBIdType, Tuple};
 
 use bench::{Latencies, Rng, report_duration, report_phase};
@@ -49,18 +48,6 @@ fn file_db_path() -> String {
         .into_owned()
 }
 
-fn retry_on_contention<T>(mut f: impl FnMut() -> Result<T, StoreError>) -> Result<T, StoreError> {
-    let mut attempt = 0u32;
-    loop {
-        match f() {
-            Err(StoreError::LockContentionError) if attempt < 8 => {
-                attempt += 1;
-                std::thread::sleep(Duration::from_micros(100 * attempt as u64));
-            }
-            other => return other,
-        }
-    }
-}
 
 fn run_backend<F>(label: &str, db_name: &str, cfg: &Config)
 where
@@ -88,7 +75,7 @@ where
     for i in 0..cfg.rows {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        retry_on_contention(|| db.insert(tid, Tuple::new(i, &small_value), &txn)).unwrap();
+        db.insert(tid, Tuple::new(i, &small_value), &txn).unwrap();
         db.commit(txn).unwrap();
         lat.record(op_start.elapsed());
     }
@@ -102,7 +89,7 @@ where
     for &k in &keys {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        let found = retry_on_contention(|| db.find(tid, DBIdType::Int(k), &txn)).unwrap();
+        let found = db.find(tid, DBIdType::Int(k), &txn).unwrap();
         assert!(found.is_some(), "unexpected missing key during perf run");
         let _ = db.rollback(txn);
         lat.record(op_start.elapsed());
@@ -155,7 +142,7 @@ where
     for &k in &keys {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        retry_on_contention(|| db.update(tid, Tuple::new(k, &small_value), &txn)).unwrap();
+        db.update(tid, Tuple::new(k, &small_value), &txn).unwrap();
         db.commit(txn).unwrap();
         lat.record(op_start.elapsed());
     }
@@ -169,7 +156,7 @@ where
     for &k in &keys[..remove_n] {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        retry_on_contention(|| db.remove(tid, DBIdType::Int(k), &txn)).unwrap();
+        db.remove(tid, DBIdType::Int(k), &txn).unwrap();
         db.commit(txn).unwrap();
         lat.record(op_start.elapsed());
     }
@@ -200,7 +187,7 @@ where
     for i in 0..cfg.large_rows {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        retry_on_contention(|| db.insert(large_tid, Tuple::new(i, &large_value), &txn)).unwrap();
+        db.insert(large_tid, Tuple::new(i, &large_value), &txn).unwrap();
         db.commit(txn).unwrap();
         lat.record(op_start.elapsed());
     }
@@ -213,7 +200,7 @@ where
     for &k in &large_keys {
         let op_start = Instant::now();
         let txn = db.begin().unwrap();
-        let found = retry_on_contention(|| db.find(large_tid, DBIdType::Int(k), &txn)).unwrap();
+        let found = db.find(large_tid, DBIdType::Int(k), &txn).unwrap();
         assert!(found.is_some(), "unexpected missing key during perf run");
         let _ = db.rollback(txn);
         lat.record(op_start.elapsed());
@@ -275,7 +262,7 @@ where
                 for i in 0..ops {
                     let key = base + i;
                     let txn = db.begin().unwrap();
-                    retry_on_contention(|| db.insert(tid, Tuple::new(key, &value), &txn)).unwrap();
+                    db.insert(tid, Tuple::new(key, &value), &txn).unwrap();
                     db.commit(txn).unwrap();
                 }
             })

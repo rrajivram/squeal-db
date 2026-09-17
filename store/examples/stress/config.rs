@@ -17,7 +17,9 @@ pub struct Config {
     pub watchdog_timeout_secs: u64,
     pub commit_probability_pct: u8,
     pub max_ops_per_txn: u32,
-    pub max_lock_retries: u32,
+    /// Phase 5: page-lock wait budget handed to Db::set_lock_timeout. Any
+    /// timeout during the run is a reported bug and fails the run.
+    pub lock_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -36,7 +38,7 @@ impl Default for Config {
             watchdog_timeout_secs: 15,
             commit_probability_pct: 90,
             max_ops_per_txn: 5,
-            max_lock_retries: 5,
+            lock_timeout_ms: 1000,
         }
     }
 }
@@ -89,9 +91,9 @@ impl Config {
                 "--max-ops-per-txn" => {
                     cfg.max_ops_per_txn = next().parse().expect("--max-ops-per-txn must be a number")
                 }
-                "--max-lock-retries" => {
-                    cfg.max_lock_retries =
-                        next().parse().expect("--max-lock-retries must be a number")
+                "--lock-timeout-ms" => {
+                    cfg.lock_timeout_ms =
+                        next().parse().expect("--lock-timeout-ms must be a number")
                 }
                 "-h" | "--help" => {
                     print_help();
@@ -127,6 +129,6 @@ fn print_help() {
          \x20\x20--watchdog-timeout-secs <N>   stall->deadlock threshold (default: 15)\n\
          \x20\x20--commit-probability-pct <N>  chance a txn commits vs rolls back (default: 90)\n\
          \x20\x20--max-ops-per-txn <N>         max ops batched per txn (default: 5)\n\
-         \x20\x20--max-lock-retries <N>        retries on LockContentionError (default: 5)\n"
+         \x20\x20--lock-timeout-ms <N>         page-lock wait budget; any timeout fails the run (default: 1000)\n"
     );
 }

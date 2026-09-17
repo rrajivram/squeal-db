@@ -21,9 +21,11 @@ use crate::{
     utils::shardedpq::ShardedPQ,
 };
 
+// Phase 6/7: modified pages reach disk only through a checkpoint capture
+// (see capture_dirty_pages), written by the checkpointing thread itself.
+// The writer thread is left with the header and shutdown.
 #[derive(Debug, Clone)]
 enum BufMsg {
-    WritePage(WriteMsg),
     WriteHeader(Header),
     // STORE_AUDIT.md T5: like WriteHeader, but with a reply channel the
     // caller blocks on — the writer thread pwrite's AND fsyncs the header
@@ -34,25 +36,7 @@ enum BufMsg {
     // already flushes and syncs the whole file — same-channel FIFO order
     // already guarantees the header write is processed first).
     WriteHeaderSynced(Header, Sender<Result<(), StoreError>>),
-    // Drop any deferred (pending) writes for this page: it has just been freed,
-    // so an as-yet-unflushed write of its old contents must not survive to
-    // clobber the next occupant after the slot is reallocated.
-    DiscardPending(PageId),
     Shutdowm,
-    Checkpoint(Sender<Result<(), StoreError>>),
-}
-
-#[derive(Debug, Clone)]
-struct WriteMsg {
-    page_num: PageId,
-    page: Arc<Page>,
-    // Counts retries specifically due to StoreError::PageTransientlyInconsistent
-    // (see write_page's own comment) — bounds how long the writer thread will
-    // wait out an in-progress overflow transition on this exact message
-    // before treating it as a genuine, un-retryable bug. Not touched for the
-    // ordinary "LSN not durable yet" deferral, which isn't bounded the same
-    // way since it's driven by an always-progressing external watermark.
-    transient_retries: u32,
 }
 
 // STORE_AUDIT.md P2: no longer Clone — ArcLockGuard now wraps a real
@@ -62,11 +46,80 @@ struct WriteMsg {
 // another thread would let a different thread masquerade as the owner).
 // Confirmed via grep before removing: nothing actually cloned a whole
 // WritePageHandle (only its `.page: Arc<Page>` field, which stays Clone).
+/// TXN_SIMPLIFICATION_PLAN.md phase 5: the page-lock order, checked at every
+/// acquisition BEFORE waiting. Index pages (any level of the tree) come
+/// before data pages; among index pages, acquiring another while holding one
+/// is allowed (crabbing top-down, a split's new sibling); among data pages
+/// (and Run pages, which share the level), only the same page may be
+/// re-entered. Requesting an Index page while holding a Data page, or a
+/// second Data page, is `LockOrderViolation` — immediately, so a mistake can
+/// never become a hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum LockLevel {
+    Index = 1,
+    Data = 2,
+}
+
+thread_local! {
+    static HELD: std::cell::RefCell<Vec<(LockLevel, PageId)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Pops this thread's held-lock stack entry when dropped.
+#[derive(Debug)]
+struct LevelToken;
+
+impl Drop for LevelToken {
+    fn drop(&mut self) {
+        HELD.with(|h| {
+            h.borrow_mut().pop();
+        });
+    }
+}
+
+/// Phase 5 (debug builds): panics if this thread holds any page lock — used
+/// at every point that can block on something other than a page lock (the
+/// writer channel, the durability condvar), so "never hold a page lock across
+/// anything that blocks" is checked, not assumed.
+pub(crate) fn debug_assert_no_page_locks_held(what: &str) {
+    if cfg!(debug_assertions) {
+        HELD.with(|h| {
+            let h = h.borrow();
+            debug_assert!(
+                h.is_empty(),
+                "{what} while holding page locks {:?} — a page lock must never be held across a blocking wait",
+                *h
+            );
+        });
+    }
+}
+
+fn check_lock_order(level: LockLevel, page: PageId) -> Result<(), StoreError> {
+    HELD.with(|h| {
+        let h = h.borrow();
+        if let Some(&(top_level, top_page)) = h.last() {
+            let ok = match (top_level, level) {
+                (LockLevel::Index, LockLevel::Index) => true,
+                (LockLevel::Index, LockLevel::Data) => true,
+                (LockLevel::Data, LockLevel::Data) => top_page == page,
+                (LockLevel::Data, LockLevel::Index) => false,
+            };
+            if !ok {
+                return Err(StoreError::LockOrderViolation(format!(
+                    "requested {level:?} page {page:?} while holding {:?}",
+                    *h
+                )));
+            }
+        }
+        Ok(())
+    })
+}
+
 #[derive(Debug)]
 pub(crate) struct WritePageHandle {
     pub(crate) page_num: PageId,
     lock: ArcLockGuard<PageId>,
     pub(crate) page: Arc<Page>,
+    _level: LevelToken,
 }
 
 // A cached page is either live (Strong) or has been evicted to make room
@@ -92,6 +145,9 @@ enum PageEntry {
 // is harmless.
 const BUFFER_SHARD_COUNT: usize = 16;
 
+/// Phase 5: see `PageBuffer::set_lock_timeout`.
+pub(crate) const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
 // The outcome of trying to free exactly one Strong slot. Distinct from a
 // bare `Option<(PageId, Arc<Page>)>` because "evicted a clean page" (no
 // flush needed) and "access_map had nothing left to offer" must not be
@@ -99,8 +155,8 @@ const BUFFER_SHARD_COUNT: usize = 16;
 // just-freed clean slot the same as total exhaustion and wrongly fall
 // back to tolerating a capacity overflow it didn't actually need to.
 enum Evicted {
-    /// A slot was freed. `Some` if the victim was dirty and needs flushing.
-    Yes(Option<(PageId, Arc<Page>)>),
+    /// A (clean) slot was freed.
+    Yes,
     /// access_map is empty — nothing left to evict.
     Exhausted,
 }
@@ -147,6 +203,17 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // to tell "shut down properly" apart from "dropped without shutdown".
     write_handle: Option<JoinHandle<Result<(), StoreError>>>,
     self_file: RwLock<F>,
+    // Phase 6: every tree write holds the read side for its whole
+    // duration; a checkpoint holds the write side while it captures the
+    // dirty pages, so the captured image is one instant of the tree — no
+    // parent on disk can point at a child that is not. Held for
+    // microseconds by writers and for one memcpy of the dirty set by the
+    // checkpoint; never across I/O, never across a wait on a transaction.
+    write_gate: RwLock<()>,
+    // Dirty pages evict_one has set aside: not evictable until a checkpoint
+    // captures them, and not worth re-scanning until then. Re-enqueued as
+    // eviction candidates by capture_dirty_pages.
+    parked_dirty: parking_lot::Mutex<Vec<PageId>>,
     // STORE_AUDIT.md P3: still a ShardedPQ (its own sharded locking already
     // handles concurrent eviction-candidate tracking fine) but priorities
     // are now insertion-sequence numbers (next_seq()), not timestamps —
@@ -165,6 +232,15 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // cache-miss read without Page/PageBuffer needing to know about
     // specific content kinds.
     content_registry: Arc<PageContentRegistry>,
+    // TXN_SIMPLIFICATION_PLAN.md phase 0: how many page writes the writer
+    // thread is currently holding back (not yet durable, or queued). Kept
+    // as a shared atomic so Db::stats() can report it without a channel
+    // round trip.
+    // Phase 5: how long get_page_mut waits before reporting LockTimeout, in
+    // microseconds. A legitimate hold is microseconds; the default (1 s) is
+    // a bug detector with a thousandfold margin, never a tunable for
+    // contention.
+    lock_timeout_us: AtomicU64,
 }
 
 impl<F: DBFile> PageBuffer<F>
@@ -179,37 +255,13 @@ where
         header: Arc<Header>,
         max_entries: usize,
         clock: Arc<LsnClock>,
-        max_pending_writes: usize,
         content_registry: Arc<PageContentRegistry>,
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let writer_file = db_file.do_clone()?;
-        // Bounded so a full `pending` in the writer thread (see writer's own
-        // comment) turns into real backpressure on senders, not an
-        // ever-growing in-memory backlog. The channel's own bound is a small
-        // fixed constant, not max_pending_writes itself: the writer's gate
-        // (pending.len() + recv.len() >= max_pending_writes) already governs
-        // the real cap, and messages can keep arriving in the channel after
-        // the gate trips (right up until the channel's own bound) before any
-        // send() actually blocks — so a channel bound equal to
-        // max_pending_writes would let the effective total run to roughly
-        // 2x the configured cap. Keeping the channel small caps that slop to
-        // a fixed, negligible amount instead of one that scales with it.
-        // Never larger than max_pending_writes itself, so a small configured
-        // cap (e.g. in tests) isn't silently widened back out by this.
-        const WRITE_CHANNEL_CAPACITY: usize = 64;
-        let (write_tx, write_rx) = bounded(max_pending_writes.clamp(1, WRITE_CHANNEL_CAPACITY));
+        let (write_tx, write_rx) = bounded(64);
         let w_header = header.clone();
-        let writer_clock = clock.clone();
-        let write_handle = thread::spawn(move || {
-            writer(
-                writer_file,
-                w_header,
-                write_rx,
-                writer_clock,
-                max_pending_writes.max(1),
-            )
-        });
+        let write_handle = thread::spawn(move || writer(writer_file, w_header, write_rx));
         Ok(Self {
             page_size,
             max_entries,
@@ -219,6 +271,8 @@ where
                 .collect(),
             write_tx,
             self_file: RwLock::new(read_file),
+            write_gate: RwLock::new(()),
+            parked_dirty: parking_lot::Mutex::new(Vec::new()),
             write_handle: Some(write_handle),
             access_map: ShardedPQ::new(max_entries / 10),
             insertion_seq: AtomicU64::new(0),
@@ -228,7 +282,21 @@ where
             free_pages: RwLock::new(vec![]),
             clock,
             content_registry,
+            lock_timeout_us: AtomicU64::new(DEFAULT_LOCK_TIMEOUT.as_micros() as u64),
         })
+    }
+
+    /// Phase 5: how long a page-lock wait may take before it is reported as
+    /// a bug (`LockTimeout`).
+    pub(crate) fn set_lock_timeout(&self, timeout: Duration) {
+        self.lock_timeout_us
+            .store(timeout.as_micros().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+
+    /// Pages currently cache-resident (Strong).
+    pub(crate) fn cached_pages(&self) -> usize {
+        self.strong_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn shard_for(&self, page_num: &PageId) -> &RwLock<HashMap<PageId, PageEntry>> {
@@ -239,7 +307,11 @@ where
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {
-        self.flush_dirty_cached_pages()?;
+        let captured = {
+            let _excl = self.exclude_writers();
+            self.capture_dirty_pages()?
+        };
+        self.write_captured(captured)?;
         self.write_tx.send(BufMsg::Shutdowm)?;
         if let Some(handle) = self.write_handle.take() {
             let res = handle.join();
@@ -364,11 +436,14 @@ where
         let WritePageHandle {
             page_num,
             page,
-            lock: _lock,
+            lock,
+            _level,
         } = handle;
         self.handle_large_page_size(page_num, &page)?;
-        self.cache_strong(page_num, page)
-        // _lock drops here, releasing the per-page lock after cache is updated.
+        self.install(page_num, page, InstallMode::Overwrite);
+        drop(lock);
+        drop(_level);
+        Ok(())
     }
 
     fn handle_large_page_size(&self, page_id: PageId, page: &Arc<Page>) -> Result<(), StoreError> {
@@ -579,11 +654,10 @@ where
         page_id: PageId,
         record_size: Option<usize>,
     ) -> Result<(), StoreError> {
-        let mut p = match record_size {
+        let p = match record_size {
             Some(rs) => Page::new_indexed(self.header.page_size, rs),
             None => Page::new_data(self.header.page_size),
         };
-        p.set_clock(self.clock.clone());
         self.write_page(page_id, &p)
     }
 
@@ -633,51 +707,103 @@ where
     // forever, with flush_evicted (eviction-triggered) never once seeing
     // it. checkpoint() and shutdown() both need every dirty page durable
     // before they proceed, so both call this first.
-    fn flush_dirty_cached_pages(&self) -> Result<(), StoreError> {
-        // Collects one shard at a time — each shard's read lock drops at
-        // the end of its own iterator chain, before the next shard is even
-        // touched, so no two shards' locks are ever held together. Same
-        // reasoning as flush_evicted: sending on the bounded channel while
-        // holding any shard lock risks stalling concurrent cache access
-        // for as long as the writer thread takes to make room.
-        let dirty: Vec<(PageId, Arc<Page>)> = self
-            .buffer
-            .iter()
-            .flat_map(|shard| {
-                shard
-                    .read()
-                    .iter()
-                    .filter_map(|(page_num, entry)| match entry {
-                        PageEntry::Strong(arc) if arc.is_dirty() => Some((*page_num, arc.clone())),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for (page_num, page) in dirty {
-            self.write_tx.send(BufMsg::WritePage(WriteMsg {
-                page_num,
-                page,
-                transient_retries: 0,
-            }))?;
+    // ---- Phase 6: checkpoint-only page flushing ----
+    //
+    // Modified pages reach the data file in exactly one way: a checkpoint
+    // (or shutdown) captures every dirty page at one instant, with writers
+    // excluded, and writes the copies. Nothing else writes a modified page
+    // — eviction never picks a dirty page (see evict_one) — so the data
+    // file is always some past instant of the whole tree plus whatever the
+    // log replays on top. That is what makes "page on disk points at a
+    // page that is not" impossible, and it is the only structural
+    // guarantee recovery needs, since splits and chain links are not
+    // logged.
+
+    /// Excludes tree writers (see `write_gate`). Held only around
+    /// `capture_dirty_pages` and the system-page writes that go with it.
+    pub(crate) fn exclude_writers(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.write_gate.write()
+    }
+
+    /// Taken by every tree write for its whole duration (BPlusTree::
+    /// write_version, table creation/drop). Cheap and never held across a
+    /// wait on another transaction, so a checkpoint's exclusion is a
+    /// microsecond stall, never a hang.
+    pub(crate) fn writer_permit(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.write_gate.read()
+    }
+
+    /// Copies every dirty cached page and marks the original clean. Must be
+    /// called with writers excluded; the copies are one consistent instant
+    /// of the tree and are written by `write_captured` after the log that
+    /// explains them is durable.
+    pub(crate) fn capture_dirty_pages(&self) -> Result<Vec<(PageId, Arc<Page>)>, StoreError> {
+        let mut out = Vec::new();
+        for shard in self.buffer.iter() {
+            let shard = shard.read();
+            for (page_num, entry) in shard.iter() {
+                if let PageEntry::Strong(arc) = entry
+                    && arc.is_dirty()
+                {
+                    let version = arc.dirty_version();
+                    out.push((*page_num, Arc::new((**arc).clone())));
+                    arc.mark_flushed_up_to(version);
+                }
+            }
         }
+        // Clean again: back on the eviction candidate list.
+        let parked: Vec<PageId> = std::mem::take(&mut *self.parked_dirty.lock());
+        for page_num in parked {
+            self.access_map.push(page_num, self.next_seq());
+        }
+        Ok(out)
+    }
+
+    /// Writes captured pages to the data file and fsyncs it.
+    pub(crate) fn write_captured(&self, pages: Vec<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
+        {
+            let file = self.self_file.read();
+            for (page_num, page) in &pages {
+                write_page_with_bounded_retry(
+                    *page_num,
+                    page,
+                    &*file,
+                    self.header.page_size,
+                    self.header.first_page_offset,
+                )?;
+            }
+        }
+        // Past the OS page cache: the log segments that could redo these
+        // pages are deleted right after the checkpoint returns.
+        self.self_file.write().do_sync()?;
         Ok(())
     }
 
+    /// Capture + write in one step, for callers with no log to sync (tests,
+    /// and code paths that own the buffer alone).
     pub(crate) fn checkpoint(&self) -> Result<(), StoreError> {
-        self.flush_dirty_cached_pages()?;
-        let (tx, rx) = bounded(1);
-        self.write_tx.send(BufMsg::Checkpoint(tx.clone()))?;
-        rx.recv()
-            .map_err(|e| StoreError::UnknownError(e.to_string()))?
+        let captured = {
+            let _excl = self.exclude_writers();
+            self.capture_dirty_pages()?
+        };
+        self.write_captured(captured)
+    }
+
+    /// Dirty pages held in the cache (bounded only by checkpoints).
+    pub(crate) fn dirty_pages(&self) -> usize {
+        self.buffer
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .values()
+                    .filter(|e| matches!(e, PageEntry::Strong(arc) if arc.is_dirty()))
+                    .count()
+            })
+            .sum()
     }
 
     pub(crate) fn free_page(&self, page: PageId) -> Result<(), StoreError> {
-        // Tell the writer to drop any deferred write still queued for this slot
-        // before it can be reallocated. Ordering is safe: this send precedes any
-        // reuse's write on the same (FIFO) channel, and the writer processes an
-        // earlier queued old write into `pending` before it sees this discard.
-        self.write_tx.send(BufMsg::DiscardPending(page))?;
         self.free_pages.write().push(page);
         Ok(())
     }
@@ -773,7 +899,7 @@ where
         // Use the in-memory page to check overflow state: freshly-allocated pages
         // may not have been written to disk yet, and disk/memory can diverge briefly
         // during concurrent overflow setup. The in-memory state is always current.
-        let handle = self.get_page_mut(from_id)?;
+        let handle = self.get_page_mut(from_id, LockLevel::Data)?;
         if handle.page.has_overflow() {
             drop(handle);
             let term = self.overflow_terminator(from_id)?;
@@ -827,8 +953,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let mut p = Page::new_indexed(self.header.page_size, record_size);
-        p.set_clock(self.clock.clone());
+        let p = Page::new_indexed(self.header.page_size, record_size);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -850,8 +975,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let mut p = Page::new_run(self.header.page_size);
-        p.set_clock(self.clock.clone());
+        let p = Page::new_run(self.header.page_size);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -866,8 +990,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let mut p = Page::new_slotted(self.header.page_size);
-        p.set_clock(self.clock.clone());
+        let p = Page::new_slotted(self.header.page_size);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -917,7 +1040,7 @@ where
         // cache_strong handles both the access_map update and the buffer
         // insert under one write lock — the old two-step was racy.
         let file = self.self_file.read();
-        let mut page = read_page(
+        let page = read_page(
             page_num,
             &*file,
             self.header.page_size,
@@ -927,7 +1050,6 @@ where
         drop(file);
         // Adopt the freshly-loaded page into this database's WAL clock before it
         // can be mutated (set_dirty stamps from it; clones inherit it).
-        page.set_clock(self.clock.clone());
         let page = Arc::new(page);
         // get_or_install, not cache_strong: a concurrent writer may have installed
         // a newer Strong while we were reading from disk; don't overwrite it with
@@ -936,33 +1058,46 @@ where
         Ok(page)
     }
 
-    pub(crate) fn get_page_mut(&self, page_num: PageId) -> Result<WritePageHandle, StoreError> {
-        // Acquire the per-page lock *before* reading: a writer holds this lock
-        // for its entire read-modify-write cycle (see write_locked_page), so
-        // reading only after we hold it guarantees we see the latest committed
-        // write rather than a snapshot from before some other writer's update.
-        // 5ms, not the ~500us this used to be: a page's critical section
-        // (read-modify-write a single page) normally finishes in low
-        // microseconds, but the *lock holder* can be preempted by the OS
-        // scheduler for a full quantum (easily 1-15ms+ on a busy machine)
-        // while still holding it. A timeout close to the actual work time
-        // gives no margin for that and times out on ordinary scheduling
-        // jitter, not just genuine contention — confirmed as a real
-        // contributor to a hard-to-reproduce flake (see the callers of
-        // retry_on_contention in db.rs). 5ms is still imperceptible for a
-        // caller that has to wait it out, but gives an order of magnitude
-        // more room before concluding the lock is genuinely contended.
-        let lock = self
-            .locks
-            .lock(page_num, 5000)
-            .ok_or(StoreError::LockContentionError)?;
+    /// Lock `page_num` for a read-modify-write. `level` is what the caller
+    /// is about to treat the page as; the order check (see `LockLevel`)
+    /// runs before any waiting. A wait longer than the configured
+    /// `lock_timeout` is `LockTimeout`, naming the holder — never retried by
+    /// anything in this crate.
+    pub(crate) fn get_page_mut(
+        &self,
+        page_num: PageId,
+        level: LockLevel,
+    ) -> Result<WritePageHandle, StoreError> {
+        check_lock_order(level, page_num)?;
+        // Warm the cache before locking: a miss evicts, and an eviction's
+        // flush should not run with this page's lock held (see
+        // get_or_install for the rare case where it still does).
+        let _ = self.get_page(page_num)?;
+        let timeout = Duration::from_micros(
+            self.lock_timeout_us
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let started = std::time::Instant::now();
+        let lock = match self.locks.lock_for(page_num, timeout) {
+            crate::arclock::LockAttempt::Acquired(g) => g,
+            crate::arclock::LockAttempt::TimedOut(holder) => {
+                let msg = format!(
+                    "{level:?} page {page_num:?}: waited {:?} (limit {timeout:?}); {holder}; this thread holds {:?}",
+                    started.elapsed(),
+                    HELD.with(|h| h.borrow().clone())
+                );
+                log::error!("page lock timeout: {msg}");
+                return Err(StoreError::LockTimeout(msg));
+            }
+        };
+        HELD.with(|h| h.borrow_mut().push((level, page_num)));
         let page = self.get_page(page_num)?;
-        let handle = WritePageHandle {
+        Ok(WritePageHandle {
             lock,
             page_num,
             page,
-        };
-        Ok(handle)
+            _level: LevelToken,
+        })
     }
 
     // Inserts/refreshes page_num as the live (Strong) resident. Thin
@@ -970,8 +1105,8 @@ where
     // which hold the per-page lock and are the authority on the page's
     // latest contents — always overwrites.
     fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
-        let (_, flushes) = self.install(page_num, page, InstallMode::Overwrite);
-        self.flush_evicted(flushes)
+        self.install(page_num, page, InstallMode::Overwrite);
+        Ok(())
     }
 
     // Reader-side cache fill. Thin wrapper over install() that returns the
@@ -979,18 +1114,7 @@ where
     // fresher version) beats our freshly-loaded/upgraded one, since a slow
     // reader must never clobber a concurrent writer's newer write.
     fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
-        let (winner, flushes) = self.install(page_num, page, InstallMode::ReuseIfPresent);
-        // Best-effort: a reader installing a freshly-loaded page is not in
-        // a position to usefully propagate a flush failure (get_or_install
-        // has no Result to return it through, and every caller is itself a
-        // read path) — an evicted dirty page that fails to flush here stays
-        // dirty in the cache and will be picked up by a later eviction,
-        // checkpoint, or shutdown instead. Logged so a persistent failure
-        // isn't silent.
-        if let Err(e) = self.flush_evicted(flushes) {
-            error!("failed to flush an evicted dirty page: {e}");
-        }
-        winner
+        self.install(page_num, page, InstallMode::ReuseIfPresent)
     }
 
     // The shared engine behind cache_strong/get_or_install. Installs `page`
@@ -1020,8 +1144,7 @@ where
         page_num: PageId,
         page: Arc<Page>,
         mode: InstallMode,
-    ) -> (Arc<Page>, Vec<(PageId, Arc<Page>)>) {
-        let mut flushes = Vec::new();
+    ) -> Arc<Page> {
         // Set once evict_one() reports the access_map genuinely has nothing
         // left to offer — forces the next pass to insert past max_entries
         // rather than retrying eviction forever. See Evicted::Exhausted.
@@ -1036,11 +1159,11 @@ where
             if let Some(arc) = existing_strong {
                 if matches!(mode, InstallMode::ReuseIfPresent) {
                     arc.mark_referenced();
-                    return (arc, flushes);
+                    return arc;
                 }
                 page.mark_referenced();
                 guard.insert(page_num, PageEntry::Strong(page.clone()));
-                return (page, flushes);
+                return page;
             }
             // page_num isn't Strong yet — this is a genuinely new resident,
             // so it needs an access_map entry and, if the cache is already
@@ -1050,10 +1173,7 @@ where
             {
                 drop(guard);
                 match self.evict_one() {
-                    Evicted::Yes(maybe_dirty) => {
-                        flushes.extend(maybe_dirty);
-                        continue;
-                    }
+                    Evicted::Yes => continue,
                     Evicted::Exhausted => {
                         // Under correct accounting this shouldn't happen,
                         // but if strong_count drifted (e.g. a crash
@@ -1069,30 +1189,8 @@ where
             self.access_map.push(page_num, self.next_seq());
             page.mark_referenced();
             guard.insert(page_num, PageEntry::Strong(page.clone()));
-            return (page, flushes);
+            return page;
         }
-    }
-
-    // Sends the flush every dirty victim install()'s eviction uncovered —
-    // the same BufMsg::WritePage the writer thread already knows how to
-    // handle (LSN-gate, dedup-by-superseding an older still-pending write
-    // for the same page, keeping the page alive via its own Arc clone
-    // while in flight — see WriteMsg's own doc comments), just triggered
-    // by "this page is leaving the cache" instead of "this page was just
-    // mutated". MUST be called without any shard's write lock held: the
-    // channel is bounded, so a full one blocks the sender — while holding
-    // a shard lock, this would stall every other reader/writer touching
-    // that shard for as long as the writer thread takes to make room, not
-    // just the caller of this specific eviction.
-    fn flush_evicted(&self, evicted: Vec<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
-        for (page_num, page) in evicted {
-            self.write_tx.send(BufMsg::WritePage(WriteMsg {
-                page_num,
-                page,
-                transient_retries: 0,
-            }))?;
-        }
-        Ok(())
     }
 
     // Frees exactly one Strong slot, chosen by access_map (see access_map's
@@ -1116,6 +1214,10 @@ where
     // to skip touching access_map at all — only eviction, not every
     // access, ever reorders anything.
     fn evict_one(&self) -> Evicted {
+        // Phase 6: a dirty page is not evictable (it reaches disk only via a
+        // checkpoint capture); it is parked until then, so a cache that is
+        // all dirty drains the candidate list once and reports Exhausted
+        // instead of re-scanning every page on every install.
         loop {
             match self.access_map.pop() {
                 None => {
@@ -1136,23 +1238,17 @@ where
                             self.access_map.push(victim, self.next_seq());
                             continue;
                         }
-                        // Cloned before downgrading: once `guard.insert`
-                        // below replaces the shard's own Strong entry, that
-                        // entry's Arc gets dropped — without a separate
-                        // owned clone here, a page that's dirty and held
-                        // nowhere else would be freed (and its unflushed
-                        // mutations lost) before this function ever gets a
-                        // chance to hand it back for flushing.
+                        if arc.is_dirty() {
+                            drop(guard);
+                            self.parked_dirty.lock().push(victim);
+                            continue;
+                        }
                         let arc = arc.clone();
                         let weak = Arc::downgrade(&arc);
                         guard.insert(victim, PageEntry::Weak(weak));
                         self.strong_count
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        return Evicted::Yes(if arc.is_dirty() {
-                            Some((victim, arc))
-                        } else {
-                            None
-                        });
+                        return Evicted::Yes;
                     }
                     // Stale entry: victim is already Weak or absent in its
                     // shard (evicted some other way, or never actually
@@ -1177,14 +1273,13 @@ where
     }
 
     fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
-        let mut p = if should_pin {
+        let p = if should_pin {
             Page::new_pinned(self.header.page_size)
         } else {
             Page::new_data(self.header.page_size)
         };
         // Adopt the page into this database's WAL clock so later mutations stamp
         // their lsn from it (and copy-on-write clones inherit it).
-        p.set_clock(self.clock.clone());
         self.write_page(page_num, &p)?;
         Ok(())
     }
@@ -1250,21 +1345,9 @@ impl Rem<PageId> for PageId {
 // a second, nowhere near long enough to look like a hang.
 const MAX_TRANSIENT_RETRIES: u32 = 100;
 
-// Increments `msg`'s transient-retry counter (see WriteMsg's own comment) and
-// turns it into a hard failure once MAX_TRANSIENT_RETRIES is exceeded.
-fn bump_transient_retries(msg: &mut WriteMsg, page_id: PageId) -> Result<(), StoreError> {
-    msg.transient_retries += 1;
-    if msg.transient_retries > MAX_TRANSIENT_RETRIES {
-        return Err(StoreError::PageTransientlyInconsistent(page_id));
-    }
-    Ok(())
-}
-
-// Bounded retry-with-sleep variant of write_page for Checkpoint/Shutdown's
-// drain loops: unlike the main pending-drain loop (which just leaves a
-// transiently-inconsistent message in `pending` for the next ~1ms outer
-// pass), these two loops consume `pending` via drain(..) and must finish
-// this one pass before returning/exiting, so they retry inline instead.
+// Bounded retry-with-sleep variant of write_page, used by the checkpoint's
+// write of captured pages: a page caught mid-overflow-transition is retried
+// briefly rather than treated as corruption.
 fn write_page_with_bounded_retry<F: DBFile>(
     page_id: PageId,
     page: &Arc<Page>,
@@ -1285,182 +1368,18 @@ fn write_page_with_bounded_retry<F: DBFile>(
 }
 
 fn writer<F: DBFile>(
-    mut file: F,
-    header: Arc<Header>,
+    file: F,
+    _header: Arc<Header>,
     recv: Receiver<BufMsg>,
-    clock: Arc<LsnClock>,
-    max_pending: usize,
 ) -> Result<(), StoreError> {
-    let mut pending: Vec<WriteMsg> = vec![];
+    let mut file = file;
     loop {
-        // Drain deferred pages EVERY iteration, not just when idle. Db::insert
-        // queues a page write *before* it logs the page's redo record, so a page
-        // almost always arrives with lsn >= last_lsn and gets deferred here.
-        // Draining only on an Empty channel (the old behavior) meant that under
-        // sustained load — when the channel never drains empty — `pending` grew
-        // without bound (observed: 12 GB RSS, then thrash). Retrying on every
-        // pass keeps it bounded to just the pages whose redo isn't durable yet.
-        let mut i = 0;
-        while i < pending.len() {
-            if pending[i].page.is_pinned()
-                // STORE_AUDIT.md T2: `<=`, not `<`. Now that a page is
-                // correctly stamped with the exact lsn of the operation
-                // that dirtied it (see Page::stamp_lsn_at_least), a page
-                // whose lsn exactly EQUALS the current watermark has its
-                // protecting redo record already durable — safe to flush
-                // now, not stuck waiting for something strictly newer.
-                || pending[i].page.lsn_id()? <= clock.last_written()
-            {
-                match write_page(
-                    pending[i].page_num,
-                    &pending[i].page,
-                    &file,
-                    header.page_size,
-                    header.first_page_offset,
-                ) {
-                    Ok(()) => {
-                        pending.swap_remove(i);
-                        // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
-                        // Don't advance i: swap_remove pulled a new element
-                        // into this position.
-                    }
-                    Err(StoreError::PageTransientlyInconsistent(pid)) => {
-                        bump_transient_retries(&mut pending[i], pid)?;
-                        // Leave it in place — retried on the next outer pass
-                        // (~1ms later, see recv_timeout below), which gives
-                        // the in-progress foreground transition plenty of
-                        // time to finish without this thread busy-spinning.
-                        i += 1;
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else {
-                i += 1;
-            }
-        }
-        // The drain above bounds `pending` to pages whose redo genuinely isn't
-        // durable yet — but under sustained write load with a small page size
-        // (many more distinct pages touched per row than a large page size),
-        // even that "not yet durable" set can grow unboundedly, since nothing
-        // upstream throttles how fast new WritePage messages arrive relative to
-        // how fast the redo watermark advances (confirmed: 13+ GB RSS for 2M
-        // rows at the default page size before this fix). Once `pending` hits
-        // the cap, stop pulling new messages off `write_tx` entirely instead of
-        // draining into an ever-growing Vec: since `write_tx` is now bounded to
-        // the same capacity, senders (get_page_mut/write_locked_page callers)
-        // block on send() once it fills, applying real backpressure all the way
-        // back to whatever's inserting.
-        //
-        // This can't deadlock: the redo watermark (clock.last_written(), which
-        // is what the drain above is waiting on) advances via the Logger's own
-        // independent redo-writer thread, not through this channel — so pending
-        // keeps draining, and thus this gate keeps re-opening, even while this
-        // thread isn't receiving anything new.
-        //
-        // Staying on one channel (not splitting control messages like
-        // Checkpoint/DiscardPending onto a separate one to dodge this) is
-        // deliberate: DiscardPending's and Checkpoint's correctness both rely
-        // on FIFO order relative to WritePage on this exact channel (see their
-        // own comments) — pausing intake entirely delays everything equally
-        // and preserves that order; splitting channels would not.
-        //
-        // Gate on `pending` alone, deliberately NOT `pending.len() +
-        // recv.len()`: counting the channel's own backlog too seems tighter,
-        // but it isn't safe — once the channel fills, the only way its
-        // backlog ever shrinks is for this thread to recv() from it, which a
-        // recv.len()-inclusive gate would itself be blocking. That's a
-        // deadlock: pending drains to 0, but pending.len() + recv.len() stays
-        // at the cap forever, since nothing is popping recv. Gating on
-        // pending alone reopens unconditionally once pending drains, which
-        // is what actually lets the channel drain too. The channel's own
-        // bound (see PageBuffer::new — a small fixed constant, not
-        // max_pending_writes) already keeps the resulting slop small.
-        if pending.len() >= max_pending {
-            thread::sleep(Duration::from_millis(1));
-            continue;
-        }
-        // Block up to 1ms for the next message instead of busy-spinning: lets
-        // this thread idle cheaply while still waking promptly to re-drain
-        // pending as last_lsn advances.
-        match recv.recv_timeout(Duration::from_millis(1)) {
-            Ok(BufMsg::Checkpoint(tx)) => {
-                let res = (|| {
-                    for m in pending.drain(..) {
-                        write_page_with_bounded_retry(
-                            m.page_num,
-                            &m.page,
-                            &file,
-                            header.page_size,
-                            header.first_page_offset,
-                        )?;
-                        // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
-                    }
-                    // A checkpoint's entire point is "everything up to here is
-                    // durable" — the redo/undo logs get truncated right after
-                    // this returns (Db::checkpoint), on the assumption that
-                    // whatever they'd replay is already safely on disk. Without
-                    // an actual fsync, "on disk" only ever meant "handed to the
-                    // OS via write()" — recoverable across a process crash via
-                    // WAL replay, but not across a real power loss, since the
-                    // OS's own page cache might not have been flushed yet. This
-                    // closes that gap for the specific point where it matters
-                    // most: right before we discard the only other record of
-                    // this data.
-                    file.do_sync()?;
-                    Ok(())
-                })();
-                let _ = tx.send(res);
-            }
+        match recv.recv() {
             Ok(BufMsg::Shutdowm) => {
-                // Flush everything still waiting before exit — all committed
-                // operations' redo records are already durable by now.
-                for m in pending.drain(..) {
-                    write_page_with_bounded_retry(
-                        m.page_num,
-                        &m.page,
-                        &file,
-                        header.page_size,
-                        header.first_page_offset,
-                    )?;
-                    // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
-                }
-                // Same rationale as Checkpoint above: close() truncates the
-                // WAL right after this returns, so this is the last point
-                // page data can be made durable before that happens.
+                // Everything the checkpoint/shutdown capture wrote is synced
+                // by the writer of those pages; this is the header's turn.
                 file.do_sync()?;
                 break;
-            }
-            Ok(BufMsg::WritePage(mut msg)) => {
-                // This write supersedes any still-deferred write of the same
-                // slot: an older snapshot must never reach disk after this one.
-                // `pending` is drained with swap_remove (out of order) and at
-                // shutdown in vector order, so without this a stale entry for a
-                // repeatedly-mutated page could flush last and clobber it.
-                pending.retain(|m| m.page_num != msg.page_num);
-                // STORE_AUDIT.md T2: `<=`, not `<` — see the matching gate
-                // above (pending's own drain loop) for why.
-                if msg.page.is_pinned() || msg.page.lsn_id()? <= clock.last_written() {
-                    match write_page(
-                        msg.page_num,
-                        &msg.page,
-                        &file,
-                        header.page_size,
-                        header.first_page_offset,
-                    ) {
-                        Ok(()) => {
-                            // write_page already marked this flushed (conditionally, via mark_flushed_up_to).
-                        }
-                        Err(StoreError::PageTransientlyInconsistent(pid)) => {
-                            bump_transient_retries(&mut msg, pid)?;
-                            // Defer instead of retrying inline — same
-                            // treatment as "LSN not durable yet" below.
-                            pending.push(msg);
-                        }
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    pending.push(msg);
-                }
             }
             Ok(BufMsg::WriteHeader(header)) => {
                 let mut bytes = to_allocvec(&header)?;
@@ -1477,24 +1396,15 @@ fn writer<F: DBFile>(
                     }
                     pwrite_all(&file, &bytes, 0)?;
                     // STORE_AUDIT.md T5: the whole point of this variant —
-                    // the caller (Db::checkpoint) must not truncate the log
-                    // until the header is confirmed durable, not just
-                    // handed to the OS via write().
+                    // the caller (Db::checkpoint) must not delete log
+                    // segments until the header is confirmed durable, not
+                    // just handed to the OS via write().
                     file.do_sync()?;
                     Ok(())
                 })();
                 let _ = tx.send(res);
             }
-            Ok(BufMsg::DiscardPending(page_id)) => {
-                // The slot was freed; drop its deferred write so it can't clobber
-                // the next occupant on a later flush. Any earlier queued write of
-                // this slot has already been moved into `pending` above (FIFO),
-                // and a reuse's write arrives after this message, so this removes
-                // exactly the stale old-contents write.
-                pending.retain(|m| m.page_num != page_id);
-            }
-            Err(crossbeam::channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+            Err(_) => {
                 // The sending PageBuffer was dropped without an explicit
                 // shutdown() (flagged separately by PageBuffer's Drop impl).
                 info!("Writer exiting: channel disconnected");
@@ -1783,7 +1693,7 @@ mod tests {
 
     use postcard::from_bytes;
 
-    use super::{BufMsg, Evicted, PageEntry, WriteMsg};
+    use super::{Evicted, PageEntry};
     use crate::cursor::Cursor;
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
@@ -1802,11 +1712,13 @@ mod tests {
     // this is byte-identical to what a full Header serialization produces).
     fn make_header_bytes(first_page_offset: u64, page_count: u64, page_size: u64) -> Vec<u8> {
         let mut v = vec![0x53u8, 0x65]; // MAGIC
-        v.extend_from_slice(&1u32.to_le_bytes()); // format_version (STORE_AUDIT.md S1)
+        v.extend_from_slice(&3u32.to_le_bytes()); // format_version
         v.extend_from_slice(&first_page_offset.to_le_bytes());
         v.extend_from_slice(&page_count.to_le_bytes());
         v.extend_from_slice(&page_size.to_le_bytes());
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap()); // last_checkpoint
+        v.extend_from_slice(&1u64.to_le_bytes()); // counter (phase 1)
+        v.extend_from_slice(&0u64.to_le_bytes()); // checkpoint_lsn (phase 6)
         // header_checksum (STORE_AUDIT.md S1) — this path never runs
         // Header::validate, so a placeholder is fine.
         v.extend_from_slice(&0u32.to_le_bytes());
@@ -1835,9 +1747,7 @@ mod tests {
             make_header(),
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
         (buf, page_counter)
     }
@@ -2365,9 +2275,7 @@ mod tests {
             header,
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
         (buf, page_counter, file_clone)
     }
@@ -2471,7 +2379,7 @@ mod tests {
         );
         let count_after_first_write = page_counter.load(Ordering::Relaxed);
 
-        let handle = buf.get_page_mut(page_id).unwrap();
+        let handle = buf.get_page_mut(page_id, crate::buffer::LockLevel::Data).unwrap();
         let different_big_data = vec![2u8; page_size as usize];
         handle
             .page
@@ -2527,9 +2435,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
 
         let retrieved = buf2.get_page(page_id).unwrap();
@@ -2597,122 +2503,6 @@ mod tests {
         assert!(buf.shutdown().is_ok());
     }
 
-    // Regression test for the writer's unbounded `pending` growth (see
-    // writer's own comment: "observed 13+ GB RSS for 2M rows at the default
-    // page size" during a bulk-load stress run). Proves two things at once:
-    // sends beyond the cap actually block (backpressure is real, not a
-    // no-op), and they unblock and complete once the redo watermark
-    // advances (not a deadlock).
-    #[test]
-    fn test_pending_write_cap_blocks_then_drains_without_deadlock() {
-        use std::sync::mpsc;
-
-        use crate::logger::{LsnClock, LsnId};
-
-        const MAX_PENDING: usize = 2;
-        const NUM_PAGES: u64 = 6;
-
-        let mut mem = MemFile::new();
-        for _ in 0..NUM_PAGES {
-            let page = Page::new_data(PAGE_SIZE);
-            mem.write_all(&page.to_bytes()).unwrap();
-        }
-        mem.seek(SeekFrom::Start(0)).unwrap();
-        let page_counter = Arc::new(AtomicU64::new(NUM_PAGES));
-        let clock = Arc::new(LsnClock::default());
-        let buf = Arc::new(
-            PageBuffer::new(
-                PAGE_SIZE,
-                page_counter,
-                mem,
-                make_header(),
-                10,
-                clock.clone(),
-                MAX_PENDING,
-                Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-            )
-            .unwrap(),
-        );
-
-        // Pull the watermark down to a real value: Page::set_dirty stamps a
-        // page with the *current* watermark, and a cold u64::MAX watermark
-        // stamps low (writes promptly) specifically to avoid deferring
-        // forever — so without this, nothing here would defer into
-        // `pending` at all.
-        clock.mark_written(LsnId(100));
-
-        // Sends straight to the writer channel rather than through
-        // write_locked_page: that now only updates the cache and defers
-        // the actual send to eviction/checkpoint/shutdown (see its own
-        // doc comment), so it no longer feeds `pending` on every call the
-        // way this test needs to exercise the writer's own backpressure/
-        // deadlock-avoidance logic.
-        //
-        // STORE_AUDIT.md T2: stamps the page at 101 (strictly above the
-        // 100 watermark set above), not just set_dirty's own watermark
-        // stamp — the writer's flush gate is now `<=`, not `<` (a page
-        // whose own lsn exactly equals the watermark is genuinely durable
-        // and correctly flushes right away), so simply calling
-        // set_dirty(true) here (which would stamp exactly 100, matching
-        // the watermark) would satisfy the gate immediately and never
-        // actually defer into `pending` at all — defeating this test's own
-        // setup. stamp_lsn_at_least(101) mimics a real not-yet-logged
-        // operation the way Db::insert/update/remove now do.
-        fn dirty_and_send(buf: &PageBuffer<MemFile>, page_num: crate::page::PageId) {
-            let mut handle = buf.get_page_mut(page_num).unwrap();
-            let page = std::sync::Arc::make_mut(&mut handle.page);
-            page.set_dirty(true).unwrap();
-            page.stamp_lsn_at_least(LsnId(101)).unwrap();
-            let page = handle.page.clone();
-            buf.write_tx
-                .send(BufMsg::WritePage(WriteMsg {
-                    page_num,
-                    page,
-                    transient_retries: 0,
-                }))
-                .unwrap();
-        }
-
-        // These fill `pending` exactly to capacity (both stamped at 101,
-        // which never satisfies "<= last_written" (100) until it advances)
-        // — sends here must not block.
-        for i in 0..MAX_PENDING as u64 {
-            dirty_and_send(&buf, i.into());
-        }
-
-        // Pending is now at the cap. Send the rest from another thread: if
-        // the cap didn't apply real backpressure, this finishes immediately;
-        // if the gating logic deadlocks instead of backing off, this hangs
-        // forever instead of taking down the whole test process.
-        let (done_tx, done_rx) = mpsc::channel();
-        let buf2 = Arc::clone(&buf);
-        let sender = std::thread::spawn(move || {
-            for i in MAX_PENDING as u64..NUM_PAGES {
-                dirty_and_send(&buf2, i.into());
-            }
-            let _ = done_tx.send(());
-        });
-
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(200))
-                .is_err(),
-            "sends beyond the cap should block until pending drains, but finished immediately"
-        );
-
-        // Advance the watermark: everything stamped at 101 now satisfies
-        // "101 <= 101". The writer's per-iteration drain (unconditional, not
-        // gated on receiving a new message) picks this up on its own,
-        // draining `pending` and reopening the gate — unblocking the sender.
-        clock.mark_written(LsnId(101));
-
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("writes beyond the cap must complete once pending drains, not hang forever");
-        sender.join().unwrap();
-
-        let _ = Arc::try_unwrap(buf).unwrap().shutdown();
-    }
 
     // write_locked_page no longer sends a write on every mutation — it only
     // updates the cache and leaves the disk write to eviction, checkpoint,
@@ -2732,7 +2522,7 @@ mod tests {
         let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, MAX_ENTRIES as u64 + 1, MAX_ENTRIES);
         let page0: crate::page::PageId = 0u64.into();
 
-        let handle = buf.get_page_mut(page0).unwrap();
+        let handle = buf.get_page_mut(page0, crate::buffer::LockLevel::Data).unwrap();
         handle.page.add_tuple(Tuple::new(1, b"hello")).unwrap();
         buf.write_locked_page(handle).unwrap();
 
@@ -2768,9 +2558,7 @@ mod tests {
             make_header(),
             MAX_ENTRIES,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
@@ -2813,6 +2601,10 @@ mod tests {
         let (buf, _) = make_buffer(2, 10);
         let page_a = Arc::new(Page::new_data(PAGE_SIZE));
         let page_b = Arc::new(Page::new_data(PAGE_SIZE));
+        // Phase 6: only clean pages are evictable (a dirty one is parked
+        // until a checkpoint captures it); these are "already on disk".
+        page_a.set_dirty(false).unwrap();
+        page_b.set_dirty(false).unwrap();
         page_a.mark_referenced(); // A: accessed since it was cached.
         // B is left un-referenced (fresh Page starts with referenced=false).
 
@@ -2830,7 +2622,7 @@ mod tests {
         buf.access_map.push(id_b, buf.next_seq());
 
         match buf.evict_one() {
-            Evicted::Yes(_) => {}
+            Evicted::Yes => {}
             Evicted::Exhausted => panic!("expected a victim to be evicted"),
         }
 
@@ -2860,7 +2652,7 @@ mod tests {
         let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, 1, 10); // generous max_entries: no eviction
         let page0: crate::page::PageId = 0u64.into();
 
-        let handle = buf.get_page_mut(page0).unwrap();
+        let handle = buf.get_page_mut(page0, crate::buffer::LockLevel::Data).unwrap();
         handle.page.add_tuple(Tuple::new(1, b"world")).unwrap();
         buf.write_locked_page(handle).unwrap();
 
@@ -2874,9 +2666,7 @@ mod tests {
             make_header(),
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
@@ -3020,9 +2810,7 @@ mod tests {
             header,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(registry_with_test_bucket()),
-        )
+            Arc::new(registry_with_test_bucket()),)
         .unwrap();
 
         let page_id = buf.alloc_page(false).unwrap();
@@ -3054,9 +2842,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(registry_with_test_bucket()),
-        )
+            Arc::new(registry_with_test_bucket()),)
         .unwrap();
 
         let retrieved = buf2.get_page(page_id).unwrap();
@@ -3083,9 +2869,7 @@ mod tests {
             header,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(registry_with_test_bucket()),
-        )
+            Arc::new(registry_with_test_bucket()),)
         .unwrap();
 
         buf.alloc_page(false).unwrap();
@@ -3139,9 +2923,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -3173,9 +2955,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -3226,9 +3006,7 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            1024,
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
-        )
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -3301,7 +3079,7 @@ mod tests {
 
         let start = std::time::Instant::now();
         for i in 0..ITERS {
-            let handle = buf.get_page_mut(page_id).unwrap();
+            let handle = buf.get_page_mut(page_id, crate::buffer::LockLevel::Data).unwrap();
             let data = vec![(i % 256) as u8; page_size as usize];
             handle
                 .page
@@ -3315,6 +3093,122 @@ mod tests {
              ({:.0} writes/s)",
             ITERS as f64 / elapsed.as_secs_f64()
         );
+        let _ = buf.shutdown();
+    }
+
+    // ---- Phase 5: enforced lock order, one generous timeout ----
+
+    // Locks are ordered Index → Data; a request that would take them in
+    // the other order (or a second Data page) is refused at once with the
+    // full held-set in the message. It never waits: an out-of-order request
+    // is the one thing that could deadlock, and a hang is not a diagnosis.
+    #[test]
+    fn test_lock_order_violation_is_refused_immediately() {
+        use crate::buffer::LockLevel::{Data, Index};
+        let (buf, _) = make_buffer(10, 100);
+        let a = buf.alloc_page(false).unwrap();
+        let b = buf.alloc_page(false).unwrap();
+
+        let held = buf.get_page_mut(a, Data).unwrap();
+        let start = std::time::Instant::now();
+        match buf.get_page_mut(b, Index) {
+            Err(StoreError::LockOrderViolation(msg)) => {
+                assert!(msg.contains("Index"), "{msg}");
+                assert!(msg.contains(&format!("{a:?}")), "must name what is held: {msg}");
+            }
+            other => panic!("expected LockOrderViolation, got {other:?}"),
+        }
+        assert!(
+            matches!(buf.get_page_mut(b, Data), Err(StoreError::LockOrderViolation(_))),
+            "a second, different Data page is out of order too"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "an order violation must not wait for the lock"
+        );
+        // Re-entering the same page is fine (ArcLock is reentrant per thread).
+        drop(buf.get_page_mut(a, Data).unwrap());
+        drop(held);
+
+        // With nothing held, Index then Data is the sanctioned order, and
+        // Index after Index (a descent) is fine.
+        let root = buf.get_page_mut(b, Index).unwrap();
+        let child = buf.get_page_mut(a, Index).unwrap();
+        let leaf_data = buf.get_page_mut(a, Data).unwrap();
+        drop(leaf_data);
+        drop(child);
+        drop(root);
+        let _ = buf.shutdown();
+    }
+
+    // A lock wait past the timeout fails — it does not hang — and the error
+    // says who holds the lock and for how long, plus what the waiter itself
+    // holds, so a stuck production system reports the deadlock instead of
+    // exhibiting it.
+    #[test]
+    fn test_lock_timeout_fails_fast_and_names_the_holder() {
+        use crate::buffer::LockLevel::Data;
+        let (buf, _) = make_buffer(10, 100);
+        let buf = Arc::new(buf);
+        buf.set_lock_timeout(std::time::Duration::from_millis(50));
+        let a = buf.alloc_page(false).unwrap();
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let buf = Arc::clone(&buf);
+            std::thread::Builder::new()
+                .name("lock-holder".into())
+                .spawn(move || {
+                    let h = buf.get_page_mut(a, Data).unwrap();
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    drop(h);
+                })
+                .unwrap()
+        };
+        held_rx.recv().unwrap();
+
+        let start = std::time::Instant::now();
+        let r = buf.get_page_mut(a, Data);
+        let waited = start.elapsed();
+        match r {
+            Err(StoreError::LockTimeout(msg)) => {
+                assert!(msg.contains("lock-holder"), "must name the holder thread: {msg}");
+                assert!(msg.contains("held by"), "{msg}");
+                assert!(msg.contains(&format!("{a:?}")), "{msg}");
+            }
+            other => panic!("expected LockTimeout, got {other:?}"),
+        }
+        assert!(waited >= std::time::Duration::from_millis(50), "returned before the timeout: {waited:?}");
+        assert!(waited < std::time::Duration::from_secs(1), "did not honour the configured timeout: {waited:?}");
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        // The failed wait left no bookkeeping behind: the page is takeable.
+        drop(buf.get_page_mut(a, Data).unwrap());
+        if let Ok(buf) = Arc::try_unwrap(buf) {
+            let _ = buf.shutdown();
+        }
+    }
+
+    // The "no page lock across a blocking wait" rule is checked, not assumed.
+    #[test]
+    #[should_panic(expected = "while holding page locks")]
+    fn test_blocking_wait_with_a_page_lock_held_is_caught() {
+        let (buf, _) = make_buffer(10, 100);
+        let a = buf.alloc_page(false).unwrap();
+        let _held = buf.get_page_mut(a, crate::buffer::LockLevel::Data).unwrap();
+        crate::buffer::debug_assert_no_page_locks_held("test wait");
+    }
+
+    #[test]
+    fn test_no_page_locks_held_passes_once_handles_drop() {
+        let (buf, _) = make_buffer(10, 100);
+        let a = buf.alloc_page(false).unwrap();
+        let held = buf.get_page_mut(a, crate::buffer::LockLevel::Data).unwrap();
+        drop(held);
+        crate::buffer::debug_assert_no_page_locks_held("test wait");
         let _ = buf.shutdown();
     }
 }

@@ -3,9 +3,10 @@ use std::sync::Arc;
 use log::error;
 
 use crate::{
+    buffer::LockLevel,
     buffer::PageBuffer,
     cursor::Cursor,
-    db::{DBFile, DBSizeType, Db},
+    db::{DBFile, DBSizeType},
     error::StoreError,
     page::{Page, PageId, PageTupleIterator, USABLE_DATA_MARGIN},
     tuple::{DBIdType, Tuple},
@@ -135,7 +136,7 @@ where
     pub fn append(&mut self, data: &[u8]) -> Result<(), StoreError> {
         let tuple = Tuple::new(0, data);
         loop {
-            let handle = self.pages.buffer.get_page_mut(self.tail)?;
+            let handle = self.pages.buffer.get_page_mut(self.tail, LockLevel::Data)?;
             if handle.page.can_store(&tuple) {
                 handle.page.add_tuple(tuple)?;
                 self.pages.buffer.write_locked_page(handle)?;
@@ -253,7 +254,7 @@ where
         if tuple.size() > max {
             return Err(StoreError::TupleTooLarge(tuple.size(), max as usize));
         }
-        let handle = self.pages.buffer.get_page_mut(page_id)?;
+        let handle = self.pages.buffer.get_page_mut(page_id, LockLevel::Data)?;
         handle.page.clear()?;
         handle.page.add_tuple(tuple)?;
         self.pages.buffer.write_locked_page(handle)?;
@@ -300,7 +301,7 @@ where
             .page_ids
             .get(page_index)
             .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
-        let handle = self.pages.buffer.get_page_mut(page_id)?;
+        let handle = self.pages.buffer.get_page_mut(page_id, LockLevel::Data)?;
         handle.page.add_tuple(Tuple::new(slot, data))?;
         self.pages.buffer.write_locked_page(handle)?;
         Ok(())

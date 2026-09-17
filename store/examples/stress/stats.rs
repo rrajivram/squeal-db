@@ -8,7 +8,8 @@ pub struct OpCounters {
     pub success: AtomicU64,
     pub key_not_found: AtomicU64,
     pub duplicate_key: AtomicU64,
-    pub lock_contention: AtomicU64,
+    /// Phase 5: LockTimeout / LockOrderViolation. Any non-zero count fails the run.
+    pub lock_timeouts: AtomicU64,
     pub other_error: AtomicU64,
 }
 
@@ -17,7 +18,7 @@ impl OpCounters {
         self.success.load(Ordering::Relaxed)
             + self.key_not_found.load(Ordering::Relaxed)
             + self.duplicate_key.load(Ordering::Relaxed)
-            + self.lock_contention.load(Ordering::Relaxed)
+            + self.lock_timeouts.load(Ordering::Relaxed)
             + self.other_error.load(Ordering::Relaxed)
     }
 }
@@ -31,7 +32,8 @@ pub struct Stats {
     pub find: OpCounters,
     pub txn_committed: AtomicU64,
     pub txn_rolled_back: AtomicU64,
-    pub dropped_after_retry_exhaustion: AtomicU64,
+    /// Repeatable-read violations observed on hot keys (see workload::ReadSet).
+    pub isolation_violations: AtomicU64,
     pub latency_buckets: Vec<AtomicU64>,
     /// Millis-since-start of each thread's last completed op; used by the
     /// watchdog to report exactly which threads are stuck.
@@ -41,6 +43,13 @@ pub struct Stats {
 }
 
 impl Stats {
+    pub fn lock_timeouts(&self) -> u64 {
+        [&self.insert, &self.update, &self.remove, &self.find]
+            .iter()
+            .map(|c| c.lock_timeouts.load(Ordering::Relaxed))
+            .sum()
+    }
+
     pub fn new(num_threads: usize) -> Self {
         Self {
             start: Instant::now(),
@@ -51,7 +60,7 @@ impl Stats {
             find: OpCounters::default(),
             txn_committed: AtomicU64::new(0),
             txn_rolled_back: AtomicU64::new(0),
-            dropped_after_retry_exhaustion: AtomicU64::new(0),
+            isolation_violations: AtomicU64::new(0),
             latency_buckets: (0..NUM_LATENCY_BUCKETS).map(|_| AtomicU64::new(0)).collect(),
             thread_last_activity_ms: (0..num_threads).map(|_| AtomicU64::new(0)).collect(),
             thread_ops_done: (0..num_threads).map(|_| AtomicU64::new(0)).collect(),

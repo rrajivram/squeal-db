@@ -37,6 +37,9 @@ mod tests;
 // store::Db doesn't implement Debug, so this can't be derived — a
 // minimal manual impl (name only) is enough for {:?} logging and for
 // Result<Arc<Schema<F>>, _>::unwrap_err() in tests.
+/// Rows per transaction for COPY INTO (phase 7).
+const COPY_BATCH_ROWS: usize = 1000;
+
 impl<F: DBFile> std::fmt::Debug for Schema<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Schema")
@@ -796,9 +799,13 @@ where
     // fails to parse or violates a constraint is skipped and counted,
     // not fatal to the whole load — matches real COPY INTO's own
     // per-row reporting, unlike this engine's own multi-row INSERT
-    // (which rolls the whole batch back on any single failure). Each
-    // row is its own independent insert_rows call (autocommit), so an
-    // earlier row's success survives a later row's failure.
+    // (which rolls the whole batch back on any single failure).
+    //
+    // TXN_SIMPLIFICATION_PLAN.md phase 7: rows are loaded COPY_BATCH_ROWS
+    // per transaction (one fsync per batch instead of one per row, which
+    // pinned a single-connection load to the disk's fsync rate); a batch
+    // that fails is replayed row by row so the bad row(s) are skipped and
+    // counted while the rest of that batch still loads.
     pub(crate) fn copy_csv_into(
         self: &Arc<Self>,
         table_name: &str,
@@ -816,22 +823,37 @@ where
 
         let mut loaded = 0usize;
         let mut failed = 0usize;
+        let mut batch: Vec<Vec<ValueItem>> = Vec::with_capacity(COPY_BATCH_ROWS);
+        let mut flush = |batch: &mut Vec<Vec<ValueItem>>, loaded: &mut usize, failed: &mut usize| {
+            if batch.is_empty() {
+                return;
+            }
+            let rows = std::mem::take(batch);
+            match self.insert_rows(table_name, rows.clone(), None) {
+                Ok(n) => *loaded += n,
+                Err(_) => {
+                    for row in rows {
+                        match self.insert_rows(table_name, vec![row], None) {
+                            Ok(_) => *loaded += 1,
+                            Err(_) => *failed += 1,
+                        }
+                    }
+                }
+            }
+        };
         for record in reader.records() {
             let row = record
                 .map_err(|e| SchemaError::UserError(e.to_string()))
                 .and_then(|record| csv_record_to_row(&record, fields));
-            let row = match row {
-                Ok(row) => row,
-                Err(_) => {
-                    failed += 1;
-                    continue;
-                }
-            };
-            match self.insert_rows(table_name, vec![row], None) {
-                Ok(_) => loaded += 1,
+            match row {
+                Ok(row) => batch.push(row),
                 Err(_) => failed += 1,
             }
+            if batch.len() >= COPY_BATCH_ROWS {
+                flush(&mut batch, &mut loaded, &mut failed);
+            }
         }
+        flush(&mut batch, &mut loaded, &mut failed);
         Ok((loaded, failed))
     }
 

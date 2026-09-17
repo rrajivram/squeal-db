@@ -188,3 +188,36 @@ fn test_copy_csv_into_rejects_a_missing_file() {
         .unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
+
+// Phase 7: rows load in batches of one transaction each; a bad row in a
+// batch costs only itself (the batch is replayed row by row), and every
+// batch boundary is exercised.
+#[test]
+fn test_copy_csv_into_batches_rows_and_still_skips_only_the_bad_ones() {
+    let mut csv = String::from("id,name\n");
+    let total = 2_500u64;
+    let bad = [7u64, 1_000, 1_001, 2_499]; // inside, on and just past a boundary, last
+    for i in 1..=total {
+        if bad.contains(&i) {
+            csv.push_str(&format!("{i},{i}\n"));
+            csv.push_str(&format!("{i},dup\n")); // duplicate primary key
+        } else {
+            csv.push_str(&format!("{i},n{i}\n"));
+        }
+    }
+    let path = write_csv("batches", &csv);
+    let c = conn();
+    execute(
+        &c,
+        "create table users (id integer not null, name varchar(10), primary key(id))",
+    )
+    .unwrap();
+    let s = c.current_schema().unwrap();
+    let (loaded, failed) = s
+        .copy_csv_into("users", path.to_str().unwrap())
+        .unwrap();
+    assert_eq!((loaded, failed), (total as usize, bad.len()));
+    assert_eq!(select_rows(&c, "users").len(), total as usize);
+    std::fs::remove_file(path).ok();
+}
+

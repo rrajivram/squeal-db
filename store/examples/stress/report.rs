@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::stats::{Stats, bucket_lower_bound_us};
@@ -34,7 +34,14 @@ pub fn spawn_watchdog(
         let mut last_completed = 0u64;
         let mut stalled_for_secs = 0u64;
         loop {
-            std::thread::sleep(Duration::from_secs(cfg.report_interval_secs.max(1)));
+            // Sleep in short slices so `stop` is noticed promptly: the main
+            // thread joins this watchdog after the workers finish, and a
+            // whole-interval sleep here used to quantize the reported
+            // elapsed time (and therefore throughput) to the report interval.
+            let deadline = Instant::now() + Duration::from_secs(cfg.report_interval_secs.max(1));
+            while Instant::now() < deadline && !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             if stop.load(Ordering::Relaxed) {
                 return;
             }
@@ -119,10 +126,11 @@ pub fn print_final_report(cfg: &Config, stats: &Stats, correctness: &Correctness
     );
     println!("elapsed={:.2}s total_ops={total_completed} throughput={rate:.0} ops/s", elapsed.as_secs_f64());
     println!(
-        "txn_committed={} txn_rolled_back={} dropped_after_retry_exhaustion={}",
+        "txn_committed={} txn_rolled_back={} lock_timeouts={} isolation_violations={}",
         stats.txn_committed.load(Ordering::Relaxed),
         stats.txn_rolled_back.load(Ordering::Relaxed),
-        stats.dropped_after_retry_exhaustion.load(Ordering::Relaxed),
+        stats.lock_timeouts(),
+        stats.isolation_violations.load(Ordering::Relaxed),
     );
     let peak_rss = stats.peak_rss_kb.load(Ordering::Relaxed);
     if peak_rss > 0 {
@@ -137,12 +145,12 @@ pub fn print_final_report(cfg: &Config, stats: &Stats, correctness: &Correctness
         ("find", &stats.find),
     ] {
         println!(
-            "{name:7} total={:<8} ok={:<8} key_not_found={:<7} duplicate_key={:<6} lock_contention={:<6} other_err={}",
+            "{name:7} total={:<8} ok={:<8} key_not_found={:<7} duplicate_key={:<6} lock_timeouts={:<6} other_err={}",
             c.total(),
             c.success.load(Ordering::Relaxed),
             c.key_not_found.load(Ordering::Relaxed),
             c.duplicate_key.load(Ordering::Relaxed),
-            c.lock_contention.load(Ordering::Relaxed),
+            c.lock_timeouts.load(Ordering::Relaxed),
             c.other_error.load(Ordering::Relaxed),
         );
     }

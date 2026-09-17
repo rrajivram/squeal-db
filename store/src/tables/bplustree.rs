@@ -5,8 +5,8 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    buffer::{PageBuffer, WritePageHandle},
-    db::{DBFile, DBSizeType, retry_on_contention},
+    buffer::{LockLevel, PageBuffer, WritePageHandle},
+    db::{DBFile, DBSizeType},
     error::StoreError,
     logger::{LsnId, Logger},
     page::{Page, PageId},
@@ -21,6 +21,27 @@ enum Node {
     Leaf(PageId),
 }
 
+/// What a `write_version` caller wants done with the row for a key, decided
+/// under the leaf lock against what is currently there
+/// (TXN_SIMPLIFICATION_PLAN.md phase 4).
+pub(crate) enum Decision {
+    /// A fresh row; the key must currently be absent.
+    Insert(Tuple),
+    /// Replace the current row with this version (same key).
+    Replace(Tuple),
+    /// Physically remove the row and its index entry.
+    Delete,
+    Skip,
+}
+
+/// What `write_version` did.
+pub(crate) enum Written {
+    Inserted(PageId),
+    Replaced(Tuple),
+    Deleted(Option<Tuple>),
+    Skipped,
+}
+
 // split_if_needed's result — see its own comment on why the no-split case
 // carries the already-held lock forward instead of dropping it.
 enum SplitOutcome {
@@ -29,6 +50,10 @@ enum SplitOutcome {
 }
 
 // Bit indices 0–3 are reserved (PINNED, INDEX_PAGE, …); user flags start at 4.
+// Phase 4: route writes with unlocked reads and lock only the leaf (see
+// leaf_for_write); false forces the locked crabbing descent for every write.
+const OPTIMISTIC_DESCENT: bool = true;
+
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
 
@@ -155,12 +180,11 @@ where
         }
         let first_index_page = buffer.alloc_page(false)?;
         let first_data_page = buffer.alloc_page(false)?;
-        let mut index_page = Page::new_indexed(pg, index_entry_size as usize);
+        let index_page = Page::new_indexed(pg, index_entry_size as usize);
         // Adopt into this database's WAL clock before flagging (set_page_flags
         // dirties it, which stamps the lsn from the clock).
-        index_page.set_clock(buffer.clock());
         index_page.set_page_flags(LEAF_NODE)?;
-        let mut handle = buffer.get_page_mut(first_index_page)?;
+        let mut handle = buffer.get_page_mut(first_index_page, LockLevel::Index)?;
         handle.page = Arc::new(index_page);
         buffer.write_locked_page(handle)?;
         let table = Table {
@@ -227,138 +251,227 @@ where
     // earlier pass of this same replay) — a fresh, unrelated row can't
     // occupy the same id without a Del in between, which would already
     // have removed it. No LSN comparison needed.
-    pub(crate) fn insert_if_needed(
-        &self,
-        tuple: &Tuple,
-        txn: TransactionId,
-    ) -> Result<PageId, StoreError> {
-        if let Some(page_id) = self.find_page(tuple.id.clone(), self.table.first_index_page)? {
-            Ok(page_id)
-        } else {
-            self.insert(tuple.clone(), txn)
+    // ------------------------------------------------------------------
+    // TXN_SIMPLIFICATION_PLAN.md phase 4: THE write primitive. insert,
+    // update, remove, the conditional reverts, recovery's redo, and vacuum's
+    // purge are all one call each through `write_version`.
+    // ------------------------------------------------------------------
+
+    /// Recovery's redo for an `Add`: apply this exact version — insert if
+    /// the key is absent, overwrite if a different occupant is there (a
+    /// checkpointed tombstone whose purge was not logged, or a stale log
+    /// older than the checkpoint), skip if it is already there.
+    pub(crate) fn insert_if_needed(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
+        let t = tuple.clone();
+        match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+            Ok(match cur {
+                None => Decision::Insert(t),
+                Some(c) if c.data == t.data && c.is_tombstoned() == t.is_tombstoned() => Decision::Skip,
+                Some(_) => Decision::Replace(t),
+            })
+        })? {
+            Written::Inserted(p) => Ok(p),
+            _ => self
+                .find_page(tuple.id.clone(), self.table.first_index_page)?
+                .ok_or_else(|| StoreError::KeyNotFound(tuple.id.clone())),
         }
     }
 
-    // STORE_AUDIT.md T2: thin wrapper over insert_at_lsn for callers with no
-    // operation-level lsn to give it (i.e. everything except Db::insert,
-    // which mints one up front — see insert_at_lsn's own comment). Mints
-    // its own here so pages this write touches still end up correctly
-    // stamped (never a stale watermark), just not tied to any redo record
-    // an external caller will actually log.
+    /// Plain insert (tests): a fresh row, DuplicateKey if present.
     pub fn insert(&self, tuple: Tuple, txn: TransactionId) -> Result<PageId, StoreError> {
         self.insert_at_lsn(tuple, txn, self.logger.next_lsn())
     }
 
-    /// Like `insert`, but takes the operation's redo lsn explicitly instead
-    /// of minting its own — used by `Db::insert`, which mints the lsn
-    /// *before* calling this (so the pages this write touches are stamped
-    /// with the SAME lsn `Db::insert` then logs the record under), closing
-    /// STORE_AUDIT.md T2: a page must never be stamped with the flush
-    /// watermark at dirty-time (see `Page::set_dirty`'s own caveat), only
-    /// with the lsn of the operation that dirtied it, or the writer's flush
-    /// gate can be satisfied before this operation's own redo record is
-    /// even logged.
+    /// Insert under a caller-minted lsn (STORE_AUDIT.md T2: the pages this
+    /// write touches are stamped with the same lsn the caller logs under).
     pub(crate) fn insert_at_lsn(
         &self,
         tuple: Tuple,
-        txn: TransactionId,
+        _txn: TransactionId,
         lsn: LsnId,
     ) -> Result<PageId, StoreError> {
-        let tuple_id = tuple.id.clone();
-        // Write the data row, then insert its index entry. If the index insert
-        // fails (e.g. DuplicateKey, or lock contention), the data-page write we
-        // just did must be undone: otherwise it's an orphaned row with no undo
-        // record (Db::insert only logs the undo *after* this returns Ok), so a
-        // rollback can't clean it up and a later retry/re-insert leaves the same
-        // key's data on multiple pages. Making the whole insert atomic here is
-        // exactly "a failed insert rolls back its own partial work".
-        let data_page_id = self.write_data(&tuple, lsn)?;
-        let res = self.insert_index(tuple_id.clone(), data_page_id, txn, lsn);
-        if res.is_err() {
-            // Undo the data-page write so a failed index insert leaves no
-            // orphaned row. Retry on LockContentionError: this cleanup is
-            // undoing a failure that may itself have been mere contention
-            // (insert_index racing another thread's page locks), so it must
-            // not be allowed to fail from that same transient cause — unlike
-            // an ordinary insert failure, a failed *cleanup* leaves the write
-            // permanently orphaned (un-indexed, so invisible to find(), but
-            // still occupying its data page) instead of rolled back. That
-            // orphan then primes a spurious, permanent DuplicateKey for any
-            // later insert of the same key that lands on the same data page
-            // (write_data's page selection is deterministic) — confirmed via
-            // reproduction, not just theory: the exact sequence was
-            // insert_index failing with LockContentionError, this cleanup's
-            // own get_page_mut *also* hitting LockContentionError and
-            // bailing out via `?` (the bug), leaving the row orphaned, then a
-            // retried insert of the same key hitting DuplicateKey on that
-            // same page. Tolerate the row already being gone (KeyNotFound):
-            // a concurrent abort-revert (drain_aborting) can remove it
-            // between write_data and here — which is exactly the cleanup
-            // goal already met. Any *other* error still propagates (real
-            // corruption isn't swallowed).
-            retry_on_contention(|| {
-                let h = self.buffer.get_page_mut(data_page_id)?;
-                match h.page.remove_tuple(tuple_id.clone()) {
-                    Ok(_) => self.buffer.write_locked_page(h),
-                    Err(StoreError::KeyNotFound(_)) => Ok(()),
-                    Err(e) => Err(e),
-                }
-            })?;
+        let id = tuple.id.clone();
+        match self.write_version(id.clone(), lsn, |cur| {
+            Ok(match cur {
+                None => Decision::Insert(tuple),
+                Some(_) => return Err(StoreError::DuplicateKey(id.clone())),
+            })
+        })? {
+            Written::Inserted(p) => Ok(p),
+            _ => Err(StoreError::DuplicateKey(id)),
         }
-        res
     }
 
-    fn insert_index(
+    /// The one write path. Descends to the leaf for `id` (splitting
+    /// proactively on the way, so an insert always has room), holds that
+    /// leaf from the lookup through the data-page write and the leaf entry
+    /// change, and calls `decide` exactly once with the row currently under
+    /// `id` (None if there is no entry, or an entry with no row behind it).
+    /// Whatever `decide` does before returning — conflict checks, building
+    /// the new version, recording it in the version store, appending to the
+    /// WAL — happens under that lock, before any byte moves. Lock order:
+    /// index pages top-down, then the leaf, then at most one data page at a
+    /// time (proposal §3.8).
+    pub(crate) fn write_version(
         &self,
-        tuple_id: DBIdType,
-        data_page_id: PageId,
-        txn: TransactionId,
+        id: DBIdType,
         lsn: LsnId,
-    ) -> Result<PageId, StoreError> {
-        // STORE_AUDIT.md P4: index/routing entries never carry a real
-        // txn_id — visibility is resolved through the DATA tuple
-        // (Db::find_visible_to), never consulted for a routing entry
-        // itself (confirmed via grep: nothing ever reads an index page's
-        // Tuple::txn_id back). Every construction site below passes None
-        // instead of a live TransactionId for exactly this reason — see
-        // MAX_ENTRY_BYTES's own comment for the budgeted bytes this saves.
-        let id_tuple = Tuple::new_with(
-            tuple_id,
-            &to_allocvec(&Node::Leaf(data_page_id))?,
+        decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
+    ) -> Result<Written, StoreError> {
+        // Phase 6: held for the whole write so a checkpoint's capture never
+        // sees a split or a chain extension half done.
+        let _writer = self.buffer.writer_permit();
+        // A stand-in for the leaf entry this write may add, for capacity and
+        // split decisions. Its data-page id is the next id that could be
+        // allocated — an upper bound on any real one — so its size is
+        // never smaller than the real entry's.
+        let probe = Tuple::new_with(
+            id.clone(),
+            &to_allocvec(&Node::Leaf(PageId::from(self.buffer.page_count_val())))?,
             None,
             None,
         );
-        // insert_recursive's own inner-node routing returns PageCapacityError
-        // (rather than splitting on the spot) when a non-root inner node is
-        // already full on arrival: splitting *this* node needs its parent's
-        // lock to add a new separator, which is no longer held by the time
-        // we're routing through it (see its own comment). The fix is to
-        // retry the whole walk from the root: on the next pass, whichever
-        // ancestor is routing *into* this now-known-full node will call
-        // split_if_needed on it first (from a level that still holds the
-        // right locks to do so), instead of descending straight into a
-        // dead end again. This was previously an abandoned, uncompilable
-        // draft (moved id_tuple/txn without cloning them for the retry) —
-        // confirmed reachable under concurrent inserts at a small page size
-        // (~1 in 10-20 runs of a targeted 16-thread stress repro) before
-        // being wired up for real.
+        let leaf = self.leaf_for_write(&probe, lsn)?;
+        let entry = leaf.page.get(id.clone())?;
+        let data_page = match &entry {
+            Some(e) => match from_bytes::<Node>(&e.data)? {
+                Node::Leaf(p) => Some(p),
+                Node::Inner(_) => {
+                    return Err(StoreError::Corruption(format!(
+                        "expected a leaf entry, found an inner routing entry at {:?}",
+                        id
+                    )));
+                }
+            },
+            None => None,
+        };
+        let current = match data_page {
+            Some(dp) => self.buffer.get_page(dp)?.get(id.clone())?,
+            None => None,
+        };
+        match decide(current.as_ref())? {
+            Decision::Skip => Ok(Written::Skipped),
+            Decision::Insert(new) => {
+                if entry.is_some() {
+                    return Err(StoreError::DuplicateKey(id));
+                }
+                // The leaf has room by count (proactive splits); check the
+                // per-entry budget and aggregate bytes before any write.
+                if let Some(max) = leaf.page.record_size()
+                    && probe.size() as usize > max
+                {
+                    return Err(StoreError::TupleTooLarge(probe.size(), max));
+                }
+                if !leaf.page.can_store(&probe) {
+                    return Err(StoreError::PageCapacityError);
+                }
+                let dp = self.write_data(&new, lsn)?;
+                let entry = Tuple::new_with(id.clone(), &to_allocvec(&Node::Leaf(dp))?, None, None);
+                if let Err(e) = leaf.page.add_tuple(entry) {
+                    // Cannot happen after the checks above; if it does, the
+                    // row must not be left orphaned on its data page.
+                    let h = self.buffer.get_page_mut(dp, LockLevel::Data)?;
+                    let _ = h.page.remove_tuple(id);
+                    self.buffer.write_locked_page_with_lsn(h, lsn)?;
+                    return Err(e);
+                }
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                Ok(Written::Inserted(dp))
+            }
+            Decision::Replace(new) => {
+                let (dp, cur) = match (data_page, current) {
+                    (Some(dp), Some(cur)) => (dp, cur),
+                    _ => return Err(StoreError::KeyNotFound(id)),
+                };
+                let h = self.buffer.get_page_mut(dp, LockLevel::Data)?;
+                // An ordinary multi-tuple page must never exceed capacity via
+                // an in-place replace (handle_large_page_size's overflow chain
+                // is only for a single oversized tuple — see Page::can_store).
+                let header = h.page.header();
+                let fits_in_place = h.page.count()? <= 1
+                    || header.used_size().saturating_sub(cur.size()) + new.size()
+                        <= header.usable_data_size();
+                if fits_in_place {
+                    let old = h.page.replace_tuple(&id, new)?;
+                    self.buffer.write_locked_page_with_lsn(h, lsn)?;
+                    drop(leaf);
+                    Ok(Written::Replaced(old))
+                } else {
+                    drop(h);
+                    self.relocate(leaf, dp, id, new, lsn)?;
+                    Ok(Written::Replaced(cur))
+                }
+            }
+            Decision::Delete => {
+                let Some(dp) = data_page else {
+                    return Ok(Written::Deleted(None));
+                };
+                let h = self.buffer.get_page_mut(dp, LockLevel::Data)?;
+                let old = match h.page.remove_tuple(id.clone()) {
+                    Ok(t) => {
+                        self.buffer.write_locked_page_with_lsn(h, lsn)?;
+                        Some(t)
+                    }
+                    // Entry with no row behind it: just finish the index side.
+                    Err(StoreError::KeyNotFound(_)) => None,
+                    Err(e) => return Err(e),
+                };
+                leaf.page.remove_tuple(id)?;
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                Ok(Written::Deleted(old))
+            }
+        }
+    }
+
+    // The locked leaf for `probe.id`, with the root split pre-check and the
+    // retry-from-root that a full inner node asks for (it can't take the
+    // separator a child split needs; the level above splits it first on the
+    // next pass).
+    fn leaf_for_write(&self, probe: &Tuple, lsn: LsnId) -> Result<WritePageHandle, StoreError> {
+        // Fast path (B-link): route with unlocked reads, lock only the leaf,
+        // and revalidate under that lock — the page is still a leaf (a root
+        // split turns the root leaf into an inner node) and still covers the
+        // key (a split moves the upper part of a leaf's range to a linked
+        // sibling and sets high_key; follow next_page like find does). If
+        // the leaf has room, done: no ancestor was ever locked. Measured
+        // (stress, 16 threads): locking the root on every write for the
+        // crabbing descent below cost ~20% throughput.
+        'optimistic: for _ in 0..(if OPTIMISTIC_DESCENT { 4 } else { 0 }) {
+            let (leaf_id, _) = self.route_to_leaf_id(&probe.id, self.table.first_index_page)?;
+            let mut handle = self.buffer.get_page_mut(leaf_id, LockLevel::Index)?;
+            loop {
+                if !handle.page.is_flag_set(LEAF_NODE) {
+                    continue 'optimistic;
+                }
+                match handle.page.high_key() {
+                    Some(hk) if probe.id >= hk => {
+                        let next = handle.page.get_next_page();
+                        if !next.is_valid_next_page() {
+                            break;
+                        }
+                        drop(handle);
+                        handle = self.buffer.get_page_mut(next, LockLevel::Index)?;
+                    }
+                    _ => break,
+                }
+            }
+            if handle.page.count()? < self.table.nodes_per_page - 1
+                && handle.page.can_store(probe)
+            {
+                return Ok(handle);
+            }
+            // Needs a split: only the locked top-down descent can do that.
+            break;
+        }
         let mut retries = 0u32;
         loop {
-            // The root-split pre-check uses an unlocked read, so by the time
-            // insert_recursive holds the root lock the root may already be split.
-            let handle = self.buffer.get_page_mut(self.table.first_index_page)?;
+            let handle = self.buffer.get_page_mut(self.table.first_index_page, LockLevel::Index)?;
             if handle.page.count()? == self.table.nodes_per_page - 1 {
-                self.split_root_page(handle, &id_tuple.id, lsn)?;
+                self.split_root_page(handle, &probe.id, lsn)?;
             } else {
                 drop(handle);
             }
-            match self.insert_recursive(
-                id_tuple.clone(),
-                txn.clone(),
-                self.table.first_index_page,
-                None,
-                lsn,
-            ) {
+            match self.descend_for_write(probe, self.table.first_index_page, None, lsn) {
                 Err(StoreError::PageCapacityError) if retries < 16 => {
                     retries += 1;
                     std::thread::sleep(std::time::Duration::from_micros(50 * retries as u64));
@@ -366,6 +479,50 @@ where
                 other => return other,
             }
         }
+    }
+
+    // A row that no longer fits alongside its siblings moves to wherever
+    // write_data lands. With the leaf held: write the new copy (other data
+    // pages, one at a time), repoint the leaf entry, remove the old copy,
+    // then publish the leaf. STORE_AUDIT.md T14: relocation_lock keeps
+    // find()'s unlocked index-then-data read from landing astride this.
+    fn relocate(
+        &self,
+        leaf: WritePageHandle,
+        old_dp: PageId,
+        id: DBIdType,
+        new: Tuple,
+        lsn: LsnId,
+    ) -> Result<(), StoreError> {
+        let _guard = self
+            .relocation_lock
+            .write()
+            .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
+        let new_dp = match self.write_data(&new, lsn) {
+            Ok(p) => p,
+            // write_data landed back on old_dp (the old copy is still there):
+            // remove the old copy first, then write.
+            Err(StoreError::DuplicateKey(d)) if d == id => {
+                let h = self.buffer.get_page_mut(old_dp, LockLevel::Data)?;
+                h.page.remove_tuple(id.clone())?;
+                self.buffer.write_locked_page_with_lsn(h, lsn)?;
+                let p = self.write_data(&new, lsn)?;
+                if p != old_dp {
+                    let entry = Tuple::new_with(id.clone(), &to_allocvec(&Node::Leaf(p))?, None, None);
+                    leaf.page.replace_tuple(&id, entry)?;
+                }
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let entry = Tuple::new_with(id.clone(), &to_allocvec(&Node::Leaf(new_dp))?, None, None);
+        leaf.page.replace_tuple(&id, entry)?;
+        let h = self.buffer.get_page_mut(old_dp, LockLevel::Data)?;
+        h.page.remove_tuple(id)?;
+        self.buffer.write_locked_page_with_lsn(h, lsn)?;
+        self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+        Ok(())
     }
 
     /// Place `tuple` on a data page and return that page's id. Locks each
@@ -394,21 +551,39 @@ where
     fn write_data(&self, tuple: &Tuple, lsn: LsnId) -> Result<PageId, StoreError> {
         let mut data_page_id = PageId::from(self.last_data_page.load(Ordering::Relaxed));
         loop {
-            let handle = self.buffer.get_page_mut(data_page_id)?;
+            let handle = self.buffer.get_page_mut(data_page_id, LockLevel::Data)?;
             if handle.page.can_store(tuple) {
                 self.write_page(handle, tuple.clone(), lsn)?;
                 return Ok(data_page_id);
             }
             let next = self.buffer.data_chain_next(&handle.page, data_page_id)?;
-            drop(handle);
             if next.is_valid_next_page() {
+                drop(handle);
                 data_page_id = next;
-            } else {
-                let new_id = self.buffer.alloc_page(false)?;
-                self.buffer.set_data_chain_next(data_page_id, new_id)?;
-                data_page_id = new_id;
-                self.last_data_page.store(new_id.into(), Ordering::Relaxed);
+                continue;
             }
+            // Extending the chain. Two rules meet here: the tail's "no
+            // successor" check and the link must happen under one hold of
+            // the tail's lock (phase 0: two writers that both saw the same
+            // tail and both linked orphaned a page full of rows), and no
+            // page lock may be held across page allocation (phase 5:
+            // alloc_page can block on the writer's channel under
+            // backpressure). So: allocate with nothing held, re-lock the
+            // tail, re-check, and either link or give the page back.
+            drop(handle);
+            let new_id = self.buffer.alloc_page(false)?;
+            let handle = self.buffer.get_page_mut(data_page_id, LockLevel::Data)?;
+            let next = self.buffer.data_chain_next(&handle.page, data_page_id)?;
+            if next.is_valid_next_page() {
+                drop(handle);
+                self.buffer.free_page(new_id)?;
+                data_page_id = next;
+                continue;
+            }
+            self.buffer.set_data_chain_next(data_page_id, new_id)?;
+            drop(handle);
+            data_page_id = new_id;
+            self.last_data_page.store(new_id.into(), Ordering::Relaxed);
         }
     }
 
@@ -437,352 +612,66 @@ where
         self.buffer.get_page(page_id)?.get(id)
     }
 
-    // STORE_AUDIT.md T2: mints its own lsn to stamp the pages this write
-    // touches (see insert's matching comment on why that's still needed
-    // even for a caller with no redo record of its own to tie it to). Only
-    // Db::update_checked_with_retry needs an externally-supplied lsn (see
-    // update_checked, called directly since it's the only pub(crate) —
-    // never test-called from outside this module — entry point); nothing
-    // calls this plain `update` with one of its own, so unlike `insert`
-    // there's no separate `update_at_lsn` split.
+    /// Replace the row for `tuple.id` with `tuple` (tests and recovery).
     pub fn update(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
-        let lsn = self.logger.next_lsn();
         let id = tuple.id.clone();
-        let pid = self
-            .find_page(id.clone(), self.table.first_index_page)?
-            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-        let h = self.buffer.get_page_mut(pid)?;
-        // Whether the replacement still fits alongside its siblings on this
-        // page. An ordinary multi-tuple page must never be allowed to
-        // exceed capacity via in-place replace: handle_large_page_size's
-        // overflow allocation is only valid for a genuinely oversized
-        // SINGLE tuple (see Page::can_store's own comment — that's the
-        // only way a page ends up needing an overflow chain in the first
-        // place). If a multi-tuple page's used_size crept over capacity
-        // here (e.g. this update setting undo_id, which insert leaves
-        // None, costs a few more serialized bytes per row), letting
-        // replace_tuple through would make handle_large_page_size wrongly
-        // treat this page as needing an overflow chain — clobbering its
-        // next_page (which points at the next SIBLING data page, not an
-        // overflow page) and permanently corrupting table_scan's walk.
-        // Confirmed via direct repro: insert enough rows to fill more than
-        // one data page, update() every row once, then table_scan silently
-        // undercounts or errors with SerializationError.
-        let header = h.page.header();
-        let old_size = h.page.get(id.clone())?.map(|t| t.size()).unwrap_or(0);
-        let fits_in_place = h.page.count()? <= 1
-            || header.used_size().saturating_sub(old_size) + tuple.size()
-                <= header.usable_data_size();
-        if fits_in_place {
-            let old = h.page.replace_tuple(&id, tuple)?;
-            self.buffer.write_locked_page_with_lsn(h, lsn)?;
-            Ok(old)
-        } else {
-            // Doesn't fit alongside its siblings: relocate instead of
-            // exceeding capacity. See relocate_tuple's own doc comment for
-            // why the old copy isn't removed until after the new one is
-            // written and the index (if needed) repointed — STORE_AUDIT.md
-            // T14.
-            let old = h
-                .page
-                .get(id.clone())?
-                .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-            self.relocate_tuple(h, pid, id, tuple, lsn)?;
-            Ok(old)
+        match self.write_version(id.clone(), self.logger.next_lsn(), |cur| {
+            Ok(match cur {
+                Some(_) => Decision::Replace(tuple),
+                None => return Err(StoreError::KeyNotFound(id.clone())),
+            })
+        })? {
+            Written::Replaced(old) => Ok(old),
+            _ => Err(StoreError::KeyNotFound(id)),
         }
     }
 
-    // STORE_AUDIT.md T14: relocates `tuple` off page `pid` (which no longer
-    // has room for it) to wherever write_data lands, repointing the index
-    // if that's a different page, and only THEN removing the stale copy
-    // left behind on `pid`.
-    //
-    // The old ordering (remove from `pid` first, write elsewhere, then
-    // repoint the index) left a window — between the remove and the index
-    // repoint — where the index still pointed at `pid` after the tuple was
-    // already gone from it. A concurrent find() landing in that gap
-    // resolved the (unchanged) index to a page that genuinely didn't have
-    // the row anymore, and reported a still-existing, committed key as
-    // missing. CONFIRMED via direct concurrent repro (real threads, no
-    // artificial delay) before this fix: ~1140-4067 false "missing" reads
-    // per 20,000 iterations across runs.
-    //
-    // Writing the new copy and repointing the index *before* removing the
-    // old one closes that gap: at every point a concurrent find() can
-    // observe, the index points at a page that actually has the row —
-    // either still `pid` (old copy, not yet superseded) or the new page
-    // (new copy, already written). Never neither.
-    //
-    // `h` (the caller's already-held lock on `pid`) is dropped before
-    // write_data runs: nothing's been mutated on it yet (the caller only
-    // ever *read* the old tuple through it), and write_data must be free
-    // to walk to (and lock) other pages — including, in a small/young
-    // table, potentially `pid` itself. If it does land back on `pid`, the
-    // still-present old copy makes write_data's own add_tuple fail with
-    // DuplicateKey rather than corrupt the page; that specific case needs
-    // no index repoint anyway (the index already points at `pid`), so it
-    // falls back to a plain, fully serialized remove-then-add, safe
-    // because nothing outside this row's own owning transaction can be
-    // racing this id (see Db::check_write_conflict).
-    fn relocate_tuple(
-        &self,
-        h: WritePageHandle,
-        pid: PageId,
-        id: DBIdType,
-        tuple: Tuple,
-        lsn: LsnId,
-    ) -> Result<(), StoreError> {
-        drop(h);
-        // Write side of relocation_lock (see find()'s own comment): held
-        // across this whole write-then-repoint-then-remove sequence so a
-        // concurrent find()'s index-then-data lookup always lands fully
-        // before or fully after this relocation, never astride it.
-        let _guard = self
-            .relocation_lock
-            .write()
-            .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
-        match self.write_data(&tuple, lsn) {
-            Ok(new_page_id) => {
-                debug_assert_ne!(
-                    new_page_id, pid,
-                    "write_data landing back on pid while pid's old copy of \
-                     id is still present should have hit DuplicateKey instead"
-                );
-                let txn = tuple.txn_id.clone().unwrap_or_default();
-                retry_on_contention(|| {
-                    self.update_index_entry(
-                        id.clone(),
-                        new_page_id,
-                        txn.clone(),
-                        self.table.first_index_page,
-                        None,
-                        lsn,
-                    )
-                })?;
-                retry_on_contention(|| {
-                    let h = self.buffer.get_page_mut(pid)?;
-                    h.page.remove_tuple(id.clone())?;
-                    self.buffer.write_locked_page_with_lsn(h, lsn)
-                })
-            }
-            Err(StoreError::DuplicateKey(dup_id)) if dup_id == id => {
-                retry_on_contention(|| {
-                    let h = self.buffer.get_page_mut(pid)?;
-                    h.page.remove_tuple(id.clone())?;
-                    self.buffer.write_locked_page_with_lsn(h, lsn)
-                })?;
-                let new_page_id = self.write_data(&tuple, lsn)?;
-                if new_page_id != pid {
-                    let txn = tuple.txn_id.clone().unwrap_or_default();
-                    retry_on_contention(|| {
-                        self.update_index_entry(
-                            id.clone(),
-                            new_page_id,
-                            txn.clone(),
-                            self.table.first_index_page,
-                            None,
-                            lsn,
-                        )
-                    })?;
+    // Redo-replay counterpart to update(): tolerates the row already
+    // reflecting this exact version (same bytes AND same tombstone state —
+    // a delete's redo changes only the flag), and a missing row (a log
+    // older than the checkpoint: the data file is ahead of this record).
+    pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<(), StoreError> {
+        self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+            Ok(match cur {
+                Some(c) if c.data == tuple.data && c.is_tombstoned() == tuple.is_tombstoned() => {
+                    Decision::Skip
                 }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Like `update`, but with two hooks that run *inside* the same
-    /// page-lock critical section as the read-and-replace, closing the
-    /// TOCTOU gap a separate `find()` followed later by `update()` leaves
-    /// open: two callers racing through that pair can both read the row,
-    /// both pass whatever check they run in between, and then race on the
-    /// final replace, with the loser's already-"passed" check now stale.
-    /// Confirmed as a real, reproducible gap before this existed (see
-    /// store's db.rs test
-    /// `test_conflict_check_and_physical_write_are_not_atomic_so_a_racer_in_between_wins`,
-    /// which manually replays that exact interleaving).
-    ///
-    /// `build` receives the row's current tuple, freshly read under this
-    /// same lock — not a possibly-stale earlier read — and returns a
-    /// `(pre_image, new_tuple)` pair: `pre_image` is what a caller wants
-    /// preserved as the undo record's content (e.g. `find_last_committed`'s
-    /// result), `new_tuple` is what actually gets physically written. This
-    /// is where an ownership/conflict check belongs, since nothing can
-    /// invalidate its premise between the check and the write anymore.
-    ///
-    /// `before_write` runs after `build` succeeds but before the physical
-    /// replace, given `(&pre_image, &new_tuple)` — this is where undo/redo
-    /// logging belongs, preserving the existing invariant that the log
-    /// record must exist before a concurrent reader can observe the new
-    /// tuple's undo_id (see the plain `update`'s own callers for why that
-    /// ordering matters). Returns the `LsnId` it logged the record under —
-    /// STORE_AUDIT.md T2: the exact lsn used to stamp the page(s) this
-    /// write physically touches below must be the SAME one `before_write`
-    /// just logged the record under, not a separately-minted value, or the
-    /// writer's flush gate has nothing correct to compare against. Callers
-    /// (`Db::update`/`Db::remove`) can't hand that lsn in ahead of time the
-    /// way `Db::insert` does — which lsn applies (a freshly minted one, or
-    /// none at all for the own-fresh-insert special case) depends on
-    /// `current`, which `build` only sees once it runs under this method's
-    /// own lock — so it flows back out through `before_write`'s return
-    /// instead.
-    pub(crate) fn update_checked(
-        &self,
-        id: DBIdType,
-        build: impl Fn(&Tuple) -> Result<(Tuple, Tuple), StoreError>,
-        before_write: impl Fn(&Tuple, &Tuple) -> Result<LsnId, StoreError>,
-    ) -> Result<Tuple, StoreError> {
-        let pid = self
-            .find_page(id.clone(), self.table.first_index_page)?
-            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-        let h = self.buffer.get_page_mut(pid)?;
-        let current = h
-            .page
-            .get(id.clone())?
-            .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
-        let (pre_image, tuple) = build(&current)?;
-        let lsn = before_write(&pre_image, &tuple)?;
-
-        // From here down, identical to update() — see its own comments on
-        // why the fits-in-place check exists, and relocate_tuple's own doc
-        // comment for what the relocation branch does (STORE_AUDIT.md T14).
-        let header = h.page.header();
-        let old_size = current.size();
-        let fits_in_place = h.page.count()? <= 1
-            || header.used_size().saturating_sub(old_size) + tuple.size()
-                <= header.usable_data_size();
-        if fits_in_place {
-            let old = h.page.replace_tuple(&id, tuple)?;
-            self.buffer.write_locked_page_with_lsn(h, lsn)?;
-            Ok(old)
-        } else {
-            self.relocate_tuple(h, pid, id, tuple, lsn)?;
-            Ok(current)
-        }
-    }
-
-    // Redo-replay counterpart to update(), mirroring insert_if_needed:
-    // tolerates the row already reflecting this exact write (the common
-    // case when a crash happens after the corresponding page write already
-    // landed), skipping update()'s underlying work entirely in that case.
-    //
-    // STORE_AUDIT.md P9: this used to matter for a second, bigger reason —
-    // update() unconditionally tore down and rebuilt the row's overflow
-    // chain on every call (write_locked_page's handle_large_page_size:
-    // free whatever overflow pages are currently linked, then allocate
-    // however many the tuple's current size needs), even when replaying
-    // against a tuple whose content hadn't actually changed. There was no
-    // guarantee the free list handed back the same pages it was just
-    // given, so the net effect could be extra pages left on the free list
-    // that a real update would never have produced (confirmed via
-    // test_freed_overflow_pages_persist_across_close_reopen). Now that
-    // handle_large_page_size skips the teardown/rebuild entirely whenever
-    // the required overflow page count hasn't changed, that specific
-    // concern no longer applies to a same-length replay either way — this
-    // early-return is still worth keeping for a byte-identical replay
-    // (skips logging/dirty-page work too, not just chain rebuilding), but
-    // isn't the only thing standing between a redo replay and free-list
-    // churn anymore.
-    pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
-        let id = tuple.id.clone();
-        if let Some(current) = self.find(id)?
-            && current.data == tuple.data
-        {
-            return Ok(current);
-        }
-        self.update(tuple)
-    }
-
-    // Returns Ok(None) when the data was already gone by the time this call
-    // reached it (see the comment below) — same convention as
-    // update_if_txn/remove_if_txn, and NOT an error: the caller's goal
-    // (this id absent from both data and index) is still met.
-    pub fn remove(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
-        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let h = self.buffer.get_page_mut(pid)?;
-        let old = match h.page.remove_tuple(id.clone()) {
-            Ok(t) => {
-                self.buffer.write_locked_page(h)?;
-                Some(t)
-            }
-            // The index entry we just found via find_page still exists, but
-            // the data behind it is already gone — this can only mean an
-            // earlier, retried attempt of this exact call already removed
-            // the data but not yet the index (see below for why that
-            // retried attempt happens at all). There's no txn-ownership
-            // question here the way update_if_txn/remove_if_txn have: with
-            // no tuple left to check, a stale index entry pointing at
-            // missing data is never valid, full stop — so finish the
-            // cleanup below unconditionally instead of bailing out and
-            // leaving it stale forever.
-            Err(StoreError::KeyNotFound(_)) => None,
-            Err(e) => return Err(e),
-        };
-        // Data is now gone for good — the index entry must follow, no matter
-        // what, or it's left pointing at a page this key no longer occupies.
-        // That's not just a leaked entry: it permanently blocks re-inserting
-        // this key (DuplicateKey forever, matching the stale entry) AND, far
-        // worse, if a *later* insert of some other key's data ever lands on
-        // this same now-vacated page (write_data's page selection walks
-        // forward through the same pages everyone else uses) and that
-        // insert's own index step fails, its cleanup-on-error can itself
-        // fail under contention and leave that new row physically present
-        // but un-indexed — at which point this stale entry, still pointing
-        // at that same page, resolves straight to it. find() then returns
-        // that unrelated orphaned row for *this* key: a committed remove
-        // whose key comes back with someone else's value. Confirmed via
-        // targeted reproduction (extreme contention: 16 threads, 1 table, 20
-        // keys), not just theory — caught by a dedicated regression test.
-        //
-        // Retrying here (not just relying on the caller retrying this whole
-        // function, e.g. commit()'s best-effort reclaim) matters because a
-        // caller-level retry is unsafe once the data step above has already
-        // succeeded: remove_tuple would hit KeyNotFound (not
-        // LockContentionError) on the retried call. That in itself is now
-        // handled (the match above tolerates it and still proceeds to the
-        // index cleanup) — but this internal retry is still needed for the
-        // common case, since it means an outer caller retry is rarely
-        // needed at all. remove_index_entry is itself idempotent (checks
-        // `contains` before removing), so retrying it — from here or from
-        // an outer caller's retry of the whole function — is always safe,
-        // never a double-remove.
-        retry_on_contention(|| {
-            self.remove_index_entry(id.clone(), self.table.first_index_page, None)
+                Some(_) => Decision::Replace(tuple),
+                None => Decision::Skip,
+            })
         })?;
-        Ok(old)
+        Ok(())
     }
 
-    /// Conditional `update` for abort-revert: replaces the row for `tuple.id`
-    /// with `tuple` **only if** the row currently on the page still belongs to
-    /// `expect_txn`. The read-check-and-write all happen under the same data-page
-    /// lock, so this is atomic with respect to a concurrent forward writer to the
-    /// same key — the write that would clobber a just-committed value never fires.
-    /// Returns Ok(None) when the row is gone or has been taken over by another
-    /// transaction (the revert is correctly a no-op in that case).
+    /// Physical removal of the row and its index entry, both under the
+    /// leaf lock. Ok(None) when the data was already gone (a dangling index
+    /// entry is still removed) or the key is unknown.
+    pub fn remove(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
+        match self.write_version(id, self.logger.next_lsn(), |_| Ok(Decision::Delete))? {
+            Written::Deleted(old) => Ok(old),
+            _ => Ok(None),
+        }
+    }
+
+    /// Conditional `update` for abort-revert: replaces the row only if it
+    /// still belongs to `expect_txn`. Ok(None) when the row is gone or has
+    /// been taken over by another transaction (the revert is correctly a
+    /// no-op then).
     pub(crate) fn update_if_txn(
         &self,
         tuple: Tuple,
         expect_txn: &TransactionId,
     ) -> Result<Option<Tuple>, StoreError> {
-        let id = tuple.id.clone();
-        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let h = self.buffer.get_page_mut(pid)?;
-        let matches = matches!(
-            h.page.get(id.clone())?,
-            Some(cur) if cur.is_same_txn(expect_txn.clone())
-        );
-        if !matches {
-            return Ok(None);
+        let expect = *expect_txn;
+        match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+            Ok(match cur {
+                Some(c) if c.is_same_txn(expect) => Decision::Replace(tuple),
+                _ => Decision::Skip,
+            })
+        })? {
+            Written::Replaced(old) => Ok(Some(old)),
+            _ => Ok(None),
         }
-        let old = h.page.replace_tuple(&id, tuple)?;
-        self.buffer.write_locked_page(h)?;
-        Ok(Some(old))
     }
 
     pub(crate) fn next_data_page(
@@ -800,55 +689,26 @@ where
         }
     }
 
-    /// Conditional `remove` for abort-revert — see `update_if_txn`. Removes the
-    /// row (and its index entry) only if it still belongs to `expect_txn`, atomic
-    /// under the data-page lock. Returns Ok(None) if it is already gone or owned
-    /// by another transaction.
+    /// Conditional physical removal for abort-revert of an insert: only if
+    /// the row still belongs to `expect_txn` (or the index entry is
+    /// dangling with no row behind it). Returns Ok(None) when there was
+    /// nothing to do.
     pub(crate) fn remove_if_txn(
         &self,
         id: DBIdType,
         expect_txn: &TransactionId,
     ) -> Result<Option<Tuple>, StoreError> {
-        let pid = match self.find_page(id.clone(), self.table.first_index_page)? {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-        let h = self.buffer.get_page_mut(pid)?;
-        let current = h.page.get(id.clone())?;
-        let old = match current {
-            // Row is still here and still ours: remove it.
-            Some(cur) if cur.is_same_txn(expect_txn.clone()) => {
-                let old = h.page.remove_tuple(id.clone())?;
-                self.buffer.write_locked_page(h)?;
-                Some(old)
-            }
-            // Row exists but now belongs to someone else — a genuine no-op,
-            // matching this function's documented contract. Nothing to
-            // clean up: the index entry is legitimately still pointing at
-            // live data.
-            Some(_) => return Ok(None),
-            // The index entry we just found via find_page still exists, but
-            // there's no data behind it at all. Unlike the case above,
-            // there's no live tuple whose ownership could still be "someone
-            // else's" — an index entry pointing at missing data is never
-            // valid, regardless of expect_txn. This can only mean an
-            // earlier, retried attempt of this exact call already removed
-            // the data but not yet the index (see remove()'s matching
-            // comment) — finish that cleanup below instead of silently
-            // leaving the index entry stale, which the old `if !matches {
-            // return Ok(None) }` short-circuit used to do.
-            None => None,
-        };
-        // See remove()'s comment on why this must retry internally rather
-        // than rely on the caller (revert_txn_writes) retrying this whole
-        // function: that's unsafe once the data step above has already
-        // succeeded. remove_index_entry checks `contains` before removing,
-        // so retrying it here — or via an outer caller retry — is always
-        // safe, never a double-remove.
-        retry_on_contention(|| {
-            self.remove_index_entry(id.clone(), self.table.first_index_page, None)
-        })?;
-        Ok(old)
+        let expect = *expect_txn;
+        match self.write_version(id, self.logger.next_lsn(), |cur| {
+            Ok(match cur {
+                Some(c) if c.is_same_txn(expect) => Decision::Delete,
+                Some(_) => Decision::Skip,
+                None => Decision::Delete,
+            })
+        })? {
+            Written::Deleted(old) => Ok(old),
+            _ => Ok(None),
+        }
     }
 
     // Routes through inner nodes to find the LEAF index page that contains
@@ -876,6 +736,16 @@ where
     // above. Returning the same reference the check already validated
     // closes that gap entirely.
     fn route_to_leaf(&self, id: &DBIdType, start: PageId) -> Result<Arc<Page>, StoreError> {
+        self.route_to_leaf_id(id, start).map(|(_, page)| page)
+    }
+
+    // route_to_leaf, also returning the leaf's own id — what an optimistic
+    // writer needs in order to lock the leaf it was routed to.
+    fn route_to_leaf_id(
+        &self,
+        id: &DBIdType,
+        start: PageId,
+    ) -> Result<(PageId, Arc<Page>), StoreError> {
         let mut current = start;
         loop {
             let page = self.buffer.get_page(current)?;
@@ -894,7 +764,7 @@ where
                 // getting stuck.
             }
             if !page.is_flag_set(INNER_NODE) {
-                return Ok(page);
+                return Ok((current, page));
             }
             // STORE_AUDIT.md P5: successor(id) is the first entry whose key
             // exceeds id — an O(log N) B-tree range lookup replacing the old
@@ -912,7 +782,7 @@ where
                     // entry (routing pages are never created empty) — this
                     // is here so the match is exhaustive, not because it's
                     // expected to happen.
-                    None => return Ok(page),
+                    None => return Ok((current, page)),
                 },
             };
             current = match from_bytes::<Node>(&entry.data)? {
@@ -966,6 +836,131 @@ where
     // means following those entries recursively from the root, same as
     // route_to_leaf's descent but branching into every child instead of
     // just the one a specific key would route to.
+    /// TXN_SIMPLIFICATION_PLAN.md phase 0: a human-readable structural dump —
+    /// every index leaf's (key -> data page) entries in chain order, then every
+    /// data page in chain order with the raw tuples it holds (key, writer
+    /// txn, tombstone flag). For diagnosing "find sees it, scan doesn't"
+    /// class disagreements without a debugger.
+    /// Every page this table owns: the index (root down through inner
+    /// children and along leaf/inner B-links) and the data chain. Used by
+    /// tests to prove page accounting closes (no orphans, no leaks).
+    #[cfg(test)]
+    pub(crate) fn reachable_pages(&self) -> Result<std::collections::HashSet<PageId>, StoreError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![self.table.first_index_page];
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            let page = self.buffer.get_page(pid)?;
+            if page.is_flag_set(INNER_NODE) {
+                for t in page.iter() {
+                    if let Ok(Node::Inner(child)) = from_bytes::<Node>(&t.data) {
+                        stack.push(child);
+                    }
+                }
+            }
+            let next = page.get_next_page();
+            if next.is_valid_next_page() {
+                stack.push(next);
+            }
+        }
+        let mut pid = self.table.first_data_page;
+        loop {
+            seen.insert(pid);
+            let page = self.buffer.get_page(pid)?;
+            let next = self.buffer.data_chain_next(&page, pid)?;
+            if !next.is_valid_next_page() {
+                break;
+            }
+            pid = next;
+        }
+        Ok(seen)
+    }
+
+    pub(crate) fn debug_dump(&self) -> Result<Vec<String>, StoreError> {
+        let mut out = vec![format!(
+            "table {} (id {}): first_index_page={:?} first_data_page={:?} last_data_page={}",
+            self.table.name,
+            self.table.id,
+            self.table.first_index_page,
+            self.table.first_data_page,
+            self.last_data_page.load(Ordering::Relaxed)
+        )];
+        // Leaves in chain order, starting from the leftmost leaf.
+        let mut leaf = {
+            let mut cur = self.buffer.get_page(self.table.first_index_page)?;
+            let mut cur_id = self.table.first_index_page;
+            while cur.is_flag_set(INNER_NODE) {
+                let first = cur.iter().next();
+                match first.map(|t| from_bytes::<Node>(&t.data)) {
+                    Some(Ok(Node::Inner(child))) => {
+                        cur_id = child;
+                        cur = self.buffer.get_page(child)?;
+                    }
+                    _ => break,
+                }
+            }
+            Some((cur_id, cur))
+        };
+        while let Some((pid, page)) = leaf {
+            let entries: Vec<String> = page
+                .iter()
+                .map(|t| match from_bytes::<Node>(&t.data) {
+                    Ok(Node::Leaf(dp)) => format!("{}->{:?}", t.id, dp),
+                    Ok(Node::Inner(ip)) => format!("{}->INNER{:?}", t.id, ip),
+                    Err(_) => format!("{}->?", t.id),
+                })
+                .collect();
+            out.push(format!(
+                "  leaf {:?} next={:?} high_key={:?}: {}",
+                pid,
+                page.get_next_page(),
+                page.high_key(),
+                entries.join(" ")
+            ));
+            leaf = self
+                .next_leaf_page(&page)?
+                .map(|n| (page.get_next_page(), n));
+        }
+        // Data pages in chain order.
+        let mut cur = self.table.first_data_page;
+        let mut guard = 0;
+        loop {
+            let page = self.buffer.get_page(cur)?;
+            let rows: Vec<String> = page
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{}(txn={} {}{})",
+                        t.id,
+                        t.txn_id.as_ref().map(|x| x.id_num()).unwrap_or(0),
+                        if t.is_tombstoned() { "TOMB " } else { "" },
+                        String::from_utf8_lossy(&t.data)
+                    )
+                })
+                .collect();
+            out.push(format!(
+                "  data {:?} next={:?} overflow={} : {}",
+                cur,
+                page.get_next_page(),
+                page.has_overflow(),
+                rows.join(" ")
+            ));
+            let next = self.buffer.data_chain_next(&page, cur)?;
+            if !next.is_valid_next_page() {
+                break;
+            }
+            cur = next;
+            guard += 1;
+            if guard > 100_000 {
+                out.push("  data chain: cycle?".into());
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn all_index_page_ids(&self) -> Result<Vec<PageId>, StoreError> {
         let mut out = vec![];
         let mut stack = vec![self.table.first_index_page];
@@ -1021,328 +1016,113 @@ where
             .transpose()
     }
 
-    fn remove_index_entry(
+    // TXN_SIMPLIFICATION_PLAN.md phase 4: the top-down, hand-over-hand
+    // descent that every write goes through (write_version), ending with the
+    // leaf that covers `probe.id` LOCKED and — because inner nodes and
+    // children are split proactively on the way down — guaranteed to have
+    // room for one more entry of `probe`'s size. Returning the held lock is
+    // the whole point: the caller does its data-page write and its leaf
+    // entry change under this one lock, so there is no window for a
+    // duplicate to slip in and no cleanup path for a half-done insert.
+    fn descend_for_write(
         &self,
-        id: DBIdType,
-        start: PageId,
-        parent: Option<WritePageHandle>,
-    ) -> Result<(), StoreError> {
-        // Hand-over-hand locking, mirroring insert_recursive: lock this node,
-        // *then* release the parent. The previous version navigated with
-        // unlocked get_page() reads, so a concurrent split could move entries
-        // (and flip a node leaf<->inner) between the routing read here and the
-        // locked remove below — corrupting the index and orphaning unrelated
-        // keys. Deciding leaf-vs-inner under the same lock we mutate under
-        // closes that window.
-        let handle = self.buffer.get_page_mut(start)?;
-        drop(parent);
-        if handle.page.is_flag_set(INNER_NODE) {
-            // STORE_AUDIT.md P5: see route_to_leaf's identical comment.
-            let entry = match handle.page.successor(&id)? {
-                Some(entry) => entry,
-                // id >= all separators: route to the last child (same
-                // fallthrough as route_to_leaf). Without this, a key in the
-                // rightmost child of a non-root inner node would never have
-                // its index entry removed.
-                None => match handle.page.last()? {
-                    Some(entry) => entry,
-                    None => return Ok(()),
-                },
-            };
-            match from_bytes::<Node>(&entry.data)? {
-                Node::Inner(page_num) => self.remove_index_entry(id, page_num, Some(handle)),
-                // STORE_AUDIT.md S8: see route_to_leaf's identical comment.
-                Node::Leaf(_) => Err(StoreError::Corruption(format!(
-                    "expected an inner routing entry, found a leaf entry at {:?}",
-                    entry.id
-                ))),
-            }
-        } else {
-            // Tolerate an already-absent entry: a concurrent path may have
-            // removed it, or a committed tombstone was reclaimed elsewhere.
-            if handle.page.contains(id.clone())? {
-                handle.page.remove_tuple(id)?;
-                self.buffer.write_locked_page(handle)?;
-            }
-            Ok(())
-        }
-    }
-
-    // Repoints an existing index entry at a new data page, used when
-    // update() relocates a row that no longer fits on its current data
-    // page. Mirrors remove_index_entry's routing/locking exactly (same
-    // hand-over-hand crabbing rationale — see its comment), differing only
-    // in the leaf-level action: replace_tuple instead of remove_tuple. The
-    // index entry's own serialized size doesn't grow unpredictably the way
-    // a data tuple's does (it's always a bounded Node::Leaf(PageId)), so
-    // this can't itself trigger the same over-capacity issue update() is
-    // guarding against.
-    fn update_index_entry(
-        &self,
-        id: DBIdType,
-        new_page_id: PageId,
-        txn: TransactionId,
+        probe: &Tuple,
         start: PageId,
         parent: Option<WritePageHandle>,
         lsn: LsnId,
-    ) -> Result<(), StoreError> {
-        let handle = self.buffer.get_page_mut(start)?;
-        drop(parent);
-        if handle.page.is_flag_set(INNER_NODE) {
-            // STORE_AUDIT.md P5: see route_to_leaf's identical comment.
-            let entry = match handle.page.successor(&id)? {
-                Some(entry) => entry,
-                None => match handle.page.last()? {
-                    Some(entry) => entry,
-                    None => return Ok(()),
-                },
-            };
-            match from_bytes::<Node>(&entry.data)? {
-                Node::Inner(page_num) => {
-                    self.update_index_entry(id, new_page_id, txn, page_num, Some(handle), lsn)
-                }
-                // STORE_AUDIT.md S8: see route_to_leaf's identical comment.
-                Node::Leaf(_) => Err(StoreError::Corruption(format!(
-                    "expected an inner routing entry, found a leaf entry at {:?}",
-                    entry.id
-                ))),
-            }
-        } else {
-            // STORE_AUDIT.md P4: see insert_index's identical comment.
-            let new_entry = Tuple::new_with(
-                id.clone(),
-                &to_allocvec(&Node::Leaf(new_page_id))?,
-                None,
-                None,
-            );
-            handle.page.replace_tuple(&id, new_entry)?;
-            self.buffer.write_locked_page_with_lsn(handle, lsn)?;
-            Ok(())
-        }
-    }
-
-    fn insert_recursive(
-        &self,
-        tuple: Tuple,
-        txn_id: TransactionId,
-        start: PageId,
-        parent: Option<WritePageHandle>,
-        lsn: LsnId,
-    ) -> Result<PageId, StoreError> {
-        let mut handle = self.buffer.get_page_mut(start)?;
-        // Hand-over-hand (crabbing): now that we hold this node's lock, release
-        // the parent's. Acquiring the child lock *before* releasing the parent
-        // guarantees the routing decision that led us here cannot be invalidated
-        // by a concurrent split of this node between the parent's routing read
-        // and our arrival — the source of the "just-inserted id unreachable" bug.
+    ) -> Result<WritePageHandle, StoreError> {
+        let mut handle = self.buffer.get_page_mut(start, LockLevel::Index)?;
+        // Crabbing: now that we hold this node's lock, release the parent's.
         drop(parent);
         if handle.page.is_flag_set(LEAF_NODE) {
             let count = handle.page.count()?;
             if count == self.table.nodes_per_page - 1 {
                 if self.is_root_page(start) {
-                    // Root leaf was filled by a concurrent insert between the
-                    // unlocked pre-check in insert_index() and this locked
-                    // arrival (that pre-check reads the count, then releases
-                    // the lock before insert_recursive re-acquires it — a
-                    // real gap, not just theoretical: reproduced under
-                    // stress once the retry_on_contention backoff/lock
-                    // timeout budgets were widened to tolerate realistic OS
-                    // scheduling jitter, which incidentally also gave more
-                    // concurrent inserts room to race this exact window).
-                    // We hold the lock here, so split it now and retry.
-                    // split_root_page re-checks the count under this same
-                    // lock and no-ops if some other thread already split it
-                    // first, so this is safe even if the race resolves a
-                    // different way than assumed here.
-                    self.split_root_page(handle, &tuple.id, lsn)?;
-                    return self.insert_recursive(tuple, txn_id, start, None, lsn);
+                    // Root leaf filled between the unlocked pre-check in
+                    // leaf_for_write and this locked arrival: split it now
+                    // (split_root_page re-checks under this lock) and retry.
+                    self.split_root_page(handle, &probe.id, lsn)?;
+                    return self.descend_for_write(probe, start, None, lsn);
                 }
-                // This used to be reachable: a non-root leaf could be
-                // concurrently filled to capacity in the window between
-                // split_if_needed's parent-level capacity check releasing
-                // the child's lock and this call re-acquiring it fresh —
-                // confirmed under stress (~1/300 runs). split_if_needed now
-                // carries that lock forward continuously instead of
-                // releasing it (see SplitOutcome::NoSplitNeeded's comment),
-                // so nothing can fill this page between the check and this
-                // arrival. If this still fires, the invariant it depends on
-                // (every non-root descent holds this page's lock
-                // continuously from its own capacity check) has been
-                // broken somewhere new.
-                // STORE_AUDIT.md S8: an internal locking-discipline
-                // invariant, not corrupted on-disk data — if it ever
-                // fires it's a real bug elsewhere in this file, not
-                // something a caller can recover from by retrying. Still
-                // surfaced as a typed error rather than a panic: for an
-                // embedded library, a panic here is a process crash for
-                // the host regardless of the root cause.
-                return Err(StoreError::UnknownError(format!(
-                    "non-root leaf {:?} unexpectedly at capacity on arrival — the \
-                     continuous-lock invariant split_if_needed relies on must have \
-                     been violated",
-                    start
-                )));
-            } else if handle.page.count()? < self.table.nodes_per_page
-                && handle.page.can_store(&tuple)
-            {
-                let id = handle.page_num;
-                self.write_page(handle, tuple, lsn)?;
-                Ok(id)
-            } else if let Some(max) = handle.page.record_size() {
-                // A tuple that will never fit this page's fixed per-entry
-                // budget (too small an index_entry_size for this key shape,
-                // see BPlusTree::new's own doc comment) is not the invariant
-                // violation the panic below guards against — it's a
-                // permanent, reportable condition. can_store's generic
-                // aggregate-bytes check can return false here for the same
-                // underlying reason (see Page::add_tuple's comment), so
-                // check this first rather than falling through to panic.
-                if tuple.size() as usize > max {
-                    Err(StoreError::TupleTooLarge(tuple.size(), max))
-                } else {
-                    // STORE_AUDIT.md S8: an internal invariant (this leaf
-                    // should have matched one of the branches above), not
-                    // corrupted on-disk data — see the non-root-leaf-at-
-                    // capacity comment above for the same reasoning.
-                    Err(StoreError::UnknownError(format!(
-                        "count == nodes {}, or too big {}",
-                        handle.page.count()?,
-                        tuple.size()
-                    )))
-                }
-            } else {
-                Err(StoreError::UnknownError(format!(
-                    "count == nodes {}, or too big {}",
-                    handle.page.count()?,
-                    tuple.size()
-                )))
-            }
-        } else if handle.page.is_flag_set(INNER_NODE) {
-            if handle.page.count()? == 0 {
-                // STORE_AUDIT.md S8: an INNER_NODE page is never created
-                // empty by any real write path (see this comment's
-                // original wording) — a corrupted or hand-crafted
-                // on-disk file could easily produce one.
-                return Err(StoreError::Corruption(format!(
-                    "inner page {:?} has no routing entries",
-                    handle.page_num
-                )));
-            }
-            // If this node is already at capacity, a child split would need to
-            // add a separator here — but there's no room. Return early so the
-            // retry loop in insert() re-enters: on the next pass, the caller
-            // one level up will call split_if_needed() on this node first, then
-            // descend into a half-full copy that can accept the new separator.
-            if handle.page.count()? == self.table.nodes_per_page - 1 {
+                // A non-root leaf full on arrival. Under the pure crabbing
+                // descent this could not happen (split_if_needed carried the
+                // child's lock forward). With the optimistic fast path it can,
+                // legitimately: a split publishes its new sibling — reachable
+                // through the old leaf's B-link `next`/high_key — and
+                // releases the sibling's lock before the splitter descends
+                // into it, so fast-path writers can fill the sibling in that
+                // window. Retry from the root: the parent now knows the
+                // sibling and split_if_needed splits it on the way down.
                 return Err(StoreError::PageCapacityError);
             }
-            // Rows are in ascending id order; find the first one whose id exceeds
-            // the search key (mirrors find_page's matching logic). The previous
-            // version broke out of the scan on the first row that *didn't*
-            // match, instead of continuing to the next row — so with 3+ entries
-            // it could get stuck on an early row and route to the wrong child.
-            //
-            // If tuple.id is >= even the LAST row's id, fall through to that
-            // last row anyway (same fallthrough find_page and
-            // remove_index_entry already implement) instead of panicking. A
-            // non-root inner node's last entry does not bound its own child —
-            // that child's true upper bound is inherited from this node's own
-            // governing entry in its parent — so "ran out of rows" does not
-            // mean "no child covers this key", it means "the key falls in the
-            // last child's range". This only matters once the tree is 3+
-            // levels deep (a non-root inner node exists); the root always
-            // carries a u64::MAX sentinel as its last entry (see
-            // update_root_page), so real ids never run off the end there.
-            // STORE_AUDIT.md P5: see route_to_leaf's identical comment —
-            // successor(id), falling back to last() when tuple.id is >=
-            // every row, is exactly "the first row whose id exceeds the
-            // search key, or the last row if none does" the old
-            // clone-and-scan loop computed by hand.
-            let row_id = match handle.page.successor(&tuple.id)? {
-                Some(row) => row,
-                None => handle
-                    .page
-                    .last()?
-                    .expect("INNER_NODE page must have at least one entry"),
-            };
-            let node = from_bytes::<Node>(&row_id.data)?;
-            if let Node::Inner(p) = node {
-                match self.split_if_needed(p, &tuple, lsn)? {
-                    SplitOutcome::Split(separator, sibling) => {
-                        let page = Arc::make_mut(&mut handle.page);
-                        // `p` kept the smaller half (keys < separator); the larger half
-                        // (up to the old upper bound, row_id.id) moved to `sibling`. The
-                        // existing entry routed that whole range to `p`, so it must now
-                        // point at `sibling`; a new entry routes the smaller half to `p`.
-                        // STORE_AUDIT.md P4: see insert_index's identical comment.
-                        page.replace_tuple(
-                            &row_id.id,
-                            Tuple::new_with(
-                                row_id.id.clone(),
-                                &to_allocvec(&Node::Inner(sibling))?,
-                                None,
-                                None,
-                            ),
-                        )?;
-                        page.add_tuple(Tuple::new_with(
-                            separator.clone(),
-                            &to_allocvec(&Node::Inner(p))?,
-                            None,
-                            None,
-                        ))?;
-                        // Crab into the destination child: lock it *before* the
-                        // parent is written/released below, so no other thread can
-                        // re-split it out from under the routing decision we just
-                        // made. write_locked_page must still run (it persists the
-                        // new separator entries and releases the parent lock); the
-                        // pre-acquired child lock is reentrantly re-taken by the
-                        // recursive get_page_mut and dropped when `child` does.
-                        let target = if tuple.id < separator { p } else { sibling };
-                        let child = self.buffer.get_page_mut(target)?;
-                        // Must persist before recursing — handle.page was a
-                        // detached COW copy (the buffer's cache still held the
-                        // pre-split version), so without this write-back the
-                        // updated routing entries are silently dropped when
-                        // `handle` goes out of scope, corrupting the index.
-                        self.buffer.write_locked_page_with_lsn(handle, lsn)?;
-                        self.insert_recursive(tuple, txn_id, target, Some(child), lsn)
-                    }
-                    SplitOutcome::NoSplitNeeded(child) => {
-                        // `child` is `p`'s own lock, held continuously since
-                        // split_if_needed's own capacity check — never
-                        // released and re-acquired. That continuity is the
-                        // fix: a concurrent inserter targeting the same
-                        // child can no longer slip in between "we checked
-                        // it wasn't full" and "we act on it", because the
-                        // lock never drops to zero holders in between (see
-                        // split_if_needed's own comment for the race this
-                        // closes). Drop the parent now — the child is
-                        // already protected, so releasing the parent here
-                        // (rather than passing it down to be dropped inside
-                        // the recursive call) is the same hand-over-hand
-                        // order, just made explicit.
-                        drop(handle);
-                        self.insert_recursive(tuple, txn_id, p, Some(child), lsn)
-                    }
-                }
-            } else {
-                // STORE_AUDIT.md S8: see route_to_leaf's identical
-                // comment — this node's own governing routing entry
-                // disagrees with its INNER_NODE flag.
-                Err(StoreError::Corruption(format!(
-                    "expected an inner routing entry, found a leaf entry at {:?}",
-                    start
-                )))
-            }
-        } else {
-            // STORE_AUDIT.md S8: a page flagged neither LEAF_NODE nor
-            // INNER_NODE — every real write path sets exactly one of the
-            // two (see BPlusTree::new/split_root_page/etc.), so this can
-            // only mean a corrupted or hand-crafted on-disk file.
-            Err(StoreError::Corruption(format!(
+            return Ok(handle);
+        }
+        if !handle.page.is_flag_set(INNER_NODE) {
+            // STORE_AUDIT.md S8: neither flag — corrupted or hand-crafted.
+            return Err(StoreError::Corruption(format!(
                 "page {:?} is flagged neither a leaf nor an inner node",
                 start
-            )))
+            )));
+        }
+        if handle.page.count()? == 0 {
+            return Err(StoreError::Corruption(format!(
+                "inner page {:?} has no routing entries",
+                handle.page_num
+            )));
+        }
+        // A full inner node can't take the separator a child split would
+        // add: back out so leaf_for_write retries from the root, where the
+        // level above will split this node first (split_if_needed).
+        if handle.page.count()? == self.table.nodes_per_page - 1 {
+            return Err(StoreError::PageCapacityError);
+        }
+        // STORE_AUDIT.md P5: successor(id), falling back to last() when the
+        // key is >= every separator (non-root inner nodes have no sentinel).
+        let row_id = match handle.page.successor(&probe.id)? {
+            Some(row) => row,
+            None => handle
+                .page
+                .last()?
+                .expect("INNER_NODE page must have at least one entry"),
+        };
+        let Node::Inner(p) = from_bytes::<Node>(&row_id.data)? else {
+            return Err(StoreError::Corruption(format!(
+                "expected an inner routing entry, found a leaf entry at {:?}",
+                start
+            )));
+        };
+        match self.split_if_needed(p, probe, lsn)? {
+            SplitOutcome::Split(separator, sibling) => {
+                let page = Arc::make_mut(&mut handle.page);
+                // `p` kept the smaller half; the larger half moved to
+                // `sibling`, which the existing entry must now route to.
+                page.replace_tuple(
+                    &row_id.id,
+                    Tuple::new_with(
+                        row_id.id.clone(),
+                        &to_allocvec(&Node::Inner(sibling))?,
+                        None,
+                        None,
+                    ),
+                )?;
+                page.add_tuple(Tuple::new_with(
+                    separator.clone(),
+                    &to_allocvec(&Node::Inner(p))?,
+                    None,
+                    None,
+                ))?;
+                // Crab into the destination child before the parent is
+                // written/released, so no other thread can re-split it out
+                // from under this routing decision.
+                let target = if probe.id < separator { p } else { sibling };
+                let child = self.buffer.get_page_mut(target, LockLevel::Index)?;
+                self.buffer.write_locked_page_with_lsn(handle, lsn)?;
+                self.descend_for_write(probe, target, Some(child), lsn)
+            }
+            SplitOutcome::NoSplitNeeded(child) => {
+                drop(handle);
+                self.descend_for_write(probe, p, Some(child), lsn)
+            }
         }
     }
 
@@ -1352,7 +1132,7 @@ where
         tuple: &Tuple,
         lsn: LsnId,
     ) -> Result<SplitOutcome, StoreError> {
-        let handle = self.buffer.get_page_mut(page_id)?;
+        let handle = self.buffer.get_page_mut(page_id, LockLevel::Index)?;
         if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
             if self.is_root_page(page_id) {
                 // STORE_AUDIT.md S8: a caller-discipline invariant (the
@@ -1501,7 +1281,7 @@ where
             new_vals[0].id.clone()
         };
         let new_page_id = self.alloc_sibling_index_page(&current_handle.page)?;
-        let mut new_handle = self.buffer.get_page_mut(new_page_id)?;
+        let mut new_handle = self.buffer.get_page_mut(new_page_id, LockLevel::Index)?;
 
         let current_page = Arc::make_mut(&mut current_handle.page);
         let new_page = Arc::make_mut(&mut new_handle.page);
@@ -1555,7 +1335,7 @@ where
         right_page: PageId,
         lsn: LsnId,
     ) -> Result<(), StoreError> {
-        let mut handle = self.buffer.get_page_mut(self.table.first_index_page)?;
+        let mut handle = self.buffer.get_page_mut(self.table.first_index_page, LockLevel::Index)?;
         // Mutate flags and data together on the COW copy. Flipping LEAF→INNER on
         // the shared cached Arc before rewriting the entries would let a
         // concurrent find_page see INNER_NODE set while the entries are still the
@@ -1631,8 +1411,8 @@ where
         };
         let left_page_id = self.alloc_sibling_index_page(&handle.page)?;
         let right_page_id = self.alloc_sibling_index_page(&handle.page)?;
-        let mut left_handle = self.buffer.get_page_mut(left_page_id)?;
-        let mut right_handle = self.buffer.get_page_mut(right_page_id)?;
+        let mut left_handle = self.buffer.get_page_mut(left_page_id, LockLevel::Index)?;
+        let mut right_handle = self.buffer.get_page_mut(right_page_id, LockLevel::Index)?;
         // Flags on the COW copy, not the shared cached Arc (see update_root_page).
         let left_page = Arc::make_mut(&mut left_handle.page);
         let right_page = Arc::make_mut(&mut right_handle.page);
@@ -1682,7 +1462,6 @@ mod tests {
         constant::FIRST_USER_PAGE,
         db::Header,
         error::StoreError,
-        generator::Generator,
         logger::Logger,
         memfile::MemFile,
         page::{Page, PageId},
@@ -1697,7 +1476,7 @@ mod tests {
 
     fn make_header(page_size: u64) -> Arc<Header> {
         let mut v = vec![0x53u8, 0x65];
-        v.extend_from_slice(&1u32.to_le_bytes()); // format_version (STORE_AUDIT.md S1)
+        v.extend_from_slice(&3u32.to_le_bytes()); // format_version
         v.extend_from_slice(&0u64.to_le_bytes()); // first_page_offset
         v.extend_from_slice(&FIRST_USER_PAGE.to_le_bytes()); // page_count
         v.extend_from_slice(&page_size.to_le_bytes());
@@ -1705,6 +1484,8 @@ mod tests {
         // encodes it — append its own to_allocvec output (see the identical
         // fix/comment in buffer.rs's make_header_bytes).
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap());
+        v.extend_from_slice(&1u64.to_le_bytes()); // counter (phase 1)
+        v.extend_from_slice(&0u64.to_le_bytes()); // checkpoint_lsn (phase 6)
         // header_checksum (STORE_AUDIT.md S1) — never validated on this
         // direct PageBuffer-construction path (only Db::open_using calls
         // Header::validate), so a placeholder value is fine here.
@@ -1712,7 +1493,25 @@ mod tests {
         Arc::new(from_bytes::<Header>(&v).unwrap())
     }
 
+    // One clock shared by buffer, transaction manager, and logger — as
+    // production wires them (TXN_SIMPLIFICATION_PLAN.md phase 1). With
+    // separate clocks the buffer's flush gate (`page.lsn <= durable`) never
+    // opens, every stamped page is deferred, and backpressure eventually
+    // blocks the test forever.
     fn make_buffer(page_size: u64) -> Arc<PageBuffer<MemFile>> {
+        let clock = Arc::new(crate::logger::LsnClock::default());
+        // These tests drive the tree directly, with no Db-level operation
+        // ever logging a record, so nothing would advance the durable
+        // watermark — and the writer gates every stamped page on it.
+        // Declare everything durable up front: there is no WAL to wait for.
+        clock.mark_written(crate::logger::LsnId(u64::MAX));
+        make_buffer_with_clock(page_size, clock)
+    }
+
+    fn make_buffer_with_clock(
+        page_size: u64,
+        clock: Arc<crate::logger::LsnClock>,
+    ) -> Arc<PageBuffer<MemFile>> {
         let header = make_header(page_size);
         let counter = Arc::new(AtomicU64::new(FIRST_USER_PAGE));
         Arc::new(
@@ -1722,24 +1521,20 @@ mod tests {
                 MemFile::new(),
                 header,
                 256,
-                Arc::new(crate::logger::LsnClock::default()),
-                1024,
+                clock,
                 Arc::new(crate::pages::content::PageContentRegistry::builtin()),
             )
             .unwrap(),
         )
     }
 
-    fn make_txn_mgr() -> Arc<TransactionManager> {
-        let generator = Arc::new(Generator::new());
-        TransactionManager::new(generator, TransactionId::new(0, 1))
-            .unwrap()
-            .into()
+    fn make_txn_mgr(clock: Arc<crate::logger::LsnClock>) -> Arc<TransactionManager> {
+        TransactionManager::new(clock).into()
     }
 
-    fn make_logger() -> Arc<Logger> {
-        let mut logger = Logger::new();
-        logger.set_db(MemFile::new(), Vec::new()).unwrap();
+    fn make_logger(clock: Arc<crate::logger::LsnClock>) -> Arc<Logger> {
+        let mut logger = Logger::with_clock(clock);
+        logger.set_db_for_test(MemFile::new()).unwrap();
         Arc::new(logger)
     }
 
@@ -1749,19 +1544,20 @@ mod tests {
 
     fn make_tree_with_entry_size(page_size: u64, index_entry_size: u64) -> BPlusTree<MemFile> {
         let buf = make_buffer(page_size);
+        let clock = buf.clock();
         BPlusTree::new(
             1.into(),
             "t".into(),
             buf,
-            make_txn_mgr(),
-            make_logger(),
+            make_txn_mgr(clock.clone()),
+            make_logger(clock),
             index_entry_size,
         )
         .unwrap()
     }
 
     fn txn() -> TransactionId {
-        TransactionId::new(1, 1)
+        TransactionId::from(1u64)
     }
 
     // update()/remove() log an undo record keyed off the *stored* tuple's own
@@ -2030,7 +1826,7 @@ mod tests {
         let with_large_txn = Tuple::new_with(
             id,
             &data,
-            Some(TransactionId::new(50_000_000, 50_000_000)),
+            Some(TransactionId::from(50_000_000u64)),
             None,
         );
         assert!(
@@ -2589,14 +2385,10 @@ mod tests {
     // critical section (in PageBuffer::write_page) takes measurably longer, and
     // several threads race concurrently rather than just two.
     //
-    // Note: a thread can legitimately fail with LockContentionError (the
-    // per-page lock in get_page_mut has a tight 500us timeout, unrelated to the
-    // race under test) — that's tracked separately and NOT retried, because
-    // insert() writes the data row and index entry as two non-atomic steps, so
-    // blindly retrying a failed insert can re-attempt an already-written data
-    // row and fail with a confusing DuplicateKey instead. We only care here
-    // about: of the inserts that returned Ok, was every single one of them
-    // actually findable afterwards?
+    // Note: a thread can legitimately fail with PageCapacityError (another
+    // racer filled the page first) — that's tracked separately and NOT
+    // retried. We only care here about: of the inserts that returned Ok, was
+    // every single one of them actually findable afterwards?
     #[test]
     fn test_concurrent_inserts_to_same_page_do_not_lose_updates() {
         use std::sync::Barrier;
@@ -2611,7 +2403,7 @@ mod tests {
         for iteration in 0..ITERATIONS {
             let tree = make_tree(BIG);
             for i in 0..PREPOPULATE {
-                tree.insert(Tuple::new(i, b"warm"), TransactionId::new(i, 1))
+                tree.insert(Tuple::new(i, b"warm"), TransactionId::from(i))
                     .unwrap();
             }
             let tree = Arc::new(tree);
@@ -2630,7 +2422,7 @@ mod tests {
                         barrier.wait();
                         tree.insert(
                             Tuple::new(id, format!("v{id}").as_bytes()),
-                            TransactionId::new(id, 1),
+                            TransactionId::from(id),
                         )
                     })
                 })
@@ -2646,13 +2438,11 @@ mod tests {
                             lost_update_iterations.push((iteration, id));
                         }
                     }
-                    // Both are legitimate, *explicit* failures under heavy contention,
-                    // not silent lost updates: LockContentionError means the 500us
-                    // lock timeout tripped; PageCapacityError means another racer
-                    // filled the page first and this insert correctly saw that
-                    // fresh (not stale) state and refused to write, rather than
-                    // silently overwriting.
-                    Err(StoreError::LockContentionError) | Err(StoreError::PageCapacityError) => {
+                    // A legitimate, *explicit* failure under heavy contention, not
+                    // a silent lost update: another racer filled the page first and
+                    // this insert correctly saw that fresh (not stale) state and
+                    // refused to write, rather than silently overwriting.
+                    Err(StoreError::PageCapacityError) => {
                         total_contention_errors += 1
                     }
                     Err(e) => panic!("unexpected insert error: {e:?}"),
@@ -2841,7 +2631,7 @@ mod tests {
         for i in 0u64..400 {
             tree.insert(
                 Tuple::new(i, format!("v{i}").as_bytes()),
-                TransactionId::new(i, 1),
+                TransactionId::from(i),
             )
             .unwrap();
         }
@@ -2861,7 +2651,15 @@ mod tests {
     #[test]
     fn test_new_rejects_zero_index_entry_size() {
         let buf = make_buffer(BIG);
-        let result = BPlusTree::new(1.into(), "t".into(), buf, make_txn_mgr(), make_logger(), 0);
+        let clock = buf.clock();
+        let result = BPlusTree::new(
+            1.into(),
+            "t".into(),
+            buf,
+            make_txn_mgr(clock.clone()),
+            make_logger(clock),
+            0,
+        );
         let err = match result {
             Ok(_) => panic!("index_entry_size = 0 must be rejected, not silently divide by zero"),
             Err(e) => e,
@@ -2874,12 +2672,13 @@ mod tests {
         let page_size = 1000u64;
         let index_entry_size = 600u64; // page_size / index_entry_size == 1 < 2
         let buf = make_buffer(page_size);
+        let clock = buf.clock();
         let result = BPlusTree::new(
             1.into(),
             "t".into(),
             buf,
-            make_txn_mgr(),
-            make_logger(),
+            make_txn_mgr(clock.clone()),
+            make_logger(clock),
             index_entry_size,
         );
         let err = match result {
@@ -3033,11 +2832,15 @@ mod tests {
         {
             let mut handle = tree
                 .buffer
-                .get_page_mut(tree.table.first_index_page)
+                .get_page_mut(tree.table.first_index_page, crate::buffer::LockLevel::Index)
                 .unwrap();
             let page = Arc::make_mut(&mut handle.page);
             let mut i = 0u64;
-            let filler = |i: u64| Tuple::new_with(DBIdType::Int(i), b"pay", Some(txn()), None);
+            // Payload sized so the page's aggregate byte budget runs out well
+            // before nodes_per_page does (a TransactionId is one varint since
+            // phase 1, so a 3-byte payload no longer gets there).
+            let filler =
+                |i: u64| Tuple::new_with(DBIdType::Int(i), b"payload-padding-", Some(txn()), None);
             while page.can_store(&filler(i)) {
                 page.add_tuple(filler(i)).unwrap();
                 i += 1;
@@ -3084,8 +2887,7 @@ mod tests {
         let page_size = 4096;
         let tree = make_tree(page_size);
 
-        let mut corrupt_root = Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize);
-        corrupt_root.set_clock(tree.buffer.clock());
+        let corrupt_root = Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize);
         corrupt_root.set_page_flags(INNER_NODE).unwrap();
         corrupt_root
             .add_tuple(Tuple::new_with(
@@ -3095,7 +2897,7 @@ mod tests {
                 None,
             ))
             .unwrap();
-        let mut handle = tree.buffer.get_page_mut(tree.table.first_index_page).unwrap();
+        let mut handle = tree.buffer.get_page_mut(tree.table.first_index_page, crate::buffer::LockLevel::Index).unwrap();
         handle.page = Arc::new(corrupt_root);
         tree.buffer.write_locked_page(handle).unwrap();
 
