@@ -674,18 +674,32 @@ where
         }
     }
 
+    // `page_id` is the CURRENT page's own id, needed (not derivable from
+    // `page` alone — Page doesn't carry its own id) to resolve the actual
+    // next DATA page rather than a raw `next_page` read: when `page` holds
+    // an oversized tuple, `next_page` points at its first overflow
+    // continuation page instead (see PageBuffer::data_chain_next's own
+    // doc comment), and decoding a continuation page's raw byte chunk as
+    // a standalone tuple page is exactly the corruption this used to hit
+    // — content-dependent, so it looked like a nondeterministic race
+    // rather than the deterministic bug it actually was.
     pub(crate) fn next_data_page(
         &self,
-        page: Option<Arc<Page>>,
-    ) -> Result<Option<Arc<Page>>, StoreError> {
-        if let Some(page) = page {
-            if PageId::is_valid_next_page(&page.get_next_page()) {
-                Ok(Some(self.buffer.get_page(page.get_next_page())?))
-            } else {
-                Ok(None)
+        current: Option<(PageId, Arc<Page>)>,
+    ) -> Result<Option<(PageId, Arc<Page>)>, StoreError> {
+        match current {
+            Some((page_id, page)) => {
+                let next = self.buffer.data_chain_next(&page, page_id)?;
+                if next.is_valid_next_page() {
+                    Ok(Some((next, self.buffer.get_page(next)?)))
+                } else {
+                    Ok(None)
+                }
             }
-        } else {
-            Ok(Some(self.buffer.get_page(self.table.first_data_page)?))
+            None => {
+                let first = self.table.first_data_page;
+                Ok(Some((first, self.buffer.get_page(first)?)))
+            }
         }
     }
 

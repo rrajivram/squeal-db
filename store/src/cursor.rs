@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     db::{DBFile, Db},
     error::StoreError,
-    page::{Page, PageTupleIterator},
+    page::{Page, PageId, PageTupleIterator},
     table::TableIdType,
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple},
@@ -53,6 +53,11 @@ impl ScanTxn {
 pub struct TableCursor<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     table: TableIdType,
+    // The CURRENT page's own id — next_data_page needs it (not derivable
+    // from `current_page` alone) to resolve the real next data page
+    // rather than a raw, possibly-overflow-continuation `next_page` read.
+    // See BPlusTree::next_data_page's own doc comment.
+    current_page_id: PageId,
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: ScanTxn,
@@ -89,7 +94,7 @@ where
             Some(id) => ScanTxn::Borrowed(id),
             None => ScanTxn::Owned(db.begin()?),
         };
-        let current_page = db
+        let (current_page_id, current_page) = db
             .table_by_id(table)?
             .next_data_page(None)?
             .ok_or(StoreError::UnknownError("No data page found".into()))?;
@@ -98,6 +103,7 @@ where
             db,
             table,
             current_iter,
+            current_page_id,
             current_page,
             transaction,
         })
@@ -115,12 +121,13 @@ where
             if let Some(t) = self.current_iter.next() {
                 return Ok(Some(t));
             }
-            let new_page = self
-                .db
-                .table_by_id(self.table)?
-                .next_data_page(Some(Arc::clone(&self.current_page)))?;
+            let new_page = self.db.table_by_id(self.table)?.next_data_page(Some((
+                self.current_page_id,
+                Arc::clone(&self.current_page),
+            )))?;
             match new_page {
-                Some(new_page) => {
+                Some((new_page_id, new_page)) => {
+                    self.current_page_id = new_page_id;
                     self.current_page = new_page;
                     self.current_iter = self.current_page.iter();
                 }
@@ -300,12 +307,13 @@ where
     // snapshot rather than picking up concurrent writes made between the
     // original scan and this reset.
     fn reset(&mut self) -> Result<(), StoreError> {
-        let current_page = self
+        let (current_page_id, current_page) = self
             .db
             .table_by_id(self.table)?
             .next_data_page(None)?
             .ok_or(StoreError::UnknownError("No data page found".into()))?;
         self.current_iter = current_page.iter();
+        self.current_page_id = current_page_id;
         self.current_page = current_page;
         Ok(())
     }
