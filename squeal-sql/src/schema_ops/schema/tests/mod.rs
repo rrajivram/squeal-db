@@ -36,6 +36,7 @@
 //   stats table itself surviving close/reopen) is in `contract` instead,
 //   alongside every other close/reopen guarantee.
 mod alter;
+mod catalog_versioning;
 mod contract;
 mod copy_into;
 mod dml;

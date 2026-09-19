@@ -168,8 +168,7 @@ committing (each stage is its own commit).
       cross-referenced both ways; nothing needed to change since no `Tuple`
       shape changed. `cargo test --workspace` green (402 squeal-sql + 538
       store), clippy clean on the touched files.
-- [x] **Stage 6 — store-level system pages — DONE (uncommitted, pending
-      the user's ok).** The table catalog (page 0), sequence state (page 1)
+- [x] **Stage 6 — store-level system pages — DONE. Committed: `7a081fe`.** The table catalog (page 0), sequence state (page 1)
       and free-page list (page 2) were each exactly ONE pinned page with
       unversioned payloads; a catalog or free list that outgrew a page could
       not be persisted (STORE_AUDIT.md S6 just made `create_table` fail
@@ -208,12 +207,50 @@ committing (each stage is its own commit).
       untracked `stats.rs`) flakes ~2-3% — measured on the Stage 5 commit
       (3/120 failures) and on this tree (1/120): a race between the async
       stats collector and `analyze_table`.
-- [ ] **Stage 7 — squeal-sql catalog** (`SqlTable`/`SchemaVersion`/
-      `SqlIndex`/`SqlForeignKey`/`Field`), modeled on `VersionedRow`'s
-      existing pattern. Also unifies `Field::default`/index-leaf `IndexKey`
-      payload onto the same hand-rolled codec `VersionedRow` already uses.
-      **This is the stage that fixes the bug class that started this
-      effort.**
+- [x] **Stage 7 — squeal-sql catalog — DONE (uncommitted, pending the
+      user's ok).** The bug class that started this effort. Two parts.
+      **(1) The catalog row is a versioned envelope.** `SqlTable` (with
+      `SchemaVersion`/`Field`/`SqlIndex`/`SqlForeignKey` nested) is stored as
+      `[0x00][u16 LE version][postcard body]` (`SqlTable::encode_catalog_row`/
+      `decode_catalog_row`, `CATALOG_ROW_VERSION = 1`). The leading 0x00 is
+      the discriminator against pre-envelope rows, which are bare postcard
+      starting with the name's length varint — 0 only for an empty name,
+      which encode now refuses and no earlier build could create — so
+      "first byte 0x00 = enveloped, anything else = legacy = version 1's
+      body" is unambiguous by construction (tested). All four call sites
+      (`create_table`, `flush_metadata`, `alter_table`, `load_tables`) go
+      through it; unknown versions, truncated envelopes and empty rows are
+      typed errors, not panics. The v1 body is the live derived shape, pinned
+      by a 340-byte fixture of a rich table (composite PK, UNIQUE, FK,
+      defaults of four types, two ALTER ADD COLUMNs) whose bytes were
+      **verified identical to the untouched Stage-6 HEAD encoder** (I
+      regenerated it in a scratch worktree, since the first capture happened
+      after part 2 below). A schema-level test writes a legacy row into a live
+      system table, loads it, flushes (which upgrades the row to the
+      envelope), and loads again.
+      **(2) `ValueItem` and `IndexKey` serde are hand-rolled**, byte-identical
+      to the old derive (explicit tags Null0 Integer1 Double2 Datetime3 Str4
+      Blob5 Boolean6, pinned from pre-change bytes). This closes the
+      "derive keys a variant by declaration index" hazard for the three
+      places `ValueItem` reaches disk via serde: `Field::default` in every
+      catalog row, every index-leaf payload (an `IndexKey`), and every
+      composite `Tuple` id. `IndexKey`'s decode deliberately does not
+      re-validate capacity (tested) — it reproduces what was written.
+      **Deliberately NOT done, and why:** (a) the index-leaf `IndexKey`
+      payload (`schema.rs` `to_allocvec(&identity)`) was not moved to the
+      other hand-rolled `to_bytes` codec as the original plan suggested: those
+      payloads carry no discriminator, so a dual-read would need a sniffing
+      heuristic; instead their bytes are now explicitly stable via (2).
+      (b) `VersionedRow` (the user-row payload) still has no envelope version
+      of its own — its first field is the schema-version index, so nothing in
+      it can serve as a discriminator. It is hand-rolled and explicit already;
+      a future change to that envelope needs its own strategy first (e.g. a
+      page-format bump). Flagged for the user rather than half-fixed.
+      **End to end (the plan's post-Stage-7 check):** rebuilt the CLI,
+      loaded the whole retail dataset (10/1000/100/10000/30271 rows, 0
+      failures, PK/FKs intact) into a scratch db and reopened it 6 times, all
+      counts identical. `cargo test --workspace` green (409 squeal-sql + 552
+      store); clippy shows nothing in touched code.
 - [ ] **Stage 8 — schema registry + stats exception**: schema registry
       (trivial, it's a `String`); `TableStatStored`/`PersistedTableStat`/
       `PersistedColumnStat` get a *deliberate* exception — decode failure

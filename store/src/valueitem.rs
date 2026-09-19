@@ -1,14 +1,14 @@
 use std::{cmp::Ordering, fmt::Display, hash::Hash, ops::Index, sync::Arc};
 
 use log::error;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     db::{DBSizeType, db_hash},
     error::StoreError,
 };
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 #[repr(u8)]
 pub enum ValueItem {
     #[default]
@@ -49,9 +49,106 @@ impl PartialEq for ValueItem {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize, Hash)]
+#[derive(Debug, PartialEq, Clone, Default, Hash)]
 pub struct IndexKey {
     data: Arc<[ValueItem]>,
+}
+
+// Persistence versioning Stage 7: hand-rolled serde for ValueItem, not
+// derived. serde's derive keys an enum variant by its DECLARATION INDEX, so
+// inserting a variant anywhere but the end would silently rotate every
+// already-persisted ValueItem — and this serde form is durable in three
+// places: `Field::default` inside every catalog row, the payload of every
+// index leaf (an `IndexKey`), and every composite `Tuple` id (`DBIdType::
+// Rec`). The tags below are exactly the indexes the derive used (pinned by
+// test_stage7_valueitem_serde_is_byte_identical_to_the_old_derive), fixed
+// forever; a new variant picks an unused tag. NOT the same as the
+// `= 5, = 10, ...` repr discriminants above, which belong to the separate
+// hand-rolled `to_bytes` codec. postcard writes a variant index as a varint,
+// which for indexes < 128 is one byte — identical to serializing a `u8` tag
+// first, which is how DBIdType/Operation do it too.
+impl ValueItem {
+    const TAG_NULL: u8 = 0;
+    const TAG_INTEGER: u8 = 1;
+    const TAG_DOUBLE: u8 = 2;
+    const TAG_DATETIME: u8 = 3;
+    const TAG_STR: u8 = 4;
+    const TAG_BLOB: u8 = 5;
+    const TAG_BOOLEAN: u8 = 6;
+}
+
+impl Serialize for ValueItem {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ValueItem::Null => (Self::TAG_NULL,).serialize(serializer),
+            ValueItem::Integer(v) => (Self::TAG_INTEGER, v).serialize(serializer),
+            ValueItem::Double(v) => (Self::TAG_DOUBLE, v).serialize(serializer),
+            ValueItem::Datetime(v) => (Self::TAG_DATETIME, v).serialize(serializer),
+            ValueItem::Str(v) => (Self::TAG_STR, v).serialize(serializer),
+            ValueItem::Blob(v) => (Self::TAG_BLOB, v).serialize(serializer),
+            ValueItem::Boolean(v) => (Self::TAG_BOOLEAN, v).serialize(serializer),
+        }
+    }
+}
+
+struct ValueItemVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ValueItemVisitor {
+    type Value = ValueItem;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a tagged ValueItem")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<ValueItem, A::Error> {
+        use serde::de::Error as DeError;
+        fn next<'de, T: Deserialize<'de>, A: serde::de::SeqAccess<'de>>(
+            seq: &mut A,
+            what: &'static str,
+        ) -> Result<T, A::Error> {
+            seq.next_element()?
+                .ok_or_else(|| serde::de::Error::custom(format!("ValueItem::{what}: missing value")))
+        }
+        let tag: u8 = seq
+            .next_element()?
+            .ok_or_else(|| DeError::custom("missing ValueItem tag"))?;
+        match tag {
+            ValueItem::TAG_NULL => Ok(ValueItem::Null),
+            ValueItem::TAG_INTEGER => Ok(ValueItem::Integer(next(&mut seq, "Integer")?)),
+            ValueItem::TAG_DOUBLE => Ok(ValueItem::Double(next(&mut seq, "Double")?)),
+            ValueItem::TAG_DATETIME => Ok(ValueItem::Datetime(next(&mut seq, "Datetime")?)),
+            ValueItem::TAG_STR => Ok(ValueItem::Str(next(&mut seq, "Str")?)),
+            ValueItem::TAG_BLOB => Ok(ValueItem::Blob(next(&mut seq, "Blob")?)),
+            ValueItem::TAG_BOOLEAN => Ok(ValueItem::Boolean(next(&mut seq, "Boolean")?)),
+            other => Err(DeError::custom(format!("unknown ValueItem tag {other}"))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ValueItem {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_tuple(2, ValueItemVisitor)
+    }
+}
+
+// IndexKey's wire form is exactly its one field (a length-prefixed sequence
+// of ValueItems) — what the derive produced for this single-field struct
+// (postcard writes struct fields back to back, no framing). Spelled out so
+// the layout is visible here rather than implied by a derive. Deliberately
+// NOT routed through `new_from`: decoding must reproduce what was written,
+// never re-validate (or reject) already-persisted bytes.
+impl Serialize for IndexKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for IndexKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self {
+            data: Arc::<[ValueItem]>::deserialize(deserializer)?,
+        })
+    }
 }
 
 impl IndexKey {
@@ -1338,5 +1435,76 @@ mod indexkey_tests {
             "ValueItem::from_bytes_many must not panic on a length prefix that overruns the \
              buffer, only report an error"
         );
+    }
+
+    // Persistence versioning Stage 7: pinned bytes of the DERIVED serde
+    // encoding, captured before ValueItem/IndexKey got hand-rolled serde.
+    // ValueItem is embedded (via serde) in persisted Field defaults, index
+    // leaf payloads, and every composite Tuple id, so its wire must be
+    // byte-identical forever. DO NOT edit the hex.
+    fn stage7_sample_values() -> Vec<ValueItem> {
+        vec![
+            ValueItem::Null,
+            ValueItem::Integer(-3),
+            ValueItem::Integer(1_000_000),
+            ValueItem::Double(2.5),
+            ValueItem::Datetime(86_400),
+            ValueItem::Str(("héllo".into(), 32)),
+            ValueItem::Blob((std::sync::Arc::from(&[1u8, 2, 3][..]), 16)),
+            ValueItem::Boolean(true),
+            ValueItem::Boolean(false),
+        ]
+    }
+
+    const STAGE7_VALUE_HEX: [&str; 9] = [
+        "00",
+        "0105",
+        "0180897a",
+        "020000000000000440",
+        "0380a305",
+        "040668c3a96c6c6f20",
+        "050301020310",
+        "0601",
+        "0600",
+    ];
+    const STAGE7_INDEXKEY_HEX: &str =
+        "090001050180897a0200000000000004400380a305040668c3a96c6c6f2005030102031006010600";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn test_stage7_valueitem_serde_is_byte_identical_to_the_old_derive() {
+        for (v, want) in stage7_sample_values().into_iter().zip(STAGE7_VALUE_HEX) {
+            let bytes = postcard::to_allocvec(&v).unwrap();
+            assert_eq!(hex(&bytes), want, "{v:?}");
+            assert_eq!(postcard::from_bytes::<ValueItem>(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn test_stage7_indexkey_serde_is_byte_identical_to_the_old_derive() {
+        let k = IndexKey::new_from(&stage7_sample_values()).unwrap();
+        let bytes = postcard::to_allocvec(&k).unwrap();
+        assert_eq!(hex(&bytes), STAGE7_INDEXKEY_HEX);
+        assert_eq!(postcard::from_bytes::<IndexKey>(&bytes).unwrap(), k);
+    }
+
+    #[test]
+    fn test_stage7_valueitem_unknown_tag_is_an_error_not_a_guess() {
+        assert!(postcard::from_bytes::<ValueItem>(&[0x63]).is_err());
+        // A known tag with its payload missing is likewise rejected.
+        assert!(postcard::from_bytes::<ValueItem>(&[0x01]).is_err());
+    }
+
+    #[test]
+    fn test_stage7_decoding_does_not_revalidate_capacity() {
+        // A Str longer than its recorded capacity was rejected when it was
+        // WRITTEN (IndexKey::new_from); decoding must hand back exactly what
+        // is on disk rather than start failing to read it.
+        let bytes = [0x01, 0x04, 0x03, b'a', b'b', b'c', 0x01];
+        let k = postcard::from_bytes::<IndexKey>(&bytes).unwrap();
+        assert_eq!(k.values().len(), 1);
     }
 }

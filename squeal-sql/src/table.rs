@@ -571,6 +571,65 @@ fn inline_foreign_key(column: &ColumnDef) -> Option<Result<SqlForeignKey, Schema
     })
 }
 
+// Persistence versioning Stage 7: how a `SqlTable` is stored as a row of its
+// schema's system table. Layout: `[0x00][u16 LE version][postcard body]`.
+//
+// The leading 0x00 is the discriminator against rows written before this
+// envelope existed: those are bare postcard of `SqlTable`, whose first field
+// is `name: String`, i.e. a length varint that is 0x00 only for an EMPTY
+// name — which `encode_catalog_row` refuses to write and no earlier build
+// could create. So a first byte of 0x00 means "enveloped", anything else
+// means "legacy, no envelope, read as version 1's body".
+//
+// The version-1 body is the live derived shape of `SqlTable`/`SchemaVersion`/
+// `Field`/`SqlIndex`/`SqlForeignKey` (`Field::default` and any embedded
+// `ValueItem` go through store's explicitly-tagged serde). It is pinned by
+// tests/catalog_versioning.rs against bytes captured from the pre-envelope
+// encoder: to change any of those structs, FIRST freeze the current shapes as
+// `...V1Shape` copies and branch on the version here, THEN edit the live ones.
+pub(crate) const CATALOG_ROW_VERSION: u16 = 1;
+
+impl SqlTable {
+    pub(crate) fn encode_catalog_row(&self) -> Result<Vec<u8>, SchemaError> {
+        if self.name.is_empty() {
+            return Err(SchemaError::UserError(
+                "a table name cannot be empty".into(),
+            ));
+        }
+        let body = postcard::to_allocvec(self)?;
+        let mut out = Vec::with_capacity(3 + body.len());
+        out.push(0x00);
+        out.extend_from_slice(&CATALOG_ROW_VERSION.to_le_bytes());
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    pub(crate) fn decode_catalog_row(bytes: &[u8]) -> Result<SqlTable, SchemaError> {
+        match bytes.first() {
+            Some(0x00) => {
+                let tag: [u8; 2] = bytes.get(1..3).and_then(|t| t.try_into().ok()).ok_or_else(|| {
+                    SchemaError::InternalSchemaError(format!(
+                        "catalog row is {} byte(s), too short for its version tag",
+                        bytes.len()
+                    ))
+                })?;
+                match u16::from_le_bytes(tag) {
+                    1 => Ok(postcard::from_bytes(&bytes[3..])?),
+                    other => Err(SchemaError::InternalSchemaError(format!(
+                        "unsupported catalog row version {other} — this database may have been \
+                         written by a newer, deprecated, or unrecognized build"
+                    ))),
+                }
+            }
+            // Legacy: bare postcard of SqlTable, identical to version 1's body.
+            Some(_) => Ok(postcard::from_bytes(bytes)?),
+            None => Err(SchemaError::InternalSchemaError(
+                "catalog row is empty".into(),
+            )),
+        }
+    }
+}
+
 impl SqlTable {
     pub(crate) fn from_sql<F>(db: &Arc<Schema<F>>, value: CreateTable) -> Result<Self, SchemaError>
     where

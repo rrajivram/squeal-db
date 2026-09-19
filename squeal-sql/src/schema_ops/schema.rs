@@ -155,7 +155,7 @@ where
     fn load_tables(&mut self) -> Result<(), SchemaError> {
         let mut cursor = self.db.table_scan(self.sys_table_id)?;
         while let Some(tuple) = cursor.next()? {
-            let table = from_bytes::<SqlTable>(tuple.data())?;
+            let table = SqlTable::decode_catalog_row(tuple.data())?;
             self.tables
                 .write()
                 .insert(table.name.clone(), Arc::new(table));
@@ -175,7 +175,12 @@ where
             let ik = IndexKey::new_from(&[ValueItem::Str((n.clone(), MAX_TABLE_NAME_LEN as u32))])?;
             self.db.update(
                 self.sys_table_id,
-                Tuple::new_with(DBIdType::Rec(ik), &to_allocvec(t)?, Some(tx.id()), None),
+                Tuple::new_with(
+                    DBIdType::Rec(ik),
+                    &t.encode_catalog_row()?,
+                    Some(tx.id()),
+                    None,
+                ),
                 &tx,
             )?;
         }
@@ -306,7 +311,7 @@ where
             self.sys_table_id,
             Tuple::new_with(
                 DBIdType::Rec(ik),
-                &to_allocvec(&table)?,
+                &table.encode_catalog_row()?,
                 Some(txn.id()),
                 None,
             ),
@@ -1102,7 +1107,7 @@ where
             self.sys_table_id,
             Tuple::new_with(
                 DBIdType::Rec(ik),
-                &to_allocvec(&table)?,
+                &table.encode_catalog_row()?,
                 Some(txn.id()),
                 None,
             ),
