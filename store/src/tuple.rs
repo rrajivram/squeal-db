@@ -2,7 +2,10 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use postcard::{from_bytes, to_allocvec};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, SeqAccess, Visitor},
+};
 
 use crate::{
     db::DBSizeType,
@@ -16,10 +19,56 @@ const NONE: u8 = 0;
 const INDEXED: u8 = 1;
 const TOMBSTONED: u8 = 2;
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+// Hand-rolled codec, not derived: see table.rs's TableType for why. DBIdType
+// is embedded directly in every persisted Tuple, so its wire tag must never
+// depend on Rust declaration order. Int=0/Rec=1 are fixed forever; a future
+// variant picks an unused tag rather than reordering these.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DBIdType {
     Int(u64),
     Rec(IndexKey),
+}
+
+impl Serialize for DBIdType {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DBIdType::Int(v) => (0u8, v).serialize(serializer),
+            DBIdType::Rec(v) => (1u8, v).serialize(serializer),
+        }
+    }
+}
+
+struct DBIdTypeVisitor;
+
+impl<'de> Visitor<'de> for DBIdTypeVisitor {
+    type Value = DBIdType;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a tagged DBIdType")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<DBIdType, A::Error> {
+        let tag: u8 = seq
+            .next_element()?
+            .ok_or_else(|| DeError::custom("missing DBIdType tag"))?;
+        match tag {
+            0 => Ok(DBIdType::Int(
+                seq.next_element()?
+                    .ok_or_else(|| DeError::custom("DBIdType::Int: missing value"))?,
+            )),
+            1 => Ok(DBIdType::Rec(
+                seq.next_element()?
+                    .ok_or_else(|| DeError::custom("DBIdType::Rec: missing value"))?,
+            )),
+            other => Err(DeError::custom(format!("unknown DBIdType tag {other}"))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DBIdType {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_tuple(2, DBIdTypeVisitor)
+    }
 }
 
 // Int orders by `hashed()` rather than structurally, so that comparisons
@@ -266,7 +315,41 @@ impl DBIdType {
 #[cfg(test)]
 mod tests {
 
-    use crate::tuple::{DBIdType, Tuple};
+    use postcard::{from_bytes, to_allocvec};
+
+    use crate::{
+        tuple::{DBIdType, Tuple},
+        valueitem::{IndexKey, ValueItem},
+    };
+
+    #[test]
+    fn test_dbidtype_round_trip() {
+        let rec = DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(7)]).unwrap());
+        for v in [DBIdType::Int(42), rec] {
+            let bytes = to_allocvec(&v).unwrap();
+            let back: DBIdType = from_bytes(&bytes).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_dbidtype_unknown_tag_errors() {
+        assert!(from_bytes::<DBIdType>(&[99, 42]).is_err());
+    }
+
+    // Fixture captured from the pre-Stage-1 `#[derive(Serialize,
+    // Deserialize)]` encoding (commit bfbc240), before DBIdType grew a
+    // hand-rolled codec.
+    #[test]
+    fn test_dbidtype_decodes_pre_stage1_derived_fixture() {
+        const INT_BYTES: &[u8] = &[0, 42];
+        const REC_BYTES: &[u8] = &[1, 1, 1, 14];
+        assert_eq!(from_bytes::<DBIdType>(INT_BYTES).unwrap(), DBIdType::Int(42));
+        assert_eq!(
+            from_bytes::<DBIdType>(REC_BYTES).unwrap(),
+            DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(7)]).unwrap())
+        );
+    }
 
     #[test]
     fn test_tuple() {

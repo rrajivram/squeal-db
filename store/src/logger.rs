@@ -12,7 +12,10 @@ use std::{
 use crossbeam::channel::{Receiver, Sender, bounded};
 use log::error;
 use postcard::{from_bytes, to_allocvec};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{Error as DeError, SeqAccess, Visitor},
+};
 
 use crate::{
     db::{DBFile, DBSizeType},
@@ -526,7 +529,12 @@ pub(crate) fn list_segments<F: DBFile>(handle: &F, name: &str) -> Result<Vec<(u6
     Ok(segs)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+// Hand-rolled codec, not derived: see table.rs's TableType for why. Operation
+// is the WAL's own record body, so its wire tag must never depend on Rust
+// declaration order. The tags below (0-6) are fixed forever at their
+// historical declaration-index values; a future variant picks an unused tag
+// (10+ is free) rather than reordering these.
+#[derive(Debug, Clone)]
 pub(crate) enum Operation {
     Add {
         txn: TransactionId,
@@ -569,6 +577,80 @@ pub(crate) enum Operation {
         table_id: TableIdType,
         key: DBIdType,
     },
+}
+
+impl Serialize for Operation {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Operation::Add { txn, post } => (0u8, txn, post).serialize(serializer),
+            Operation::Mod { txn, pre, post } => (1u8, txn, pre, post).serialize(serializer),
+            Operation::Del { txn, pre } => (2u8, txn, pre).serialize(serializer),
+            Operation::Commit(txn) => (3u8, txn).serialize(serializer),
+            Operation::Rollback(txn) => (4u8, txn).serialize(serializer),
+            Operation::Sequence {
+                name,
+                high_water,
+                dropped,
+            } => (5u8, name, high_water, dropped).serialize(serializer),
+            Operation::Purge { txn, table_id, key } => {
+                (6u8, txn, table_id, key).serialize(serializer)
+            }
+        }
+    }
+}
+
+struct OperationVisitor;
+
+impl<'de> Visitor<'de> for OperationVisitor {
+    type Value = Operation;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a tagged Operation")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Operation, A::Error> {
+        macro_rules! next {
+            ($what:literal) => {
+                seq.next_element()?
+                    .ok_or_else(|| DeError::custom(concat!("Operation: missing ", $what)))?
+            };
+        }
+        let tag: u8 = next!("tag");
+        match tag {
+            0 => Ok(Operation::Add {
+                txn: next!("txn"),
+                post: next!("post"),
+            }),
+            1 => Ok(Operation::Mod {
+                txn: next!("txn"),
+                pre: next!("pre"),
+                post: next!("post"),
+            }),
+            2 => Ok(Operation::Del {
+                txn: next!("txn"),
+                pre: next!("pre"),
+            }),
+            3 => Ok(Operation::Commit(next!("txn"))),
+            4 => Ok(Operation::Rollback(next!("txn"))),
+            5 => Ok(Operation::Sequence {
+                name: next!("name"),
+                high_water: next!("high_water"),
+                dropped: next!("dropped"),
+            }),
+            6 => Ok(Operation::Purge {
+                txn: next!("txn"),
+                table_id: next!("table_id"),
+                key: next!("key"),
+            }),
+            other => Err(DeError::custom(format!("unknown Operation tag {other}"))),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Operation {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_tuple(4, OperationVisitor)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1030,14 +1112,85 @@ mod tests {
 
     use super::{LOG_MAGIC, LogHeader, LsnId, read_and_validate_log_header, scan_log,
                 write_log_header};
+    use postcard::{from_bytes, to_allocvec};
     use crate::{
         error::StoreError,
         logger::{Logger, Operation, Record, frame_record},
         memfile::MemFile,
-        tuple::Tuple,
+        table::TableIdType,
+        tuple::{DBIdType, Tuple},
         txn::TransactionId,
     };
-    use postcard::to_allocvec;
+
+    #[test]
+    fn test_operation_round_trip() {
+        let txn = TransactionId::from(1);
+        let tuple = Tuple::new(5, b"hello");
+        let record = Record::new(TableIdType::from(2), tuple, Some(crate::page::PageId::from(9u64)));
+        // Tuple's cached serialized_size (#[serde(skip)]) is 0 after any
+        // real deserialize; round-trip the freshly-built record once so
+        // the "expected" side matches that, instead of comparing a
+        // never-deserialized Tuple's populated cache against a decoded
+        // one's cleared cache.
+        let record: Record = from_bytes(&to_allocvec(&record).unwrap()).unwrap();
+        let ops = [
+            Operation::Add { txn, post: record.clone() },
+            Operation::Mod { txn, pre: record.clone(), post: record.clone() },
+            Operation::Del { txn, pre: record.clone() },
+            Operation::Commit(txn),
+            Operation::Rollback(txn),
+            Operation::Sequence { name: "s".to_string(), high_water: 7, dropped: false },
+            Operation::Purge { txn, table_id: TableIdType::from(2), key: DBIdType::Int(5) },
+        ];
+        for op in ops {
+            let bytes = to_allocvec(&op).unwrap();
+            let back: Operation = from_bytes(&bytes).unwrap();
+            assert_eq!(format!("{op:?}"), format!("{back:?}"));
+        }
+    }
+
+    #[test]
+    fn test_operation_unknown_tag_errors() {
+        assert!(from_bytes::<Operation>(&[99, 1]).is_err());
+    }
+
+    // Fixtures captured from the pre-Stage-1 `#[derive(Serialize,
+    // Deserialize)]` encoding (commit bfbc240), before Operation grew a
+    // hand-rolled codec. One per variant, since the WAL is crash/replay-
+    // critical (T4_S2_WAL_DESIGN.md).
+    #[test]
+    fn test_operation_decodes_pre_stage1_derived_fixtures() {
+        const ADD_BYTES: &[u8] = &[0, 1, 2, 0, 5, 0, 0, 5, 104, 101, 108, 108, 111, 0, 1, 9];
+        const MOD_BYTES: &[u8] = &[
+            1, 1, 2, 0, 5, 0, 0, 5, 104, 101, 108, 108, 111, 0, 1, 9, 2, 0, 5, 0, 0, 5, 104, 101,
+            108, 108, 111, 0, 1, 9,
+        ];
+        const DEL_BYTES: &[u8] = &[2, 1, 2, 0, 5, 0, 0, 5, 104, 101, 108, 108, 111, 0, 1, 9];
+        const COMMIT_BYTES: &[u8] = &[3, 1];
+        const ROLLBACK_BYTES: &[u8] = &[4, 1];
+        const SEQ_BYTES: &[u8] = &[5, 1, 115, 7, 0];
+        const PURGE_BYTES: &[u8] = &[6, 1, 2, 0, 5];
+
+        let txn = TransactionId::from(1);
+        let tuple = Tuple::new(5, b"hello");
+        let record = Record::new(TableIdType::from(2), tuple, Some(crate::page::PageId::from(9u64)));
+        // See test_operation_round_trip: normalize the cached, non-persisted
+        // Tuple::serialized_size the same way a real decode does.
+        let record: Record = from_bytes(&to_allocvec(&record).unwrap()).unwrap();
+
+        macro_rules! assert_decodes {
+            ($bytes:expr, $expected:expr) => {
+                assert_eq!(format!("{:?}", from_bytes::<Operation>($bytes).unwrap()), format!("{:?}", $expected));
+            };
+        }
+        assert_decodes!(ADD_BYTES, Operation::Add { txn, post: record.clone() });
+        assert_decodes!(MOD_BYTES, Operation::Mod { txn, pre: record.clone(), post: record.clone() });
+        assert_decodes!(DEL_BYTES, Operation::Del { txn, pre: record.clone() });
+        assert_decodes!(COMMIT_BYTES, Operation::Commit(txn));
+        assert_decodes!(ROLLBACK_BYTES, Operation::Rollback(txn));
+        assert_decodes!(SEQ_BYTES, Operation::Sequence { name: "s".to_string(), high_water: 7, dropped: false });
+        assert_decodes!(PURGE_BYTES, Operation::Purge { txn, table_id: TableIdType::from(2), key: DBIdType::Int(5) });
+    }
 
     #[test]
     fn test_log_redo_returns_incrementing_lsn() {

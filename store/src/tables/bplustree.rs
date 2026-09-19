@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use postcard::{from_bytes, to_allocvec};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 
 use crate::{
     buffer::{LockLevel, PageBuffer, WritePageHandle},
@@ -15,10 +15,34 @@ use crate::{
     txn::{TransactionId, TransactionManager},
 };
 
-#[derive(Debug, Serialize, Deserialize, Clone, Hash, PartialEq, PartialOrd)]
+// Hand-rolled codec, not derived: see table.rs's TableType for why. Node is
+// embedded in on-disk B+tree routing entries, so its wire tag must never
+// depend on Rust declaration order. Inner=0/Leaf=1 are fixed forever; a
+// future variant picks an unused tag rather than reordering these.
+#[derive(Debug, Clone, Hash, PartialEq, PartialOrd)]
 enum Node {
     Inner(PageId),
     Leaf(PageId),
+}
+
+impl Serialize for Node {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Node::Inner(id) => (0u8, id).serialize(serializer),
+            Node::Leaf(id) => (1u8, id).serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (tag, id): (u8, PageId) = Deserialize::deserialize(deserializer)?;
+        match tag {
+            0 => Ok(Node::Inner(id)),
+            1 => Ok(Node::Leaf(id)),
+            other => Err(DeError::custom(format!("unknown Node tag {other}"))),
+        }
+    }
 }
 
 /// What a `write_version` caller wants done with the row for a key, decided
@@ -1468,7 +1492,7 @@ impl Eq for Node {}
 mod tests {
     use std::sync::{Arc, atomic::AtomicU64};
 
-    use postcard::from_bytes;
+    use postcard::{from_bytes, to_allocvec};
 
     use super::{BPlusTree, INNER_NODE, LEAF_NODE, MAX_ENTRY_BYTES, Node};
     use crate::{
@@ -1483,6 +1507,31 @@ mod tests {
         txn::{TransactionId, TransactionManager},
         valueitem::{IndexKey, ValueItem},
     };
+
+    #[test]
+    fn test_node_round_trip() {
+        for v in [Node::Inner(PageId::from(3u64)), Node::Leaf(PageId::from(9u64))] {
+            let bytes = to_allocvec(&v).unwrap();
+            let back: Node = from_bytes(&bytes).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_node_unknown_tag_errors() {
+        assert!(from_bytes::<Node>(&[99, 3]).is_err());
+    }
+
+    // Fixture captured from the pre-Stage-1 `#[derive(Serialize,
+    // Deserialize)]` encoding (commit bfbc240), before Node grew a
+    // hand-rolled codec.
+    #[test]
+    fn test_node_decodes_pre_stage1_derived_fixture() {
+        const INNER_BYTES: &[u8] = &[0, 3];
+        const LEAF_BYTES: &[u8] = &[1, 9];
+        assert_eq!(from_bytes::<Node>(INNER_BYTES).unwrap(), Node::Inner(PageId::from(3u64)));
+        assert_eq!(from_bytes::<Node>(LEAF_BYTES).unwrap(), Node::Leaf(PageId::from(9u64)));
+    }
 
     fn page_overhead(page_size: u64) -> u64 {
         page_size - Page::new_data(page_size).get_data_size()

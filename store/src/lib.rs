@@ -60,5 +60,6 @@ pub mod tables;
 pub mod tuple;
 pub mod txn;
 mod version;
+mod versioned;
 mod utils;
 pub mod valueitem;
