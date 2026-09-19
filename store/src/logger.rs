@@ -155,11 +155,77 @@ pub struct LsnId(pub(crate) u64);
 /// own 2-byte `MAGIC` (`db.rs`), so the two file kinds can never be mistaken
 /// for each other even under partial/garbled reads.
 pub(crate) const LOG_MAGIC: [u8; 4] = [0x53, 0x71, 0x57, 0x4c];
-/// WAL format version. Bump on any incompatible framing/`Operation` change —
-/// checked for an EXACT match on open (not `<=`): a version this build
-/// doesn't recognize is exactly the "don't guess" case, not something to
-/// silently tolerate.
+/// WAL format version. Bump on any incompatible framing/`LogRecord`/
+/// `Operation`/`Tuple`-as-embedded change. Persistence versioning Stage 4:
+/// this is no longer an exact-match gate — every version this build has ever
+/// shipped stays readable (see `log_header_len` / `decode_log_record`, which
+/// dispatch on a segment's own version), and only the CURRENT version is ever
+/// written. A version with no dispatch arm is refused as unrecognized, never
+/// guessed at.
+///
+/// When bumping this: FIRST copy `LogHeader` and `LogRecord`/`Record` (and
+/// whatever they embed that is changing) to frozen `...V2Shape` structs and
+/// point the version-2 arms at those, THEN change the live definitions. The
+/// fixture tests (`test_v2_wal_fixture_*`) fail the moment a v2 shape drifts,
+/// which is the mechanical enforcement of "new code opens old files".
 pub(crate) const CURRENT_LOG_VERSION: u16 = 2;
+
+/// Oldest WAL format version number that has ever existed. Version 1
+/// predates the framing rewrite (T4_S2_WAL_DESIGN.md) and was never given a
+/// decoder in this codebase, so a version-1 WAL is recognized but NOT
+/// readable — by explicit decision (the project has no production
+/// databases; an old database is recreated, not migrated). Every version
+/// from 2 on is readable.
+pub(crate) const MIN_SUPPORTED_LOG_VERSION: u16 = 1;
+
+/// The version-1 refusal, shared by header and record decode so the message
+/// is identical wherever a v1 WAL is first noticed.
+fn unreadable_v1_wal() -> StoreError {
+    StoreError::LogHeaderMismatch(
+        "WAL format version 1 predates the framing rewrite and has no decoder in this build; \
+         recreate the database (an old database is not migrated)"
+            .into(),
+    )
+}
+
+/// `magic` (4 bytes) + `version` (a 2-byte fixint u16): at the same fixed
+/// byte offset in every WAL format version — declared first in `LogHeader`,
+/// and postcard's derive serializes struct fields in declaration order
+/// regardless of Rust's in-memory layout — so a reader can peek them before
+/// knowing which version's shape (and length) the rest of the header has.
+const LOG_HEADER_PREFIX_LEN: usize = 6;
+
+/// Encoded length of a version-2 `LogHeader`: 4 (magic) + 2 (version) + 8
+/// (page_size, a fixint u64). Frozen; a test pins it to the live encoding.
+const LOG_HEADER_V2_LEN: usize = 14;
+
+/// Total encoded header length for a segment of WAL format `version`, or an
+/// error if this build doesn't recognize that version.
+fn log_header_len(version: u16) -> Result<usize, StoreError> {
+    match version {
+        1 => Err(unreadable_v1_wal()),
+        2 => Ok(LOG_HEADER_V2_LEN),
+        other => Err(StoreError::LogHeaderMismatch(format!(
+            "WAL format version {other} is not supported by this build (known versions: \
+             {MIN_SUPPORTED_LOG_VERSION}..={CURRENT_LOG_VERSION}, readable from 2) — this WAL \
+             may have been written by a newer or unrecognized build"
+        ))),
+    }
+}
+
+/// Peeks a segment's `(magic, version)` from the first bytes of its header.
+fn peek_log_prefix(bytes: &[u8]) -> Result<([u8; 4], u16), StoreError> {
+    let prefix = bytes.get(..LOG_HEADER_PREFIX_LEN).ok_or_else(|| {
+        StoreError::LogHeaderMismatch(format!(
+            "WAL header is {} byte(s), shorter than the {LOG_HEADER_PREFIX_LEN}-byte \
+             magic+version prefix",
+            bytes.len()
+        ))
+    })?;
+    let magic: [u8; 4] = prefix[..4].try_into().unwrap();
+    let version = u16::from_le_bytes(prefix[4..6].try_into().unwrap());
+    Ok((magic, version))
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub(crate) struct LogHeader {
@@ -215,44 +281,69 @@ pub(crate) fn write_log_header<F: DBFile>(
     Ok(bytes)
 }
 
+/// A successfully validated segment header: which WAL format version the
+/// segment was written in (which governs how its records decode — see
+/// `scan_log`), plus its raw bytes.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ValidatedLogHeader {
+    pub(crate) version: u16,
+    /// Byte-identical to what a fresh `write_log_header` would produce when
+    /// `version == CURRENT_LOG_VERSION`; its `len()` is where this segment's
+    /// records start, for any version.
+    pub(crate) bytes: Vec<u8>,
+}
+
 /// Reads and validates an EXISTING log file's header against the paired main
-/// file's `page_size`. Returns the raw header bytes on success (byte-
-/// identical to what a fresh `write_log_header` would produce, since every
-/// field it read back just got re-verified) for the same post-checkpoint
-/// restore purpose as above. Checks all three fields before failing, not
-/// just the first mismatch, so one error message can name everything that
-/// disagreed at once.
+/// file's `page_size`. Persistence versioning Stage 4: dispatches on the
+/// segment's own version (peeked from the fixed magic+version prefix) rather
+/// than requiring an exact match with `CURRENT_LOG_VERSION`, so a segment
+/// left behind by an older build — a crash, then an upgrade — still opens.
+/// Checks every field it can decode before failing, not just the first
+/// mismatch, so one error message can name everything that disagreed at
+/// once; an unrecognized version can't be decoded past its prefix, so it
+/// reports magic and version only.
 pub(crate) fn read_and_validate_log_header<F: DBFile>(
     file: &mut F,
     expected_page_size: DBSizeType,
-) -> Result<Vec<u8>, StoreError> {
-    let mut bytes = vec![0u8; LogHeader::encoded_len()];
+) -> Result<ValidatedLogHeader, StoreError> {
+    let mut prefix = vec![0u8; LOG_HEADER_PREFIX_LEN];
     file.seek(SeekFrom::Start(0))?;
-    file.read_exact(&mut bytes)?;
-    let header: LogHeader = from_bytes(&bytes)?;
+    file.read_exact(&mut prefix)?;
+    let (magic, version) = peek_log_prefix(&prefix)?;
     let mut problems = Vec::new();
-    if header.magic != LOG_MAGIC {
+    if magic != LOG_MAGIC {
         problems.push(format!(
             "magic {:?} != expected {:?} — this file is not a squeal_db WAL",
-            header.magic, LOG_MAGIC
+            magic, LOG_MAGIC
         ));
     }
-    if header.version != CURRENT_LOG_VERSION {
+    let header_len = match log_header_len(version) {
+        Ok(len) => len,
+        Err(StoreError::LogHeaderMismatch(msg)) => {
+            problems.push(msg);
+            return Err(StoreError::LogHeaderMismatch(problems.join("; ")));
+        }
+        Err(other) => return Err(other),
+    };
+    let mut bytes = vec![0u8; header_len];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut bytes)?;
+    let page_size = match version {
+        // Version 2 is also the current shape; when a version 3 exists this
+        // arm decodes a frozen `LogHeaderV2Shape` instead (see
+        // CURRENT_LOG_VERSION's doc comment).
+        2 => from_bytes::<LogHeader>(&bytes)?.page_size,
+        _ => unreachable!("log_header_len already rejected every unsupported version"),
+    };
+    if page_size != expected_page_size {
         problems.push(format!(
-            "WAL format version {} != this build's version {}",
-            header.version, CURRENT_LOG_VERSION
-        ));
-    }
-    if header.page_size != expected_page_size {
-        problems.push(format!(
-            "page_size {} != the paired database file's page_size {}",
-            header.page_size, expected_page_size
+            "page_size {page_size} != the paired database file's page_size {expected_page_size}"
         ));
     }
     if !problems.is_empty() {
         return Err(StoreError::LogHeaderMismatch(problems.join("; ")));
     }
-    Ok(bytes)
+    Ok(ValidatedLogHeader { version, bytes })
 }
 
 // ---------------------------------------------------------------------------
@@ -301,8 +392,23 @@ pub(crate) struct ScannedLog {
     pub(crate) records: Vec<LogRecord>,
 }
 
+/// Decodes one checksum-verified record payload as WAL format `version`
+/// wrote it. The framing (`[len][checksum][payload]`) is identical across
+/// versions; only the payload's shape can differ, and this is the one place
+/// that knows how. Version 2 is also the live `LogRecord` shape; when a
+/// version 3 exists, this arm decodes a frozen `LogRecordV2Shape` and
+/// upgrades it (see CURRENT_LOG_VERSION's doc comment).
+fn decode_log_record(version: u16, payload: &[u8]) -> Result<LogRecord, StoreError> {
+    match version {
+        1 => Err(unreadable_v1_wal()),
+        2 => Ok(from_bytes::<LogRecord>(payload)?),
+        other => Err(crate::versioned::unsupported_version("WAL record", other)),
+    }
+}
+
 /// Scans a buffer of framed records (starting right after the `LogHeader`
-/// region — callers slice that off first) per the recovery scan rule:
+/// region — callers slice that off first) written by WAL format `version`
+/// (the owning segment's header version) per the recovery scan rule:
 ///
 /// 1. Fewer than 8 bytes left → torn tail at the frame header. Stop; not an
 ///    error.
@@ -322,7 +428,7 @@ pub(crate) struct ScannedLog {
 /// does not touch the file — it's pure buffer-in, records/error-out — so
 /// the framing/scan-rule logic is testable in total isolation from `Logger`
 /// or `Db`.
-pub(crate) fn scan_log(buf: &[u8]) -> Result<ScannedLog, StoreError> {
+pub(crate) fn scan_log(version: u16, buf: &[u8]) -> Result<ScannedLog, StoreError> {
     let mut records = Vec::new();
     let mut pos = 0usize;
     loop {
@@ -349,17 +455,25 @@ pub(crate) fn scan_log(buf: &[u8]) -> Result<ScannedLog, StoreError> {
                 break; // torn tail: nothing valid follows, treat as never fully written
             }
         }
-        let record: LogRecord = from_bytes(payload)?;
-        records.push(record);
+        records.push(decode_log_record(version, payload)?);
         pos = payload_start + len;
     }
     Ok(ScannedLog { records })
 }
 
-/// Byte length of the WAL's `LogHeader` — so a tool can slice a WAL file
-/// into header and record region without knowing the header's layout.
+/// Byte length of the CURRENT version's `LogHeader` — so a tool can slice a
+/// freshly written WAL file into header and record region without knowing
+/// the header's layout. For a file of unknown provenance use
+/// `header_len_of`, which honors the file's own version.
 pub fn header_len() -> usize {
     LogHeader::encoded_len()
+}
+
+/// Byte length of the header of the WAL segment whose bytes start `bytes`,
+/// per that segment's own version.
+pub fn header_len_of(bytes: &[u8]) -> Result<usize, StoreError> {
+    let (_, version) = peek_log_prefix(bytes)?;
+    log_header_len(version)
 }
 
 /// Human-readable dump of a whole WAL file's bytes (header included) — one
@@ -368,7 +482,23 @@ pub fn header_len() -> usize {
 /// debugger. Never touches a `Db`; pure bytes in, strings out.
 pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let header_len = LogHeader::encoded_len();
+    let (magic, version) = match peek_log_prefix(bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            out.push(format!("LogHeader undecodable: {e}"));
+            return out;
+        }
+    };
+    let header_len = match log_header_len(version) {
+        Ok(len) => len,
+        Err(e) => {
+            out.push(format!(
+                "LogHeader magic={magic:?} version={version} (magic {}, version UNSUPPORTED): {e}",
+                if magic == LOG_MAGIC { "ok" } else { "MISMATCH" },
+            ));
+            return out;
+        }
+    };
     if bytes.len() < header_len {
         out.push(format!(
             "file is {} byte(s), shorter than the {header_len}-byte LogHeader",
@@ -376,19 +506,21 @@ pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
         ));
         return out;
     }
-    match from_bytes::<LogHeader>(&bytes[..header_len]) {
-        Ok(h) => out.push(format!(
-            "LogHeader magic={:?} version={} page_size={} (magic {}, version {})",
-            h.magic,
-            h.version,
-            h.page_size,
-            if h.magic == LOG_MAGIC { "ok" } else { "MISMATCH" },
-            if h.version == CURRENT_LOG_VERSION { "ok" } else { "MISMATCH" },
-        )),
-        Err(e) => out.push(format!("LogHeader undecodable: {e}")),
+    match version {
+        2 => match from_bytes::<LogHeader>(&bytes[..header_len]) {
+            Ok(h) => out.push(format!(
+                "LogHeader magic={:?} version={} page_size={} (magic {}, version ok)",
+                h.magic,
+                h.version,
+                h.page_size,
+                if h.magic == LOG_MAGIC { "ok" } else { "MISMATCH" },
+            )),
+            Err(e) => out.push(format!("LogHeader undecodable: {e}")),
+        },
+        _ => unreachable!("log_header_len already rejected every unsupported version"),
     }
     let body = &bytes[header_len..];
-    let scanned = match scan_log(body) {
+    let scanned = match scan_log(version, body) {
         Ok(s) => s,
         Err(e) => {
             out.push(format!("scan: {e}"));
@@ -1110,7 +1242,7 @@ fn log_runner<F: DBFile>(
 #[cfg(test)]
 mod tests {
 
-    use super::{LOG_MAGIC, LogHeader, LsnId, read_and_validate_log_header, scan_log,
+    use super::{CURRENT_LOG_VERSION, LOG_MAGIC, LogHeader, LsnId, read_and_validate_log_header, scan_log,
                 write_log_header};
     use postcard::{from_bytes, to_allocvec};
     use crate::{
@@ -1342,7 +1474,8 @@ mod tests {
         let mut file = MemFile::new();
         let written = write_log_header(&mut file, 4096).unwrap();
         let validated = read_and_validate_log_header(&mut file, 4096).unwrap();
-        assert_eq!(written, validated);
+        assert_eq!(written, validated.bytes);
+        assert_eq!(validated.version, CURRENT_LOG_VERSION);
     }
 
     #[test]
@@ -1387,7 +1520,10 @@ mod tests {
     const CURRENT_LOG_VERSION_FOR_TEST_ONLY_NEVER_MATCHES: u16 = 0xFFFF;
 
     #[test]
-    fn test_log_header_names_every_mismatched_field_at_once() {
+    fn test_log_header_unrecognized_version_names_magic_and_version() {
+        // An unrecognized version can't be decoded past its magic+version
+        // prefix (its header length is unknown), so it reports what it can
+        // see: a wrong magic and the unsupported version, together.
         let bad = LogHeader {
             magic: [0, 0, 0, 0],
             version: CURRENT_LOG_VERSION_FOR_TEST_ONLY_NEVER_MATCHES,
@@ -1403,7 +1539,231 @@ mod tests {
         };
         assert!(msg.contains("magic"), "message was: {msg}");
         assert!(msg.contains("version"), "message was: {msg}");
+    }
+
+    #[test]
+    fn test_log_header_names_every_mismatched_field_of_a_recognized_version() {
+        let bad = LogHeader {
+            magic: [0, 0, 0, 0],
+            version: CURRENT_LOG_VERSION,
+            page_size: 1,
+        };
+        let bytes = to_allocvec(&bad).unwrap();
+        let mut file = MemFile::new();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        let StoreError::LogHeaderMismatch(msg) = read_and_validate_log_header(&mut file, 4096)
+            .unwrap_err()
+        else {
+            panic!("expected LogHeaderMismatch");
+        };
+        assert!(msg.contains("magic"), "message was: {msg}");
         assert!(msg.contains("page_size"), "message was: {msg}");
+    }
+
+    #[test]
+    fn test_v2_header_length_constant_matches_the_live_encoding() {
+        // LOG_HEADER_V2_LEN is frozen forever; the live encoding is
+        // version 2 today, so they must agree until a version 3 exists —
+        // at which point this pins the FROZEN constant, not the live one.
+        assert_eq!(super::LOG_HEADER_V2_LEN, LogHeader::encoded_len());
+        assert_eq!(super::log_header_len(2).unwrap(), super::LOG_HEADER_V2_LEN);
+    }
+
+    #[test]
+    fn test_header_len_of_honors_the_segments_own_version() {
+        let mut file = MemFile::new();
+        write_log_header(&mut file, 4096).unwrap();
+        assert_eq!(super::header_len_of(&file.data()).unwrap(), LogHeader::encoded_len());
+        assert!(super::header_len_of(&[0u8; 3]).is_err(), "truncated prefix");
+    }
+
+    #[test]
+    fn test_v1_wal_is_recognized_but_refused_with_a_recreate_message() {
+        let bytes = to_allocvec(&LogHeader {
+            magic: LOG_MAGIC,
+            version: 1,
+            page_size: 4096,
+        })
+        .unwrap();
+        let mut file = MemFile::new();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        let err = read_and_validate_log_header(&mut file, 4096).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::LogHeaderMismatch(m) if m.contains("recreate the database")),
+            "got {err}"
+        );
+        assert!(scan_log(1, &[]).is_ok(), "an empty body has nothing to decode");
+        let framed = super::frame_record(&sample_record_bytes(1));
+        assert!(scan_log(1, &framed).is_err());
+    }
+
+    #[test]
+    fn test_scan_log_refuses_an_unsupported_record_version() {
+        let mut buf = super::frame_record(&sample_record_bytes(1));
+        buf.extend(super::frame_record(&sample_record_bytes(2)));
+        let err = scan_log(CURRENT_LOG_VERSION_FOR_TEST_ONLY_NEVER_MATCHES, &buf).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported WAL record version"),
+            "got {err}"
+        );
+    }
+
+    // --- Persistence versioning Stage 4: version-2 WAL fixture ---
+    //
+    // A real WAL segment (header + one record per Operation variant), written
+    // by the version-2 encoder and then pinned as raw bytes below. The
+    // decode test is PERMANENT: it is the mechanical proof of "new code
+    // opens old WALs" — if a later change drifts any version-2 shape
+    // (LogRecord, Record, Tuple, DBIdType, TransactionId, ...) without first
+    // freezing a `...V2Shape` copy, it fails here instead of on a customer's
+    // crash-then-upgrade. Regenerate ONLY by deliberately re-running the
+    // ignored `print_v2_wal_fixture` below against a build that still writes
+    // version 2, never to make a failing decode test pass.
+    fn v2_fixture_records() -> Vec<super::LogRecord> {
+        use crate::{
+            page::PageId,
+            table::TableIdType,
+            tuple::{DBIdType, Tuple},
+            valueitem::{IndexKey, ValueItem},
+        };
+        let rec_id = DBIdType::Rec(
+            IndexKey::new_from(&[ValueItem::Str(("k".into(), 8)), ValueItem::Integer(7)]).unwrap(),
+        );
+        let t = |n: u64| TransactionId::from(n);
+        let row = |id: DBIdType, data: &[u8], txn: u64, pre: Option<u64>| {
+            Tuple::new_with(id, data, Some(t(txn)), pre.map(LsnId))
+        };
+        let rec = |tid: u64, tuple: Tuple, page: Option<u64>| {
+            super::Record::new(TableIdType::from(tid), tuple, page.map(PageId))
+        };
+        let ops = vec![
+            Operation::Add {
+                txn: t(10),
+                post: rec(3, row(DBIdType::Int(1), b"alpha", 10, None), Some(5)),
+            },
+            Operation::Mod {
+                txn: t(11),
+                pre: rec(3, row(DBIdType::Int(1), b"alpha", 10, None), None),
+                post: rec(3, row(DBIdType::Int(1), b"beta", 11, Some(1)), None),
+            },
+            Operation::Del {
+                txn: t(12),
+                pre: rec(4, row(rec_id.clone(), b"gamma", 11, Some(2)), None),
+            },
+            Operation::new_commit(t(10)),
+            Operation::new_rollback(t(11)),
+            Operation::Sequence {
+                name: "seq_a".into(),
+                high_water: 4096,
+                dropped: false,
+            },
+            Operation::Purge {
+                txn: t(12),
+                table_id: TableIdType::from(4),
+                key: rec_id,
+            },
+        ];
+        ops.into_iter()
+            .enumerate()
+            .map(|(i, operation)| super::LogRecord {
+                lsn: LsnId(i as u64 + 1),
+                operation,
+            })
+            .collect()
+    }
+
+    fn v2_fixture_segment_bytes() -> Vec<u8> {
+        let mut file = MemFile::new();
+        let mut out = write_log_header(&mut file, 4096).unwrap();
+        for r in v2_fixture_records() {
+            out.extend(super::frame_record(&to_allocvec(&r).unwrap()));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore]
+    fn print_v2_wal_fixture() {
+        let hex: String = v2_fixture_segment_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        println!("{hex}");
+    }
+
+    // Captured from `print_v2_wal_fixture` (above) at the commit that
+    // introduced version dispatch; DO NOT edit.
+    const V2_WAL_SEGMENT_HEX: &str =
+        "5371574c0200001000000000000012000000c2cb8f8c01000a030001010a0005616c7068610001051f000000b1bcff5202010b030001010a0005616c7068610000030001010b010104626574610000180000001f61d77003020c04010204016b08010e010b01020567616d6d610000030000000ecb0ee704030a03000000055939a305040b0b000000fe80469d0605057365715f618020000c00000044a2e08407060c04010204016b08010e";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // `Tuple::serialized_size` is `#[serde(skip)]` — a cache that is 0 on a
+    // freshly decoded tuple and filled in lazily on one built in memory —
+    // not part of the wire format, so it must not participate in equality.
+    fn without_cached_size(mut s: String) -> String {
+        let key = "serialized_size: ";
+        let mut from = 0;
+        while let Some(rel) = s[from..].find(key) {
+            let start = from + rel + key.len();
+            let end = start + s[start..].find(|c: char| !c.is_ascii_digit()).unwrap();
+            s.replace_range(start..end, "_");
+            from = start + 1;
+        }
+        s
+    }
+
+    #[test]
+    fn test_v2_wal_fixture_header_and_records_decode_with_current_code() {
+        let bytes = unhex(V2_WAL_SEGMENT_HEX);
+        let mut file = MemFile::new();
+        std::io::Write::write_all(&mut file, &bytes).unwrap();
+        let header = read_and_validate_log_header(&mut file, 4096).unwrap();
+        assert_eq!(header.version, 2);
+        assert_eq!(header.bytes.len(), super::LOG_HEADER_V2_LEN);
+
+        let scanned = scan_log(header.version, &bytes[header.bytes.len()..]).unwrap();
+        let expected = v2_fixture_records();
+        assert_eq!(scanned.records.len(), expected.len());
+        for (got, want) in scanned.records.iter().zip(&expected) {
+            assert_eq!(got.lsn, want.lsn);
+            assert_eq!(
+                without_cached_size(format!("{:?}", got.operation)),
+                without_cached_size(format!("{:?}", want.operation))
+            );
+        }
+        // Every Operation variant is represented, so a shape drift in any
+        // one of them fails this test.
+        let kinds: std::collections::HashSet<_> = scanned
+            .records
+            .iter()
+            .map(|r| std::mem::discriminant(&r.operation))
+            .collect();
+        assert_eq!(kinds.len(), 7);
+    }
+
+    #[test]
+    fn test_v2_wal_fixture_page_size_mismatch_is_still_rejected() {
+        let mut file = MemFile::new();
+        std::io::Write::write_all(&mut file, &unhex(V2_WAL_SEGMENT_HEX)).unwrap();
+        let err = read_and_validate_log_header(&mut file, 8192).unwrap_err();
+        assert!(matches!(err, StoreError::LogHeaderMismatch(_)));
+    }
+
+    #[test]
+    fn test_v2_wal_fixture_torn_tail_still_stops_cleanly() {
+        // The torn-tail rule must hold for old-version segments too: chop
+        // the last frame in half and the durable prefix (6 records) survives.
+        let bytes = unhex(V2_WAL_SEGMENT_HEX);
+        let header_len = super::LOG_HEADER_V2_LEN;
+        let torn = &bytes[header_len..bytes.len() - 5];
+        let scanned = scan_log(2, torn).unwrap();
+        assert_eq!(scanned.records.len(), 6);
     }
 
     // --- record framing / recovery scan rule (T4_S2_WAL_DESIGN.md §3) ---
@@ -1423,7 +1783,7 @@ mod tests {
         buf.extend(frame_record(&sample_record_bytes(1)));
         buf.extend(frame_record(&sample_record_bytes(2)));
         buf.extend(frame_record(&sample_record_bytes(3)));
-        let scanned = scan_log(&buf).unwrap();
+        let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
         assert_eq!(scanned.records.len(), 3);
         assert_eq!(scanned.records[0].lsn, LsnId(1));
         assert_eq!(scanned.records[2].lsn, LsnId(3));
@@ -1431,7 +1791,7 @@ mod tests {
 
     #[test]
     fn test_scan_log_empty_buffer_is_not_an_error() {
-        let scanned = scan_log(&[]).unwrap();
+        let scanned = scan_log(CURRENT_LOG_VERSION, &[]).unwrap();
         assert!(scanned.records.is_empty());
     }
 
@@ -1440,7 +1800,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend(frame_record(&sample_record_bytes(1)));
         buf.extend_from_slice(&[1, 2, 3]); // fewer than 8 bytes — a torn frame header
-        let scanned = scan_log(&buf).unwrap();
+        let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
         assert_eq!(scanned.records.len(), 1, "the one complete record must still be recovered");
     }
 
@@ -1452,7 +1812,7 @@ mod tests {
         // A complete, correct frame HEADER claiming more payload than
         // actually follows — exactly what a crash mid-write_all leaves.
         buf.extend_from_slice(&full_second[..full_second.len() - 2]);
-        let scanned = scan_log(&buf).unwrap();
+        let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
         assert_eq!(scanned.records.len(), 1, "the torn second record must be dropped, not errored");
     }
 
@@ -1464,7 +1824,7 @@ mod tests {
         // that happened to leave a coherent length prefix behind.
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
-        let scanned = scan_log(&buf).unwrap();
+        let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
         assert!(scanned.records.is_empty(), "must be treated as a torn tail, not an error");
     }
 
@@ -1474,7 +1834,7 @@ mod tests {
         let last = buf.len() - 1;
         buf[last] ^= 0xFF; // corrupt record 1's payload
         buf.extend(frame_record(&sample_record_bytes(2))); // but record 2 is intact
-        let err = scan_log(&buf).unwrap_err();
+        let err = scan_log(CURRENT_LOG_VERSION, &buf).unwrap_err();
         assert!(
             matches!(err, StoreError::LogCorruption(_)),
             "a corrupted record with more valid data after it must be a hard error, not a \
@@ -1519,7 +1879,7 @@ mod tests {
         }
         let mut f = open_readonly(&path);
         let bytes = read_and_validate_log_header(&mut f, 4096).unwrap();
-        assert_eq!(bytes.len(), LogHeader::encoded_len());
+        assert_eq!(bytes.bytes.len(), LogHeader::encoded_len());
         std::fs::remove_file(&path).unwrap_or_default();
     }
 }

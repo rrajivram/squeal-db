@@ -50,7 +50,7 @@ committing (each stage is its own commit).
       known-width prefix, then decode `DBIdType`) moves to Stage 5 too,
       keyed off the page's version instead of a per-tuple one.
 - [x] **Stage 3 — `Header` versioning + `max_index_key_size` +
-      `PAGE_OVERHEAD` runtime-derived — DONE (part 3, DDL check, uncommitted).**
+      `PAGE_OVERHEAD` runtime-derived — DONE.**
       Done: `Header::decode` replaces the exact-match `format_version` gate
       with real dispatch (`magic`+`format_version` sit at a fixed byte
       offset in every version there's been, since postcard's derive
@@ -102,11 +102,41 @@ committing (each stage is its own commit).
       `ENTRY_OVERHEAD_BYTES`; `size` now builds on it). Tests:
       `schema_ops/schema/tests/key_width.rs` (6). `cargo test --workspace`
       green (402 squeal-sql + 525 store). **Stage 3 is now fully done.**
-      Uncommitted pending the user's ok (also includes the small
-      `Db::max_index_key_size()` accessor in `store/src/db.rs`).
-- [ ] **Stage 4 — WAL (`LogHeader` + `LogRecord`/`Record`)**: real version
-      dispatch instead of the exact-match gate; fixture is a full WAL
-      segment replayed through `Db::open`'s recovery path.
+      Committed: `482e753` (parts 1-2: `8526f5e`, `5585bdf`).
+- [x] **Stage 4 — WAL (`LogHeader` + `LogRecord`/`Record`) — DONE.** Design: the WAL's version lives
+      once per SEGMENT (in `LogHeader`), not per record — it declares the
+      shape of every record in that segment, including the embedded `Tuple`
+      (same reasoning as Stage 2's "version the container, not the element").
+      `Db::open` already never appends to a recovered segment (always starts a
+      fresh one), so an old-version segment is only ever READ, and new writes
+      are always the current version — no mixed-version segment can exist.
+      Done: `read_and_validate_log_header` peeks the fixed magic+version
+      prefix (6 bytes, same offset in every version), dispatches through
+      `log_header_len(version)`, and returns `ValidatedLogHeader { version,
+      bytes }`; `scan_log` now takes the segment's version explicitly (no
+      caller can silently apply the current decoder to an old segment) and
+      routes payloads through `decode_log_record(version, ..)`. Unrecognized
+      versions are refused with a message naming the known range.
+      `MIN_SUPPORTED_LOG_VERSION = 1` (user's decision: no cut-off recorded;
+      old databases are simply recreated). Version 1 predates the framing
+      rewrite and **never had a decoder**, so it is recognized but not
+      readable: header and record decode return an explicit "recreate the
+      database" error for it (`unreadable_v1_wal`), tested. If v1 support is
+      ever wanted for real, the format must be reconstructed from git
+      history first. `describe_wal` and a new `header_len_of` honor the
+      file's own version (tools such as `wal_dump` keep working on old
+      files); `header_len()` remains "current version".
+      Live `LogHeader`/`LogRecord` are the v2 shapes today; the doc comment on
+      `CURRENT_LOG_VERSION` says to freeze `...V2Shape` copies BEFORE changing
+      them. Enforcement is mechanical: a permanent fixture — a real v2 segment
+      (header + one record per `Operation` variant, both `DBIdType`s) pinned as
+      hex in `logger.rs` — must decode with current code, plus page-size
+      mismatch and torn-tail behavior on that fixture. 7 new logger tests +
+      the reworked header tests. `cargo test --workspace` green (402
+      squeal-sql + 532 store). Not done, by design: a full `Db::open` replay of
+      the fixture — the replay path itself is unchanged and already covered
+      by the existing crash-recovery tests; the new surface is the
+      version-aware header/record decode, which the fixture tests directly.
 - [ ] **Stage 5 — page shell (`PageHeader`/`PageDto`) + deferred Stage 2
       (`Tuple`)**: lower priority than it first appeared now that Stage 3
       resolves the urgent overhead crisis, but now also carries Stage 2's

@@ -846,16 +846,19 @@ where
         let mut last_file = None;
         for (n, path) in segs {
             let mut f = handle.open_sibling(&path, opts.clone())?;
-            let header_bytes = read_and_validate_log_header(&mut f, page_size)?;
+            let validated = read_and_validate_log_header(&mut f, page_size)?;
             let mut bytes = Vec::new();
-            f.seek(SeekFrom::Start(header_bytes.len() as u64))?;
+            f.seek(SeekFrom::Start(validated.bytes.len() as u64))?;
             f.read_to_end(&mut bytes)?;
             // The torn-tail rule applies to every segment: only the last
             // can have one (a roll syncs a segment before opening the
             // next), and a clean segment simply has no tail to drop.
-            let scan = scan_log(&bytes)?;
+            // Records decode per THIS segment's own format version — a
+            // segment left by an older build (crash, then upgrade) is read
+            // as that build wrote it, never as the current shape.
+            let scan = scan_log(validated.version, &bytes)?;
             let max_lsn = scan.records.iter().map(|r| r.lsn.0).max().unwrap_or(0);
-            let size = (header_bytes.len() + bytes.len()) as u64;
+            let size = (validated.bytes.len() + bytes.len()) as u64;
             records.extend(scan.records);
             scanned.push(Segment {
                 n,
@@ -2781,7 +2784,7 @@ mod tests {
         // even before this comment existed — see git blame — at a low but
         // nonzero rate; a slower path anywhere upstream of a commit (e.g.
         // create_table's own checkpoint) makes the window wider.
-        crate::logger::scan_log(&data[header_len..])
+        crate::logger::scan_log(crate::logger::CURRENT_LOG_VERSION, &data[header_len..])
             .unwrap()
             .records
             .iter()
