@@ -387,7 +387,7 @@ mod tests {
     // (not just within a single starting leaf, like the basic test above).
     #[test]
     fn test_range_scan_spans_multiple_leaf_splits() {
-        let db = Db::<MemFile>::create_with_page_size("range_multi_leaf.db", 256).unwrap();
+        let db = Db::<MemFile>::create_with_page_size_and_max_index_key_size("range_multi_leaf.db", 256, 8).unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
 
         let t = db.begin().unwrap();

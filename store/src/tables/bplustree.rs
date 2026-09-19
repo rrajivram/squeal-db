@@ -204,7 +204,7 @@ where
         }
         let first_index_page = buffer.alloc_page(false)?;
         let first_data_page = buffer.alloc_page(false)?;
-        let index_page = Page::new_indexed(pg, index_entry_size as usize);
+        let index_page = Page::new_indexed(pg, index_entry_size as usize, buffer.page_overhead());
         // Adopt into this database's WAL clock before flagging (set_page_flags
         // dirties it, which stamps the lsn from the clock).
         index_page.set_page_flags(LEAF_NODE)?;
@@ -1533,10 +1533,6 @@ mod tests {
         assert_eq!(from_bytes::<Node>(LEAF_BYTES).unwrap(), Node::Leaf(PageId::from(9u64)));
     }
 
-    fn page_overhead(page_size: u64) -> u64 {
-        page_size - Page::new_data(page_size).get_data_size()
-    }
-
     fn make_header(page_size: u64) -> Arc<Header> {
         let mut v = vec![0x53u8, 0x65];
         v.extend_from_slice(&4u32.to_le_bytes()); // format_version (persistence versioning Stage 3)
@@ -1549,7 +1545,15 @@ mod tests {
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap());
         v.extend_from_slice(&1u64.to_le_bytes()); // counter (phase 1)
         v.extend_from_slice(&0u64.to_le_bytes()); // checkpoint_lsn (phase 6)
-        v.extend_from_slice(&512u64.to_le_bytes()); // max_index_key_size (Stage 3)
+        // max_index_key_size (Stage 3): 0, not the production default (512)
+        // — these tests deliberately use tiny page sizes (down to 180
+        // bytes, MAX_ENTRY_BYTES-based) to stress the tree at real depth
+        // without millions of rows, and never populate a real wide
+        // high_key (plain small Int keys), so the smallest possible
+        // reservation keeps page_overhead() well under those page sizes.
+        // Bypasses Header::validate's [64, 8192] floor entirely (this raw
+        // byte path never calls it — see the comment below).
+        v.extend_from_slice(&0u64.to_le_bytes());
         // header_checksum (STORE_AUDIT.md S1) — never validated on this
         // direct PageBuffer-construction path (only Db::open_using calls
         // Header::validate), so a placeholder value is fine here.
@@ -3059,7 +3063,8 @@ mod tests {
         let page_size = 4096;
         let tree = make_tree(page_size);
 
-        let corrupt_root = Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize);
+        let corrupt_root =
+            Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize, tree.buffer.page_overhead());
         corrupt_root.set_page_flags(INNER_NODE).unwrap();
         corrupt_root
             .add_tuple(Tuple::new_with(

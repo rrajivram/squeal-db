@@ -69,12 +69,33 @@ committing (each stage is its own commit).
       formula) opens with the default key size; a v3 header with a bad
       checksum is still rejected; an unrecognized `format_version` is
       rejected. `cargo test --workspace` green.
-      **Not yet done** (paused here to check in before the risky part):
-      `PageBuffer` denormalizing a runtime `page_overhead: usize` (replacing
-      the global `PAGE_OVERHEAD` const, threaded through ~20 call sites in
-      `page.rs`/`buffer.rs`) — this is the part that actually resolves the
-      `high_key` motivating bug — and the `CREATE TABLE`/`CREATE INDEX`
-      DDL-time key-width rejection in squeal-sql.
+      **`PAGE_OVERHEAD` rewrite — DONE.** Real scope turned out to be 77
+      call sites (every `Page` constructor/decode call site, not just the
+      ~20 direct `PAGE_OVERHEAD` references — most already had a `Header`/
+      `PageBuffer` handle in scope, since that's where `page_size` itself
+      came from, so `page_overhead()` piggybacks on the same handle rather
+      than inventing new plumbing). `PAGE_OVERHEAD = size_of::<PageDto>()`
+      is gone — confirmed genuinely broken by direct measurement (a 512-
+      byte high_key serializes to 556 bytes vs. the old fixed 112-byte
+      boundary). Replaced with `page::page_overhead(max_index_key_size)`
+      (measured fixed-field cost + configured key cap + margin),
+      denormalized onto `PageBuffer` like `page_size` already is.
+      **Deliberate one-time breaking change** for any database with pages
+      already on disk (confirmed and accepted — see page.rs's own comment):
+      the header/data byte boundary moves, so old pages are a different
+      physical layout, not just an old logical version. True non-breaking
+      support for old page layouts needs page-level versioning (deferred
+      to Stage 5, alongside Stage 2's deferred `Tuple` work).
+      Regression test: `test_persistence_versioning_stage3_wide_composite_key_survives_split_and_reopen`
+      inserts wide composite keys past the old 112-byte ceiling, forces a
+      real split (the only thing that ever sets `high_key`), and verifies
+      a close/reopen round-trip — the actual motivating bug, reproduced and
+      proven fixed. `cargo test --workspace` and clippy both green.
+      **Not yet done**: `CREATE TABLE`/`CREATE INDEX` DDL-time key-width
+      rejection in squeal-sql (reject a key up front if it would exceed
+      `max_index_key_size`) — currently nothing stops a real SQL statement
+      from creating an index wide enough to need this stage's larger
+      overhead reservation in the first place.
 - [ ] **Stage 4 — WAL (`LogHeader` + `LogRecord`/`Record`)**: real version
       dispatch instead of the exact-match gate; fixture is a full WAL
       segment replayed through `Db::open`'s recovery path.

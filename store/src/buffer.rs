@@ -16,7 +16,7 @@ use crate::{
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::{LsnClock, LsnId},
-    page::{PAGE_MAGIC, PAGE_OVERHEAD, Page, PageHeader, PageId, fnv1a_32},
+    page::{PAGE_MAGIC, Page, PageHeader, PageId, fnv1a_32},
     pages::content::PageContentRegistry,
     utils::shardedpq::ShardedPQ,
 };
@@ -191,6 +191,10 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     buffer: Vec<RwLock<HashMap<PageId, PageEntry>>>,
     header: Arc<Header>,
     page_size: DBSizeType,
+    // Persistence versioning Stage 3: denormalized off `header` the same
+    // way page_size already is, for fast, lock-free access on the hot
+    // path (every Page construction/decode needs it).
+    page_overhead: usize,
     page_count: Arc<AtomicU64>,
     max_entries: usize,
     // Count of currently-Strong residents — what max_entries actually bounds.
@@ -262,8 +266,10 @@ where
         let (write_tx, write_rx) = bounded(64);
         let w_header = header.clone();
         let write_handle = thread::spawn(move || writer(writer_file, w_header, write_rx));
+        let page_overhead = header.page_overhead();
         Ok(Self {
             page_size,
+            page_overhead,
             max_entries,
             strong_count: AtomicUsize::new(0),
             buffer: (0..BUFFER_SHARD_COUNT)
@@ -333,6 +339,10 @@ where
         self.page_size
     }
 
+    pub(crate) fn page_overhead(&self) -> usize {
+        self.page_overhead
+    }
+
     pub(crate) fn page_count_val(&self) -> u64 {
         self.page_count.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -381,6 +391,7 @@ where
             &*(self.self_file.read()),
             self.header.page_size,
             self.header.first_page_offset,
+            self.page_overhead,
         )
         // write_page itself marks the page flushed (conditionally — see
         // Page::mark_flushed_up_to) on success now.
@@ -656,8 +667,8 @@ where
         record_size: Option<usize>,
     ) -> Result<(), StoreError> {
         let p = match record_size {
-            Some(rs) => Page::new_indexed(self.header.page_size, rs),
-            None => Page::new_data(self.header.page_size),
+            Some(rs) => Page::new_indexed(self.header.page_size, rs, self.page_overhead),
+            None => Page::new_data(self.header.page_size, self.page_overhead),
         };
         self.write_page(page_id, &p)
     }
@@ -674,7 +685,7 @@ where
         let offset = self.header.first_page_offset + page_size * num;
         let file = self.self_file.read();
         // TODO - Need some cleaner refactoring here.
-        let mut bytes = vec![0u8; PageHeader::header_size()];
+        let mut bytes = vec![0u8; self.page_overhead];
         pread_exact(&*file, &mut bytes, offset)?;
         Ok(from_bytes::<PageHeader>(&bytes)?)
     }
@@ -694,8 +705,8 @@ where
         let file = self.self_file.read();
         // TODO - Need some cleaner refactoring here.
         let mut bytes = to_allocvec(&header)?;
-        if bytes.len() < PageHeader::header_size() {
-            bytes.append(&mut vec![0u8; PageHeader::header_size() - bytes.len()]);
+        if bytes.len() < self.page_overhead {
+            bytes.append(&mut vec![0u8; self.page_overhead - bytes.len()]);
         }
         pwrite_all(&*file, &bytes, offset)?;
         Ok(())
@@ -771,6 +782,7 @@ where
                     &*file,
                     self.header.page_size,
                     self.header.first_page_offset,
+                    self.page_overhead,
                 )?;
             }
         }
@@ -954,7 +966,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let p = Page::new_indexed(self.header.page_size, record_size);
+        let p = Page::new_indexed(self.header.page_size, record_size, self.page_overhead);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -976,7 +988,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let p = Page::new_run(self.header.page_size);
+        let p = Page::new_run(self.header.page_size, self.page_overhead);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -991,7 +1003,7 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
                 .into(),
         };
-        let p = Page::new_slotted(self.header.page_size);
+        let p = Page::new_slotted(self.header.page_size, self.page_overhead);
         self.write_page(page_num, &p)?;
         Ok(page_num)
     }
@@ -1046,6 +1058,7 @@ where
             &*file,
             self.header.page_size,
             self.header.first_page_offset,
+            self.page_overhead,
             &self.content_registry,
         )?;
         drop(file);
@@ -1270,9 +1283,9 @@ where
 
     fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
         let p = if should_pin {
-            Page::new_pinned(self.header.page_size)
+            Page::new_pinned(self.header.page_size, self.page_overhead)
         } else {
-            Page::new_data(self.header.page_size)
+            Page::new_data(self.header.page_size, self.page_overhead)
         };
         // Adopt the page into this database's WAL clock so later mutations stamp
         // their lsn from it (and copy-on-write clones inherit it).
@@ -1354,10 +1367,11 @@ fn write_page_with_bounded_retry<F: DBFile>(
     file: &F,
     page_size: DBSizeType,
     first_offset: DBSizeType,
+    page_overhead: usize,
 ) -> Result<(), StoreError> {
     let mut attempt = 0u32;
     loop {
-        match write_page(page_id, page, file, page_size, first_offset) {
+        match write_page(page_id, page, file, page_size, first_offset, page_overhead) {
             Err(StoreError::PageTransientlyInconsistent(_)) if attempt < MAX_TRANSIENT_RETRIES => {
                 attempt += 1;
                 thread::sleep(Duration::from_micros(200 * attempt as u64));
@@ -1466,6 +1480,7 @@ fn write_page(
     file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
+    page_overhead: usize,
 ) -> Result<(), StoreError> {
     // Captured *before* the byte snapshot below, and handed to
     // mark_flushed_up_to at the end instead of an unconditional
@@ -1509,16 +1524,17 @@ fn write_page(
         first_chunk[..first_len].copy_from_slice(&data[..first_len]);
         header.checksum = fnv1a_32(&first_chunk);
         let mut header_bytes = to_allocvec(&header).unwrap_or_default();
-        if header_bytes.len() < PAGE_OVERHEAD {
-            header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
+        if header_bytes.len() < page_overhead {
+            header_bytes.append(&mut vec![0u8; page_overhead - header_bytes.len()]);
         }
         pwrite_all(file, &header_bytes, start_offset)?; // header with HAS_OVERFLOW
-        pwrite_all(file, &first_chunk, start_offset + PAGE_OVERHEAD as u64)?;
+        pwrite_all(file, &first_chunk, start_offset + page_overhead as u64)?;
         let mut start = first_len;
         let mut cur_page_id = header.next_page();
         loop {
             let cur_offset = page_offset(cur_page_id, page_size, first_offset);
-            let mut cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
+            let mut cur_header =
+                read_page_header(cur_page_id, file, page_size, first_offset, page_overhead)?;
             let chunk_len =
                 (cur_header.page_data_size as usize).min(data.len().saturating_sub(start));
             let mut chunk = vec![0u8; cur_header.page_data_size as usize];
@@ -1527,11 +1543,11 @@ fn write_page(
             }
             cur_header.checksum = fnv1a_32(&chunk);
             let mut cur_header_bytes = to_allocvec(&cur_header)?;
-            if cur_header_bytes.len() < PAGE_OVERHEAD {
-                cur_header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - cur_header_bytes.len()]);
+            if cur_header_bytes.len() < page_overhead {
+                cur_header_bytes.append(&mut vec![0u8; page_overhead - cur_header_bytes.len()]);
             }
             pwrite_all(file, &cur_header_bytes, cur_offset)?;
-            pwrite_all(file, &chunk, cur_offset + PAGE_OVERHEAD as u64)?;
+            pwrite_all(file, &chunk, cur_offset + page_overhead as u64)?;
             start += chunk_len;
             // Walk all the way to the physical terminator, not just until
             // the real data runs out: handle_large_page_size sizes the
@@ -1552,8 +1568,8 @@ fn write_page(
         }
     } else {
         let mut header_bytes = to_allocvec(&header).unwrap_or_default();
-        if header_bytes.len() < PAGE_OVERHEAD {
-            header_bytes.append(&mut vec![0u8; PAGE_OVERHEAD - header_bytes.len()]);
+        if header_bytes.len() < page_overhead {
+            header_bytes.append(&mut vec![0u8; page_overhead - header_bytes.len()]);
         }
         let mut bytes = header_bytes;
         bytes.extend_from_slice(&data);
@@ -1586,9 +1602,10 @@ fn read_page(
     file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
+    page_overhead: usize,
     content_registry: &PageContentRegistry,
 ) -> Result<Page, StoreError> {
-    let header = read_page_header(page_id, file, page_size, first_offset)?;
+    let header = read_page_header(page_id, file, page_size, first_offset, page_overhead)?;
     if header.has_overflow() {
         // Use a single pread (like the old read()), not pread_exact: the last
         // overflow page (terminator) may hold fewer bytes than page_data_size
@@ -1605,7 +1622,7 @@ fn read_page(
         let mut all_data = vec![0u8; header.page_data_size as usize];
         file.pread(
             &mut all_data,
-            page_offset(page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
+            page_offset(page_id, page_size, first_offset) + page_overhead as u64,
         )?;
         if header.checksum != fnv1a_32(&all_data) {
             return Err(StoreError::PageChecksumMismatch(page_id));
@@ -1624,7 +1641,7 @@ fn read_page(
                     page_id
                 )));
             }
-            cur_header = read_page_header(cur_page_id, file, page_size, first_offset)?;
+            cur_header = read_page_header(cur_page_id, file, page_size, first_offset, page_overhead)?;
             if cur_header.page_data_size > page_size {
                 return Err(StoreError::UnknownError(format!(
                     "read_page: corrupt overflow page_data_size {} > page_size {}",
@@ -1634,7 +1651,7 @@ fn read_page(
             let mut chunk = vec![0u8; cur_header.page_data_size as usize];
             file.pread(
                 &mut chunk,
-                page_offset(cur_page_id, page_size, first_offset) + PAGE_OVERHEAD as u64,
+                page_offset(cur_page_id, page_size, first_offset) + page_overhead as u64,
             )?;
             // Verified per physical page, against its own header — not
             // against some checksum over the whole reassembled object — the
@@ -1650,9 +1667,9 @@ fn read_page(
         }
         // Reconstruct as full header+data bytes so Page::from_bytes can deserialize correctly.
         let mut full_bytes = primary_header.to_bytes()?;
-        full_bytes.resize(PAGE_OVERHEAD, 0);
+        full_bytes.resize(page_overhead, 0);
         full_bytes.extend_from_slice(&all_data);
-        Ok(Page::from_bytes(&full_bytes, content_registry)?)
+        Ok(Page::from_bytes(&full_bytes, content_registry, page_overhead)?)
     } else {
         // Read the full page slot so Page::from_bytes gets the complete
         // serialized data. Single pread, not pread_exact: if the async writer
@@ -1660,10 +1677,10 @@ fn read_page(
         // zero-initialized buffer acts as padding.
         let mut bytes = vec![0u8; page_size as usize];
         file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
-        if header.checksum != fnv1a_32(&bytes[PAGE_OVERHEAD..]) {
+        if header.checksum != fnv1a_32(&bytes[page_overhead..]) {
             return Err(StoreError::PageChecksumMismatch(page_id));
         }
-        Ok(Page::from_bytes(&bytes, content_registry)?)
+        Ok(Page::from_bytes(&bytes, content_registry, page_overhead)?)
     }
 }
 
@@ -1672,8 +1689,9 @@ fn read_page_header(
     file: &impl DBFile,
     page_size: DBSizeType,
     first_offset: DBSizeType,
+    page_overhead: usize,
 ) -> Result<PageHeader, StoreError> {
-    let mut bytes = vec![0u8; PageHeader::header_size()];
+    let mut bytes = vec![0u8; page_overhead];
     pread_exact(file, &mut bytes, page_offset(page, page_size, first_offset))?;
     let header: PageHeader = from_bytes(&bytes)?;
     // Cheap, header-only sanity check — catches a garbage/zeroed/wrong-offset
@@ -1697,7 +1715,7 @@ mod tests {
     use crate::cursor::Cursor;
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
-    use crate::page::{PAGE_OVERHEAD, Page, PageId};
+    use crate::page::{Page, PageId};
     use crate::run::Run;
     use crate::tuple::{DBIdType, Tuple};
     use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
@@ -1710,7 +1728,17 @@ mod tests {
     // annotation, so postcard varint-encodes it; append its own to_allocvec
     // output (postcard concatenates struct fields with no extra framing, so
     // this is byte-identical to what a full Header serialization produces).
-    fn make_header_bytes(first_page_offset: u64, page_count: u64, page_size: u64) -> Vec<u8> {
+    // max_index_key_size is an explicit param, not hardcoded: several tests
+    // below use a deliberately tiny page_size (down to 300 bytes) to
+    // exercise page-allocation edge cases, and page_overhead(max_index_key_
+    // size) must stay well under whatever page_size they use or Page::new_*
+    // underflows computing page_data_size = page_size - page_overhead.
+    fn make_header_bytes(
+        first_page_offset: u64,
+        page_count: u64,
+        page_size: u64,
+        max_index_key_size: u64,
+    ) -> Vec<u8> {
         let mut v = vec![0x53u8, 0x65]; // MAGIC
         v.extend_from_slice(&4u32.to_le_bytes()); // format_version (persistence versioning Stage 3)
         v.extend_from_slice(&first_page_offset.to_le_bytes());
@@ -1719,15 +1747,33 @@ mod tests {
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap()); // last_checkpoint
         v.extend_from_slice(&1u64.to_le_bytes()); // counter (phase 1)
         v.extend_from_slice(&0u64.to_le_bytes()); // checkpoint_lsn (phase 6)
-        v.extend_from_slice(&512u64.to_le_bytes()); // max_index_key_size (Stage 3)
+        v.extend_from_slice(&max_index_key_size.to_le_bytes()); // Stage 3
         // header_checksum (STORE_AUDIT.md S1) — this path never runs
         // Header::validate, so a placeholder is fine.
         v.extend_from_slice(&0u32.to_le_bytes());
         v
     }
 
+    // Default max_index_key_size for tests that don't care about it —
+    // matches the production default and stays well under PAGE_SIZE (1000).
+    const TEST_MAX_INDEX_KEY_SIZE: u64 = 512;
+    const TEST_OVERHEAD: usize = crate::page::page_overhead(TEST_MAX_INDEX_KEY_SIZE);
+    // For tests that use a small or caller-supplied page_size (down to 300
+    // bytes) where the default above would overflow it.
+    const TEST_MIN_MAX_INDEX_KEY_SIZE: u64 = 64;
+    const TEST_MIN_OVERHEAD: usize = crate::page::page_overhead(TEST_MIN_MAX_INDEX_KEY_SIZE);
+
     fn make_header() -> Arc<Header> {
-        let bytes = make_header_bytes(0, 0, PAGE_SIZE);
+        let bytes = make_header_bytes(0, 0, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE);
+        Arc::new(from_bytes::<Header>(&bytes).unwrap())
+    }
+
+    // Matches make_buffer_ps's own max_index_key_size (TEST_MIN_OVERHEAD),
+    // for a second PageBuffer opened over bytes a make_buffer_ps-backed
+    // buffer actually wrote — page_overhead must agree on both sides or
+    // the header/data boundary disagrees and every read fails its checksum.
+    fn make_header_min() -> Arc<Header> {
+        let bytes = make_header_bytes(0, 0, PAGE_SIZE, TEST_MIN_MAX_INDEX_KEY_SIZE);
         Arc::new(from_bytes::<Header>(&bytes).unwrap())
     }
 
@@ -1736,7 +1782,7 @@ mod tests {
     fn make_buffer(num_pages: u64, max_entries: usize) -> (PageBuffer<MemFile>, Arc<AtomicU64>) {
         let mut mem = MemFile::new();
         for _ in 0..num_pages {
-            let page = Page::new_data(PAGE_SIZE);
+            let page = Page::new_data(PAGE_SIZE, TEST_OVERHEAD);
             mem.write_all(&page.to_bytes()).unwrap();
         }
         mem.seek(SeekFrom::Start(0)).unwrap();
@@ -2273,14 +2319,21 @@ mod tests {
     ) -> (PageBuffer<MemFile>, Arc<AtomicU64>, MemFile) {
         let mut mem = MemFile::new();
         for _ in 0..num_pages {
-            let page = Page::new_data(page_size);
+            let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
             mem.write_all(&page.to_bytes()).unwrap();
         }
         let file_clone = mem.clone(); // shares Arc<RwLock<Vec<u8>>> with mem
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(num_pages));
-        let header =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, num_pages, page_size)).unwrap());
+        let header = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                num_pages,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf = PageBuffer::new(
             page_size,
             page_counter.clone(),
@@ -2298,7 +2351,7 @@ mod tests {
     fn test_write_and_read_normal_page() {
         let (buf, _, _) = make_buffer_ps(PAGE_SIZE, 0, 10);
         let page_id = buf.alloc_page(false).unwrap();
-        let page = Page::new_data(PAGE_SIZE);
+        let page = Page::new_data(PAGE_SIZE, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, b"hello")).unwrap();
         buf.write_page(page_id, &page).unwrap();
         let cached = buf.get_page(page_id).unwrap();
@@ -2318,7 +2371,7 @@ mod tests {
         let count_after_alloc = page_counter.load(Ordering::Relaxed);
 
         let big_data = vec![42u8; page_size as usize]; // definitely larger than page_data_size
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
@@ -2339,7 +2392,7 @@ mod tests {
         let page_id = buf.alloc_page(false).unwrap();
 
         let big_data = vec![7u8; page_size as usize];
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
@@ -2382,7 +2435,7 @@ mod tests {
         let page_id = buf.alloc_page(false).unwrap();
 
         let big_data = vec![1u8; page_size as usize];
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
@@ -2433,7 +2486,7 @@ mod tests {
         let page_id = buf.alloc_page(false).unwrap();
 
         let big_data = vec![9u8; page_size as usize];
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
         // shutdown flushes the writer thread, persisting all writes to the shared MemFile
@@ -2443,7 +2496,7 @@ mod tests {
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
         let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size)).unwrap());
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,
@@ -2501,7 +2554,7 @@ mod tests {
         let p = buf.get_page(0usize.into()).unwrap();
         assert!(!p.is_pinned());
         // Write a pinned page into the cache slot for page 0
-        let new_page = Page::new_pinned(PAGE_SIZE);
+        let new_page = Page::new_pinned(PAGE_SIZE, TEST_OVERHEAD);
         assert!(buf.write_page(0usize.into(), &new_page).is_ok());
         // Cache must now hold the updated page
         let p2 = buf.get_page(0usize.into()).unwrap();
@@ -2515,7 +2568,7 @@ mod tests {
     fn test_write_header_sends_without_error() {
         let (buf, _) = make_buffer(0, 10);
         // Create an updated header via the same deserialization path
-        let header = from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE)).unwrap();
+        let header = from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap();
         assert!(buf.write_header(header).is_ok());
         assert!(buf.shutdown().is_ok());
     }
@@ -2573,7 +2626,7 @@ mod tests {
             PAGE_SIZE,
             page_counter2,
             file_clone,
-            make_header(),
+            make_header_min(),
             MAX_ENTRIES,
             Arc::new(crate::logger::LsnClock::default()),
             Arc::new(crate::pages::content::PageContentRegistry::builtin()),
@@ -2618,8 +2671,8 @@ mod tests {
     #[test]
     fn test_evict_one_gives_a_referenced_page_a_second_chance() {
         let (buf, _) = make_buffer(2, 10);
-        let page_a = Arc::new(Page::new_data(PAGE_SIZE));
-        let page_b = Arc::new(Page::new_data(PAGE_SIZE));
+        let page_a = Arc::new(Page::new_data(PAGE_SIZE, TEST_OVERHEAD));
+        let page_b = Arc::new(Page::new_data(PAGE_SIZE, TEST_OVERHEAD));
         // Phase 6: only clean pages are evictable (a dirty one is parked
         // until a checkpoint captures it); these are "already on disk".
         page_a.set_dirty(false).unwrap();
@@ -2684,7 +2737,7 @@ mod tests {
             PAGE_SIZE,
             page_counter2,
             file_clone,
-            make_header(),
+            make_header_min(),
             10,
             Arc::new(crate::logger::LsnClock::default()),
             Arc::new(crate::pages::content::PageContentRegistry::builtin()),
@@ -2823,7 +2876,7 @@ mod tests {
         let file_clone = mem.clone();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
 
         let buf = PageBuffer::new(
             page_size,
@@ -2843,6 +2896,7 @@ mod tests {
             None,
             Box::new(TestBucketPage::default()),
             TEST_BUCKET_KIND,
+            TEST_MIN_OVERHEAD,
         );
         page.add_tuple(Tuple::new(1, b"bucket-entry")).unwrap();
         buf.write_page(page_id, &page).unwrap();
@@ -2857,7 +2911,7 @@ mod tests {
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
         let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size)).unwrap());
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,
@@ -2885,7 +2939,7 @@ mod tests {
         let mut mem = MemFile::new();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size)).unwrap());
+        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf = PageBuffer::new(
             page_size,
             page_counter.clone(),
@@ -2904,12 +2958,13 @@ mod tests {
             None,
             Box::new(TestBucketPage::default()),
             TEST_BUCKET_KIND,
+            TEST_MIN_OVERHEAD,
         );
         page.add_tuple(Tuple::new(1, b"bucket-entry")).unwrap();
         let raw_bytes = page.to_bytes();
 
         let unregistered = crate::pages::content::PageContentRegistry::builtin();
-        let err = Page::from_bytes(&raw_bytes, &unregistered).unwrap_err();
+        let err = Page::from_bytes(&raw_bytes, &unregistered, TEST_MIN_OVERHEAD).unwrap_err();
         assert!(matches!(err, StoreError::UnknownPageContentKind(3)));
         let _ = buf.shutdown();
     }
@@ -2920,14 +2975,14 @@ mod tests {
     fn test_get_page_detects_a_bitflipped_data_byte_via_checksum() {
         let (buf, page_counter, file_clone) = make_buffer_ps(PAGE_SIZE, 0, 10);
         let page_id = buf.alloc_page(false).unwrap();
-        let page = Page::new_data(PAGE_SIZE);
+        let page = Page::new_data(PAGE_SIZE, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, b"hello")).unwrap();
         buf.write_page(page_id, &page).unwrap();
         // shutdown flushes the write to the shared MemFile before we corrupt it.
         buf.shutdown().unwrap();
 
         // Flip a byte inside the page's data region, well past the header, directly on disk.
-        let corrupt_offset = crate::page::PageHeader::header_size() as u64 + 5;
+        let corrupt_offset = TEST_MIN_OVERHEAD as u64 + 5;
         let mut byte = [0u8; 1];
         file_clone.pread(&mut byte, corrupt_offset).unwrap();
         byte[0] ^= 0xFF;
@@ -2940,7 +2995,7 @@ mod tests {
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
         let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE)).unwrap());
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf2 = PageBuffer::new(
             PAGE_SIZE,
             page_counter2,
@@ -2973,7 +3028,7 @@ mod tests {
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
         let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE)).unwrap());
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf2 = PageBuffer::new(
             PAGE_SIZE,
             page_counter2,
@@ -2999,7 +3054,7 @@ mod tests {
 
         // Large enough to need several overflow continuation pages, not just one.
         let big_data = vec![9u8; page_size as usize * 3];
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
         buf.shutdown().unwrap();
@@ -3017,7 +3072,7 @@ mod tests {
         // the primary's — to specifically exercise per-physical-page
         // verification of an overflow chain, not just the primary.
         let corrupt_offset =
-            super::page_offset(continuation_id, page_size, 0) + PAGE_OVERHEAD as u64 + 2;
+            super::page_offset(continuation_id, page_size, 0) + TEST_MIN_OVERHEAD as u64 + 2;
         let mut byte = [0u8; 1];
         file_clone.pread(&mut byte, corrupt_offset).unwrap();
         byte[0] ^= 0xFF;
@@ -3025,7 +3080,7 @@ mod tests {
 
         let page_counter2 = Arc::new(AtomicU64::new(count_after));
         let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, count_after, page_size)).unwrap());
+            Arc::new(from_bytes::<Header>(&make_header_bytes(0, count_after, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,
@@ -3101,7 +3156,7 @@ mod tests {
         let (buf, _, _) = make_buffer_ps(page_size, 0, 10);
         let page_id = buf.alloc_page(false).unwrap();
         let big_data = vec![0u8; page_size as usize];
-        let page = Page::new_data(page_size);
+        let page = Page::new_data(page_size, TEST_MIN_OVERHEAD);
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 

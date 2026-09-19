@@ -132,7 +132,42 @@ const HAS_OVERFLOW: u16 = 1 << 2;
 const IS_OVERFLOW: u16 = 1 << 3;
 const RESERVED_FLAGS: u16 = 0x0f;
 
-pub(crate) const PAGE_OVERHEAD: usize = size_of::<PageDto>();
+// Persistence versioning Stage 3: replaces the old `PAGE_OVERHEAD =
+// size_of::<PageDto>()` const, which was never actually correct —
+// `size_of` measures Rust's in-memory struct layout (a handful of bytes
+// for `high_key: Option<DBIdType>`'s enum discriminant + pointer-sized
+// fields), completely disconnected from `high_key`'s real postcard-
+// serialized byte count once it holds an actual composite index key.
+// Measured directly (not assumed): a worst-case header with every OTHER
+// field at its own maximum encoded width and high_key=None serializes to
+// 60 bytes; a real Rec high_key adds its own tag byte, IndexKey's field-
+// count varint, and per-ValueItem framing — measured at 5-7 bytes of
+// overhead beyond the key's own declared content width, for content
+// widths from 64 to 8192 bytes (MIN/MAX_MAX_INDEX_KEY_SIZE's own range).
+// FIXED_HEADER_BYTES is rounded up from the measured 60, and
+// HIGH_KEY_RESERVE_MARGIN is generous rather than exact, to also cover a
+// composite (multi-column) key costing a little more framing than one
+// big field of the same total declared width would.
+//
+// This is a deliberate, one-time BREAKING CHANGE for any database file
+// that already has pages on disk: the header/data byte boundary moves,
+// so a page written before this change is a different physical layout,
+// not just an old logical version — existing files must be recreated.
+// True non-breaking support for old page layouts needs a page-level
+// version tag (deferred; see PERSISTENCE_VERSIONING_PROGRESS.md's Stage 5
+// note), which is what would let old- and new-layout pages coexist in one
+// file. That page-level tag is also where a future, more space-efficient
+// per-index (record_size-based, rather than database-wide) reservation
+// belongs — positioned I/O in buffer.rs reads/writes a page's data region
+// via a fixed byte offset *without* first parsing that page's header, so
+// a per-page-varying overhead needs that redesign, not just a formula
+// change (confirmed while investigating this).
+const FIXED_HEADER_BYTES: usize = 64;
+const HIGH_KEY_RESERVE_MARGIN: usize = 32;
+
+pub(crate) const fn page_overhead(max_index_key_size: DBSizeType) -> usize {
+    FIXED_HEADER_BYTES + max_index_key_size as usize + HIGH_KEY_RESERVE_MARGIN
+}
 
 // Bytes reserved below the physical data-region size when deciding whether a
 // page is "full" (can_store / handle_large_page_size's overflow trigger).
@@ -146,15 +181,16 @@ pub(crate) const PAGE_OVERHEAD: usize = size_of::<PageDto>();
 //     and a varint(data.len()) around it — up to three stacked length varints
 //     per page, none accounted by any individual tuple's size().
 // NOTE: this must shrink the *fullness threshold* (usable_data_size), not
-// `page_data_size` itself. `page_data_size = page_size - PAGE_OVERHEAD` is the
-// true physical data-region size (used to know where the on-disk data region
-// ends); page_used_size is allowed to fill right up to whatever ceiling
-// can_store checks against. Folding this margin into PAGE_OVERHEAD instead
-// just reduces page_data_size by the same amount as the threshold — a zero-sum
-// relabeling that leaves no actual slack, since the header always pads out to
-// exactly PAGE_OVERHEAD regardless of its value. The margin only creates real
-// headroom by making the fullness ceiling strictly less than the true physical
-// capacity — see `PageHeader::usable_data_size` / `Page::usable_data_size`.
+// `page_data_size` itself. `page_data_size = page_size - page_overhead(..)` is
+// the true physical data-region size (used to know where the on-disk data
+// region ends); page_used_size is allowed to fill right up to whatever
+// ceiling can_store checks against. Folding this margin into the overhead
+// reservation instead just reduces page_data_size by the same amount as the
+// threshold — a zero-sum relabeling that leaves no actual slack, since the
+// header always pads out to exactly that reservation regardless of its
+// value. The margin only creates real headroom by making the fullness
+// ceiling strictly less than the true physical capacity — see
+// `PageHeader::usable_data_size` / `Page::usable_data_size`.
 // Postcard's varint is 7 bits/byte, so even a 3-byte varint covers values up to
 // ~2M; this is deliberately oversized rather than tightly computed per page.
 pub(crate) const USABLE_DATA_MARGIN: DBSizeType = 16;
@@ -254,6 +290,13 @@ pub(crate) struct Page {
     dirty_version: AtomicU64,
     flushed_version: AtomicU64,
     page_data_size: DBSizeType,
+    // Persistence versioning Stage 3: the database-wide overhead (see
+    // page_overhead()) this page was constructed/decoded with — needed by
+    // to_bytes to know how many bytes to reserve for the header slot.
+    // Never persisted itself (it's derived from Header.max_index_key_size
+    // at open, not a per-page fact); a freshly-decoded page gets it from
+    // whatever from_bytes was called with, exactly as page_data_size does.
+    page_overhead: usize,
     record_size: Option<usize>,
     // Which PageContentRegistry kind built `inner.data` — set once at
     // construction (Page::new picks it from record_size; from_bytes reads
@@ -287,16 +330,16 @@ pub(crate) struct PageTupleIterator {
 }
 
 impl Page {
-    pub(crate) fn new_data(size: DBSizeType) -> Self {
-        Self::new(size, NONE, None)
+    pub(crate) fn new_data(size: DBSizeType, page_overhead: usize) -> Self {
+        Self::new(size, NONE, None, page_overhead)
     }
 
-    pub(crate) fn new_pinned(size: DBSizeType) -> Self {
-        Self::new(size, PINNED, None)
+    pub(crate) fn new_pinned(size: DBSizeType, page_overhead: usize) -> Self {
+        Self::new(size, PINNED, None, page_overhead)
     }
 
-    pub(crate) fn new_indexed(size: DBSizeType, record_size: usize) -> Self {
-        Self::new(size, INDEX_PAGE, Some(record_size))
+    pub(crate) fn new_indexed(size: DBSizeType, record_size: usize, page_overhead: usize) -> Self {
+        Self::new(size, INDEX_PAGE, Some(record_size), page_overhead)
     }
 
     // A Run's pages (crate::run::Run) — like new_data, an ordinary
@@ -306,13 +349,14 @@ impl Page {
     // distinction matters. Goes through new_with_content, not new's own
     // record_size-driven branch, the same way any other registered
     // custom content kind would.
-    pub(crate) fn new_run(size: DBSizeType) -> Self {
+    pub(crate) fn new_run(size: DBSizeType, page_overhead: usize) -> Self {
         Self::new_with_content(
             size,
             NONE,
             None,
             Box::new(crate::pages::run::RunPage::new()),
             PageContentKind::RUN_TUPLE,
+            page_overhead,
         )
     }
 
@@ -329,18 +373,19 @@ impl Page {
     // access shape from the one that made SlottedPage a net loss as
     // Page::new's own default (see slotted.rs's "Why this isn't the
     // default").
-    pub(crate) fn new_slotted(size: DBSizeType) -> Self {
-        let capacity = (size - PAGE_OVERHEAD as DBSizeType) as usize;
+    pub(crate) fn new_slotted(size: DBSizeType, page_overhead: usize) -> Self {
+        let capacity = (size - page_overhead as DBSizeType) as usize;
         Self::new_with_content(
             size,
             NONE,
             None,
             Box::new(crate::pages::slotted::SlottedPage::new(capacity)),
             PageContentKind::SLOTTED_TUPLE,
+            page_overhead,
         )
     }
 
-    fn new(size: DBSizeType, flags: u16, record_size: Option<usize>) -> Self {
+    fn new(size: DBSizeType, flags: u16, record_size: Option<usize>, page_overhead: usize) -> Self {
         let (pt, content_kind): (Box<dyn PageTuple>, PageContentKind) =
             if let Some(record_size) = record_size {
                 (
@@ -350,7 +395,7 @@ impl Page {
             } else {
                 (Box::new(AnyTuplePage::new()), PageContentKind::ANY_TUPLE)
             };
-        Self::new_with_content(size, flags, record_size, pt, content_kind)
+        Self::new_with_content(size, flags, record_size, pt, content_kind, page_overhead)
     }
 
     // Lets a caller supply its own PageTuple implementor for a registered
@@ -359,14 +404,16 @@ impl Page {
     // page never needs the registry itself — only reconstructing one from
     // raw bytes (Page::from_bytes) does — since whoever's allocating a page
     // of a given kind already knows its own concrete type.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_content(
         size: DBSizeType,
         flags: u16,
         record_size: Option<usize>,
         content: Box<dyn PageTuple>,
         content_kind: PageContentKind,
+        page_overhead: usize,
     ) -> Self {
-        let ds = size - PAGE_OVERHEAD as DBSizeType;
+        let ds = size - page_overhead as DBSizeType;
         Self {
             inner: RwLock::new(PageInner {
                 data: content,
@@ -379,16 +426,13 @@ impl Page {
             dirty_version: AtomicU64::new(1),
             flushed_version: AtomicU64::new(0),
             page_data_size: ds,
+            page_overhead,
             record_size,
             content_kind,
             lsn: RwLock::new(LsnId(0)),
             flags: AtomicU16::new(flags),
             referenced: AtomicBool::new(false),
         }
-    }
-
-    pub(crate) fn get_overhead() -> DBSizeType {
-        PAGE_OVERHEAD as DBSizeType
     }
 
     // Builds a PageHeader from an already-held `inner` read guard, folding
@@ -805,14 +849,28 @@ impl Page {
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let (header, data) = self.to_bytes_snapshot();
         let mut v = to_allocvec(&header).unwrap_or_default();
-        if v.len() < PAGE_OVERHEAD {
-            v.append(&mut vec![0u8; PAGE_OVERHEAD - v.len()]);
+        // A page's header must never actually exceed the overhead it was
+        // constructed with — page_data_size was already computed as
+        // `size - page_overhead` at construction, so overrunning here would
+        // silently write into what the data region below assumes is its
+        // own space. CREATE TABLE/CREATE INDEX reject a key too wide for
+        // the database's configured max_index_key_size up front (the loud,
+        // cheap-to-refuse point); this is the defense-in-depth backstop.
+        debug_assert!(
+            v.len() <= self.page_overhead,
+            "page header serialized to {} byte(s), exceeding its {}-byte reservation — a \
+             high_key wider than max_index_key_size slipped past DDL validation",
+            v.len(),
+            self.page_overhead
+        );
+        if v.len() < self.page_overhead {
+            v.append(&mut vec![0u8; self.page_overhead - v.len()]);
         }
         v.extend_from_slice(&data);
-        if v.len() < self.page_data_size as usize + PAGE_OVERHEAD {
+        if v.len() < self.page_data_size as usize + self.page_overhead {
             v.append(&mut vec![
                 0u8;
-                (self.page_data_size as usize + PAGE_OVERHEAD)
+                (self.page_data_size as usize + self.page_overhead)
                     - v.len()
             ]);
         }
@@ -834,10 +892,11 @@ impl Page {
     pub(crate) fn from_bytes(
         bytes: &[u8],
         registry: &PageContentRegistry,
+        page_overhead: usize,
     ) -> Result<Self, StoreError> {
-        let header = &bytes[..PAGE_OVERHEAD];
+        let header = &bytes[..page_overhead];
         let header = from_bytes::<PageHeader>(header)?;
-        let data = &bytes[PAGE_OVERHEAD..];
+        let data = &bytes[page_overhead..];
         // Deserialize the tuple payload with `?` rather than routing through the
         // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
         // read into a panic instead of a recoverable StoreError.
@@ -860,6 +919,7 @@ impl Page {
             dirty_version: AtomicU64::new(0),
             flushed_version: AtomicU64::new(0),
             page_data_size: header.page_data_size,
+            page_overhead,
             record_size: header.record_size,
             content_kind: header.content_kind,
             flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
@@ -927,20 +987,12 @@ impl PageHeader {
         self.flags &= !HAS_OVERFLOW;
     }
 
-    pub(crate) fn header_size() -> usize {
-        PAGE_OVERHEAD
-    }
-
     pub(crate) fn used_size(&self) -> DBSizeType {
         self.page_used_size
     }
 
     pub(crate) fn usable_data_size(&self) -> DBSizeType {
         self.page_data_size.saturating_sub(USABLE_DATA_MARGIN)
-    }
-
-    pub(crate) fn total_page_size(&self) -> usize {
-        self.page_used_size as usize + Self::header_size()
     }
 }
 
@@ -988,6 +1040,15 @@ impl From<PageDto> for Page {
             dirty_version: AtomicU64::new(0),
             flushed_version: AtomicU64::new(0),
             page_data_size: value.page_data_size,
+            // This impl is never actually invoked (see this fn's own top
+            // comment) — Page::from_bytes is the real decode path and
+            // takes page_overhead explicitly, exactly because a plain
+            // From::from can't. Defaulted rather than plumbed through
+            // PageDto (which has no overhead field of its own — it's a
+            // runtime-only, per-database value, not part of the wire
+            // format), matching this impl's existing hardcoded-to-built-
+            // ins style.
+            page_overhead: page_overhead(crate::db::DEFAULT_MAX_INDEX_KEY_SIZE),
             record_size: value.record_size,
             content_kind: value.content_kind,
             flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
@@ -1054,6 +1115,7 @@ impl Clone for Page {
                 self.flushed_version.load(std::sync::atomic::Ordering::Relaxed),
             ),
             page_data_size: self.page_data_size,
+            page_overhead: self.page_overhead,
             record_size: self.record_size,
             content_kind: self.content_kind,
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
@@ -1132,10 +1194,16 @@ mod tests {
 
     use crate::{
         error::StoreError,
-        page::{PAGE_OVERHEAD, Page, USABLE_DATA_MARGIN},
+        page::{Page, USABLE_DATA_MARGIN, page_overhead},
         pages::content::PageContentRegistry,
         tuple::{DBIdType, Tuple},
     };
+
+    // Kept small (MIN_MAX_INDEX_KEY_SIZE-ish) rather than the production
+    // default, so tests using a tiny page_size (down to 300 bytes, for
+    // capacity/overflow edge cases) still have real room left for content
+    // after the header's reservation.
+    const TEST_OVERHEAD: usize = page_overhead(64);
 
     type FixedPage = Page;
 
@@ -1145,7 +1213,7 @@ mod tests {
 
     #[test]
     fn page_test_unique_id() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         assert!(p.add_tuple(Tuple::new(1, b"abcdefabcd")).is_ok());
         assert!(p.add_tuple(Tuple::new(2, b"abcdefabcd")).is_ok());
         assert!(matches!(
@@ -1168,7 +1236,7 @@ mod tests {
     // rather than trying to engineer a panic inside Page's own methods.
     #[test]
     fn page_test_remains_usable_after_a_panic_while_its_internal_lock_was_held() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = p.inner.write();
             panic!("simulated bug elsewhere, unrelated to Page itself");
@@ -1187,8 +1255,8 @@ mod tests {
         // (room reserved for page-serialization framing the per-tuple size sum
         // doesn't see — see USABLE_DATA_MARGIN), so fitting 10 tuples with 1
         // byte to spare needs that margin folded into the requested page size.
-        let page_size = tuple_sz * 10 + USABLE_DATA_MARGIN + PAGE_OVERHEAD as u64 + 1;
-        let p = Page::new_data(page_size);
+        let page_size = tuple_sz * 10 + USABLE_DATA_MARGIN + TEST_OVERHEAD as u64 + 1;
+        let p = Page::new_data(page_size, TEST_OVERHEAD);
         for i in 0..10 {
             assert!(
                 p.add_tuple(Tuple::new(i, b"abcdef")).is_ok(),
@@ -1197,7 +1265,7 @@ mod tests {
         }
         let b = p.to_bytes();
         assert_eq!(b.len(), page_size as usize);
-        let p1 = Page::from_bytes(&b, &registry());
+        let p1 = Page::from_bytes(&b, &registry(), TEST_OVERHEAD);
         assert!(p1.is_ok());
         let p1 = p1.unwrap();
         assert_eq!(p1, p);
@@ -1205,16 +1273,16 @@ mod tests {
 
     #[test]
     fn page_test_4() {
-        let p = Page::new_data(1024);
+        let p = Page::new_data(1024, TEST_OVERHEAD);
         let b = p.to_bytes();
         assert_eq!(b.len(), 1024);
-        let p1 = Page::from_bytes(&b, &registry()).unwrap();
+        let p1 = Page::from_bytes(&b, &registry(), TEST_OVERHEAD).unwrap();
         assert_eq!(p, p1);
     }
 
     #[test]
     fn page_test_get_existing_and_missing() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(7, b"payload")).unwrap();
         let found = p.get(DBIdType::Int(7)).unwrap();
         assert!(found.is_some());
@@ -1225,7 +1293,7 @@ mod tests {
 
     #[test]
     fn page_test_contains() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(3, b"x")).unwrap();
         assert!(p.contains(DBIdType::Int(3)).unwrap());
         assert!(!p.contains(DBIdType::Int(4)).unwrap());
@@ -1233,7 +1301,7 @@ mod tests {
 
     #[test]
     fn page_test_iter_yields_all_tuples() {
-        let p = Page::new_data(4000);
+        let p = Page::new_data(4000, TEST_OVERHEAD);
         for i in 0..5u64 {
             p.add_tuple(Tuple::new(i, b"data")).unwrap();
         }
@@ -1243,7 +1311,7 @@ mod tests {
 
     #[test]
     fn page_test_next_page() {
-        let p = Page::new_data(1024);
+        let p = Page::new_data(1024, TEST_OVERHEAD);
         assert_eq!(p.get_next_page(), 0usize.into());
         p.set_next_page(42usize.into()).unwrap();
         assert_eq!(p.get_next_page(), 42usize.into());
@@ -1251,15 +1319,15 @@ mod tests {
 
     #[test]
     fn page_test_pinned_flag() {
-        let p = Page::new_data(1024);
+        let p = Page::new_data(1024, TEST_OVERHEAD);
         assert!(!p.is_pinned());
-        let p_pinned = Page::new_pinned(1024);
+        let p_pinned = Page::new_pinned(1024, TEST_OVERHEAD);
         assert!(p_pinned.is_pinned());
     }
 
     #[test]
     fn page_test_dirty_state() {
-        let p = Page::new_data(1024);
+        let p = Page::new_data(1024, TEST_OVERHEAD);
         assert!(p.is_dirty());
         p.set_dirty(false).unwrap();
         assert!(!p.is_dirty());
@@ -1269,11 +1337,11 @@ mod tests {
 
     #[test]
     fn page_test_roundtrip_preserves_tuples() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(1, b"first")).unwrap();
         p.add_tuple(Tuple::new(2, b"second")).unwrap();
         let bytes = p.to_bytes();
-        let p2 = Page::from_bytes(&bytes, &registry()).unwrap();
+        let p2 = Page::from_bytes(&bytes, &registry(), TEST_OVERHEAD).unwrap();
         assert!(p2.contains(DBIdType::Int(1)).unwrap());
         assert!(p2.contains(DBIdType::Int(2)).unwrap());
         assert_eq!(
@@ -1290,13 +1358,13 @@ mod tests {
 
     #[test]
     fn page_iter_any_empty() {
-        let p = Page::new_data(1024);
+        let p = Page::new_data(1024, TEST_OVERHEAD);
         assert_eq!(p.iter().count(), 0);
     }
 
     #[test]
     fn page_iter_any_correct_data() {
-        let p = Page::new_data(4000);
+        let p = Page::new_data(4000, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(1, b"alpha")).unwrap();
         p.add_tuple(Tuple::new(2, b"beta")).unwrap();
         p.add_tuple(Tuple::new(3, b"gamma")).unwrap();
@@ -1308,10 +1376,10 @@ mod tests {
 
     #[test]
     fn page_iter_any_after_roundtrip() {
-        let p = Page::new_data(2000);
+        let p = Page::new_data(2000, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(10, b"x")).unwrap();
         p.add_tuple(Tuple::new(20, b"y")).unwrap();
-        let p2 = Page::from_bytes(&p.to_bytes(), &registry()).unwrap();
+        let p2 = Page::from_bytes(&p.to_bytes(), &registry(), TEST_OVERHEAD).unwrap();
         assert_eq!(p2.iter().count(), 2);
     }
 
@@ -1320,14 +1388,14 @@ mod tests {
     #[test]
     fn page_iter_fixed_empty() {
         let record_size = Tuple::new(0, b"xxxx").size() as usize;
-        let p = FixedPage::new_indexed(1024, record_size);
+        let p = FixedPage::new_indexed(1024, record_size, TEST_OVERHEAD);
         assert_eq!(p.iter().count(), 0);
     }
 
     #[test]
     fn page_iter_fixed_correct_count() {
         let record_size = Tuple::new(0, b"data").size() as usize;
-        let p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size, TEST_OVERHEAD);
         for i in 0..4u64 {
             p.add_tuple(Tuple::new(i, b"data")).unwrap();
         }
@@ -1337,7 +1405,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_correct_data() {
         let record_size = Tuple::new(0, b"hello").size() as usize;
-        let p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(10, b"hello")).unwrap();
         p.add_tuple(Tuple::new(20, b"hello")).unwrap();
         assert!(p.iter().all(|t| t.data.to_vec() == b"hello"));
@@ -1355,7 +1423,7 @@ mod tests {
     #[test]
     fn page_iter_fixed_oversized_rejected_iter_stays_empty() {
         let record_size = Tuple::new(0, b"hi").size() as usize;
-        let p = FixedPage::new_indexed(4000, record_size);
+        let p = FixedPage::new_indexed(4000, record_size, TEST_OVERHEAD);
         assert!(p.add_tuple(Tuple::new(1, b"way_too_long_payload")).is_err());
         assert_eq!(p.iter().count(), 0);
     }
@@ -1363,23 +1431,23 @@ mod tests {
     #[test]
     fn page_iter_fixed_after_roundtrip() {
         let record_size = Tuple::new(0, b"abc").size() as usize;
-        let p = FixedPage::new_indexed(2000, record_size);
+        let p = FixedPage::new_indexed(2000, record_size, TEST_OVERHEAD);
         p.add_tuple(Tuple::new(1, b"abc")).unwrap();
         p.add_tuple(Tuple::new(2, b"abc")).unwrap();
-        let p2 = FixedPage::from_bytes(&p.to_bytes(), &registry()).unwrap();
+        let p2 = FixedPage::from_bytes(&p.to_bytes(), &registry(), TEST_OVERHEAD).unwrap();
         assert_eq!(p2.iter().count(), 2);
         assert!(p2.iter().all(|t| t.data.to_vec() == b"abc"));
     }
 
     #[test]
     fn test_can_store_true_for_fresh_page() {
-        let p = Page::new_data(1000);
+        let p = Page::new_data(1000, TEST_OVERHEAD);
         assert!(p.can_store(&Tuple::new(1, b"anything")));
     }
 
     #[test]
     fn test_any_size_tuple_accepted_while_page_has_capacity() {
-        let p = Page::new_data(1000);
+        let p = Page::new_data(1000, TEST_OVERHEAD);
         let big_data = vec![0u8; 2000]; // much larger than page_data_size
         assert!(p.can_store(&Tuple::new(1, &big_data)));
         assert!(p.add_tuple(Tuple::new(1, &big_data)).is_ok());
@@ -1387,7 +1455,7 @@ mod tests {
 
     #[test]
     fn test_used_size_tracks_tuple_size() {
-        let p = Page::new_data(1000);
+        let p = Page::new_data(1000, TEST_OVERHEAD);
         let t = Tuple::new(1, b"hello");
         let expected = t.size();
         p.add_tuple(t).unwrap();
@@ -1396,7 +1464,7 @@ mod tests {
 
     #[test]
     fn test_can_store_false_after_oversized_tuple() {
-        let p = Page::new_data(1000);
+        let p = Page::new_data(1000, TEST_OVERHEAD);
         let big_data = vec![0u8; 2000]; // page_used_size will exceed page_data_size
         p.add_tuple(Tuple::new(1, &big_data)).unwrap();
         assert!(!p.can_store(&Tuple::new(2, b"x")));
@@ -1404,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_second_tuple_rejected_when_page_full() {
-        let p = Page::new_data(1000);
+        let p = Page::new_data(1000, TEST_OVERHEAD);
         let big_data = vec![0u8; 2000];
         p.add_tuple(Tuple::new(1, &big_data)).unwrap();
         assert!(matches!(
@@ -1419,7 +1487,7 @@ mod tests {
         // mimicking a too-small index_entry_size chosen for a BPlusTree's
         // index page.
         let record_size = Tuple::new(0, b"small").size() as usize;
-        let p = FixedPage::new_indexed(300, record_size);
+        let p = FixedPage::new_indexed(300, record_size, TEST_OVERHEAD);
         // Fill the page's aggregate byte budget with tuples that individually
         // stay within record_size, so page_used_size ends up close to
         // usable_data_size (can_store's own threshold) — the generic
@@ -1451,7 +1519,7 @@ mod tests {
         // legitimate "no room right now" case for a tuple that fits its own
         // per-entry budget just fine.
         let record_size = Tuple::new(0, b"small").size() as usize;
-        let p = FixedPage::new_indexed(300, record_size);
+        let p = FixedPage::new_indexed(300, record_size, TEST_OVERHEAD);
         let mut i = 0u64;
         while p.can_store(&Tuple::new(i, b"small")) {
             p.add_tuple(Tuple::new(i, b"small")).unwrap();
@@ -1510,7 +1578,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
 
-        let page = Arc::new(Page::new_data(1000));
+        let page = Arc::new(Page::new_data(1000, TEST_OVERHEAD));
         let (mutator, stop) = spawn_overflow_transition_mutator(Arc::clone(&page));
 
         let mut saw_mismatch = false;
@@ -1558,7 +1626,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::Ordering;
 
-        let page = Arc::new(Page::new_data(1000));
+        let page = Arc::new(Page::new_data(1000, TEST_OVERHEAD));
         let (mutator, stop) = spawn_overflow_transition_mutator(Arc::clone(&page));
 
         for _ in 0..50_000 {

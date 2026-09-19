@@ -152,7 +152,7 @@ where
     }
 
     pub fn available_size(&self) -> DBSizeType {
-        self.pages.buffer.page_size() - Page::get_overhead()
+        self.pages.buffer.page_size() - self.pages.buffer.page_overhead() as DBSizeType
     }
 
     /// The largest single blob `set_content` will accept without erroring.
@@ -570,7 +570,7 @@ mod tests {
     fn test_page_ids_tracks_pages_new_page_and_append_both_allocate() {
         // append()'s own internal page-growth loop must also register
         // into page_ids, not just the explicit new_page() path.
-        let db: Arc<Db<MemFile>> = Db::create_with_page_size("run_page_ids_append.db", 512).unwrap();
+        let db: Arc<Db<MemFile>> = Db::create_with_page_size_and_max_index_key_size("run_page_ids_append.db", 512, 8).unwrap();
         let mut run = db.create_run().unwrap();
         for i in 0..100u32 {
             run.append(&i.to_be_bytes()).unwrap();

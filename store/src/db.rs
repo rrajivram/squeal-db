@@ -367,6 +367,15 @@ impl Header {
         crate::page::fnv1a_32(&self.checksum_input())
     }
 
+    // Persistence versioning Stage 3: the runtime-derived replacement for
+    // the old global PAGE_OVERHEAD const — see page::page_overhead's own
+    // comment for why size_of::<PageDto>() was never actually correct.
+    // Computed from this database's own configured max_index_key_size, the
+    // same way page_size already varies per database.
+    pub(crate) fn page_overhead(&self) -> usize {
+        crate::page::page_overhead(self.max_index_key_size)
+    }
+
     // Must be called right before every write of a Header to disk — every
     // write site (create_core_db, Db::checkpoint, Db::close) mutates
     // page_count/last_checkpoint and then calls this before handing the
@@ -2501,7 +2510,7 @@ where
     }
 
     fn write_system_tables(&self) -> Result<(), StoreError> {
-        let page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
         let tables = self.tables.read();
         for (i, t) in tables.values().enumerate() {
             let bytes = to_allocvec(&t.table)?;
@@ -2510,10 +2519,10 @@ where
         }
         self.buffer.write_page(0usize.into(), &page)?;
         let gens = self.generator.get_values()?;
-        let page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
         page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
         self.buffer.write_page(1usize.into(), &page)?;
-        let page = Page::new_pinned(self.header.page_size);
+        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
         page.add_tuple(Tuple::new(0, &to_allocvec(&self.buffer.get_free_pages())?))?;
         self.buffer.write_page(2usize.into(), &page)?;
 
@@ -3210,7 +3219,7 @@ mod tests {
     fn test_run_append_and_cursor_preserves_order_across_pages() {
         // Small page size so a handful of records forces at least one
         // page-chain extension, not just a single-page happy path.
-        let db: Arc<TestDB> = TestDB::create_with_page_size("run_order.db", 512).unwrap();
+        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("run_order.db", 512, 8).unwrap();
         let mut run = db.create_run().unwrap();
         let records: Vec<Vec<u8>> = (0..50).map(|i: u32| i.to_be_bytes().to_vec()).collect();
         for r in &records {
@@ -3230,7 +3239,7 @@ mod tests {
 
     #[test]
     fn test_dropping_a_run_frees_its_pages_once_nothing_else_references_them() {
-        let db: Arc<TestDB> = TestDB::create_with_page_size("run_drop_frees.db", 512).unwrap();
+        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("run_drop_frees.db", 512, 8).unwrap();
         let mut run = db.create_run().unwrap();
         for i in 0..50u32 {
             run.append(&i.to_be_bytes()).unwrap();
@@ -3257,7 +3266,7 @@ mod tests {
         // free pages the cursor is still reading, and the pages must
         // finally free once the cursor itself is also dropped.
         let db: Arc<TestDB> =
-            TestDB::create_with_page_size("run_cursor_keeps_alive.db", 512).unwrap();
+            TestDB::create_with_page_size_and_max_index_key_size("run_cursor_keeps_alive.db", 512, 8).unwrap();
         let mut run = db.create_run().unwrap();
         run.append(b"a").unwrap();
         run.append(b"b").unwrap();
@@ -7105,7 +7114,7 @@ mod tests {
     fn test_concurrent_inserts_at_small_page_size_do_not_panic_or_lose_rows() {
         const THREADS: u64 = 16;
         const ROWS_PER_THREAD: u64 = 40;
-        let db: Arc<TestDB> = TestDB::create_with_page_size("small_page_race.db", 512).unwrap();
+        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("small_page_race.db", 512, 8).unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         let mut handles = Vec::new();
         for thread_idx in 0..THREADS {
@@ -8029,7 +8038,7 @@ mod tests {
         // reachable page is free — simulates a checkpoint snapshot taken
         // before that page was ever allocated, now stale relative to
         // committed reality.
-        let page = crate::page::Page::new_pinned(db.header.page_size);
+        let page = crate::page::Page::new_pinned(db.header.page_size, db.buffer.page_overhead());
         page.add_tuple(Tuple::new(
             0,
             &postcard::to_allocvec(&vec![reachable_page]).unwrap(),
@@ -8207,6 +8216,64 @@ mod tests {
             "expected HeaderCorruption, got {:?}",
             result.err()
         );
+    }
+
+    // Persistence versioning Stage 3: the actual motivating bug, reproduced
+    // and proven fixed. Before this stage, PAGE_OVERHEAD was a fixed 112
+    // bytes (Rust's size_of::<PageDto>(), unrelated to a real high_key's
+    // postcard-serialized size — measured directly during this stage's
+    // design, not assumed). A composite index key wide enough to make
+    // high_key's real encoding exceed that boundary once a split set it
+    // would silently misalign the header/data split on every future read
+    // of that page. This inserts enough 200-byte composite-keyed rows
+    // (well past the old 112-byte ceiling, comfortably under the new
+    // page_overhead's default 512-byte cap) to force at least one index
+    // split — the only event that ever sets high_key (see
+    // alloc_sibling_index_page) — then verifies every row still round-
+    // trips correctly across a close/reopen.
+    #[test]
+    fn test_persistence_versioning_stage3_wide_composite_key_survives_split_and_reopen() {
+        use crate::valueitem::{IndexKey, ValueItem};
+
+        const KEY_WIDTH: usize = 200;
+        const ROWS: u64 = 100; // comfortably more than DEFAULT_PAGE_SIZE / 250 nodes_per_page
+
+        let wide_key = |i: u64| -> DBIdType {
+            let s = format!("{i:0>width$}", width = KEY_WIDTH);
+            DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str((s, KEY_WIDTH as u32))]).unwrap())
+        };
+
+        let db = TestDB::create_with_page_size("wide_key.db", DEFAULT_PAGE_SIZE).unwrap();
+        // index_entry_size wide enough for this composite key (well past
+        // the production default MAX_ENTRY_BYTES, which only fits a plain
+        // Int key) — forces real splits within ROWS inserts at the default
+        // 16 KiB page size.
+        let tid = db
+            .create_table_with_index_entry_size("rows".to_string(), 250)
+            .unwrap();
+
+        let t = db.begin().unwrap();
+        for i in 0..ROWS {
+            db.insert(
+                tid,
+                Tuple::new_with(wide_key(i), format!("value-{i}").as_bytes(), None, None),
+                &t,
+            )
+            .unwrap();
+        }
+        db.commit(t).unwrap();
+
+        let (f, l) = db.close().unwrap();
+        let db2 = TestDB::open_using("wide_key.db", f, l).unwrap();
+        let t2 = db2.begin().unwrap();
+        for i in 0..ROWS {
+            let found = db2.find(tid, wide_key(i), &t2).unwrap();
+            assert_eq!(
+                found.map(|t| t.data().to_vec()),
+                Some(format!("value-{i}").into_bytes()),
+                "row {i} did not survive the composite-key split + reopen"
+            );
+        }
     }
 
     // STORE_AUDIT.md T17: drop_table used to remove a table and free its
