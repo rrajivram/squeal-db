@@ -307,16 +307,14 @@ where
             table.name.clone(),
             MAX_TABLE_NAME_LEN as u32,
         ))])?;
-        self.db.insert(
-            self.sys_table_id,
-            Tuple::new_with(
-                DBIdType::Rec(ik),
-                &table.encode_catalog_row()?,
-                Some(txn.id()),
-                None,
-            ),
-            &txn,
-        )?;
+        // The catalog row is inserted LAST, inside the block below, once the
+        // row-storage table's and every index's store id have been assigned.
+        // It used to be written first, with those ids still the "none"
+        // placeholder, and never rewritten — so a crash before a clean close
+        // (flush_metadata) left a durable catalog row pointing at table id 0.
+        // Writing it last also means a failure anywhere in here (including
+        // this insert) goes through the same cleanup that drops whatever
+        // store tables were already created.
         // Tracks names/generators as they're actually created (not just
         // planned), so a later failure in this same sequence — a
         // transient I/O error or lock contention on some
@@ -361,8 +359,20 @@ where
                         .create_table_with_index_entry_size(qualified.clone(), size as u64)?;
                     i.db_table_id = iid;
                     created_names.push(qualified.clone());
-                    Ok(())
-                })
+                    Ok::<(), SchemaError>(())
+                })?;
+
+            self.db.insert(
+                self.sys_table_id,
+                Tuple::new_with(
+                    DBIdType::Rec(ik),
+                    &table.encode_catalog_row()?,
+                    Some(txn.id()),
+                    None,
+                ),
+                &txn,
+            )?;
+            Ok(())
         })();
         if res.is_err() {
             for name in &created_names {

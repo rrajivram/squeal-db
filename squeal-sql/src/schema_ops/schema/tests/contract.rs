@@ -445,3 +445,61 @@ fn test_create_table_rejects_index_name_colliding_with_an_unrelated_store_table(
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
     assert!(!s.table_exists("t"));
 }
+
+// Regression: create_table used to insert the catalog row BEFORE it assigned
+// the table's (and each index's) store table id, commit, and never rewrite
+// it — the corrected row only reached disk at a clean close
+// (flush_metadata). A crash or kill after create_table and before that left
+// a catalog row whose db_table_id / index ids were the "none" placeholder
+// (0). Loading a schema WITHOUT flush_metadata (what recovery after such a
+// crash sees) must give back the real ids.
+#[test]
+fn test_a_created_table_is_durable_with_its_real_store_ids_before_any_clean_close() {
+    let path = temp_schema_path("create_table_ids_durable");
+    NamedMemFile::delete(&path);
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    create_table_directly(
+        &s,
+        "create table with_keys (id integer not null, code varchar(8) not null, \
+         primary key(id), unique(code))",
+    );
+    // No primary key: keyed by a generated rowid, and its own store id must
+    // still be right.
+    create_table_directly(&s, "create table no_pk (v integer)");
+
+    // Deliberately NO flush_metadata / close: load straight from disk state.
+    let reloaded = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone())
+        .unwrap();
+    for name in ["with_keys", "no_pk"] {
+        let live = s.get_table(name).unwrap();
+        let disk = reloaded.get_table(name).unwrap();
+        assert_ne!(
+            disk.db_table_id,
+            store::table::TableIdType::none(),
+            "{name}: row-storage id must not be the placeholder"
+        );
+        assert_eq!(disk.db_table_id, live.db_table_id, "{name}");
+        assert_eq!(disk.indices.len(), live.indices.len(), "{name}");
+        for (d, l) in disk.indices.iter().zip(&live.indices) {
+            assert_ne!(d.db_table_id, store::table::TableIdType::none(), "{name} index");
+            assert_eq!(d.db_table_id, l.db_table_id, "{name} index");
+        }
+    }
+
+    // CREATE INDEX on an existing table must be equally durable.
+    s.create_index("no_pk", "idx_v".into(), &["v".to_string()], false).unwrap();
+    let reloaded2 = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone())
+        .unwrap();
+    let live_idx = &s.get_table("no_pk").unwrap().indices[0];
+    let disk_idx = &reloaded2.get_table("no_pk").unwrap().indices[0];
+    assert_ne!(disk_idx.db_table_id, store::table::TableIdType::none());
+    assert_eq!(disk_idx.db_table_id, live_idx.db_table_id);
+
+    for schema in [&s, &reloaded, &reloaded2] {
+        schema.persist_and_shutdown_stats().unwrap();
+    }
+    drop((s, reloaded, reloaded2));
+    db.close().unwrap();
+    NamedMemFile::delete(&path);
+}

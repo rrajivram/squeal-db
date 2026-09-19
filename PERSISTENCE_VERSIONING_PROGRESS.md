@@ -250,8 +250,8 @@ committing (each stage is its own commit).
       failures, PK/FKs intact) into a scratch db and reopened it 6 times, all
       counts identical. `cargo test --workspace` green (409 squeal-sql + 552
       store); clippy shows nothing in touched code.
-- [x] **Stage 8 — schema registry + stats exception — DONE (uncommitted,
-      pending the user's ok).**
+- [x] **Stage 8 — schema registry + stats exception — DONE. Committed:
+      `ad31bb0`.**
       **Schema registry** (`sql_system.schemas`, one row per schema): now
       `[0x00][u16 version][postcard String]`, with the legacy bare-`String`
       row read as version 1's body. To avoid duplicating Stage 7's logic the
@@ -280,16 +280,27 @@ committing (each stage is its own commit).
       `cargo test --workspace` green (421 squeal-sql + 552 store); clippy shows
       nothing new. End to end: retail dataset loaded (0 failures) and
       reopened 5 times, counts identical.
-      **Found, NOT part of this effort, NOT fixed:** `Schema::create_table`
-      inserts the catalog row BEFORE it assigns the table's (and each
-      index's) store table id, commits, and never rewrites the row; the
-      corrected row is only written by `flush_metadata` at a clean close. A
-      crash or kill after `create_table` and before a clean close therefore
-      leaves a catalog row whose `db_table_id`/index ids are the "none" value
-      (0). Observed directly: reloading a schema without `flush_metadata`
-      keyed a table's stats under id 0. The CLI's `conn.close()` masks it on
-      clean exit. Needs its own fix (write the row after ids are assigned, or
-      rewrite it in the same transaction) — flagged for the user.
+      **Found while testing this stage, and FIXED separately (uncommitted,
+      pending the user's ok):** `Schema::create_table` inserted the catalog
+      row BEFORE assigning the table's (and each index's) store table id,
+      committed, and never rewrote it — the corrected row only reached disk
+      at a clean close (`flush_metadata`). A crash or kill after
+      `create_table` and before that left a durable catalog row whose
+      `db_table_id`/index ids were the "none" placeholder (0); the CLI's
+      `conn.close()` masked it on clean exit. Not a versioning issue, but a
+      real durability bug in the same catalog path. Fix (`schema.rs`): the row
+      is now inserted LAST, inside the same cleanup-protected block, after
+      every store id is assigned — so a failure anywhere (including that
+      insert) drops whatever store tables were already created, and a crash
+      can no longer leave a placeholder-id row. Regression test
+      `test_a_created_table_is_durable_with_its_real_store_ids_before_any_clean_close`
+      (contract.rs) loads a schema straight from disk WITHOUT
+      `flush_metadata` and checks the row-storage id and every index id for a
+      keyed table, a no-primary-key table (rowid generator), and a
+      `CREATE INDEX` afterwards; confirmed red before the fix, green after.
+      One behavioral note: a crash between creating the store tables and
+      committing now leaves orphan store tables with NO catalog row (a leak),
+      instead of a catalog row pointing at id 0 (a wrong answer).
 
 ## Where the policy stands
 
