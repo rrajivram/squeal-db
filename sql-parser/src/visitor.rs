@@ -165,7 +165,9 @@ impl Visit for Statement {
             | Statement::ShowTables(_)
             | Statement::ShowSchemas(_)
             | Statement::ShowTableIndex(_)
-            | Statement::DescribeTable(_) => {}
+            | Statement::DescribeTable(_)
+            | Statement::AnalyzeTable(_)
+            | Statement::AnalyzeTables(_) => {}
         }
         v.post_visit_statement(self)
     }

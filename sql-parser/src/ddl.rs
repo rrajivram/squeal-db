@@ -55,6 +55,21 @@ pub struct ShowTableIndex {
     pub name: ObjectName,
 }
 
+/// `ANALYZE TABLE <name>` — collect stats for one table.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct AnalyzeTable {
+    pub analyze: kw::Analyze,
+    pub table: kw::Table,
+    pub name: ObjectName,
+}
+
+/// `ANALYZE TABLES` — collect stats for every table in the current schema.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct AnalyzeTables {
+    pub analyze: kw::Analyze,
+    pub tables: kw::Tables,
+}
+
 impl CreateTable {
     pub fn columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.elements.items().filter_map(|e| match e {

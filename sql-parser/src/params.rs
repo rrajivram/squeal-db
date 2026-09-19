@@ -101,7 +101,9 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
         | Statement::ShowTables(_)
         | Statement::ShowSchemas(_)
         | Statement::ShowTableIndex(_)
-        | Statement::DescribeTable(_) => {}
+        | Statement::DescribeTable(_)
+        | Statement::AnalyzeTable(_)
+        | Statement::AnalyzeTables(_) => {}
     }
 }
 

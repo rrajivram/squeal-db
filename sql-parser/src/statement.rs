@@ -13,9 +13,9 @@ use macros::SQLParser;
 use crate::{
     datatype::DataType,
     ddl::{
-        AlterTable, CopyInto, CreateDatabase, CreateIndex, CreateTable, DescribeTable,
-        DropDatabase, DropIndex, DropTable, ShowSchemas, ShowTableIndex, ShowTables, Truncate,
-        UseStatement,
+        AlterTable, AnalyzeTable, AnalyzeTables, CopyInto, CreateDatabase, CreateIndex,
+        CreateTable, DescribeTable, DropDatabase, DropIndex, DropTable, ShowSchemas,
+        ShowTableIndex, ShowTables, Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -55,6 +55,8 @@ pub enum Statement {
     ShowSchemas(ShowSchemas),
     ShowTableIndex(ShowTableIndex),
     DescribeTable(DescribeTable),
+    AnalyzeTable(AnalyzeTable),
+    AnalyzeTables(AnalyzeTables),
 }
 
 impl<'src, I, E> SQLParser<'src, I, E, SqlCtx<'src, I, E>> for Statement

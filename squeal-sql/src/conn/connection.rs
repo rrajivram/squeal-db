@@ -235,6 +235,25 @@ where
         self.current_schema.read().clone()
     }
 
+    // Public entry point for `!show table stats` (squeal-cli) — the one
+    // thing outside this crate ever needs from optim::table_stats::
+    // SchemaStats, so it's wrapped in the same ResultSet shape every
+    // other tabular output (SHOW TABLES, DESCRIBE TABLE, SELECT) already
+    // uses rather than exposing TableStat/ColumnStat (both pub(crate))
+    // directly.
+    pub fn table_stats_report(&self) -> Result<crate::rslt::resultset::ResultSet, SchemaError> {
+        let schema = self
+            .current_schema()
+            .ok_or(SchemaError::NoSchemaSelected)?;
+        let columns = ["Table", "Column", "Rows", "Unique", "Nulls", "Min", "Max"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = schema.table_stats_rows();
+        let message = format!("{} row(s)", rows.len());
+        Ok(crate::rslt::resultset::ResultSet::new(columns, rows, message))
+    }
+
     // Looks up any named schema in this connection's current database —
     // not necessarily the current one, and doesn't change it (unlike
     // use_schema). For resolving a schema-qualified table reference

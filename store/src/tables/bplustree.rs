@@ -2821,6 +2821,114 @@ mod tests {
         );
     }
 
+    // Scratch investigation, not a permanent benchmark: measures how much of
+    // a hot-path point lookup's allocation/time is attributable to
+    // ValueItem/IndexKey decode specifically, and how that scales with the
+    // number of Str fields in a composite key. Every SlottedPage::bound
+    // comparison step during descent calls decode_id_at, which for a Rec
+    // key means postcard-decoding the whole IndexKey — an Arc<[ValueItem]>
+    // allocation plus, per Str field, a fresh String — just to compare one
+    // field; DBIdType::Int decode is a fixed-width integer read with no
+    // allocation at all, so the int row is the zero-allocation baseline.
+    // The per-field delta is what a zero-copy/borrowed comparison path
+    // (compare against the raw on-disk bytes directly, never materializing
+    // a ValueItem/IndexKey/String) could plausibly recover, and this is
+    // meant to be re-run with the identical text against that change once
+    // it exists, the same way alloc_proxy_table_scan_snapshot (cursor.rs)
+    // and this file's own composite-key tests were used for their fixes'
+    // before/after numbers. Run with:
+    //   cargo test -p store --lib tables::bplustree::tests::\
+    //     alloc_proxy_find_scaling_by_composite_key_str_field_count \
+    //     -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn alloc_proxy_find_scaling_by_composite_key_str_field_count() {
+        const ROWS: u64 = 20_000;
+        // Comfortably fits up to 3 ~14-byte Str fields plus IndexKey/Tuple
+        // framing; bumped from the single-field version's 300.
+        const ENTRY_SIZE: u64 = 500;
+
+        struct FindBenchResult {
+            label: String,
+            ns_per_find: f64,
+            allocs_per_find: f64,
+            bytes_per_find: f64,
+        }
+
+        fn measure(
+            label: String,
+            rows: u64,
+            entry_size: u64,
+            key_for: impl Fn(u64) -> DBIdType,
+        ) -> FindBenchResult {
+            let tree = make_tree_with_entry_size(BIG, entry_size);
+            for i in 0..rows {
+                tree.insert(Tuple::new_with(key_for(i), b"v", None, None), txn())
+                    .unwrap();
+            }
+            let before = crate::alloc::stats();
+            let start = std::time::Instant::now();
+            for i in 0..rows {
+                assert!(tree.find(key_for(i)).unwrap().is_some());
+            }
+            let elapsed = start.elapsed();
+            let after = crate::alloc::stats();
+            let allocs: usize = after
+                .size_histogram
+                .iter()
+                .zip(before.size_histogram.iter())
+                .map(|(a, b)| a - b)
+                .sum();
+            let bytes = after.total_allocated - before.total_allocated;
+            FindBenchResult {
+                label,
+                ns_per_find: elapsed.as_nanos() as f64 / rows as f64,
+                allocs_per_find: allocs as f64 / rows as f64,
+                bytes_per_find: bytes as f64 / rows as f64,
+            }
+        }
+
+        let mut results = vec![measure(
+            "int (0 Str fields)".into(),
+            ROWS,
+            ENTRY_SIZE,
+            DBIdType::Int,
+        )];
+        for fields in 1..=3usize {
+            let key_for = move |i: u64| -> DBIdType {
+                let items: Vec<ValueItem> = (0..fields)
+                    .map(|f| {
+                        let s = format!("key{f}-{i:08}");
+                        let len = s.len() as u32;
+                        ValueItem::Str((s, len))
+                    })
+                    .collect();
+                DBIdType::Rec(IndexKey::new_from(&items).unwrap())
+            };
+            let label = format!(
+                "rec ({fields} Str field{})",
+                if fields == 1 { "" } else { "s" }
+            );
+            results.push(measure(label, ROWS, ENTRY_SIZE, key_for));
+        }
+
+        let baseline_ns = results[0].ns_per_find;
+        println!(
+            "{:<24} {:>10} {:>13} {:>12} {:>12}",
+            "key shape", "ns/find", "allocs/find", "bytes/find", "delta vs int"
+        );
+        for r in &results {
+            println!(
+                "{:<24} {:>10.0} {:>13.2} {:>12.1} {:>+12.0}",
+                r.label,
+                r.ns_per_find,
+                r.allocs_per_find,
+                r.bytes_per_find,
+                r.ns_per_find - baseline_ns
+            );
+        }
+    }
+
     #[test]
     fn test_oversized_insert_on_nonempty_leaf_returns_tuple_too_large_not_panic() {
         // Regression test for the masking bug fixed alongside this: once a

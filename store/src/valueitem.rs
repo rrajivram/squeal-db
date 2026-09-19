@@ -152,10 +152,22 @@ impl IndexKey {
     /// mean validating every field and allocating an `Arc<[ValueItem]>`
     /// just to hash it once and immediately discard it.
     pub fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a ValueItem>) -> u64 {
-        let mut h = 0x811C9DC5;
+        let mut h: u64 = 0x811C9DC5;
         for d in fields {
+            // Unlike db_hash's own byte-at-a-time loop (where XORing in
+            // a u8 can never push `h` past the `& 0xFFFFFFFF` mask
+            // applied at the end of the *previous* iteration), `d.hash()`
+            // returns a full, unmasked 64-bit value for Integer/Double/
+            // Datetime/Boolean (only Str/Blob route through db_hash,
+            // which is itself already 32-bit-bounded) — XORing that in
+            // can set bits above 32, and the following multiply by
+            // 0x01000193 can then overflow a plain `u64` `*`. Wrapping
+            // is correct here regardless: this is a hash mixer, not an
+            // arithmetic quantity, so letting it wrap is the intended
+            // FNV-1a behavior, not a bug to avoid — only the panic
+            // (debug builds check `*` for overflow) needed fixing.
             h ^= d.hash();
-            h = (h * 0x01000193) & 0xFFFFFFFF;
+            h = h.wrapping_mul(0x01000193) & 0xFFFFFFFF;
         }
         h
     }

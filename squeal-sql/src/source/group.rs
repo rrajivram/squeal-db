@@ -96,20 +96,25 @@ impl GroupSource {
     }
 
     // The one output row a grand-total aggregate (no GROUP BY at all)
-    // still owes when the input is completely empty — each aggregate's
-    // freshly-reset `current()` value, not `eval_row`'s `eval()`, which
-    // would incorrectly count a row that was never actually there.
-    // validate_aggregations (see logical.rs) already guarantees every
-    // projected field is either a bare aggregate call or a GROUP BY key
-    // column, and key_positions is empty in exactly this branch, so
-    // there are no non-aggregate fields left to evaluate here.
+    // still owes when the input is completely empty. Aggregate calls use
+    // their freshly-`reset` `current()` value, not `eval_row`'s `eval()`,
+    // which would incorrectly count a row that was never actually there.
+    // Anything else (a scalar function call, or a bare literal) has no
+    // accumulator to read `current()` from — validate_aggreations (see
+    // logical.rs) guarantees such a field has no live column references
+    // when key_positions is empty (no GROUP BY to source one from), so
+    // it's safe to evaluate it directly against an empty row.
     fn empty_group_row(&mut self) -> Result<IndexKey, SchemaError> {
         let start = Instant::now();
         let mut out = vec![];
-        for f in &self.fields {
-            out.push(match &f.expr {
-                EvalExpr::Function(func) => func.current(),
-                _ => ValueItem::Null,
+        for f in &mut self.fields {
+            let agg_value = match &f.expr {
+                EvalExpr::Function(func) if func.is_aggregate() => Some(func.current()),
+                _ => None,
+            };
+            out.push(match agg_value {
+                Some(v) => v,
+                None => f.expr.eval(&[], 0)?,
             });
         }
         self.eval_time += start.elapsed().as_nanos();
@@ -200,7 +205,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        plan::funcs::{Count, FuncArgs, FuncObj},
+        plan::funcs::{Avg, Count, FuncArgs, FuncObj, Upper},
         source::test_support::{VecSource, drain},
         table::Field,
     };
@@ -217,6 +222,37 @@ mod tests {
             0,
             EvalExpr::Function(FuncObj::Count(
                 Count::new(vec![FuncArgs::Wildcard], false, None).unwrap(),
+            )),
+        )
+    }
+
+    fn avg_field(name: &str, pos: usize) -> ProjectableField {
+        ProjectableField::new_with_field(
+            name.to_string(),
+            Arc::new(Field::from(name)),
+            0,
+            0,
+            EvalExpr::Function(FuncObj::Avg(
+                Avg::new(vec![FuncArgs::Field(Box::new(EvalExpr::Value(pos)))], None).unwrap(),
+            )),
+        )
+    }
+
+    // A scalar (non-aggregate) function call over a plain literal — legal
+    // per validate_aggreations even with an aggregate in the same SELECT
+    // list and no GROUP BY, since it has no live column reference. See
+    // test_grand_total_with_scalar_function_alongside_aggregate_over_empty_table.
+    fn upper_literal_field(name: &str, s: &str) -> ProjectableField {
+        ProjectableField::new_with_field(
+            name.to_string(),
+            Arc::new(Field::from(name)),
+            0,
+            0,
+            EvalExpr::Function(FuncObj::Upper(
+                Upper::new(vec![FuncArgs::Field(Box::new(EvalExpr::Literal(
+                    ValueItem::Str((s.to_string(), s.len() as u32)),
+                )))])
+                .unwrap(),
             )),
         )
     }
@@ -302,6 +338,61 @@ mod tests {
                 vec![ValueItem::Str(("a".into(), 1)), ValueItem::Integer(3)],
                 vec![ValueItem::Str(("b".into(), 1)), ValueItem::Integer(1)],
             ]
+        );
+    }
+
+    // Proves FuncObj's dispatch generalizes past a single aggregate
+    // variant: get_funcs()/reset_aggregates() must find and reset *both*
+    // the Count and the Avg call for every group, not just repeats of
+    // whichever variant existed when that code was written.
+    #[test]
+    fn test_group_by_with_multiple_aggregate_variants_in_one_query() {
+        let source: Box<dyn Source> = Box::new(VecSource::new(
+            &["category", "amount"],
+            vec![
+                vec![ValueItem::Str(("a".into(), 1)), ValueItem::Integer(10)],
+                vec![ValueItem::Str(("a".into(), 1)), ValueItem::Integer(20)],
+                vec![ValueItem::Str(("b".into(), 1)), ValueItem::Integer(5)],
+            ],
+        ));
+        let fields = vec![
+            key_field("category", 0),
+            count_star_field("count"),
+            avg_field("avg_amount", 1),
+        ];
+        let mut group = GroupSource::new(source, fields, vec![0]);
+        assert_eq!(
+            drain(&mut group),
+            vec![
+                vec![
+                    ValueItem::Str(("a".into(), 1)),
+                    ValueItem::Integer(2),
+                    ValueItem::Double(15.0)
+                ],
+                vec![
+                    ValueItem::Str(("b".into(), 1)),
+                    ValueItem::Integer(1),
+                    ValueItem::Double(5.0)
+                ],
+            ]
+        );
+    }
+
+    // Regression test for the get_funcs()/empty_group_row() aggregate-
+    // awareness fix (see both methods' own doc comments). Before that
+    // fix: reset_aggregates() would call FuncTrait::reset() on the
+    // scalar UPPER(...) call, and empty_group_row() would call
+    // FuncTrait::current() on it — Upper deliberately panics on both
+    // (see funcs.rs), so this test would fail loudly instead of quietly
+    // passing if that filtering regressed.
+    #[test]
+    fn test_grand_total_with_scalar_function_alongside_aggregate_over_empty_table() {
+        let source: Box<dyn Source> = Box::new(VecSource::new(&["id"], vec![]));
+        let fields = vec![count_star_field("count"), upper_literal_field("shout", "hello")];
+        let mut group = GroupSource::new(source, fields, vec![]);
+        assert_eq!(
+            drain(&mut group),
+            vec![vec![ValueItem::Integer(0), ValueItem::Str(("HELLO".into(), 5))]]
         );
     }
 }

@@ -141,7 +141,7 @@ where
                 }
                 rl.add_history_entry(line)?;
                 if let Some(command) = line.strip_prefix('!') {
-                    run_custom_command(command.trim(), &last_stats);
+                    run_custom_command(command.trim(), &conn, &last_stats);
                     continue;
                 }
                 if let Some(stats) = run(&conn, line) {
@@ -266,14 +266,45 @@ fn print_result(r: &mut ResultType) -> Option<Vec<(String, QueryStats)>> {
 // trimmed) as a REPL-only command rather than SQL. Kept as a flat match
 // rather than a registry/trait — there's a small, fixed number of these
 // and no shape yet that motivates more indirection.
-fn run_custom_command(command: &str, last_stats: &Option<Vec<(String, QueryStats)>>) {
+fn run_custom_command<F>(
+    command: &str,
+    conn: &Arc<Connection<F>>,
+    last_stats: &Option<Vec<(String, QueryStats)>>,
+) where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    const USAGE: &str = "try '!print stats', '!reset stats', or '!show table stats'";
     match command {
         "print stats" => print_query_stats(last_stats),
         "reset stats" => reset_alloc_stats(),
-        "" => println!("empty command — try '!print stats' or '!reset stats'"),
-        other => {
-            println!("unrecognized command: {other:?} — try '!print stats' or '!reset stats'")
+        "show table stats" => show_table_stats(conn),
+        "" => println!("empty command — {USAGE}"),
+        other => println!("unrecognized command: {other:?} — {USAGE}"),
+    }
+}
+
+// `!show table stats`: optim::table_stats::SchemaStats' current snapshot
+// for the connection's current schema, rendered the same way an ordinary
+// query result is (see print_result's own ResultType::Result branch) —
+// reuses Connection::table_stats_report so this file doesn't need to
+// know anything about how those stats are collected or stored.
+fn show_table_stats<F>(conn: &Arc<Connection<F>>)
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    match conn.table_stats_report() {
+        Ok(rs) => {
+            let mut table = comfy_table::Table::new();
+            table.set_header(rs.columns().to_vec());
+            for row in rs.rows_as_strings() {
+                table.add_row(row);
+            }
+            println!("{table}");
+            println!("{}", rs.get_final_message());
         }
+        Err(e) => println!("error: {e}"),
     }
 }
 

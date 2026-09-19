@@ -289,10 +289,11 @@ where
     /// Phase 5: how long a page-lock wait may take before it is reported as
     /// a bug (`LockTimeout`).
     pub(crate) fn set_lock_timeout(&self, timeout: Duration) {
-        self.lock_timeout_us
-            .store(timeout.as_micros().max(1) as u64, std::sync::atomic::Ordering::Relaxed);
+        self.lock_timeout_us.store(
+            timeout.as_micros().max(1) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
-
 
     /// Pages currently cache-resident (Strong).
     pub(crate) fn cached_pages(&self) -> usize {
@@ -1139,12 +1140,7 @@ where
     //
     // `mode` exists because the two callers need genuinely different
     // "page_num is already Strong" behavior — see InstallMode's own comment.
-    fn install(
-        &self,
-        page_num: PageId,
-        page: Arc<Page>,
-        mode: InstallMode,
-    ) -> Arc<Page> {
+    fn install(&self, page_num: PageId, page: Arc<Page>, mode: InstallMode) -> Arc<Page> {
         // Set once evict_one() reports the access_map genuinely has nothing
         // left to offer — forces the next pass to insert past max_entries
         // rather than retrying eviction forever. See Evicted::Exhausted.
@@ -1288,6 +1284,10 @@ where
     /// that create a Page outside the buffer and must adopt it before use.
     pub(crate) fn clock(&self) -> Arc<LsnClock> {
         self.clock.clone()
+    }
+
+    pub(crate) fn page_data_size(&self) -> usize {
+        self.get_page(PageId(0)).unwrap().get_data_size() as usize
     }
 }
 
@@ -1697,8 +1697,8 @@ mod tests {
     use crate::cursor::Cursor;
     use crate::db::{DBSizeType, Opener};
     use crate::error::StoreError;
-    use crate::run::Run;
     use crate::page::{PAGE_OVERHEAD, Page, PageId};
+    use crate::run::Run;
     use crate::tuple::{DBIdType, Tuple};
     use crate::{buffer::PageBuffer, db::Header, memfile::MemFile};
 
@@ -1747,7 +1747,8 @@ mod tests {
             make_header(),
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
         (buf, page_counter)
     }
@@ -2096,7 +2097,8 @@ mod tests {
             let slot = (idx % self.records_per_page) as u64;
             let page_id = self.run.page_ids()[page_idx];
             let fill_order_on_page = *self.page_fill_counts.get(&page_id).unwrap_or(&0);
-            self.page_fill_counts.insert(page_id, fill_order_on_page + 1);
+            self.page_fill_counts
+                .insert(page_id, fill_order_on_page + 1);
             self.history.insert(
                 key,
                 InsertRecord {
@@ -2108,7 +2110,9 @@ mod tests {
                     pages_in_run_at_insert: self.run.page_ids().len(),
                 },
             );
-            self.run.set_slot_at(page_idx, slot, &key.to_le_bytes()).unwrap();
+            self.run
+                .set_slot_at(page_idx, slot, &key.to_le_bytes())
+                .unwrap();
         }
 
         fn rehash(&mut self, new_capacity: usize) {
@@ -2201,8 +2205,13 @@ mod tests {
             present.sort_unstable();
             present.dedup();
             let present_set: std::collections::HashSet<u64> = present.iter().copied().collect();
-            let missing: Vec<u64> = (0..TOTAL_KEYS).filter(|k| !present_set.contains(k)).collect();
-            eprintln!("=== {} missing keys — last recorded insert site for each ===", missing.len());
+            let missing: Vec<u64> = (0..TOTAL_KEYS)
+                .filter(|k| !present_set.contains(k))
+                .collect();
+            eprintln!(
+                "=== {} missing keys — last recorded insert site for each ===",
+                missing.len()
+            );
             for key in &missing {
                 match table.history.get(key) {
                     Some(r) => eprintln!(
@@ -2230,7 +2239,10 @@ mod tests {
             }
             eprintln!("=== missing keys grouped by page_id ===");
             for (page_id, keys) in &by_page {
-                eprintln!("  page_id={page_id:?}: {} missing key(s): {keys:?}", keys.len());
+                eprintln!(
+                    "  page_id={page_id:?}: {} missing key(s): {keys:?}",
+                    keys.len()
+                );
             }
         }
         assert_eq!(
@@ -2275,7 +2287,8 @@ mod tests {
             header,
             max_entries,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
         (buf, page_counter, file_clone)
     }
@@ -2379,7 +2392,9 @@ mod tests {
         );
         let count_after_first_write = page_counter.load(Ordering::Relaxed);
 
-        let handle = buf.get_page_mut(page_id, crate::buffer::LockLevel::Data).unwrap();
+        let handle = buf
+            .get_page_mut(page_id, crate::buffer::LockLevel::Data)
+            .unwrap();
         let different_big_data = vec![2u8; page_size as usize];
         handle
             .page
@@ -2435,7 +2450,8 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
 
         let retrieved = buf2.get_page(page_id).unwrap();
@@ -2503,7 +2519,6 @@ mod tests {
         assert!(buf.shutdown().is_ok());
     }
 
-
     // write_locked_page no longer sends a write on every mutation — it only
     // updates the cache and leaves the disk write to eviction, checkpoint,
     // or shutdown (see its own doc comment). This exercises the eviction
@@ -2522,7 +2537,9 @@ mod tests {
         let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, MAX_ENTRIES as u64 + 1, MAX_ENTRIES);
         let page0: crate::page::PageId = 0u64.into();
 
-        let handle = buf.get_page_mut(page0, crate::buffer::LockLevel::Data).unwrap();
+        let handle = buf
+            .get_page_mut(page0, crate::buffer::LockLevel::Data)
+            .unwrap();
         handle.page.add_tuple(Tuple::new(1, b"hello")).unwrap();
         buf.write_locked_page(handle).unwrap();
 
@@ -2558,7 +2575,8 @@ mod tests {
             make_header(),
             MAX_ENTRIES,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
@@ -2652,7 +2670,9 @@ mod tests {
         let (buf, _, file_clone) = make_buffer_ps(PAGE_SIZE, 1, 10); // generous max_entries: no eviction
         let page0: crate::page::PageId = 0u64.into();
 
-        let handle = buf.get_page_mut(page0, crate::buffer::LockLevel::Data).unwrap();
+        let handle = buf
+            .get_page_mut(page0, crate::buffer::LockLevel::Data)
+            .unwrap();
         handle.page.add_tuple(Tuple::new(1, b"world")).unwrap();
         buf.write_locked_page(handle).unwrap();
 
@@ -2666,7 +2686,8 @@ mod tests {
             make_header(),
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
         let from_disk = buf2.get_page(page0).unwrap();
         assert_eq!(
@@ -2810,7 +2831,8 @@ mod tests {
             header,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(registry_with_test_bucket()),)
+            Arc::new(registry_with_test_bucket()),
+        )
         .unwrap();
 
         let page_id = buf.alloc_page(false).unwrap();
@@ -2842,7 +2864,8 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(registry_with_test_bucket()),)
+            Arc::new(registry_with_test_bucket()),
+        )
         .unwrap();
 
         let retrieved = buf2.get_page(page_id).unwrap();
@@ -2869,7 +2892,8 @@ mod tests {
             header,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(registry_with_test_bucket()),)
+            Arc::new(registry_with_test_bucket()),
+        )
         .unwrap();
 
         buf.alloc_page(false).unwrap();
@@ -2923,7 +2947,8 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -2955,7 +2980,8 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -3006,7 +3032,8 @@ mod tests {
             header2,
             10,
             Arc::new(crate::logger::LsnClock::default()),
-            Arc::new(crate::pages::content::PageContentRegistry::builtin()),)
+            Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+        )
         .unwrap();
 
         let err = buf2.get_page(page_id).unwrap_err();
@@ -3079,7 +3106,9 @@ mod tests {
 
         let start = std::time::Instant::now();
         for i in 0..ITERS {
-            let handle = buf.get_page_mut(page_id, crate::buffer::LockLevel::Data).unwrap();
+            let handle = buf
+                .get_page_mut(page_id, crate::buffer::LockLevel::Data)
+                .unwrap();
             let data = vec![(i % 256) as u8; page_size as usize];
             handle
                 .page
@@ -3114,12 +3143,18 @@ mod tests {
         match buf.get_page_mut(b, Index) {
             Err(StoreError::LockOrderViolation(msg)) => {
                 assert!(msg.contains("Index"), "{msg}");
-                assert!(msg.contains(&format!("{a:?}")), "must name what is held: {msg}");
+                assert!(
+                    msg.contains(&format!("{a:?}")),
+                    "must name what is held: {msg}"
+                );
             }
             other => panic!("expected LockOrderViolation, got {other:?}"),
         }
         assert!(
-            matches!(buf.get_page_mut(b, Data), Err(StoreError::LockOrderViolation(_))),
+            matches!(
+                buf.get_page_mut(b, Data),
+                Err(StoreError::LockOrderViolation(_))
+            ),
             "a second, different Data page is out of order too"
         );
         assert!(
@@ -3174,14 +3209,23 @@ mod tests {
         let waited = start.elapsed();
         match r {
             Err(StoreError::LockTimeout(msg)) => {
-                assert!(msg.contains("lock-holder"), "must name the holder thread: {msg}");
+                assert!(
+                    msg.contains("lock-holder"),
+                    "must name the holder thread: {msg}"
+                );
                 assert!(msg.contains("held by"), "{msg}");
                 assert!(msg.contains(&format!("{a:?}")), "{msg}");
             }
             other => panic!("expected LockTimeout, got {other:?}"),
         }
-        assert!(waited >= std::time::Duration::from_millis(50), "returned before the timeout: {waited:?}");
-        assert!(waited < std::time::Duration::from_secs(1), "did not honour the configured timeout: {waited:?}");
+        assert!(
+            waited >= std::time::Duration::from_millis(50),
+            "returned before the timeout: {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "did not honour the configured timeout: {waited:?}"
+        );
 
         release_tx.send(()).unwrap();
         holder.join().unwrap();

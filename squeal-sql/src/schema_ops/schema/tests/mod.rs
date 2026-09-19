@@ -27,12 +27,18 @@
 //   permissive (continue-on-error, not atomic) row handling. COPY INTO
 //   *dispatch* (parsing, result reporting) is tested in stmt.rs, same
 //   split as everything else.
+// - `stats`: optim::table_stats::SchemaStats actually being driven —
+//   insert_rows_in_txn's log_stat calls, analyze_table's exhaustive
+//   rebuild. The lifecycle side (create/load/persist/shutdown, the
+//   stats table itself surviving close/reopen) is in `contract` instead,
+//   alongside every other close/reopen guarantee.
 mod alter;
 mod contract;
 mod copy_into;
 mod dml;
 mod foreign_key;
 mod mapping;
+mod stats;
 
 use std::sync::Arc;
 

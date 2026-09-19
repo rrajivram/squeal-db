@@ -39,4 +39,12 @@ impl TableIdType {
     pub fn none() -> Self {
         Self(0)
     }
+
+    // For a caller (e.g. squeal-sql's SchemaStats) that needs to key a
+    // store-level row by table id — DBIdType::Int only takes a raw u64,
+    // and DBSizeType itself is pub(crate), so this is the narrowest way
+    // to hand the underlying value out.
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
 }

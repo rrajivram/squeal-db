@@ -653,6 +653,34 @@ where
                         "".into(),
                     ))));
                 }
+                // Entry point for optim::table_stats::SchemaStats —
+                // Schema::analyze_table (schema_ops/schema.rs) does a real,
+                // synchronous full-table scan and rebuilds that table's
+                // stats from it (see its own doc comment).
+                sql_parser::Statement::AnalyzeTable(a) => {
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&a.name)?;
+                    reject_qualified_field("ANALYZE TABLE", field)?;
+                    let (schema, table) = expect_real(table_ref, "ANALYZE TABLE")?;
+                    schema.analyze_table(&table.name)?;
+                    self.results.push(Some(ResultType::ResultString(format!(
+                        "Table '{}' analyzed",
+                        table.name
+                    ))));
+                }
+                sql_parser::Statement::AnalyzeTables(_) => {
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let tables = schema.list_tables();
+                    for name in &tables {
+                        schema.analyze_table(name)?;
+                    }
+                    self.results.push(Some(ResultType::ResultString(format!(
+                        "{} table(s) analyzed",
+                        tables.len()
+                    ))));
+                }
                 _ => {}
             }
         }

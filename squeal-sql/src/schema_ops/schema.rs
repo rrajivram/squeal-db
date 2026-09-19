@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use postcard::{from_bytes, to_allocvec};
 use store::{
     cursor::Cursor,
@@ -15,9 +15,17 @@ use store::{
 use crate::{
     constant::MAX_TABLE_NAME_LEN,
     error::SchemaError,
+    optim::table_stats::{SchemaStats, TableStat},
     rslt::resultset::ResultSet,
     table::{Field, SqlForeignKey, SqlIndex, SqlTable, VersionedRow},
 };
+
+// Default per-column-value sampling rate for a schema's SchemaStats (see
+// optim::table_stats) — 1.0 means every logged row is applied (no
+// skipping). Not yet exposed as something a caller can tune; a
+// reasonable placeholder until something drives that decision (e.g. a
+// SQL-level setting).
+const DEFAULT_STATS_SAMPLING_RATE: f64 = 1.0;
 
 #[derive(Clone)]
 pub struct Schema<F: DBFile> {
@@ -29,6 +37,14 @@ pub struct Schema<F: DBFile> {
     pub(crate) db: Arc<Db<F>>,
     tables: Arc<RwLock<HashMap<String, Arc<SqlTable>>>>,
     sys_table_id: TableIdType,
+    // One SchemaStats per Schema, persisted to its own store table (see
+    // stats_table_name) and shut down alongside it — see
+    // persist_and_shutdown_stats. `Option` so close can `.take()` it out
+    // for SchemaStats::shutdown, which consumes `self` to join its
+    // background thread; `None` afterward means a closed schema (nothing
+    // else re-populates it — Schema itself is on its way out too).
+    stats: Arc<Mutex<Option<SchemaStats<F>>>>,
+    stats_table_id: TableIdType,
 }
 
 #[cfg(test)]
@@ -58,30 +74,75 @@ where
     // has to share its Database's single Db<F> rather than owning one.
     pub(crate) fn create(name: String, db: Arc<Db<F>>) -> Result<Arc<Self>, SchemaError> {
         let sys_table_id = db.create_table(Self::system_table_name(&name))?;
-        Ok(Arc::new(Self {
+        let stats_table_id = db.create_table(Self::stats_table_name(&name))?;
+        let schema = Arc::new(Self {
             name,
             db,
             tables: Arc::new(RwLock::new(HashMap::new())),
             sys_table_id,
-        }))
+            stats: Arc::new(Mutex::new(None)),
+            stats_table_id,
+        });
+        // SchemaStats::new needs the Arc<Schema<F>> this struct doesn't
+        // exist as until the constructor above returns — a brand-new
+        // schema has no tables yet either way, so there's nothing for it
+        // to find via schema.list_tables() at this point regardless.
+        let stats = SchemaStats::new(schema.clone(), DEFAULT_STATS_SAMPLING_RATE)?;
+        *schema.stats.lock() = Some(stats);
+        Ok(schema)
     }
 
     pub(crate) fn load(name: String, db: Arc<Db<F>>) -> Result<Arc<Self>, SchemaError> {
         let sys_table_id = db
             .table_id_by_name(Self::system_table_name(&name))?
             .ok_or_else(|| SchemaError::SchemaNotFound(name.clone()))?;
+        // Backward compatibility: a schema created before SchemaStats
+        // existed has no stats table yet. Create one now (instead of
+        // failing to open) and start fresh, exactly like a brand-new
+        // schema would — `existed` is what tells SchemaStats::load
+        // apart from SchemaStats::new below.
+        let (stats_table_id, existed) = match db.table_id_by_name(Self::stats_table_name(&name))? {
+            Some(id) => (id, true),
+            None => (db.create_table(Self::stats_table_name(&name))?, false),
+        };
         let mut s = Self {
             name,
             db,
             tables: Arc::new(RwLock::new(HashMap::new())),
             sys_table_id,
+            stats: Arc::new(Mutex::new(None)),
+            stats_table_id,
         };
         s.load_tables()?;
-        Ok(Arc::new(s))
+        let schema = Arc::new(s);
+        let stats = if existed {
+            SchemaStats::load(schema.clone(), DEFAULT_STATS_SAMPLING_RATE, stats_table_id)?
+        } else {
+            SchemaStats::new(schema.clone(), DEFAULT_STATS_SAMPLING_RATE)?
+        };
+        *schema.stats.lock() = Some(stats);
+        Ok(schema)
     }
 
     pub(crate) fn system_table_name(schema_name: &str) -> String {
         format!("{schema_name}.{}", crate::constant::SYSTEM_TABLES_SUFFIX)
+    }
+
+    pub(crate) fn stats_table_name(schema_name: &str) -> String {
+        format!("{schema_name}.{}", crate::constant::SYSTEM_STATS_SUFFIX)
+    }
+
+    // Persists every table's current stats (see SchemaStats::persist) and
+    // stops its background collector thread (SchemaStats::shutdown, which
+    // consumes it — hence the `.take()`). Called by Database::close
+    // alongside flush_metadata, before the underlying Db<F> is released.
+    // A no-op if already shut down (or somehow never started).
+    pub(crate) fn persist_and_shutdown_stats(&self) -> Result<(), SchemaError> {
+        if let Some(stats) = self.stats.lock().take() {
+            stats.persist(self.stats_table_id)?;
+            stats.shutdown();
+        }
+        Ok(())
     }
 
     // Every store-level table/index name this schema creates or looks up
@@ -273,9 +334,21 @@ where
             return res;
         }
         self.db.commit(txn)?;
-        self.tables
-            .write()
-            .insert(table.name.clone(), Arc::new(table));
+        let table = Arc::new(table);
+        // Best-effort, same reasoning as log_stat: the table is already
+        // durably created (committed above), so a stats-registration
+        // hiccup here (Bloom construction failing — effectively never,
+        // given fixed parameters) must not fail table creation itself.
+        // update_table_stats also tolerates a table missing from
+        // SchemaStats entirely (see its own comment), so skipping this
+        // on error just means that table's stats never start collecting
+        // rather than anything unsound.
+        if let Some(stats) = self.stats.lock().as_ref()
+            && let Err(e) = stats.add_table(table.clone())
+        {
+            log::warn!("failed to register {:?} with SchemaStats: {e}", table.name);
+        }
+        self.tables.write().insert(table.name.clone(), table);
         Ok(())
     }
 
@@ -435,6 +508,17 @@ where
                 ),
                 txn,
             )?;
+            // Best-effort, matching SchemaStats' own approximate nature
+            // (bloom-filter uniqueness, a skippable send — see log_stat's
+            // own doc comment): logged per row right after its own
+            // insert succeeds, not after the whole batch/transaction
+            // commits, so a row whose transaction later rolls back may
+            // still count once here. Fine for stats used to guide query
+            // planning, not worth threading commit/rollback awareness
+            // into an already-lossy background collector for.
+            if let Some(stats) = self.stats.lock().as_ref() {
+                stats.log_stat(table.db_table_id, row_data.values.clone());
+            }
             count += 1;
         }
         Ok(count)
@@ -726,9 +810,10 @@ where
             is_unique,
             fields: fields.clone().into(),
         };
-        let index_table_id = self
-            .db
-            .create_table_with_index_entry_size(qualified.clone(), sizing_index.size(identity_size) as u64)?;
+        let index_table_id = self.db.create_table_with_index_entry_size(
+            qualified.clone(),
+            sizing_index.size(identity_size) as u64,
+        )?;
 
         let backfill: Result<(), SchemaError> = (|| {
             let txn = self.db.begin()?;
@@ -752,10 +837,12 @@ where
                         &txn,
                     )
                     .map_err(|e| match e {
-                        StoreError::DuplicateKey(_) if is_unique => SchemaError::UserError(format!(
-                            "cannot create unique index {name:?}: table {table_name:?} has \
+                        StoreError::DuplicateKey(_) if is_unique => {
+                            SchemaError::UserError(format!(
+                                "cannot create unique index {name:?}: table {table_name:?} has \
                              duplicate values for column(s) {column_names:?}"
-                        )),
+                            ))
+                        }
                         other => other.into(),
                     })?;
             }
@@ -824,23 +911,24 @@ where
         let mut loaded = 0usize;
         let mut failed = 0usize;
         let mut batch: Vec<Vec<ValueItem>> = Vec::with_capacity(COPY_BATCH_ROWS);
-        let mut flush = |batch: &mut Vec<Vec<ValueItem>>, loaded: &mut usize, failed: &mut usize| {
-            if batch.is_empty() {
-                return;
-            }
-            let rows = std::mem::take(batch);
-            match self.insert_rows(table_name, rows.clone(), None) {
-                Ok(n) => *loaded += n,
-                Err(_) => {
-                    for row in rows {
-                        match self.insert_rows(table_name, vec![row], None) {
-                            Ok(_) => *loaded += 1,
-                            Err(_) => *failed += 1,
+        let mut flush =
+            |batch: &mut Vec<Vec<ValueItem>>, loaded: &mut usize, failed: &mut usize| {
+                if batch.is_empty() {
+                    return;
+                }
+                let rows = std::mem::take(batch);
+                match self.insert_rows(table_name, rows.clone(), None) {
+                    Ok(n) => *loaded += n,
+                    Err(_) => {
+                        for row in rows {
+                            match self.insert_rows(table_name, vec![row], None) {
+                                Ok(_) => *loaded += 1,
+                                Err(_) => *failed += 1,
+                            }
                         }
                     }
                 }
-            }
-        };
+            };
         for record in reader.records() {
             let row = record
                 .map_err(|e| SchemaError::UserError(e.to_string()))
@@ -855,6 +943,97 @@ where
         }
         flush(&mut batch, &mut loaded, &mut failed);
         Ok((loaded, failed))
+    }
+
+    // Entry point for `ANALYZE TABLE <name>` / `ANALYZE TABLES` (stmt.rs).
+    // Unlike insert_rows_in_txn's incidental, sampled log_stat calls (fed
+    // by live traffic, lossy under load by design), this is a deliberate,
+    // exhaustive rebuild: drop whatever was collected before, start fresh
+    // (same shape a brand-new table gets), then replay every row
+    // currently in the table through record_row_sync — the synchronous
+    // counterpart to log_stat that can't silently drop rows the way the
+    // background collector's capacity-1 channel would under a tight
+    // scan loop (see record_row_sync's own comment).
+    pub(crate) fn analyze_table(self: &Arc<Self>, table_name: &str) -> Result<(), SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let guard = self.stats.lock();
+        // None means this schema is already closing (persist_and_
+        // shutdown_stats took it) — nothing left to analyze into.
+        let Some(stats) = guard.as_ref() else {
+            return Ok(());
+        };
+        stats.drop_table_stats(table.db_table_id);
+        stats.add_table(table.clone())?;
+        let mut cursor = self.db.table_scan(table.db_table_id)?;
+        while let Some(tuple) = cursor.next()? {
+            let row = from_bytes::<VersionedRow>(tuple.data())?;
+            stats.record_row_sync(table.db_table_id, table.reproject(&row)?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn get_table_stats(
+        self: Arc<Self>,
+        table: TableIdType,
+    ) -> Result<Option<TableStat>, SchemaError> {
+        Ok(self
+            .stats
+            .lock()
+            .as_ref()
+            .and_then(|t| t.get_table_stats(table)))
+    }
+
+    // Backing data for `!show table stats` (squeal-cli, via
+    // Connection::table_stats_report) — one row per (table, column) with
+    // tracked stats, plus one placeholder row for a table with none
+    // (e.g. every column is a lone PRIMARY KEY/UNIQUE field — see
+    // SchemaStats::table_data). Columns: table, column, row_count,
+    // unique, nulls, min, max. `min`/`max` pass the underlying ValueItem
+    // straight through rather than pre-formatting to a string — whatever
+    // renders this (ResultSet::rows_as_strings today) already knows how
+    // to display any ValueItem variant.
+    pub(crate) fn table_stats_rows(self: &Arc<Self>) -> Vec<Vec<ValueItem>> {
+        let guard = self.stats.lock();
+        let Some(stats) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for name in self.list_tables() {
+            let Some(table) = self.get_table(&name) else {
+                continue;
+            };
+            let Some(stat) = stats.get_table_stats(table.db_table_id) else {
+                continue;
+            };
+            if stat.col_stats.is_empty() {
+                rows.push(vec![
+                    ValueItem::Str((name, MAX_TABLE_NAME_LEN as u32)),
+                    ValueItem::Str(("(no tracked columns)".into(), MAX_TABLE_NAME_LEN as u32)),
+                    ValueItem::Integer(stat.row_count as i64),
+                    ValueItem::Null,
+                    ValueItem::Null,
+                    ValueItem::Null,
+                    ValueItem::Null,
+                ]);
+                continue;
+            }
+            let mut cols: Vec<_> = stat.col_stats.iter().collect();
+            cols.sort_by_key(|(field_index, _)| **field_index);
+            for (_, c) in cols {
+                rows.push(vec![
+                    ValueItem::Str((name.clone(), MAX_TABLE_NAME_LEN as u32)),
+                    ValueItem::Str((c.name.clone(), MAX_TABLE_NAME_LEN as u32)),
+                    ValueItem::Integer(stat.row_count as i64),
+                    ValueItem::Integer(c.unique as i64),
+                    ValueItem::Integer(c.null as i64),
+                    c.min.clone(),
+                    c.max.clone(),
+                ]);
+            }
+        }
+        rows
     }
 
     fn alter_table(

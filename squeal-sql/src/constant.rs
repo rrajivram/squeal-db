@@ -5,6 +5,10 @@ pub(crate) const SYSTEM_SCHEMAS_TABLE: &str = "sql_system.schemas";
 // tables/indices — the actual store table name is
 // `format!("{schema_name}.{SYSTEM_TABLES_SUFFIX}")`.
 pub(crate) const SYSTEM_TABLES_SUFFIX: &str = "sql_system.tables";
+// Schema-level: suffix for each schema's own store table holding its
+// optim::table_stats::SchemaStats snapshot (one row per table id) — see
+// Schema::stats_table_name. Same naming convention as SYSTEM_TABLES_SUFFIX.
+pub(crate) const SYSTEM_STATS_SUFFIX: &str = "sql_system.stats";
 // Auto-created by Database::create, and best-effort auto-loaded by
 // Database::open.
 pub(crate) const DEFAULT_SCHEMA_NAME: &str = "default";

@@ -95,6 +95,11 @@ where
     pub fn close(self: Arc<Self>) -> Result<(F, F), SchemaError> {
         for schema in self.schemas.read().values() {
             schema.flush_metadata()?;
+            // Persists SchemaStats' current state and joins its
+            // background collector thread — must happen before Db::close
+            // below, same as flush_metadata, since both still need a
+            // live Db<F> to write through.
+            schema.persist_and_shutdown_stats()?;
         }
         let db = self.db.clone();
         // Drop every reference this Database holds to `db` — including,

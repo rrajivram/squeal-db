@@ -1757,6 +1757,55 @@ fn test_show_table_index_fails_for_a_temp_table() {
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
+// ---- ANALYZE ----
+//
+// Schema::analyze_table (schema_ops/schema.rs) is a no-op stub for now
+// (see its own comment) — these only prove the SQL surface (parsing,
+// table resolution, dispatch) works end-to-end, not that any stats
+// actually get collected yet.
+
+#[test]
+fn test_analyze_table_parses_and_dispatches() {
+    let c = conn();
+    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+
+    let mut stmt = c.create_statement("analyze table customers").unwrap();
+    stmt.execute().unwrap();
+    let ResultType::ResultString(s) = nth_result(&stmt, 0) else {
+        panic!("expected a ResultString, got a different ResultType variant");
+    };
+    assert_eq!(s, "Table 'customers' analyzed");
+}
+
+#[test]
+fn test_analyze_table_fails_for_an_unknown_table() {
+    let c = conn();
+    let err = run(&c, "analyze table nope").unwrap_err();
+    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
+}
+
+#[test]
+fn test_analyze_table_fails_for_a_temp_table() {
+    let c = conn();
+    run(&c, "create table temp.t (id integer)").unwrap();
+    let err = run(&c, "analyze table temp.t").unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+}
+
+#[test]
+fn test_analyze_tables_covers_every_table_in_the_current_schema() {
+    let c = conn();
+    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table orders (id integer not null, primary key(id))").unwrap();
+
+    let mut stmt = c.create_statement("analyze tables").unwrap();
+    stmt.execute().unwrap();
+    let ResultType::ResultString(s) = nth_result(&stmt, 0) else {
+        panic!("expected a ResultString, got a different ResultType variant");
+    };
+    assert_eq!(s, "2 table(s) analyzed");
+}
+
 // ---- CREATE INDEX ----
 
 #[test]

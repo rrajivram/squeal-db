@@ -92,7 +92,11 @@ impl EvalExpr {
                 v
             }
             Self::Function(f) => {
-                vec![f]
+                if f.is_aggregate() {
+                    vec![f]
+                } else {
+                    vec![]
+                }
             }
             _ => vec![],
         }

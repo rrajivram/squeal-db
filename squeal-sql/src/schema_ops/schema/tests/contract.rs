@@ -153,6 +153,87 @@ fn test_schema_state_survives_close_and_reopen() {
     NamedMemFile::delete(&path);
 }
 
+// SchemaStats lifecycle (Schema::create/load/persist_and_shutdown_stats):
+// its own store table is created alongside the schema's catalog table,
+// survives a close/reopen, and Database::close's call to
+// persist_and_shutdown_stats doesn't error even with real tables present.
+#[test]
+fn test_schema_stats_table_is_created_and_survives_close_and_reopen() {
+    let path = temp_schema_path("stats_table_close_reopen");
+    NamedMemFile::delete(&path);
+
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    create_table_directly(&s, "create table orders (id integer not null, primary key(id))");
+    assert!(
+        s.db
+            .table_id_by_name(Schema::<NamedMemFile>::stats_table_name(DEFAULT_SCHEMA_NAME))
+            .unwrap()
+            .is_some(),
+        "SchemaStats' own store table must exist right after schema creation"
+    );
+    drop(s);
+    db.close().unwrap();
+
+    let db2 = Database::<NamedMemFile>::open(path.clone()).unwrap();
+    let s2 = db2.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    assert!(
+        s2.db
+            .table_id_by_name(Schema::<NamedMemFile>::stats_table_name(DEFAULT_SCHEMA_NAME))
+            .unwrap()
+            .is_some(),
+        "the stats table must still exist after reopen"
+    );
+    // Closing again — the actual point of the round trip — must succeed:
+    // this is where persist_and_shutdown_stats runs against the reloaded
+    // (SchemaStats::load, not ::new) instance.
+    drop(s2);
+    db2.close().unwrap();
+
+    NamedMemFile::delete(&path);
+}
+
+// Backward compatibility: a schema created by a version of this engine
+// before SchemaStats existed has a catalog table but no stats table.
+// Simulated here by dropping the stats table out from under a schema
+// that isn't currently loaded (between two independent get_schema calls,
+// the same way a real "upgrade an old database" scenario would only ever
+// see it — never while a live Schema instance still holds the id).
+#[test]
+fn test_schema_load_creates_stats_table_for_a_schema_that_predates_it() {
+    let path = temp_schema_path("stats_table_backward_compat");
+    NamedMemFile::delete(&path);
+
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let stats_name = Schema::<NamedMemFile>::stats_table_name(DEFAULT_SCHEMA_NAME);
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    assert!(s.db.table_id_by_name(&stats_name).unwrap().is_some());
+    drop(s);
+    db.close().unwrap();
+
+    // Dropped via a raw store::Db handle, entirely outside Database/
+    // Schema, and closed again before Database::open runs: Database::
+    // open's own construction eagerly loads "default" (see its own
+    // comment), so dropping the table any later (e.g. through db2.db)
+    // would already be too late — this is the only ordering that
+    // actually simulates "an old database that never had the table in
+    // the first place" rather than "one that had it and lost it".
+    let raw = store::db::Db::<NamedMemFile>::open(&path).unwrap();
+    raw.drop_table(&stats_name).unwrap();
+    raw.close().unwrap();
+
+    let db2 = Database::<NamedMemFile>::open(path.clone()).unwrap();
+    let s2 = db2.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    assert!(
+        s2.db.table_id_by_name(&stats_name).unwrap().is_some(),
+        "Schema::load must recreate a missing stats table instead of failing to open"
+    );
+    drop(s2);
+    db2.close().unwrap();
+
+    NamedMemFile::delete(&path);
+}
+
 #[test]
 fn test_reopened_schema_rejects_recreating_an_existing_table() {
     // A more targeted version of the round-trip test above: confirms
