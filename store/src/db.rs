@@ -1051,6 +1051,16 @@ where
         self.table_by_id(tid)?.debug_dump()
     }
 
+    /// Persistence versioning Stage 3: this database's configured cap on an
+    /// index key's worst-case serialized size (see
+    /// `DEFAULT_MAX_INDEX_KEY_SIZE`) — the ceiling a caller (e.g. squeal-sql's
+    /// `CREATE TABLE`/`CREATE INDEX`) should validate a key's declared
+    /// column widths against before creating an index wide enough to
+    /// threaten `PAGE_OVERHEAD`'s reservation.
+    pub fn max_index_key_size(&self) -> u64 {
+        self.header.max_index_key_size
+    }
+
     /// See `DbStats`. Safe to call from any thread at any time.
     pub fn stats(&self) -> DbStats {
         let m = &self.maintenance.stats;

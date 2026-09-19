@@ -49,8 +49,8 @@ committing (each stage is its own commit).
       decode rewrite. `slotted.rs`'s `decode_id_at` fast-path change (skip a
       known-width prefix, then decode `DBIdType`) moves to Stage 5 too,
       keyed off the page's version instead of a per-tuple one.
-- [~] **Stage 3 — `Header` versioning + `max_index_key_size` +
-      `PAGE_OVERHEAD` runtime-derived — PARTLY DONE.**
+- [x] **Stage 3 — `Header` versioning + `max_index_key_size` +
+      `PAGE_OVERHEAD` runtime-derived — DONE (part 3, DDL check, uncommitted).**
       Done: `Header::decode` replaces the exact-match `format_version` gate
       with real dispatch (`magic`+`format_version` sit at a fixed byte
       offset in every version there's been, since postcard's derive
@@ -91,11 +91,19 @@ committing (each stage is its own commit).
       real split (the only thing that ever sets `high_key`), and verifies
       a close/reopen round-trip — the actual motivating bug, reproduced and
       proven fixed. `cargo test --workspace` and clippy both green.
-      **Not yet done**: `CREATE TABLE`/`CREATE INDEX` DDL-time key-width
-      rejection in squeal-sql (reject a key up front if it would exceed
-      `max_index_key_size`) — currently nothing stops a real SQL statement
-      from creating an index wide enough to need this stage's larger
-      overhead reservation in the first place.
+      **DDL-time key-width rejection — DONE.** `Schema::check_key_width`
+      (squeal-sql `schema.rs`) refuses, before anything is created, a
+      `CREATE TABLE` whose PRIMARY KEY or any UNIQUE/PK index, or a
+      `CREATE INDEX`, whose worst-case key (summed `DataType::size()` — a
+      declared capacity is already an enforced ceiling on real data, via
+      `IndexKey::new_from`'s `validate`) exceeds `Db::max_index_key_size()`.
+      A non-unique index's key includes the appended row identity, so a wide
+      PK counts against it. New `SqlIndex::key_size` (key only, no
+      `ENTRY_OVERHEAD_BYTES`; `size` now builds on it). Tests:
+      `schema_ops/schema/tests/key_width.rs` (6). `cargo test --workspace`
+      green (402 squeal-sql + 525 store). **Stage 3 is now fully done.**
+      Uncommitted pending the user's ok (also includes the small
+      `Db::max_index_key_size()` accessor in `store/src/db.rs`).
 - [ ] **Stage 4 — WAL (`LogHeader` + `LogRecord`/`Record`)**: real version
       dispatch instead of the exact-match gate; fixture is a full WAL
       segment replayed through `Db::open`'s recovery path.

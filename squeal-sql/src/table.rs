@@ -1212,12 +1212,21 @@ impl SqlIndex {
     // key rejection enforce the constraint); every other caller can just
     // pass 0 to say "this index doesn't need it."
     pub(crate) fn size(&self, identity_size: usize) -> usize {
+        self.key_size(identity_size) + ENTRY_OVERHEAD_BYTES
+    }
+
+    // Worst-case width of just this index's tree KEY (indexed columns, plus
+    // the row identity appended to make a non-unique index's key unique) —
+    // what a B-link `high_key` can end up holding, and so what
+    // Db::max_index_key_size bounds. Excludes ENTRY_OVERHEAD_BYTES, which is
+    // per-entry storage slack, not part of the key itself.
+    pub(crate) fn key_size(&self, identity_size: usize) -> usize {
         let extra = if self.is_primary || self.is_unique {
             0
         } else {
             identity_size
         };
-        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + extra + ENTRY_OVERHEAD_BYTES
+        self.fields.iter().map(|f| f.datatype.size()).sum::<usize>() + extra
     }
 }
 

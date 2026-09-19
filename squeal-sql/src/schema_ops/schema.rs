@@ -201,11 +201,47 @@ where
     // index's, just holding full rows instead of indexed columns — and,
     // for a table with no PRIMARY KEY, the auto-increment sequence used
     // to key rows in it.
+    // Persistence versioning Stage 3: rejects DDL up front whose worst-case
+    // key (summed declared column widths — a column's declared capacity is
+    // already a true ceiling on real data, see IndexKey::new_from's
+    // validate) would exceed this database's configured max_index_key_size,
+    // the ceiling page_overhead() reserves header space for. Loud and early
+    // by design: this is the one point where refusing is still cheap.
+    fn check_key_width(&self, what: &str, key_size: usize) -> Result<(), SchemaError> {
+        let cap = self.db.max_index_key_size() as usize;
+        if key_size > cap {
+            return Err(SchemaError::UserError(format!(
+                "{what} would be up to {key_size} bytes wide, exceeding this database's \
+                 max index key size of {cap} bytes — use narrower or fewer columns"
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_table(self: &Arc<Self>, table: SqlTable) -> Result<(), SchemaError> {
         let mut table = table;
         let row_table_name = self.qualify(&table.name);
         let rowid_seq_name = self.rowid_seq_name(&table.name);
         let has_primary_key = table.primary_key().is_some();
+
+        // The row-storage tree is keyed by the PRIMARY KEY (or a small
+        // generated rowid), and every index tree by its own key — each is
+        // a tree whose split can stamp a high_key, so each must fit.
+        let identity_size = table.identity_size();
+        self.check_key_width(
+            &format!("PRIMARY KEY of table {:?}", table.name),
+            identity_size,
+        )?;
+        for i in &table.indices {
+            self.check_key_width(
+                &format!(
+                    "index {:?} on table {:?}",
+                    i.name.as_deref().unwrap_or("(unnamed)"),
+                    table.name
+                ),
+                i.key_size(identity_size),
+            )?;
+        }
 
         // Resolve every store-level name this needs up front — the row
         // table itself, plus each index's backing table — and fail
@@ -810,6 +846,10 @@ where
             is_unique,
             fields: fields.clone().into(),
         };
+        self.check_key_width(
+            &format!("index {name:?} on table {table_name:?}"),
+            sizing_index.key_size(identity_size),
+        )?;
         let index_table_id = self.db.create_table_with_index_entry_size(
             qualified.clone(),
             sizing_index.size(identity_size) as u64,
