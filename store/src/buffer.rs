@@ -1701,6 +1701,7 @@ fn read_page_header(
     if header.magic != PAGE_MAGIC {
         return Err(StoreError::InvalidPageMagic(page));
     }
+    header.check_format_version()?;
     Ok(header)
 }
 

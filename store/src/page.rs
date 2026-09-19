@@ -67,9 +67,34 @@ pub(crate) struct PageHeader {
     // they're trusted (see buffer.rs's read_page).
     #[serde(with = "postcard::fixint::le")]
     pub(crate) checksum: u32,
+    // Persistence versioning Stage 5: which page format this page was
+    // written in — see CURRENT_PAGE_FORMAT_VERSION. Deliberately the LAST
+    // field, and fixed-width: a header is zero-padded out to page_overhead
+    // on disk, so a page written before this field existed reads back with
+    // these two bytes as zero, i.e. LEGACY_PAGE_FORMAT_VERSION, with no
+    // migration. Any future header field must likewise be appended here
+    // (never inserted earlier), with 0 meaning "absent/legacy".
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) format_version: u16,
 }
 
 impl PageHeader {
+    /// Refuses a page whose format version this build has no decoder for.
+    /// Version 0 (a page written before the field existed) and the current
+    /// version share one layout today; when a version 2 changes anything a
+    /// page's decoding depends on — this header's fields, the framing of a
+    /// content codec, or the `Tuple` shape every tuple on the page uses —
+    /// FIRST freeze the current shapes as `...V1Shape` copies, THEN branch
+    /// on this value in `Page::from_bytes`. The fixture tests
+    /// (`test_pre_format_version_page_fixtures_*`) fail the moment a
+    /// version-0/1 shape drifts without that.
+    pub(crate) fn check_format_version(&self) -> Result<(), StoreError> {
+        match self.format_version {
+            LEGACY_PAGE_FORMAT_VERSION | CURRENT_PAGE_FORMAT_VERSION => Ok(()),
+            other => Err(crate::versioned::unsupported_version("page", other)),
+        }
+    }
+
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
         Ok(to_allocvec(self)?)
     }
@@ -99,6 +124,8 @@ struct PageDto {
     magic: u32,
     #[serde(with = "postcard::fixint::le")]
     checksum: u32,
+    #[serde(with = "postcard::fixint::le")]
+    format_version: u16,
     data: Vec<u8>,
 }
 
@@ -107,6 +134,23 @@ struct PageDto {
 // as ASCII bytes, read as one little-endian u32) distinguishing an
 // actually-initialized page from a zeroed/garbage/wrong-offset read.
 pub(crate) const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"SQDB");
+
+/// Page format version written into every page header from Stage 5 on. One
+/// page-format version fixes, uniformly for every tuple the page holds, the
+/// shape of the header, the content codec framing (`AnyTuplePage`/
+/// `FixedTuplePage`/...), AND the `Tuple` wire shape — deliberately the unit
+/// of versioning, rather than a tag per `Tuple`, because `AnyTuplePage`
+/// decodes its tuples with one bulk `Vec<Tuple>` call that has no per-element
+/// hook (see PERSISTENCE_VERSIONING_PROGRESS.md, Stage 2). It also means
+/// `SlottedPage::decode_id_at`'s "`id` is `Tuple`'s first field" fast path is
+/// a promise made by page format versions 0 and 1; a version that moves it
+/// must change that function in the same commit.
+pub(crate) const CURRENT_PAGE_FORMAT_VERSION: u16 = 1;
+
+/// A page written before `format_version` existed: its header's trailing
+/// bytes are zero padding, which decodes as this. Same layout as the current
+/// version.
+pub(crate) const LEGACY_PAGE_FORMAT_VERSION: u16 = 0;
 
 // The standard FNV-1a 32-bit hash (basis 0x811c9dc5, prime 0x01000193 —
 // the same constants IndexKey::hash/ValueItem::hash already use, applied
@@ -144,7 +188,9 @@ const RESERVED_FLAGS: u16 = 0x0f;
 // count varint, and per-ValueItem framing — measured at 5-7 bytes of
 // overhead beyond the key's own declared content width, for content
 // widths from 64 to 8192 bytes (MIN/MAX_MAX_INDEX_KEY_SIZE's own range).
-// FIXED_HEADER_BYTES is rounded up from the measured 60, and
+// FIXED_HEADER_BYTES is rounded up from the measured 60 (62 once Stage 5's
+// trailing format_version landed — see test_page_header_fixed_fields_fit_
+// the_reserved_budget, which guards it), and
 // HIGH_KEY_RESERVE_MARGIN is generous rather than exact, to also cover a
 // composite (multi-column) key costing a little more framing than one
 // big field of the same total declared width would.
@@ -466,6 +512,7 @@ impl Page {
             // per physical page, for an overflow chain). 0 here is never
             // itself written to disk.
             checksum: 0,
+            format_version: CURRENT_PAGE_FORMAT_VERSION,
         }
     }
 
@@ -896,6 +943,7 @@ impl Page {
     ) -> Result<Self, StoreError> {
         let header = &bytes[..page_overhead];
         let header = from_bytes::<PageHeader>(header)?;
+        header.check_format_version()?;
         let data = &bytes[page_overhead..];
         // Deserialize the tuple payload with `?` rather than routing through the
         // `From<PageDto>` impl, which `.unwrap()`s and would turn a torn/partial
@@ -1085,6 +1133,7 @@ impl From<Page> for PageDto {
             content_kind: value.content_kind,
             magic: PAGE_MAGIC,
             checksum: fnv1a_32(&data),
+            format_version: CURRENT_PAGE_FORMAT_VERSION,
             data,
         }
     }
@@ -1645,5 +1694,173 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         mutator.join().unwrap();
+    }
+
+    // --- Persistence versioning Stage 5: pre-format-version page fixtures ---
+    //
+    // Deterministic pages. The PINNED hex below was captured from the shape
+    // that had NO trailing format_version field (Stage 3 layout), before
+    // that field was added — `print_page_fixtures` now prints the CURRENT
+    // (versioned) encoding, and must never be used to "refresh" the pinned
+    // legacy bytes.
+    fn fixture_pages() -> Vec<(&'static str, Page)> {
+        use crate::page::PageId;
+        let data_page = Page::new_data(1024, TEST_OVERHEAD);
+        data_page.add_tuple(Tuple::new(1, b"alpha")).unwrap();
+        data_page.add_tuple(Tuple::new(2, b"beta")).unwrap();
+        data_page.set_next_page(PageId(9)).unwrap();
+
+        let record_size = Tuple::new(0, b"small").size() as usize;
+        let index_page = Page::new_indexed(1024, record_size, TEST_OVERHEAD);
+        index_page.add_tuple(Tuple::new(10, b"small")).unwrap();
+        index_page.add_tuple(Tuple::new(11, b"small")).unwrap();
+        index_page.set_next_page(PageId(4)).unwrap();
+        // A real, variable-length high_key sits between fixed fields and the
+        // trailing ones — the exact spot a newly appended field must
+        // survive.
+        index_page
+            .set_high_key(Some(DBIdType::Rec(
+                crate::valueitem::IndexKey::new_from(&[
+                    crate::valueitem::ValueItem::Str(("hk".into(), 16)),
+                    crate::valueitem::ValueItem::Integer(3),
+                ])
+                .unwrap(),
+            )))
+            .unwrap();
+        vec![("data", data_page), ("index_with_high_key", index_page)]
+    }
+
+    #[test]
+    #[ignore]
+    fn print_page_fixtures() {
+        for (name, page) in fixture_pages() {
+            let bytes = page.to_bytes();
+            let end = bytes.iter().rposition(|b| *b != 0).map(|i| i + 1).unwrap_or(0);
+            let hex: String = bytes[..end].iter().map(|b| format!("{b:02x}")).collect();
+            println!("FIXTURE {name} total_len={} hex={hex}", bytes.len());
+        }
+    }
+
+    // Captured BEFORE format_version existed (Stage 3 layout); DO NOT edit.
+    // Each fixture is (header bytes, data bytes) with the zero padding between
+    // them (up to TEST_OVERHEAD) and after the data (up to the page size)
+    // elided — that padding is a fixed part of the layout, and a long run of
+    // zeros is the easiest thing to mangle in a pinned hex string.
+    const LEGACY_DATA_PAGE: (&str, &str) = (
+        "090000000000000060030000000000001500000000000000\
+         0000000000535144422d47e5bc",
+        "020001000005616c70686100000200000462657461",
+    );
+    const LEGACY_INDEX_PAGE: (&str, &str) = (
+        "040000000000000060030000000000001600000000000000\
+         010b00020101020402686b100106015351444252663a9c",
+        "0b1702000a000005736d616c6c00000b000005736d616c6c",
+    );
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn legacy_page_bytes((header, data): (&str, &str), total_len: usize) -> Vec<u8> {
+        let mut bytes = unhex(header);
+        assert!(bytes.len() <= TEST_OVERHEAD);
+        bytes.resize(TEST_OVERHEAD, 0);
+        bytes.extend(unhex(data));
+        bytes.resize(total_len, 0);
+        bytes
+    }
+
+    fn header_of(bytes: &[u8]) -> super::PageHeader {
+        postcard::from_bytes(&bytes[..TEST_OVERHEAD]).unwrap()
+    }
+
+    #[test]
+    fn test_pre_format_version_page_fixtures_decode_as_legacy_version_zero() {
+        use crate::page::{LEGACY_PAGE_FORMAT_VERSION, PageId};
+        let reg = registry();
+
+        let bytes = legacy_page_bytes(LEGACY_DATA_PAGE, 1024);
+        assert_eq!(header_of(&bytes).format_version, LEGACY_PAGE_FORMAT_VERSION);
+        let page = Page::from_bytes(&bytes, &reg, TEST_OVERHEAD).unwrap();
+        assert_eq!(page.get_next_page(), PageId(9));
+        let tuples: Vec<_> = page.iter().collect();
+        assert_eq!(tuples.len(), 2);
+        assert_eq!(tuples[0].data(), b"alpha");
+        assert_eq!(tuples[1].data(), b"beta");
+
+        let bytes = legacy_page_bytes(LEGACY_INDEX_PAGE, 1024);
+        assert_eq!(header_of(&bytes).format_version, LEGACY_PAGE_FORMAT_VERSION);
+        let page = Page::from_bytes(&bytes, &reg, TEST_OVERHEAD).unwrap();
+        assert_eq!(page.get_next_page(), PageId(4));
+        assert!(
+            matches!(page.high_key(), Some(DBIdType::Rec(_))),
+            "a variable-length high_key must survive ahead of the trailing version field"
+        );
+        assert_eq!(page.iter().count(), 2);
+    }
+
+    #[test]
+    fn test_rewriting_a_legacy_page_upgrades_it_to_the_current_version() {
+        use crate::page::CURRENT_PAGE_FORMAT_VERSION;
+        let reg = registry();
+        let bytes = legacy_page_bytes(LEGACY_INDEX_PAGE, 1024);
+        let page = Page::from_bytes(&bytes, &reg, TEST_OVERHEAD).unwrap();
+        let rewritten = page.to_bytes();
+        assert_eq!(header_of(&rewritten).format_version, CURRENT_PAGE_FORMAT_VERSION);
+        let again = Page::from_bytes(&rewritten, &reg, TEST_OVERHEAD).unwrap();
+        assert_eq!(again.iter().count(), 2);
+        assert_eq!(again.get_next_page(), page.get_next_page());
+        assert_eq!(again.high_key(), page.high_key());
+    }
+
+    #[test]
+    fn test_new_pages_are_stamped_with_the_current_format_version() {
+        use crate::page::CURRENT_PAGE_FORMAT_VERSION;
+        for (_, page) in fixture_pages() {
+            assert_eq!(header_of(&page.to_bytes()).format_version, CURRENT_PAGE_FORMAT_VERSION);
+        }
+    }
+
+    #[test]
+    fn test_a_page_with_an_unknown_format_version_is_refused() {
+        let (_, page) = fixture_pages().remove(0);
+        let mut header = page.header();
+        header.format_version = 99;
+        let mut bytes = page.to_bytes();
+        let hb = postcard::to_allocvec(&header).unwrap();
+        bytes[..hb.len()].copy_from_slice(&hb);
+        let err = Page::from_bytes(&bytes, &registry(), TEST_OVERHEAD).unwrap_err();
+        assert!(err.to_string().contains("unsupported page version 99"), "got {err}");
+    }
+
+    // Guards FIXED_HEADER_BYTES: every fixed/scalar header field at its
+    // widest encoded value, high_key None (the variable part is budgeted
+    // separately, by max_index_key_size). A new header field that no longer
+    // fits fails here instead of silently eating into the high_key reserve.
+    #[test]
+    fn test_page_header_fixed_fields_fit_the_reserved_budget() {
+        use crate::{logger::LsnId, pages::content::PageContentKind};
+        let widest = super::PageHeader {
+            next_page: u64::MAX,
+            page_data_size: u64::MAX,
+            page_used_size: u64::MAX,
+            record_size: Some(usize::MAX),
+            lsn: LsnId(u64::MAX),
+            flags: u16::MAX,
+            high_key: None,
+            content_kind: PageContentKind(u16::MAX),
+            magic: u32::MAX,
+            checksum: u32::MAX,
+            format_version: u16::MAX,
+        };
+        let len = postcard::to_allocvec(&widest).unwrap().len();
+        assert!(
+            len <= super::FIXED_HEADER_BYTES,
+            "fixed header fields take {len} byte(s), over the {}-byte budget",
+            super::FIXED_HEADER_BYTES
+        );
     }
 }

@@ -298,6 +298,11 @@ impl SlottedPage {
         Ok(from_bytes::<Tuple>(bytes)?)
     }
 
+    // Persistence versioning Stage 5: `id` being `Tuple`'s first field is a
+    // promise of page format versions 0 and 1 (page::CURRENT_PAGE_FORMAT_VERSION);
+    // a page format version that moves it must change this function in the
+    // same commit.
+    //
     // PERF (revert this whole function + its two call sites below back to
     // `decode_at(idx)?.id` if measurement ever says otherwise): `id` is
     // `Tuple`'s first declared struct field, and postcard serializes

@@ -26,7 +26,7 @@ committing (each stage is its own commit).
       fixture-decode test using bytes captured from the pre-Stage-1 derived
       encoding (commit `bfbc240`). `cargo test --workspace` green.
       Committed: `fcc6843`.
-- [~] **Stage 2 — `Tuple` envelope — DEFERRED, folded into Stage 5.**
+- [x] **Stage 2 — `Tuple` envelope — folded into Stage 5 (done there).**
       Investigated giving `Tuple` its own per-record version tag as
       originally planned. Found a real blocker: `Tuple` is decoded in two
       incompatible contexts — (a) standalone from a raw byte slice
@@ -137,12 +137,37 @@ committing (each stage is its own commit).
       the fixture — the replay path itself is unchanged and already covered
       by the existing crash-recovery tests; the new surface is the
       version-aware header/record decode, which the fixture tests directly.
-- [ ] **Stage 5 — page shell (`PageHeader`/`PageDto`) + deferred Stage 2
-      (`Tuple`)**: lower priority than it first appeared now that Stage 3
-      resolves the urgent overhead crisis, but now also carries Stage 2's
-      deferred work: the page's own version tag dictates which `Tuple`
-      shape every tuple it holds decodes as (see Stage 2's note above),
-      and `slotted.rs`'s `decode_id_at` fast path moves here too.
+- [x] **Stage 5 — page format version (`PageHeader`/`PageDto`) + the
+      deferred Stage 2 (`Tuple`) — DONE (uncommitted, pending the user's ok).**
+      Design (per the Stage 2 decision): the PAGE is the unit of versioning.
+      One page-format version fixes, uniformly for every tuple on the page,
+      the header shape, the content-codec framing, AND the `Tuple` wire shape
+      — no per-`Tuple` tag, no bulk-decode rewrite. Implemented as a trailing,
+      fixed-width `format_version: u16` on `PageHeader`/`PageDto`
+      (`CURRENT_PAGE_FORMAT_VERSION = 1`). It is the LAST field on purpose: a
+      header is zero-padded to `page_overhead` on disk, so every page written
+      before this stage (Stage 3 layout) reads back with those bytes as 0 =
+      `LEGACY_PAGE_FORMAT_VERSION` — same layout, no migration, and a
+      variable-length `high_key` ahead of it is unaffected (tested). Any
+      future header field must likewise be appended, with 0 = absent/legacy.
+      New/rewritten pages are stamped 1, so old pages upgrade lazily on their
+      next flush. `PageHeader::check_format_version` (called from
+      `read_page_header` in buffer.rs and `Page::from_bytes`) accepts 0 and 1
+      and refuses anything else via `versioned::unsupported_version`; its doc
+      comment says to freeze `...V1Shape` copies BEFORE changing any shape and
+      then branch on the version. Fixtures: two real pre-change pages (an
+      `AnyTuplePage` data page, and a `FixedTuplePage` index page with a
+      real composite `high_key`), pinned as header-hex + data-hex (zero
+      padding rebuilt in the test — a long zero run is too easy to mangle).
+      Also: rewrite-upgrades-to-v1, unknown-version-refused, and
+      `test_page_header_fixed_fields_fit_the_reserved_budget` (worst-case
+      fixed fields = 62 bytes ≤ `FIXED_HEADER_BYTES` 64, so a header field
+      that no longer fits fails loudly instead of eating the high_key
+      reserve). `SlottedPage::decode_id_at`'s "id is `Tuple`'s first field"
+      fast path is now documented as a promise of page versions 0 and 1 and
+      cross-referenced both ways; nothing needed to change since no `Tuple`
+      shape changed. `cargo test --workspace` green (402 squeal-sql + 538
+      store), clippy clean on the touched files.
 - [ ] **Stage 6 — store-level system pages**: table catalog (page 0),
       generator state (page 1), free-page list (page 2).
 - [ ] **Stage 7 — squeal-sql catalog** (`SqlTable`/`SchemaVersion`/
