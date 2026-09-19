@@ -138,7 +138,7 @@ committing (each stage is its own commit).
       by the existing crash-recovery tests; the new surface is the
       version-aware header/record decode, which the fixture tests directly.
 - [x] **Stage 5 — page format version (`PageHeader`/`PageDto`) + the
-      deferred Stage 2 (`Tuple`) — DONE (uncommitted, pending the user's ok).**
+      deferred Stage 2 (`Tuple`) — DONE. Committed: `28f0ec1`.**
       Design (per the Stage 2 decision): the PAGE is the unit of versioning.
       One page-format version fixes, uniformly for every tuple on the page,
       the header shape, the content-codec framing, AND the `Tuple` wire shape
@@ -168,8 +168,46 @@ committing (each stage is its own commit).
       cross-referenced both ways; nothing needed to change since no `Tuple`
       shape changed. `cargo test --workspace` green (402 squeal-sql + 538
       store), clippy clean on the touched files.
-- [ ] **Stage 6 — store-level system pages**: table catalog (page 0),
-      generator state (page 1), free-page list (page 2).
+- [x] **Stage 6 — store-level system pages — DONE (uncommitted, pending
+      the user's ok).** The table catalog (page 0), sequence state (page 1)
+      and free-page list (page 2) were each exactly ONE pinned page with
+      unversioned payloads; a catalog or free list that outgrew a page could
+      not be persisted (STORE_AUDIT.md S6 just made `create_table` fail
+      cleanly). Each is now a versioned, growable page CHAIN — new module
+      `store/src/systempages.rs`. The head stays the fixed page 0/1/2;
+      continuation pages come from the ordinary allocator and link through
+      `next_page`. Every chain page starts with a reserved HEADER tuple (id
+      `u64::MAX`, which no payload id can reach): `[u16 chain version][kind]
+      [position u32]`, validated on read (kind/position mismatch, unknown
+      version, missing header, or a cycle are all typed errors, tested).
+      Payloads are per-entry and carry their OWN version tag (catalog: one
+      `Table` per tuple; generator: one `(name, value)` per tuple; free list:
+      chunks of 128 ids), so a payload shape can change without touching the
+      chain layout. **Backward compat:** a head page with no header tuple is
+      the pre-Stage-6 layout (single page, unversioned) and is read as such;
+      the next checkpoint upgrades it. Verified with a test that writes the
+      exact pre-change layout and reopens it, plus a pinned byte fixture for
+      the `Table` payload shape (`0701740003040a`, captured from the encoder,
+      not hand-written). **Growth:** `write_chain` allocates continuation
+      pages as needed, re-serializing after each allocation because taking a
+      page from the free list mutates the very list being written (catalog and
+      generator are written first, free list last). **Chains never shrink**
+      (unused continuation pages stay chained, header-only) — releasing them
+      would mutate the free list mid-write; the cost is bounded by the
+      historical peak (~0.1% of freed pages for the free list). Continuation
+      pages are added to `reconcile_free_list`'s reachable set so a stale
+      on-disk list can never hand one out. The old S6 test (create_table
+      fails once the catalog page is full) is replaced: 150 tables at the
+      4 KiB minimum page size now succeed, span a multi-page catalog, and
+      survive reopen; likewise 1500 sequences and 4000 free pages.
+      `BPlusTree::from_bytes` is now explicitly the legacy decode path;
+      `from_table` is the new one. `cargo test --workspace` green (402
+      squeal-sql + 548 store), clippy clean on touched files. **Observed and
+      NOT caused by this stage:** `schema::tests::stats::
+      test_analyze_table_resets_stale_stats_before_rebuilding` (in the
+      untracked `stats.rs`) flakes ~2-3% — measured on the Stage 5 commit
+      (3/120 failures) and on this tree (1/120): a race between the async
+      stats collector and `analyze_table`.
 - [ ] **Stage 7 — squeal-sql catalog** (`SqlTable`/`SchemaVersion`/
       `SqlIndex`/`SqlForeignKey`/`Field`), modeled on `VersionedRow`'s
       existing pattern. Also unifies `Field::default`/index-leaf `IndexKey`

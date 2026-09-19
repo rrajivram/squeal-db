@@ -229,13 +229,24 @@ where
         })
     }
 
+    /// Decodes a PRE-Stage-6, unversioned catalog entry (raw postcard of
+    /// `Table`). Current catalog entries carry a version tag and go through
+    /// `systempages::decode_catalog_entry` + `from_table` instead.
     pub fn from_bytes(
         bytes: &[u8],
         buffer: Arc<PageBuffer<F>>,
         txn_mgr: Arc<TransactionManager>,
         logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
-        let t: Table = from_bytes(bytes)?;
+        Self::from_table(from_bytes(bytes)?, buffer, txn_mgr, logger)
+    }
+
+    pub(crate) fn from_table(
+        t: Table,
+        buffer: Arc<PageBuffer<F>>,
+        txn_mgr: Arc<TransactionManager>,
+        logger: Arc<Logger>,
+    ) -> Result<Self, StoreError> {
         // One-time cost, not per-insert: walk the chain to its real end so
         // write_data doesn't have to rediscover it on every call after reopen.
         let tail = Self::discover_tail_data_page(&buffer, t.first_data_page)?;

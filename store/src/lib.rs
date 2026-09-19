@@ -24,6 +24,7 @@ pub mod db;
 pub mod error;
 pub mod generator;
 mod maintenance;
+mod systempages;
 pub mod logger;
 pub mod memfile;
 pub mod named_memfile;

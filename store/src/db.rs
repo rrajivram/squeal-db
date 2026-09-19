@@ -28,6 +28,7 @@ use crate::page::Page;
 use crate::page::PageId;
 use crate::run::Run;
 use crate::table::Table;
+use crate::systempages::{self, SystemKind};
 use crate::table::TableIdType;
 use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
@@ -552,6 +553,11 @@ pub struct Db<F: DBFile + 'static> {
     // Records recovery replayed at open (those at or above the persisted
     // floor); 0 for a freshly created database.
     recovered_records: std::sync::atomic::AtomicUsize,
+    // Persistence versioning Stage 6: the continuation page ids of each
+    // system chain (indexed by SystemKind), as last loaded or written — see
+    // systempages.rs. Head pages are the fixed 0/1/2; only continuations
+    // are tracked here.
+    system_chains: parking_lot::Mutex<[Vec<PageId>; 3]>,
     #[cfg(test)]
     fail_reverts: std::sync::atomic::AtomicBool,
 }
@@ -781,6 +787,7 @@ where
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         };
@@ -915,6 +922,12 @@ where
         reachable.insert(SYSTEM_TABLE_PAGE.into());
         reachable.insert(GENERATOR_TABLE_PAGE.into());
         reachable.insert(FREE_PAGE_TABLE_PAGE.into());
+        // Stage 6: the continuation pages of every system chain are as live
+        // as the three heads — a stale on-disk free list must never hand one
+        // out.
+        for chain in self.system_chains.lock().iter() {
+            reachable.extend(chain.iter().copied());
+        }
         for table in self.tables.read().values() {
             reachable.extend(table.all_index_page_ids()?);
             // Raw next_page-following, not the overflow-skipping
@@ -2499,6 +2512,7 @@ where
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2522,23 +2536,47 @@ where
         Ok(())
     }
 
+    // Persistence versioning Stage 6: each of the three system structures is
+    // a versioned page CHAIN (see systempages.rs) that grows past its head
+    // page as needed. Order matters: catalog and generator first, free list
+    // LAST — growing any chain pops pages off the free list, and the free
+    // list must be serialized after its final shape is known.
     fn write_system_tables(&self) -> Result<(), StoreError> {
-        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
-        let tables = self.tables.read();
-        for (i, t) in tables.values().enumerate() {
-            let bytes = to_allocvec(&t.table)?;
-            // We dont care what the tables id is or if it is consistent across saves.
-            page.add_tuple(Tuple::new(i as DBSizeType, &bytes))?;
-        }
-        self.buffer.write_page(0usize.into(), &page)?;
-        let gens = self.generator.get_values()?;
-        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
-        page.add_tuple(Tuple::new(0, &to_allocvec(&gens)?))?;
-        self.buffer.write_page(1usize.into(), &page)?;
-        let page = Page::new_pinned(self.header.page_size, self.buffer.page_overhead());
-        page.add_tuple(Tuple::new(0, &to_allocvec(&self.buffer.get_free_pages())?))?;
-        self.buffer.write_page(2usize.into(), &page)?;
-
+        let mut chains = self.system_chains.lock();
+        let catalog: Vec<Vec<u8>> = {
+            let tables = self.tables.read();
+            tables
+                .values()
+                .map(|t| systempages::encode_catalog_entry(&t.table))
+                .collect::<Result<_, _>>()?
+        };
+        systempages::write_chain(
+            &self.buffer,
+            SYSTEM_TABLE_PAGE.into(),
+            SystemKind::Catalog,
+            || Ok(catalog.clone()),
+            &mut chains[SystemKind::Catalog.index()],
+        )?;
+        let generators: Vec<Vec<u8>> = self
+            .generator
+            .get_values()?
+            .iter()
+            .map(|(name, value)| systempages::encode_generator_entry(name, *value))
+            .collect::<Result<_, _>>()?;
+        systempages::write_chain(
+            &self.buffer,
+            GENERATOR_TABLE_PAGE.into(),
+            SystemKind::Generator,
+            || Ok(generators.clone()),
+            &mut chains[SystemKind::Generator.index()],
+        )?;
+        systempages::write_chain(
+            &self.buffer,
+            FREE_PAGE_TABLE_PAGE.into(),
+            SystemKind::FreeList,
+            || systempages::encode_free_list(&self.buffer.get_free_pages()),
+            &mut chains[SystemKind::FreeList.index()],
+        )?;
         Ok(())
     }
 
@@ -2559,25 +2597,77 @@ where
                 "Unable to load system tables".into(),
             ));
         }
-        let page = self.buffer.get_page(SYSTEM_TABLE_PAGE.into())?;
+        let mut chains = self.system_chains.lock();
+
+        let catalog = systempages::read_chain(
+            &self.buffer,
+            SYSTEM_TABLE_PAGE.into(),
+            SystemKind::Catalog,
+        )?;
         let mut tables = self.tables.write();
-        for t in page.iter() {
-            let t: BPlusTree<F> = BPlusTree::from_bytes(
-                &t.data,
-                self.buffer.clone(),
-                self.tx_mgr.clone(),
-                self.logger.clone(),
-            )?;
+        for bytes in &catalog.payloads {
+            let t: BPlusTree<F> = if catalog.legacy {
+                // Pre-Stage-6: raw, unversioned `Table` postcard.
+                BPlusTree::from_bytes(
+                    bytes,
+                    self.buffer.clone(),
+                    self.tx_mgr.clone(),
+                    self.logger.clone(),
+                )?
+            } else {
+                BPlusTree::from_table(
+                    systempages::decode_catalog_entry(bytes)?,
+                    self.buffer.clone(),
+                    self.tx_mgr.clone(),
+                    self.logger.clone(),
+                )?
+            };
             tables.insert(t.table.id, Arc::new(t));
         }
-        let page = self.buffer.get_page(GENERATOR_TABLE_PAGE.into())?;
-        let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
-        let gens = from_bytes(&tuple.data)?;
+        chains[SystemKind::Catalog.index()] = catalog.continuations;
+
+        let generator = systempages::read_chain(
+            &self.buffer,
+            GENERATOR_TABLE_PAGE.into(),
+            SystemKind::Generator,
+        )?;
+        let gens: Vec<(String, DBSizeType)> = if generator.legacy {
+            // Pre-Stage-6: one tuple holding the whole Vec, unversioned. A
+            // page with no tuple at all (a brand-new database that has not
+            // checkpointed yet) is simply "no generators".
+            match generator.payloads.first() {
+                Some(bytes) => from_bytes(bytes)?,
+                None => Vec::new(),
+            }
+        } else {
+            generator
+                .payloads
+                .iter()
+                .map(|b| systempages::decode_generator_entry(b))
+                .collect::<Result<_, _>>()?
+        };
         self.generator.set_values(gens)?;
-        let page = self.buffer.get_page(FREE_PAGE_TABLE_PAGE.into())?;
-        let tuple = page.get(DBIdType::Int(0))?.unwrap_or_default();
-        let free_pages = from_bytes::<Vec<_>>(&tuple.data)?;
+        chains[SystemKind::Generator.index()] = generator.continuations;
+
+        let free = systempages::read_chain(
+            &self.buffer,
+            FREE_PAGE_TABLE_PAGE.into(),
+            SystemKind::FreeList,
+        )?;
+        let free_pages: Vec<PageId> = if free.legacy {
+            match free.payloads.first() {
+                Some(bytes) => from_bytes::<Vec<_>>(bytes)?,
+                None => Vec::new(),
+            }
+        } else {
+            let mut all = Vec::new();
+            for chunk in &free.payloads {
+                all.extend(systempages::decode_free_list_chunk(chunk)?);
+            }
+            all
+        };
         self.buffer.set_free_pages(free_pages);
+        chains[SystemKind::FreeList.index()] = free.continuations;
         Ok(())
     }
 
@@ -7535,36 +7625,289 @@ mod tests {
         FileDB::delete(&db_name).unwrap_or_default();
     }
 
-    // STORE_AUDIT.md S6: the catalog (system table page) has a hard
-    // capacity — create_table inserts into the in-memory `tables` map
-    // BEFORE persisting, so once the catalog page is full, the failing
-    // call leaves a table that's visible in memory (table_id_by_name
-    // finds it) but was never actually persisted — and every later
-    // checkpoint()/close() fails forever after, since they keep trying
-    // to persist a catalog that no longer fits.
-    #[test]
-    fn test_audit_s6_create_table_fails_cleanly_once_the_catalog_page_is_full() {
-        let db = TestDB::create("audit_s6_catalog_full.db").unwrap();
-        let mut failed_name = None;
-        for i in 0..1000 {
-            let name = format!("table_number_{i:05}");
-            if db.create_table(name.clone()).is_err() {
-                failed_name = Some(name);
-                break;
-            }
-        }
-        let failed_name = failed_name
-            .expect("expected create_table to eventually fail once the catalog page is full");
+    // STORE_AUDIT.md S6 (superseded by persistence versioning Stage 6): the
+    // catalog used to be ONE page, so create_table had to fail cleanly once
+    // it filled. The catalog is now a chain of pages that grows as needed —
+    // see systempages.rs — so the same workload must simply keep working.
+    // Uses the minimum page size so a few hundred tables overflow one page
+    // quickly.
+    fn small_page_db(name: &str) -> Arc<TestDB> {
+        TestDB::create_with_page_size(name, 4 * 1024).unwrap()
+    }
 
+    fn chain_len(db: &TestDB, kind: crate::systempages::SystemKind) -> usize {
+        db.system_chains.lock()[kind.index()].len()
+    }
+
+    // Reopens `db` as a crashed-and-restarted process would see it: whatever
+    // the last checkpoint made durable.
+    fn reopen_after_checkpoint(db: &TestDB, name: &str) -> Arc<TestDB> {
+        db.checkpoint().unwrap();
+        let (f, l) = crash_clone(db);
+        TestDB::open_using(name, f, l).unwrap()
+    }
+
+    #[test]
+    fn test_stage6_catalog_grows_past_one_page_and_survives_reopen() {
+        use crate::systempages::SystemKind;
+        let db = small_page_db("stage6_catalog_grows.db");
+        let mut ids = Vec::new();
+        for i in 0..150 {
+            let name = format!("table_number_{i:05}");
+            let id = db
+                .create_table(name.clone())
+                .unwrap_or_else(|e| panic!("create_table #{i} must not hit a page limit: {e}"));
+            ids.push((name, id));
+        }
         assert!(
-            db.table_id_by_name(&failed_name).unwrap().is_none(),
-            "a table whose create_table call FAILED must not be left half-created in memory"
+            chain_len(&db, SystemKind::Catalog) >= 1,
+            "150 tables cannot fit on one 4 KiB catalog page — the chain must have grown"
         );
+
+        let db2 = reopen_after_checkpoint(&db, "stage6_catalog_grows.db");
+        for (name, id) in &ids {
+            assert_eq!(db2.table_id_by_name(name).unwrap(), Some(*id), "{name}");
+        }
+        assert_eq!(
+            chain_len(&db2, SystemKind::Catalog),
+            chain_len(&db, SystemKind::Catalog),
+            "the reopened database must know the same continuation pages"
+        );
+    }
+
+    #[test]
+    fn test_stage6_generator_state_grows_past_one_page_and_survives_reopen() {
+        use crate::systempages::SystemKind;
+        let db = small_page_db("stage6_generator_grows.db");
+        let gen_handle = db.get_generator();
+        for i in 0..1500u64 {
+            gen_handle
+                .create_generator(format!("sequence_number_{i:05}"), Some(i))
+                .unwrap();
+        }
+        assert!(chain_len(&db, SystemKind::Generator) == 0, "not written yet");
+        let db2 = reopen_after_checkpoint(&db, "stage6_generator_grows.db");
         assert!(
-            db.checkpoint().is_ok(),
-            "checkpoint must still succeed after a cleanly-rejected create_table, not fail \
-             forever afterward"
+            chain_len(&db, SystemKind::Generator) >= 1,
+            "1500 named sequences cannot fit on one 4 KiB page"
         );
+        let mut got = db2.get_generator().get_values().unwrap();
+        got.sort();
+        for i in 0..1500u64 {
+            let name = format!("sequence_number_{i:05}");
+            assert!(
+                got.iter().any(|(n, v)| *n == name && *v >= i),
+                "sequence {name} lost across reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stage6_free_list_grows_past_one_page_and_survives_reopen() {
+        use crate::systempages::SystemKind;
+        let db = small_page_db("stage6_free_list_grows.db");
+        // Allocate many real pages, then free them all: what a dropped
+        // large table leaves behind.
+        let pages: Vec<_> = (0..4000)
+            .map(|_| db.buffer.alloc_page(false).unwrap())
+            .collect();
+        for p in pages {
+            db.buffer.reset_and_free_page(p, None).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert!(
+            chain_len(&db, SystemKind::FreeList) >= 1,
+            "4000 free pages cannot fit on one 4 KiB free-list page"
+        );
+        // The continuation pages were taken FROM the list, so what is
+        // durable is the list as it stands after the chain grew.
+        let expected = db.buffer.get_free_pages();
+        assert!(expected.len() < 4000);
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("stage6_free_list_grows.db", f, l).unwrap();
+        assert_eq!(db2.buffer.get_free_pages(), expected);
+        assert_eq!(
+            chain_len(&db2, SystemKind::FreeList),
+            chain_len(&db, SystemKind::FreeList)
+        );
+        // And none of the chain's own pages can be handed out again.
+        let chain: std::collections::HashSet<_> =
+            db2.system_chains.lock()[SystemKind::FreeList.index()].iter().copied().collect();
+        assert!(db2.buffer.get_free_pages().iter().all(|p| !chain.contains(p)));
+    }
+
+    #[test]
+    fn test_stage6_a_chain_never_shrinks_and_stays_readable() {
+        use crate::systempages::SystemKind;
+        let db = small_page_db("stage6_never_shrinks.db");
+        let pages: Vec<_> = (0..4000)
+            .map(|_| db.buffer.alloc_page(false).unwrap())
+            .collect();
+        for p in pages {
+            db.buffer.reset_and_free_page(p, None).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let grown = chain_len(&db, SystemKind::FreeList);
+        assert!(grown >= 1);
+        // Consume most of the free list, leaving the chain oversized.
+        while db.buffer.get_free_pages().len() > 10 {
+            db.buffer.alloc_page(false).unwrap();
+        }
+        let db2 = reopen_after_checkpoint(&db, "stage6_never_shrinks.db");
+        assert_eq!(chain_len(&db, SystemKind::FreeList), grown, "chains only grow");
+        assert_eq!(chain_len(&db2, SystemKind::FreeList), grown);
+        assert_eq!(db2.buffer.get_free_pages().len(), db.buffer.get_free_pages().len());
+    }
+
+    // The exact pre-Stage-6 write path, kept here as the definition of "the
+    // legacy layout": three single pinned pages, no header tuple, unversioned
+    // payloads (raw postcard of each `Table`, one `Vec<(String, u64)>` tuple,
+    // one `Vec<PageId>` tuple).
+    fn write_legacy_system_pages(db: &TestDB) {
+        let page_size = db.header.page_size;
+        let overhead = db.buffer.page_overhead();
+        let page = crate::page::Page::new_pinned(page_size, overhead);
+        for (i, t) in db.tables.read().values().enumerate() {
+            page.add_tuple(Tuple::new(i as u64, &postcard::to_allocvec(&t.table).unwrap()))
+                .unwrap();
+        }
+        db.buffer.write_page(0usize.into(), &page).unwrap();
+        let page = crate::page::Page::new_pinned(page_size, overhead);
+        page.add_tuple(Tuple::new(
+            0,
+            &postcard::to_allocvec(&db.generator.get_values().unwrap()).unwrap(),
+        ))
+        .unwrap();
+        db.buffer.write_page(1usize.into(), &page).unwrap();
+        let page = crate::page::Page::new_pinned(page_size, overhead);
+        page.add_tuple(Tuple::new(
+            0,
+            &postcard::to_allocvec(&db.buffer.get_free_pages()).unwrap(),
+        ))
+        .unwrap();
+        db.buffer.write_page(2usize.into(), &page).unwrap();
+    }
+
+    #[test]
+    fn test_stage6_legacy_single_page_system_pages_still_load_and_upgrade() {
+        use crate::systempages::{SystemKind, read_chain};
+        let db = TestDB::create("stage6_legacy.db").unwrap();
+        let ta = db.create_table("table_a".to_string()).unwrap();
+        let tb = db.create_table("table_b".to_string()).unwrap();
+        db.get_generator().create_generator("legacy_seq", Some(77)).unwrap();
+        let spare: Vec<_> = (0..10).map(|_| db.buffer.alloc_page(false).unwrap()).collect();
+        for p in spare {
+            db.buffer.reset_and_free_page(p, None).unwrap();
+        }
+        write_legacy_system_pages(&db);
+        assert!(read_chain(&db.buffer, 0usize.into(), SystemKind::Catalog).unwrap().legacy);
+        sync_header_without_truncating_logs(&db);
+        let expected_free = db.buffer.get_free_pages();
+
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("stage6_legacy.db", f, l).unwrap();
+        assert_eq!(db2.table_id_by_name("table_a").unwrap(), Some(ta));
+        assert_eq!(db2.table_id_by_name("table_b").unwrap(), Some(tb));
+        assert!(
+            db2.get_generator().get_values().unwrap().iter().any(|(n, v)| n == "legacy_seq" && *v >= 77)
+        );
+        assert_eq!(db2.buffer.get_free_pages(), expected_free);
+        for kind in SystemKind::ALL {
+            assert_eq!(chain_len(&db2, kind), 0, "a legacy layout has no continuation pages");
+        }
+
+        // The next checkpoint rewrites all three in the versioned layout,
+        // and THAT reopens too.
+        db2.checkpoint().unwrap();
+        for kind in SystemKind::ALL {
+            let head = [0usize, 1, 2][kind.index()];
+            assert!(!read_chain(&db2.buffer, head.into(), kind).unwrap().legacy, "{kind:?}");
+        }
+        let (f, l) = crash_clone(&db2);
+        let db3 = TestDB::open_using("stage6_legacy.db", f, l).unwrap();
+        assert_eq!(db3.table_id_by_name("table_a").unwrap(), Some(ta));
+        assert_eq!(db3.table_id_by_name("table_b").unwrap(), Some(tb));
+        assert_eq!(db3.buffer.get_free_pages(), db2.buffer.get_free_pages());
+    }
+
+    // Pinned from the pre-Stage-6 encoder: postcard of
+    // `Table { id: 7, name: "t", BtreeTable, first_index_page: 3,
+    // first_data_page: 4, nodes_per_page: 10 }`. This is what a legacy
+    // catalog tuple holds, and what version-1 catalog payloads embed after
+    // their 2-byte tag — so it must never change without freezing the old
+    // shape first.
+    const LEGACY_TABLE_HEX: &str = "0701740003040a";
+
+    fn legacy_table() -> crate::table::Table {
+        crate::table::Table {
+            id: 7u64.into(),
+            name: "t".into(),
+            table_type: crate::table::TableType::BtreeTable,
+            first_index_page: PageId(3),
+            first_data_page: PageId(4),
+            nodes_per_page: 10,
+        }
+    }
+
+    #[test]
+    fn test_stage6_the_table_payload_shape_is_frozen() {
+        let bytes = postcard::to_allocvec(&legacy_table()).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, LEGACY_TABLE_HEX);
+        // And the versioned catalog entry is exactly [u16 version][that].
+        let entry = crate::systempages::encode_catalog_entry(&legacy_table()).unwrap();
+        assert_eq!(&entry[..2], &crate::systempages::CATALOG_PAYLOAD_VERSION.to_le_bytes());
+        assert_eq!(&entry[2..], &bytes[..]);
+        assert_eq!(
+            crate::systempages::decode_catalog_entry(&entry).unwrap().name,
+            "t"
+        );
+    }
+
+    #[test]
+    fn test_stage6_a_system_chain_with_an_unknown_version_refuses_to_open() {
+        let db = TestDB::create("stage6_unknown_chain_version.db").unwrap();
+        db.create_table("t".to_string()).unwrap();
+        db.checkpoint().unwrap();
+        let page = crate::page::Page::new_pinned(db.header.page_size, db.buffer.page_overhead());
+        page.add_tuple(Tuple::new(
+            crate::systempages::HEADER_TUPLE_ID,
+            &crate::versioned::write_versioned(99, |out| {
+                out.push(0);
+                out.extend_from_slice(&0u32.to_le_bytes());
+            }),
+        ))
+        .unwrap();
+        db.buffer.write_page(0usize.into(), &page).unwrap();
+        sync_header_without_truncating_logs(&db);
+        let (f, l) = crash_clone(&db);
+        let err = TestDB::open_using("stage6_unknown_chain_version.db", f, l)
+            .err()
+            .expect("an unrecognized chain version must not open");
+        assert!(
+            err.to_string().contains("unsupported system page chain version 99"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn test_stage6_a_cyclic_system_chain_is_reported_not_looped_forever() {
+        let db = small_page_db("stage6_cyclic_chain.db");
+        for i in 0..150 {
+            db.create_table(format!("table_number_{i:05}")).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let cont = db.system_chains.lock()[crate::systempages::SystemKind::Catalog.index()][0];
+        let page = db.buffer.get_page(cont).unwrap();
+        page.set_next_page(cont).unwrap();
+        db.buffer.write_page(cont, &page).unwrap();
+        sync_header_without_truncating_logs(&db);
+        let (f, l) = crash_clone(&db);
+        let err = TestDB::open_using("stage6_cyclic_chain.db", f, l)
+            .err()
+            .expect("a cyclic chain must not open");
+        assert!(err.to_string().contains("cycle"), "got {err}");
     }
 
     // STORE_AUDIT.md S7 (part 1): validate_table_name only checks length
