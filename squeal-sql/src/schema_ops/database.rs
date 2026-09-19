@@ -17,6 +17,31 @@ use crate::{
     schema_ops::schema::Schema,
 };
 
+// Persistence versioning Stage 8: a row of the database-wide schema registry
+// (`sql_system.schemas`) is `[0x00][u16 version][postcard String]` — see
+// crate::envelope. A row from before the envelope is the bare postcard
+// `String`, whose first byte is the name's length varint (0 only for an
+// empty name, which is refused here), read as version 1's body.
+const SCHEMA_REGISTRY_ROW_VERSION: u16 = 1;
+
+fn encode_registry_row(name: &str) -> Result<Vec<u8>, SchemaError> {
+    if name.is_empty() {
+        return Err(SchemaError::UserError("a schema name cannot be empty".into()));
+    }
+    Ok(crate::envelope::seal(
+        SCHEMA_REGISTRY_ROW_VERSION,
+        &to_allocvec(&name.to_string())?,
+    ))
+}
+
+fn decode_registry_row(bytes: &[u8]) -> Result<String, SchemaError> {
+    use crate::envelope::{Opened, open, unsupported};
+    match open(bytes, "schema registry")? {
+        Opened::Versioned { version: 1, body } | Opened::Legacy(body) => Ok(from_bytes(body)?),
+        Opened::Versioned { version, .. } => Err(unsupported("schema registry", version)),
+    }
+}
+
 // One Database wraps exactly one store-level Db<F> and hosts multiple
 // Schemas — replaces the old model where Schema itself owned a Db<F>
 // (a hidden 1-schema-per-database assumption). Every Schema this
@@ -131,6 +156,8 @@ where
             return Err(SchemaError::SchemaInUseError(name.to_string()));
         }
 
+        // Encoded (and an empty name refused) before any transaction begins.
+        let row = encode_registry_row(name)?;
         let txn = self.db.begin()?;
         let ik = IndexKey::new_from(&[ValueItem::Str((
             name.to_string(),
@@ -138,12 +165,7 @@ where
         ))])?;
         self.db.insert(
             self.schemas_table,
-            Tuple::new_with(
-                DBIdType::Rec(ik),
-                &to_allocvec(&name.to_string())?,
-                Some(txn.id()),
-                None,
-            ),
+            Tuple::new_with(DBIdType::Rec(ik), &row, Some(txn.id()), None),
             &txn,
         )?;
         // Schema::create's own db.create_table call is DDL, not undone by
@@ -192,7 +214,7 @@ where
         let mut cursor = self.db.table_scan(self.schemas_table)?;
         let mut names = Vec::new();
         while let Some(tuple) = cursor.next()? {
-            names.push(from_bytes::<String>(tuple.data())?);
+            names.push(decode_registry_row(tuple.data())?);
         }
         Ok(names)
     }

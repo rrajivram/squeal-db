@@ -103,9 +103,30 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         let mut tables: HashMap<TableIdType, TableStatStored> = HashMap::new();
         let mut cursor = schema.db.table_scan(stats_table_id)?;
         while let Some(tuple) = cursor.next()? {
-            let persisted: PersistedTableStat = from_bytes(tuple.data())?;
-            let stat = TableStatStored::from_persisted(persisted)?;
-            tables.insert(stat.id, stat);
+            // DELIBERATE EXCEPTION to the "every release must read every
+            // earlier on-disk format" rule (persistence versioning Stage 8,
+            // decided by the user): stats are a rebuildable CACHE, not data.
+            // Nothing in them is authoritative — ANALYZE TABLE re-derives
+            // every field from the table's own rows — and they embed a
+            // third-party wire format (the bloom filter's) this engine does
+            // not control. So a row that cannot be decoded, for ANY reason
+            // (an older or newer shape, corruption, a bloom-crate change),
+            // is dropped and that table simply starts fresh below, exactly
+            // like a table that never had stats. Never let this become a
+            // hard error: an unreadable cache must not make a database
+            // unopenable. (Do not "fix" this into a versioned decoder.)
+            match Self::decode_persisted_row(&tuple) {
+                Ok(stat) => {
+                    tables.insert(stat.id, stat);
+                }
+                Err(reason) => {
+                    log::warn!(
+                        "discarding unreadable persisted table stats (key {:?}); they will be \
+                         rebuilt: {reason}",
+                        tuple.id()
+                    );
+                }
+            }
         }
         for t in schema.list_tables() {
             let table = schema.get_table(&t).unwrap();
@@ -114,6 +135,24 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             }
         }
         Self::spawn(schema, tables, sampling_rate)
+    }
+
+    // One stats row -> its in-memory form, or why it cannot be trusted.
+    // Also rejects a row whose own table id disagrees with the key it is
+    // stored under: postcard is positional, so a changed shape can decode
+    // "successfully" into nonsense, and this is the cheap cross-check that
+    // catches most of that.
+    fn decode_persisted_row(tuple: &Tuple) -> Result<TableStatStored, String> {
+        let persisted: PersistedTableStat =
+            from_bytes(tuple.data()).map_err(|e| format!("undecodable: {e}"))?;
+        if !matches!(tuple.id(), DBIdType::Int(k) if *k == persisted.id.as_u64()) {
+            return Err(format!(
+                "row stored under key {:?} claims to be table {:?}",
+                tuple.id(),
+                persisted.id
+            ));
+        }
+        TableStatStored::from_persisted(persisted).map_err(|e| format!("bad column stats: {e}"))
     }
 
     fn spawn(
@@ -550,5 +589,23 @@ mod tests {
             assert_eq!(restored_col.min, orig_col.min);
             assert_eq!(restored_col.max, orig_col.max);
         }
+    }
+
+    // The bloom filter's own byte format is a third-party wire format this
+    // engine does not control (see SchemaStats::load's exception): bytes it
+    // cannot parse must come back as an error, which load turns into "start
+    // this table's stats fresh" rather than a failed open.
+    #[test]
+    fn test_unparseable_bloom_bytes_are_an_error_not_a_panic() {
+        let persisted = PersistedColumnStat {
+            id: 0,
+            name: "c".into(),
+            bloom_bytes: vec![1, 2, 3],
+            unique: 0,
+            nulls: 0,
+            min: None,
+            max: None,
+        };
+        assert!(ColumnStatStored::from_persisted(persisted).is_err());
     }
 }

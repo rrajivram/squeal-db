@@ -207,8 +207,7 @@ committing (each stage is its own commit).
       untracked `stats.rs`) flakes ~2-3% — measured on the Stage 5 commit
       (3/120 failures) and on this tree (1/120): a race between the async
       stats collector and `analyze_table`.
-- [x] **Stage 7 — squeal-sql catalog — DONE (uncommitted, pending the
-      user's ok).** The bug class that started this effort. Two parts.
+- [x] **Stage 7 — squeal-sql catalog — DONE. Committed: `ea43bfe`.** The bug class that started this effort. Two parts.
       **(1) The catalog row is a versioned envelope.** `SqlTable` (with
       `SchemaVersion`/`Field`/`SqlIndex`/`SqlForeignKey` nested) is stored as
       `[0x00][u16 LE version][postcard body]` (`SqlTable::encode_catalog_row`/
@@ -251,11 +250,59 @@ committing (each stage is its own commit).
       failures, PK/FKs intact) into a scratch db and reopened it 6 times, all
       counts identical. `cargo test --workspace` green (409 squeal-sql + 552
       store); clippy shows nothing in touched code.
-- [ ] **Stage 8 — schema registry + stats exception**: schema registry
-      (trivial, it's a `String`); `TableStatStored`/`PersistedTableStat`/
-      `PersistedColumnStat` get a *deliberate* exception — decode failure
-      (including bloom-filter format failure) is caught and treated as "no
-      stats yet," never propagated as a hard error.
+- [x] **Stage 8 — schema registry + stats exception — DONE (uncommitted,
+      pending the user's ok).**
+      **Schema registry** (`sql_system.schemas`, one row per schema): now
+      `[0x00][u16 version][postcard String]`, with the legacy bare-`String`
+      row read as version 1's body. To avoid duplicating Stage 7's logic the
+      envelope moved to a tiny shared module, `squeal-sql/src/envelope.rs`
+      (`seal`/`open`/`unsupported`, unit-tested; the catalog codec was
+      refactored onto it and its tests still pass unchanged). The 0x00
+      discriminator is sound for the same reason as the catalog's: a legacy
+      row starts with a name-length varint, 0 only for an empty name, and
+      `create_schema` now refuses an empty name (encoded before any
+      transaction begins, so nothing is left behind). Tests: new rows are
+      enveloped; a pinned legacy row still lists and coexists; unknown
+      version, empty and truncated rows are errors; empty name refused.
+      **Stats exception (the user's deliberate carve-out):**
+      `SchemaStats::load` no longer propagates a decode failure. Any persisted
+      stats row that cannot be decoded — older/newer shape, corruption, the
+      third-party bloom-filter format failing — is logged, discarded, and that
+      table starts fresh exactly like a table that never had stats; other
+      tables keep theirs. It also cross-checks that the row's own table id
+      matches the key it is stored under (postcard is positional, so a changed
+      shape can decode "successfully" into nonsense; a mismatch is treated as
+      unreadable too). The code carries a comment saying this is intentional
+      and must not be "fixed" into a versioned decoder. Tests: valid stats
+      restored (control); garbage row -> only that table resets; wrong-key row
+      not trusted; and a real close/corrupt-on-disk/reopen where the database
+      still opens. Plus a bloom-bytes-unparseable unit test.
+      `cargo test --workspace` green (421 squeal-sql + 552 store); clippy shows
+      nothing new. End to end: retail dataset loaded (0 failures) and
+      reopened 5 times, counts identical.
+      **Found, NOT part of this effort, NOT fixed:** `Schema::create_table`
+      inserts the catalog row BEFORE it assigns the table's (and each
+      index's) store table id, commits, and never rewrites the row; the
+      corrected row is only written by `flush_metadata` at a clean close. A
+      crash or kill after `create_table` and before a clean close therefore
+      leaves a catalog row whose `db_table_id`/index ids are the "none" value
+      (0). Observed directly: reloading a schema without `flush_metadata`
+      keyed a table's stats under id 0. The CLI's `conn.close()` masks it on
+      clean exit. Needs its own fix (write the row after ids are assigned, or
+      rewrite it in the same transaction) — flagged for the user.
+
+## Where the policy stands
+
+Every persisted format in scope now has an explicit version or discriminator
+and a fixture proving new code reads what earlier code wrote: file header
+(`Header::decode`, v3 frozen), WAL (per-segment version, v2 fixture), pages
+(format version, legacy fixtures), system pages (chained, legacy layout
+read), SQL catalog and schema registry (enveloped, legacy rows read), plus
+byte-stable `ValueItem`/`IndexKey`/enum encodings. Known gaps, all recorded
+above: `VersionedRow` (user-row payload) and index-leaf payloads have no
+version of their own; WAL v1 is recognized but unreadable (by decision);
+databases with pages written before Stage 3's `PAGE_OVERHEAD` change are a
+deliberate one-time break.
 
 ## After Stage 7
 

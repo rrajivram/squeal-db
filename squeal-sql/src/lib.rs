@@ -3,6 +3,7 @@ pub(crate) mod constant;
 pub mod datatype;
 pub(crate) mod datetime;
 pub(crate) mod ds;
+pub(crate) mod envelope;
 pub mod error;
 pub mod optim;
 pub mod plan;

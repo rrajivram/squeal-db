@@ -137,7 +137,7 @@ fn count_schema_registry_rows(db: &Database<MemFile>, name: &str) -> usize {
     let mut cursor = db.db.table_scan(db.schemas_table).unwrap();
     let mut count = 0;
     while let Some(tuple) = cursor.next().unwrap() {
-        let stored: String = postcard::from_bytes(tuple.data()).unwrap();
+        let stored = super::decode_registry_row(tuple.data()).unwrap();
         if stored == name {
             count += 1;
         }
@@ -293,4 +293,81 @@ fn test_open_tolerates_a_missing_default_schema() {
     ));
 
     NamedMemFile::delete(&path);
+}
+
+// --- Persistence versioning Stage 8: the schema registry row ---
+
+fn registry_rows<F>(db: &Arc<Database<F>>) -> Vec<Vec<u8>>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    use store::cursor::Cursor;
+    let mut cur = db.db.table_scan(db.schemas_table).unwrap();
+    let mut out = Vec::new();
+    while let Some(t) = cur.next().unwrap() {
+        out.push(t.data().to_vec());
+    }
+    out
+}
+
+fn registry_key(name: &str) -> store::tuple::DBIdType {
+    store::tuple::DBIdType::Rec(
+        store::valueitem::IndexKey::new_from(&[store::valueitem::ValueItem::Str((
+            name.to_string(),
+            crate::constant::MAX_TABLE_NAME_LEN as u32,
+        ))])
+        .unwrap(),
+    )
+}
+
+#[test]
+fn test_new_registry_rows_are_enveloped() {
+    let db = Database::<MemFile>::create("registry_enveloped".to_string()).unwrap();
+    let rows = registry_rows(&db);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][..3], &[0x00, 1, 0], "[0x00][version 1 LE]");
+    // The body is exactly what a legacy row was: postcard of the name.
+    assert_eq!(&rows[0][3..], &postcard::to_allocvec(&"default".to_string()).unwrap()[..]);
+}
+
+#[test]
+fn test_a_legacy_registry_row_still_lists_and_is_upgraded_by_a_rewrite() {
+    let db = Database::<MemFile>::create("registry_legacy".to_string()).unwrap();
+    db.create_schema("other").unwrap();
+    // Pinned: what the pre-envelope code stored for "other" — the bare
+    // postcard String (length varint, then the bytes).
+    let legacy: Vec<u8> = vec![5, b'o', b't', b'h', b'e', b'r'];
+    assert_eq!(postcard::to_allocvec(&"other".to_string()).unwrap(), legacy);
+    let tx = db.db.begin().unwrap();
+    db.db
+        .update(
+            db.schemas_table,
+            store::tuple::Tuple::new_with(registry_key("other"), &legacy, Some(tx.id()), None),
+            &tx,
+        )
+        .unwrap();
+    db.db.commit(tx).unwrap();
+    assert!(registry_rows(&db).iter().any(|r| r == &legacy), "row is legacy now");
+
+    let mut names = db.list_schemas().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["default".to_string(), "other".to_string()]);
+}
+
+#[test]
+fn test_a_registry_row_with_an_unknown_version_is_refused() {
+    let err = super::decode_registry_row(&[0x00, 99, 0, 5, b'o', b't', b'h', b'e', b'r'])
+        .unwrap_err();
+    assert!(err.to_string().contains("unsupported schema registry row version 99"), "got {err}");
+    assert!(super::decode_registry_row(&[]).is_err());
+    assert!(super::decode_registry_row(&[0x00, 1]).is_err());
+}
+
+#[test]
+fn test_an_empty_schema_name_is_refused_and_leaves_nothing_behind() {
+    let db = Database::<MemFile>::create("registry_empty_name".to_string()).unwrap();
+    let before = registry_rows(&db).len();
+    assert!(db.create_schema("").is_err());
+    assert_eq!(registry_rows(&db).len(), before);
 }

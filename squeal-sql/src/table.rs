@@ -596,36 +596,19 @@ impl SqlTable {
                 "a table name cannot be empty".into(),
             ));
         }
-        let body = postcard::to_allocvec(self)?;
-        let mut out = Vec::with_capacity(3 + body.len());
-        out.push(0x00);
-        out.extend_from_slice(&CATALOG_ROW_VERSION.to_le_bytes());
-        out.extend_from_slice(&body);
-        Ok(out)
+        Ok(crate::envelope::seal(
+            CATALOG_ROW_VERSION,
+            &postcard::to_allocvec(self)?,
+        ))
     }
 
     pub(crate) fn decode_catalog_row(bytes: &[u8]) -> Result<SqlTable, SchemaError> {
-        match bytes.first() {
-            Some(0x00) => {
-                let tag: [u8; 2] = bytes.get(1..3).and_then(|t| t.try_into().ok()).ok_or_else(|| {
-                    SchemaError::InternalSchemaError(format!(
-                        "catalog row is {} byte(s), too short for its version tag",
-                        bytes.len()
-                    ))
-                })?;
-                match u16::from_le_bytes(tag) {
-                    1 => Ok(postcard::from_bytes(&bytes[3..])?),
-                    other => Err(SchemaError::InternalSchemaError(format!(
-                        "unsupported catalog row version {other} — this database may have been \
-                         written by a newer, deprecated, or unrecognized build"
-                    ))),
-                }
-            }
+        use crate::envelope::{Opened, open, unsupported};
+        match open(bytes, "catalog")? {
+            Opened::Versioned { version: 1, body } => Ok(postcard::from_bytes(body)?),
+            Opened::Versioned { version, .. } => Err(unsupported("catalog", version)),
             // Legacy: bare postcard of SqlTable, identical to version 1's body.
-            Some(_) => Ok(postcard::from_bytes(bytes)?),
-            None => Err(SchemaError::InternalSchemaError(
-                "catalog row is empty".into(),
-            )),
+            Opened::Legacy(body) => Ok(postcard::from_bytes(body)?),
         }
     }
 }

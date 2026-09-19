@@ -44,6 +44,7 @@ mod foreign_key;
 mod key_width;
 mod mapping;
 mod stats;
+mod stats_resilience;
 
 use std::sync::Arc;
 
