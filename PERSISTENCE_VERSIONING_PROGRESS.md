@@ -25,24 +25,65 @@ committing (each stage is its own commit).
       order). Each has: round-trip test, unknown-tag error test, and a
       fixture-decode test using bytes captured from the pre-Stage-1 derived
       encoding (commit `bfbc240`). `cargo test --workspace` green.
-      Not yet committed — pending go-ahead.
-- [ ] **Stage 2 — `Tuple` envelope**: version-tag `Tuple` itself, preserving
-      `slotted.rs`'s `decode_id_at` byte-prefix fast path (skip the 2-byte
-      tag, then decode `DBIdType`).
-- [ ] **Stage 3 — `Header` versioning + `max_index_key_size` +
-      `PAGE_OVERHEAD` runtime-derived**: replaces the exact-match
-      `format_version` gate with real dispatch; adds
-      `max_index_key_size: DBSizeType` (default 512, validated range);
-      `PageBuffer` gets a denormalized `page_overhead: usize` computed at
-      open instead of the global `PAGE_OVERHEAD` const; `CREATE
-      TABLE`/`CREATE INDEX` reject a too-wide key up front. This is the
-      stage that actually resolves the `high_key` motivating bug.
+      Committed: `fcc6843`.
+- [~] **Stage 2 — `Tuple` envelope — DEFERRED, folded into Stage 5.**
+      Investigated giving `Tuple` its own per-record version tag as
+      originally planned. Found a real blocker: `Tuple` is decoded in two
+      incompatible contexts — (a) standalone from a raw byte slice
+      (`slotted.rs`'s `decode_at`/`decode_id_at`), where a leading tag can
+      be sniffed and dispatched on, and (b) as an element of `Vec<Tuple>`
+      decoded via ONE bulk `postcard::from_bytes::<Vec<Tuple>>(bytes)` call
+      — `AnyTuplePage::from_bytes` (`pages/anytuple.rs:57`), the **default,
+      primary** on-disk page format (`SlottedPage` was tried and reverted
+      for performance — see `page.rs`'s own comment). Inside a `Vec<T>`
+      decode, each element goes through serde's generic
+      `Deserializer`/`SeqAccess` machinery with no raw-byte access to sniff
+      — doing this properly would mean rewriting `AnyTuplePage` (and
+      checking `fixedtuple.rs`/`run.rs`) to decode tuple-by-tuple via
+      `postcard::take_from_bytes` instead of one bulk call, just to support
+      a per-record tag.
+      **Decision (confirmed with the user)**: skip a per-`Tuple` tag
+      entirely. Give the *page* itself a version tag instead (pulled
+      forward from Stage 5) that declares which `Tuple` shape applies
+      uniformly to every tuple it holds — no per-record ambiguity, no bulk-
+      decode rewrite. `slotted.rs`'s `decode_id_at` fast-path change (skip a
+      known-width prefix, then decode `DBIdType`) moves to Stage 5 too,
+      keyed off the page's version instead of a per-tuple one.
+- [~] **Stage 3 — `Header` versioning + `max_index_key_size` +
+      `PAGE_OVERHEAD` runtime-derived — PARTLY DONE.**
+      Done: `Header::decode` replaces the exact-match `format_version` gate
+      with real dispatch (`magic`+`format_version` sit at a fixed byte
+      offset in every version there's been, since postcard's derive
+      serializes struct fields in declaration order regardless of Rust's
+      in-memory layout — safe to peek before deciding how to decode the
+      rest). `HeaderV3Shape` is a frozen copy of the pre-Stage-3 shape
+      (including ITS OWN frozen checksum formula — the stored checksum was
+      computed without `max_index_key_size` ever existing, so validating a
+      v3 file against the *new* formula would spuriously report checksum
+      corruption on every existing database). Added
+      `max_index_key_size: DBSizeType` (`DEFAULT_MAX_INDEX_KEY_SIZE = 512`,
+      range-validated `[64, 8192]`), and
+      `Db::create_with_page_size_and_max_index_key_size` as the override
+      entry point (`create`/`create_with_page_size` funnel through it with
+      the default). Fixture tests: a v3-shaped header (real checksum, old
+      formula) opens with the default key size; a v3 header with a bad
+      checksum is still rejected; an unrecognized `format_version` is
+      rejected. `cargo test --workspace` green.
+      **Not yet done** (paused here to check in before the risky part):
+      `PageBuffer` denormalizing a runtime `page_overhead: usize` (replacing
+      the global `PAGE_OVERHEAD` const, threaded through ~20 call sites in
+      `page.rs`/`buffer.rs`) — this is the part that actually resolves the
+      `high_key` motivating bug — and the `CREATE TABLE`/`CREATE INDEX`
+      DDL-time key-width rejection in squeal-sql.
 - [ ] **Stage 4 — WAL (`LogHeader` + `LogRecord`/`Record`)**: real version
       dispatch instead of the exact-match gate; fixture is a full WAL
       segment replayed through `Db::open`'s recovery path.
-- [ ] **Stage 5 — page shell (`PageHeader`/`PageDto`)**: lower priority now
-      that Stage 3 resolves the urgent overhead crisis; still needed so the
-      page shell itself can grow safely later.
+- [ ] **Stage 5 — page shell (`PageHeader`/`PageDto`) + deferred Stage 2
+      (`Tuple`)**: lower priority than it first appeared now that Stage 3
+      resolves the urgent overhead crisis, but now also carries Stage 2's
+      deferred work: the page's own version tag dictates which `Tuple`
+      shape every tuple it holds decodes as (see Stage 2's note above),
+      and `slotted.rs`'s `decode_id_at` fast path moves here too.
 - [ ] **Stage 6 — store-level system pages**: table catalog (page 0),
       generator state (page 1), free-page list (page 2).
 - [ ] **Stage 7 — squeal-sql catalog** (`SqlTable`/`SchemaVersion`/

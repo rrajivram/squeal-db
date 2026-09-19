@@ -203,9 +203,17 @@ impl<T> DBFile for T where
 // race that double-buffering primarily exists to survive; the double-slot
 // mechanism would be belt-and-suspenders on top of that, not something
 // closing a live bug, so it's deferred (see audit-progress.md).
-const HEADER_FORMAT_VERSION: u32 = 3;
+const HEADER_FORMAT_VERSION: u32 = 4;
 const MIN_PAGE_SIZE: DBSizeType = 4 * 1024;
 const MAX_PAGE_SIZE: DBSizeType = 1024 * 1024;
+// Persistence versioning Stage 3: the database-wide, per-file cap on a
+// B-link tree page's `high_key` (see PageHeader — the one variable-size
+// field in the page header, bounded by a column's declared capacity via
+// ValueItem::validate, summed across an index's key columns). Chosen at
+// creation time like page_size, persisted here, validated below.
+pub(crate) const DEFAULT_MAX_INDEX_KEY_SIZE: DBSizeType = 512;
+const MIN_MAX_INDEX_KEY_SIZE: DBSizeType = 64;
+const MAX_MAX_INDEX_KEY_SIZE: DBSizeType = 8 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Header {
@@ -232,11 +240,105 @@ pub(crate) struct Header {
     // segment is kept whole while anything in it is at or above a floor).
     #[serde(with = "postcard::fixint::le")]
     pub(crate) checkpoint_lsn: u64,
+    // Persistence versioning Stage 3 (format_version 4): see
+    // DEFAULT_MAX_INDEX_KEY_SIZE above. Absent in format_version 3 files —
+    // HeaderV3Shape::upgrade defaults it to DEFAULT_MAX_INDEX_KEY_SIZE.
+    #[serde(with = "postcard::fixint::le")]
+    pub(crate) max_index_key_size: DBSizeType,
     // Always the last field: computed over every OTHER field's bytes (see
     // checksum_input) and patched in via seal() right before a write —
     // never meaningful to read until seal() has run.
     #[serde(with = "postcard::fixint::le")]
     pub(crate) header_checksum: u32,
+}
+
+// Persistence versioning Stage 3: format_version 3's exact on-disk shape,
+// frozen forever (never touched again once superseded — see
+// PERSISTENCE_VERSIONING_PROGRESS.md). Every format_version-3 file this
+// engine will ever encounter was written with exactly these fields, in
+// exactly this order; decode dispatches here by format_version alone
+// (Header::decode) rather than trying to read every version through one
+// derive with optional/defaulted fields, which postcard has no concept of.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct HeaderV3Shape {
+    magic: [u8; 2],
+    #[serde(with = "postcard::fixint::le")]
+    format_version: u32,
+    #[serde(with = "postcard::fixint::le")]
+    first_page_offset: DBSizeType,
+    #[serde(with = "postcard::fixint::le")]
+    page_count: DBSizeType,
+    #[serde(with = "postcard::fixint::le")]
+    page_size: DBSizeType,
+    last_checkpoint: u128,
+    #[serde(with = "postcard::fixint::le")]
+    counter: u64,
+    #[serde(with = "postcard::fixint::le")]
+    checkpoint_lsn: u64,
+    #[serde(with = "postcard::fixint::le")]
+    header_checksum: u32,
+}
+
+impl HeaderV3Shape {
+    // Frozen copy of what Header::checksum_input computed back when format
+    //_version 3 was current — must never change, even if Header's own
+    // checksum_input changes shape for a later version.
+    fn checksum_input(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(32);
+        v.extend_from_slice(&self.magic);
+        v.extend_from_slice(&self.format_version.to_le_bytes());
+        v.extend_from_slice(&self.first_page_offset.to_le_bytes());
+        v.extend_from_slice(&self.page_count.to_le_bytes());
+        v.extend_from_slice(&self.page_size.to_le_bytes());
+        v.extend_from_slice(&self.last_checkpoint.to_le_bytes());
+        v.extend_from_slice(&self.counter.to_le_bytes());
+        v.extend_from_slice(&self.checkpoint_lsn.to_le_bytes());
+        v
+    }
+
+    // Validates this v3 header against ITS OWN (frozen) checksum formula
+    // and page_size bounds, then upgrades it into a current Header with
+    // max_index_key_size defaulted — the concrete proof this stage's own
+    // versioning works: a v3 file (missing the field entirely) opens with
+    // the default, not an error.
+    fn validate_and_upgrade(self) -> Result<Header, StoreError> {
+        let expected = crate::page::fnv1a_32(&self.checksum_input());
+        if self.header_checksum != expected {
+            return Err(StoreError::HeaderCorruption(format!(
+                "header checksum mismatch: stored {}, computed {}",
+                self.header_checksum, expected
+            )));
+        }
+        if !self.page_size.is_power_of_two()
+            || self.page_size < MIN_PAGE_SIZE
+            || self.page_size > MAX_PAGE_SIZE
+        {
+            return Err(StoreError::HeaderCorruption(format!(
+                "invalid page_size {} (must be a power of two in [{}, {}])",
+                self.page_size, MIN_PAGE_SIZE, MAX_PAGE_SIZE
+            )));
+        }
+        if self.first_page_offset < size_of::<Header>() as DBSizeType {
+            return Err(StoreError::HeaderCorruption(format!(
+                "first_page_offset {} is smaller than the header itself",
+                self.first_page_offset
+            )));
+        }
+        let mut header = Header {
+            magic: self.magic,
+            format_version: HEADER_FORMAT_VERSION,
+            first_page_offset: self.first_page_offset,
+            page_count: self.page_count,
+            page_size: self.page_size,
+            last_checkpoint: self.last_checkpoint,
+            counter: self.counter,
+            checkpoint_lsn: self.checkpoint_lsn,
+            max_index_key_size: DEFAULT_MAX_INDEX_KEY_SIZE,
+            header_checksum: 0,
+        };
+        header.seal();
+        Ok(header)
+    }
 }
 
 impl Header {
@@ -257,6 +359,7 @@ impl Header {
         v.extend_from_slice(&self.last_checkpoint.to_le_bytes());
         v.extend_from_slice(&self.counter.to_le_bytes());
         v.extend_from_slice(&self.checkpoint_lsn.to_le_bytes());
+        v.extend_from_slice(&self.max_index_key_size.to_le_bytes());
         v
     }
 
@@ -273,10 +376,54 @@ impl Header {
         self.header_checksum = self.compute_checksum();
     }
 
-    // Called once, right after magic is checked, before this Header is
-    // trusted for anything else (page_size drives every subsequent I/O
-    // offset calculation, so a corrupt value here must be caught before
-    // it can drive a huge or misaligned read/write downstream).
+    // Persistence versioning Stage 3: real version dispatch, replacing the
+    // old exact-match-or-fail gate. magic (2 bytes) + format_version (a
+    // 4-byte fixint u32) sit at the same fixed byte offset in every format
+    // version there has ever been — declared first in both HeaderV3Shape
+    // and the current Header, and postcard's derive serializes struct
+    // fields in declaration order regardless of Rust's in-memory layout —
+    // so it's safe to peek them before deciding how to decode the rest.
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
+        let magic_bytes = bytes.get(0..2).ok_or_else(|| {
+            StoreError::HeaderCorruption(format!(
+                "need at least 2 byte(s) for the magic, buffer is {} byte(s)",
+                bytes.len()
+            ))
+        })?;
+        if magic_bytes != MAGIC {
+            return Err(StoreError::FileError);
+        }
+        let version_bytes = bytes.get(2..6).ok_or_else(|| {
+            StoreError::HeaderCorruption(format!(
+                "need at least 6 byte(s) for magic+format_version, buffer is {} byte(s)",
+                bytes.len()
+            ))
+        })?;
+        let format_version = u32::from_le_bytes(version_bytes.try_into().unwrap());
+        match format_version {
+            3 => {
+                let v3: HeaderV3Shape = from_bytes(bytes)?;
+                v3.validate_and_upgrade()
+            }
+            HEADER_FORMAT_VERSION => {
+                let header: Header = from_bytes(bytes)?;
+                header.validate()?;
+                Ok(header)
+            }
+            other => Err(StoreError::HeaderCorruption(format!(
+                "unsupported header format_version {other} — this file may have been written \
+                 by a newer, deprecated, or unrecognized build"
+            ))),
+        }
+    }
+
+    // Called once, right after magic+format_version dispatch (Header::decode),
+    // before this Header is trusted for anything else (page_size drives
+    // every subsequent I/O offset calculation, so a corrupt value here must
+    // be caught before it can drive a huge or misaligned read/write
+    // downstream). Only ever runs against the CURRENT format_version's
+    // checksum formula — an older version validates via its own frozen
+    // shape's validate_and_upgrade instead.
     fn validate(&self) -> Result<(), StoreError> {
         if self.format_version != HEADER_FORMAT_VERSION {
             return Err(StoreError::HeaderCorruption(format!(
@@ -310,6 +457,14 @@ impl Header {
             return Err(StoreError::HeaderCorruption(format!(
                 "first_page_offset {} is smaller than the header itself",
                 self.first_page_offset
+            )));
+        }
+        if self.max_index_key_size < MIN_MAX_INDEX_KEY_SIZE
+            || self.max_index_key_size > MAX_MAX_INDEX_KEY_SIZE
+        {
+            return Err(StoreError::HeaderCorruption(format!(
+                "invalid max_index_key_size {} (must be in [{}, {}])",
+                self.max_index_key_size, MIN_MAX_INDEX_KEY_SIZE, MAX_MAX_INDEX_KEY_SIZE
             )));
         }
         Ok(())
@@ -498,7 +653,24 @@ where
         name: S,
         page_size: DBSizeType,
     ) -> Result<Arc<Self>, StoreError> {
-        let sf = Self::create_core_db(name.as_ref().to_string(), page_size)?;
+        Self::create_with_page_size_and_max_index_key_size(
+            name,
+            page_size,
+            DEFAULT_MAX_INDEX_KEY_SIZE,
+        )
+    }
+
+    // Persistence versioning Stage 3: lets a caller override the database-
+    // wide cap on an index key's worst-case serialized size (see
+    // DEFAULT_MAX_INDEX_KEY_SIZE) at creation time, the same way
+    // create_with_page_size overrides page_size. create/create_with_page_size
+    // both funnel through here with the default.
+    pub fn create_with_page_size_and_max_index_key_size<S: AsRef<str>>(
+        name: S,
+        page_size: DBSizeType,
+        max_index_key_size: DBSizeType,
+    ) -> Result<Arc<Self>, StoreError> {
+        let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_index_key_size)?;
         sf.generator.attach_logger(sf.logger.clone());
         sf.create_system_tables()?;
         let db = Arc::new(sf);
@@ -515,16 +687,12 @@ where
         let mut file = file;
         file.seek(SeekFrom::Start(0))?;
         file.read_exact(&mut bytes)?;
-        let header = from_bytes::<Header>(&bytes)?;
-        if header.magic != MAGIC {
-            return Err(StoreError::FileError);
-        }
-        // STORE_AUDIT.md S1: format_version/checksum/page_size/
-        // first_page_offset validation — before this, a corrupted or
-        // foreign header decoded (or failed to decode) however postcard
-        // happened to interpret the bytes, with nothing catching a bogus
-        // page_size before it drove every later page-offset calculation.
-        header.validate()?;
+        // Persistence versioning Stage 3: Header::decode dispatches on
+        // format_version (real dispatch, not an exact-match gate), and does
+        // its own magic-check + validation (STORE_AUDIT.md S1's original
+        // motivation: a corrupted or foreign header must be refused before
+        // a bogus page_size can drive any later offset calculation).
+        let header = Header::decode(&bytes)?;
         let header = Arc::new(header);
         // Phase 6: `log_file` is the handle through which the WAL segments
         // are found (its namespace: the directory for a real file). Every
@@ -2229,7 +2397,11 @@ where
         Ok(nm)
     }
 
-    fn create_core_db(name: String, page_size: DBSizeType) -> Result<Self, StoreError> {
+    fn create_core_db(
+        name: String,
+        page_size: DBSizeType,
+        max_index_key_size: DBSizeType,
+    ) -> Result<Self, StoreError> {
         // STORE_AUDIT.md S4: create(true) opens-or-creates, so Db::create
         // on an already-existing path silently reopened it, then
         // unconditionally overwrote its header with page_count=0 and
@@ -2258,6 +2430,7 @@ where
             last_checkpoint: timestamp(),
             counter: 1,
             checkpoint_lsn: 0,
+            max_index_key_size,
             header_checksum: 0,
         };
         header.seal();
@@ -7943,6 +8116,89 @@ mod tests {
         let (f, l) = db.close().unwrap();
         tamper_header(&f, |hdr| {
             hdr.first_page_offset = 4;
+            hdr.seal();
+        });
+        let result = TestDB::open_using("txn_test.db", f, l);
+        assert!(
+            matches!(result, Err(StoreError::HeaderCorruption(_))),
+            "expected HeaderCorruption, got {:?}",
+            result.err()
+        );
+    }
+
+    // Persistence versioning Stage 3: downgrades a real, freshly-closed
+    // database's on-disk header to the pre-Stage-3 (format_version 3) shape
+    // — no max_index_key_size field at all, sealed with THAT version's own
+    // (frozen) checksum formula — the actual proof this stage's own
+    // versioning works: a v3 file opens with the default, not an error.
+    #[test]
+    fn test_header_decodes_pre_stage3_v3_fixture_with_default_key_size() {
+        use super::{DEFAULT_MAX_INDEX_KEY_SIZE, HEADER_FORMAT_VERSION, HeaderV3Shape};
+
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        let mut buf = vec![0u8; 128];
+        f.pread(&mut buf, 0).unwrap();
+        let current: Header = postcard::from_bytes(&buf).unwrap();
+        let mut v3 = HeaderV3Shape {
+            magic: current.magic,
+            format_version: 3,
+            first_page_offset: current.first_page_offset,
+            page_count: current.page_count,
+            page_size: current.page_size,
+            last_checkpoint: current.last_checkpoint,
+            counter: current.counter,
+            checkpoint_lsn: current.checkpoint_lsn,
+            header_checksum: 0,
+        };
+        v3.header_checksum = crate::page::fnv1a_32(&v3.checksum_input());
+        let bytes = postcard::to_allocvec(&v3).unwrap();
+        f.pwrite(&bytes, 0).unwrap();
+
+        let db2 = TestDB::open_using("txn_test.db", f, l).unwrap();
+        assert_eq!(db2.header.max_index_key_size, DEFAULT_MAX_INDEX_KEY_SIZE);
+        assert_eq!(db2.header.format_version, HEADER_FORMAT_VERSION);
+        assert_eq!(db2.header.page_count, current.page_count);
+        assert_eq!(db2.header.counter, current.counter);
+    }
+
+    #[test]
+    fn test_header_decode_rejects_a_v3_fixture_with_a_bad_checksum() {
+        use super::HeaderV3Shape;
+
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        let mut buf = vec![0u8; 128];
+        f.pread(&mut buf, 0).unwrap();
+        let current: Header = postcard::from_bytes(&buf).unwrap();
+        let v3 = HeaderV3Shape {
+            magic: current.magic,
+            format_version: 3,
+            first_page_offset: current.first_page_offset,
+            page_count: current.page_count,
+            page_size: current.page_size,
+            last_checkpoint: current.last_checkpoint,
+            counter: current.counter,
+            checkpoint_lsn: current.checkpoint_lsn,
+            header_checksum: 0xDEAD_BEEF, // wrong on purpose
+        };
+        let bytes = postcard::to_allocvec(&v3).unwrap();
+        f.pwrite(&bytes, 0).unwrap();
+
+        let result = TestDB::open_using("txn_test.db", f, l);
+        assert!(
+            matches!(result, Err(StoreError::HeaderCorruption(_))),
+            "expected HeaderCorruption, got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_header_decode_rejects_an_unrecognized_format_version() {
+        let (db, _tid) = make_db_with_table();
+        let (f, l) = db.close().unwrap();
+        tamper_header(&f, |hdr| {
+            hdr.format_version = 99;
             hdr.seal();
         });
         let result = TestDB::open_using("txn_test.db", f, l);

@@ -1539,7 +1539,7 @@ mod tests {
 
     fn make_header(page_size: u64) -> Arc<Header> {
         let mut v = vec![0x53u8, 0x65];
-        v.extend_from_slice(&3u32.to_le_bytes()); // format_version
+        v.extend_from_slice(&4u32.to_le_bytes()); // format_version (persistence versioning Stage 3)
         v.extend_from_slice(&0u64.to_le_bytes()); // first_page_offset
         v.extend_from_slice(&FIRST_USER_PAGE.to_le_bytes()); // page_count
         v.extend_from_slice(&page_size.to_le_bytes());
@@ -1549,6 +1549,7 @@ mod tests {
         v.extend_from_slice(&postcard::to_allocvec(&0u128).unwrap());
         v.extend_from_slice(&1u64.to_le_bytes()); // counter (phase 1)
         v.extend_from_slice(&0u64.to_le_bytes()); // checkpoint_lsn (phase 6)
+        v.extend_from_slice(&512u64.to_le_bytes()); // max_index_key_size (Stage 3)
         // header_checksum (STORE_AUDIT.md S1) — never validated on this
         // direct PageBuffer-construction path (only Db::open_using calls
         // Header::validate), so a placeholder value is fine here.
