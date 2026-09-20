@@ -22,6 +22,7 @@ use crate::{
     source::{ProjectableField, QueryStats, Source, join::JoinType, merge_stats},
 };
 
+#[allow(unused)]
 pub(crate) struct HashedSource<F: DBFile + 'static> {
     sources: Vec<Box<dyn Source>>,
     capacity: usize,
@@ -158,9 +159,23 @@ impl<F: DBFile + 'static> HashedSource<F> {
                     JoinType::Right => JoinType::Left,
                     other => other,
                 };
-                (right_source, right_fields, left_source, left_fields, mirrored, true)
+                (
+                    right_source,
+                    right_fields,
+                    left_source,
+                    left_fields,
+                    mirrored,
+                    true,
+                )
             } else {
-                (left_source, left_fields, right_source, right_fields, join_type, false)
+                (
+                    left_source,
+                    left_fields,
+                    right_source,
+                    right_fields,
+                    join_type,
+                    false,
+                )
             }
         };
         // Size the table from the BUILD side — `left_source` here, whichever
@@ -253,7 +268,8 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // Slots per page for a run of this record size; the run only supplies
     // its page data size. Asserts at least one fits.
     fn slots_per_page(run: &Run<F>, record_size: usize) -> usize {
-        let records_per_page = run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
+        let records_per_page =
+            run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
         assert!(
             records_per_page > 0,
             "a single page must be able to hold at least one hash slot"
@@ -1554,7 +1570,11 @@ mod tests {
         };
         let build = |with_stats: bool| -> HashedSource<MemFile> {
             let left: Box<dyn Source> = Box::new(VecSource::new(&["id", "val"], rows(n)));
-            let left: Box<dyn Source> = if with_stats { Box::new(WithRowCount(left, n)) } else { left };
+            let left: Box<dyn Source> = if with_stats {
+                Box::new(WithRowCount(left, n))
+            } else {
+                left
+            };
             HashedSource::new(
                 left,
                 Box::new(VecSource::new(&["id", "val"], rows(1))),
@@ -1571,13 +1591,19 @@ mod tests {
         let initial = sized.capacity;
         while sized.next().unwrap().is_some() {}
         assert_eq!(sized.count, n);
-        assert_eq!(sized.capacity, initial, "a correctly pre-sized build must never rehash");
+        assert_eq!(
+            sized.capacity, initial,
+            "a correctly pre-sized build must never rehash"
+        );
 
         let mut unsized_ = build(false);
         let initial = unsized_.capacity;
         while unsized_.next().unwrap().is_some() {}
         assert_eq!(unsized_.count, n);
-        assert!(unsized_.capacity > initial, "with no stats the build has to grow by rehashing");
+        assert!(
+            unsized_.capacity > initial,
+            "with no stats the build has to grow by rehashing"
+        );
     }
 
     // The hash table lives in the database's scratch pool, which spills to its
@@ -1614,6 +1640,10 @@ mod tests {
         assert_eq!(db.page_count(), main_before);
         drop(join);
         assert_eq!(db.stats().temp.live_pages, 0);
-        assert_eq!(db.stats().temp.file_bytes, 0, "the file is given back once idle");
+        assert_eq!(
+            db.stats().temp.file_bytes,
+            0,
+            "the file is given back once idle"
+        );
     }
 }

@@ -24,19 +24,16 @@ use crate::logger::write_log_header;
 use crate::logger::{Segment, list_segments, segment_path, segment_prefix};
 use crate::maintenance::Maintenance;
 use crate::memfile::MemFile;
-use crate::page::Page;
-use std::ops::Bound;
-use crate::valueitem::IndexKey;
 use crate::page::PageId;
 use crate::run::Run;
-use crate::table::Table;
-use crate::temppool::{DEFAULT_TEMP_CACHE_BYTES, TempPool, TempStats};
 use crate::systempages::{self, SystemKind};
+use crate::table::Table;
 use crate::table::TableIdType;
 use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
 use crate::tables::bplustree::Decision;
 use crate::tables::bplustree::Written;
+use crate::temppool::{DEFAULT_TEMP_CACHE_BYTES, TempPool, TempStats};
 use crate::tuple::DBIdType;
 use crate::tuple::Tuple;
 use crate::txn::ConflictPolicy;
@@ -45,6 +42,7 @@ use crate::txn::TransactionId;
 use crate::txn::TransactionManager;
 use crate::txn::TxnSink;
 use crate::utils::shardedmap::ShardedMap;
+use crate::valueitem::IndexKey;
 use crate::version::Tombstone;
 use crate::version::VersionStore;
 use log::LevelFilter;
@@ -67,6 +65,7 @@ use std::fs::TryLockError;
 use std::fs::remove_file;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -1820,6 +1819,7 @@ where
     // operation, not just the lookup — binding it to a local variable (not
     // `_`) for the rest of the calling function's body is what actually
     // provides the protection.
+    #[allow(clippy::type_complexity)]
     fn table_by_id_guarded(
         &self,
         id: TableIdType,
@@ -2700,11 +2700,8 @@ where
         }
         let mut chains = self.system_chains.lock();
 
-        let catalog = systempages::read_chain(
-            &self.buffer,
-            SYSTEM_TABLE_PAGE.into(),
-            SystemKind::Catalog,
-        )?;
+        let catalog =
+            systempages::read_chain(&self.buffer, SYSTEM_TABLE_PAGE.into(), SystemKind::Catalog)?;
         let mut tables = self.tables.write();
         for bytes in &catalog.payloads {
             let t: BPlusTree<F> = if catalog.legacy {
@@ -3431,7 +3428,8 @@ mod tests {
     fn test_run_append_and_cursor_preserves_order_across_pages() {
         // Small page size so a handful of records forces at least one
         // page-chain extension, not just a single-page happy path.
-        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("run_order.db", 512, 8).unwrap();
+        let db: Arc<TestDB> =
+            TestDB::create_with_page_size_and_max_index_key_size("run_order.db", 512, 8).unwrap();
         let mut run = db.create_run().unwrap();
         let records: Vec<Vec<u8>> = (0..50).map(|i: u32| i.to_be_bytes().to_vec()).collect();
         for r in &records {
@@ -3451,14 +3449,19 @@ mod tests {
 
     #[test]
     fn test_dropping_a_run_frees_its_pages_once_nothing_else_references_them() {
-        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("run_drop_frees.db", 512, 8).unwrap();
+        let db: Arc<TestDB> =
+            TestDB::create_with_page_size_and_max_index_key_size("run_drop_frees.db", 512, 8)
+                .unwrap();
         let main_pages = db.page_count();
         let mut run = db.create_run().unwrap();
         for i in 0..50u32 {
             run.append(&i.to_be_bytes()).unwrap();
         }
         let pages = run.page_count() as u64;
-        assert!(pages >= 2, "a 50-record run at a 512-byte page size must span more than one page");
+        assert!(
+            pages >= 2,
+            "a 50-record run at a 512-byte page size must span more than one page"
+        );
         assert_eq!(db.stats().temp.live_pages, pages);
 
         drop(run);
@@ -3479,8 +3482,12 @@ mod tests {
         // does (see RunPages) — dropping the Run it came from must not
         // free pages the cursor is still reading, and the pages must
         // finally free once the cursor itself is also dropped.
-        let db: Arc<TestDB> =
-            TestDB::create_with_page_size_and_max_index_key_size("run_cursor_keeps_alive.db", 512, 8).unwrap();
+        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size(
+            "run_cursor_keeps_alive.db",
+            512,
+            8,
+        )
+        .unwrap();
         let mut run = db.create_run().unwrap();
         run.append(b"a").unwrap();
         run.append(b"b").unwrap();
@@ -3517,15 +3524,25 @@ mod tests {
         db.set_temp_cache_bytes(4 * 512);
         let mut run = db.create_run().unwrap();
         run.append(b"small").unwrap();
-        assert!(!exists(&db), "a run that fits in the cache never creates the file");
+        assert!(
+            !exists(&db),
+            "a run that fits in the cache never creates the file"
+        );
 
         for i in 0..2000u32 {
             run.append(&i.to_be_bytes()).unwrap();
         }
         assert!(exists(&db));
         let s = db.stats().temp;
-        assert!(s.spills > 0 && s.file_bytes > 0 && s.cached_pages <= 4, "{s:?}");
-        assert_eq!(db.page_count(), main_pages, "scratch pages never grow the database");
+        assert!(
+            s.spills > 0 && s.file_bytes > 0 && s.cached_pages <= 4,
+            "{s:?}"
+        );
+        assert_eq!(
+            db.page_count(),
+            main_pages,
+            "scratch pages never grow the database"
+        );
 
         let mut cursor = run.cursor().unwrap();
         let mut n = 0;
@@ -3556,7 +3573,11 @@ mod tests {
         let tmp = format!("{name}.tmp");
         let (file, log) = db.close().unwrap();
         // As if a crash had left scratch data behind.
-        file.open_sibling(&tmp, std::fs::OpenOptions::new().create(true).write(true).clone()).unwrap();
+        file.open_sibling(
+            &tmp,
+            std::fs::OpenOptions::new().create(true).write(true).clone(),
+        )
+        .unwrap();
         assert_eq!(file.list_siblings(&tmp).unwrap().len(), 1);
         let db = TestDB::open_using(name, file.do_clone().unwrap(), log).unwrap();
         assert!(file.list_siblings(&tmp).unwrap().is_empty());
@@ -7387,7 +7408,9 @@ mod tests {
     fn test_concurrent_inserts_at_small_page_size_do_not_panic_or_lose_rows() {
         const THREADS: u64 = 16;
         const ROWS_PER_THREAD: u64 = 40;
-        let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("small_page_race.db", 512, 8).unwrap();
+        let db: Arc<TestDB> =
+            TestDB::create_with_page_size_and_max_index_key_size("small_page_race.db", 512, 8)
+                .unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         let mut handles = Vec::new();
         for thread_idx in 0..THREADS {
@@ -7855,7 +7878,10 @@ mod tests {
                 .create_generator(format!("sequence_number_{i:05}"), Some(i))
                 .unwrap();
         }
-        assert!(chain_len(&db, SystemKind::Generator) == 0, "not written yet");
+        assert!(
+            chain_len(&db, SystemKind::Generator) == 0,
+            "not written yet"
+        );
         let db2 = reopen_after_checkpoint(&db, "stage6_generator_grows.db");
         assert!(
             chain_len(&db, SystemKind::Generator) >= 1,
@@ -7902,9 +7928,17 @@ mod tests {
             chain_len(&db, SystemKind::FreeList)
         );
         // And none of the chain's own pages can be handed out again.
-        let chain: std::collections::HashSet<_> =
-            db2.system_chains.lock()[SystemKind::FreeList.index()].iter().copied().collect();
-        assert!(db2.buffer.get_free_pages().iter().all(|p| !chain.contains(p)));
+        let chain: std::collections::HashSet<_> = db2.system_chains.lock()
+            [SystemKind::FreeList.index()]
+        .iter()
+        .copied()
+        .collect();
+        assert!(
+            db2.buffer
+                .get_free_pages()
+                .iter()
+                .all(|p| !chain.contains(p))
+        );
     }
 
     #[test]
@@ -7925,9 +7959,16 @@ mod tests {
             db.buffer.alloc_page(false).unwrap();
         }
         let db2 = reopen_after_checkpoint(&db, "stage6_never_shrinks.db");
-        assert_eq!(chain_len(&db, SystemKind::FreeList), grown, "chains only grow");
+        assert_eq!(
+            chain_len(&db, SystemKind::FreeList),
+            grown,
+            "chains only grow"
+        );
         assert_eq!(chain_len(&db2, SystemKind::FreeList), grown);
-        assert_eq!(db2.buffer.get_free_pages().len(), db.buffer.get_free_pages().len());
+        assert_eq!(
+            db2.buffer.get_free_pages().len(),
+            db.buffer.get_free_pages().len()
+        );
     }
 
     // The exact pre-Stage-6 write path, kept here as the definition of "the
@@ -7939,8 +7980,11 @@ mod tests {
         let overhead = db.buffer.page_overhead();
         let page = crate::page::Page::new_pinned(page_size, overhead);
         for (i, t) in db.tables.read().values().enumerate() {
-            page.add_tuple(Tuple::new(i as u64, &postcard::to_allocvec(&t.table).unwrap()))
-                .unwrap();
+            page.add_tuple(Tuple::new(
+                i as u64,
+                &postcard::to_allocvec(&t.table).unwrap(),
+            ))
+            .unwrap();
         }
         db.buffer.write_page(0usize.into(), &page).unwrap();
         let page = crate::page::Page::new_pinned(page_size, overhead);
@@ -7965,13 +8009,21 @@ mod tests {
         let db = TestDB::create("stage6_legacy.db").unwrap();
         let ta = db.create_table("table_a".to_string()).unwrap();
         let tb = db.create_table("table_b".to_string()).unwrap();
-        db.get_generator().create_generator("legacy_seq", Some(77)).unwrap();
-        let spare: Vec<_> = (0..10).map(|_| db.buffer.alloc_page(false).unwrap()).collect();
+        db.get_generator()
+            .create_generator("legacy_seq", Some(77))
+            .unwrap();
+        let spare: Vec<_> = (0..10)
+            .map(|_| db.buffer.alloc_page(false).unwrap())
+            .collect();
         for p in spare {
             db.buffer.reset_and_free_page(p, None).unwrap();
         }
         write_legacy_system_pages(&db);
-        assert!(read_chain(&db.buffer, 0usize.into(), SystemKind::Catalog).unwrap().legacy);
+        assert!(
+            read_chain(&db.buffer, 0usize.into(), SystemKind::Catalog)
+                .unwrap()
+                .legacy
+        );
         sync_header_without_truncating_logs(&db);
         let expected_free = db.buffer.get_free_pages();
 
@@ -7980,11 +8032,19 @@ mod tests {
         assert_eq!(db2.table_id_by_name("table_a").unwrap(), Some(ta));
         assert_eq!(db2.table_id_by_name("table_b").unwrap(), Some(tb));
         assert!(
-            db2.get_generator().get_values().unwrap().iter().any(|(n, v)| n == "legacy_seq" && *v >= 77)
+            db2.get_generator()
+                .get_values()
+                .unwrap()
+                .iter()
+                .any(|(n, v)| n == "legacy_seq" && *v >= 77)
         );
         assert_eq!(db2.buffer.get_free_pages(), expected_free);
         for kind in SystemKind::ALL {
-            assert_eq!(chain_len(&db2, kind), 0, "a legacy layout has no continuation pages");
+            assert_eq!(
+                chain_len(&db2, kind),
+                0,
+                "a legacy layout has no continuation pages"
+            );
         }
 
         // The next checkpoint rewrites all three in the versioned layout,
@@ -7992,7 +8052,10 @@ mod tests {
         db2.checkpoint().unwrap();
         for kind in SystemKind::ALL {
             let head = [0usize, 1, 2][kind.index()];
-            assert!(!read_chain(&db2.buffer, head.into(), kind).unwrap().legacy, "{kind:?}");
+            assert!(
+                !read_chain(&db2.buffer, head.into(), kind).unwrap().legacy,
+                "{kind:?}"
+            );
         }
         let (f, l) = crash_clone(&db2);
         let db3 = TestDB::open_using("stage6_legacy.db", f, l).unwrap();
@@ -8027,10 +8090,15 @@ mod tests {
         assert_eq!(hex, LEGACY_TABLE_HEX);
         // And the versioned catalog entry is exactly [u16 version][that].
         let entry = crate::systempages::encode_catalog_entry(&legacy_table()).unwrap();
-        assert_eq!(&entry[..2], &crate::systempages::CATALOG_PAYLOAD_VERSION.to_le_bytes());
+        assert_eq!(
+            &entry[..2],
+            &crate::systempages::CATALOG_PAYLOAD_VERSION.to_le_bytes()
+        );
         assert_eq!(&entry[2..], &bytes[..]);
         assert_eq!(
-            crate::systempages::decode_catalog_entry(&entry).unwrap().name,
+            crate::systempages::decode_catalog_entry(&entry)
+                .unwrap()
+                .name,
             "t"
         );
     }
@@ -8056,7 +8124,8 @@ mod tests {
             .err()
             .expect("an unrecognized chain version must not open");
         assert!(
-            err.to_string().contains("unsupported system page chain version 99"),
+            err.to_string()
+                .contains("unsupported system page chain version 99"),
             "got {err}"
         );
     }
@@ -8091,12 +8160,22 @@ mod tests {
         let reachable = db.table_by_id(tid).unwrap().table.first_data_page;
         db.checkpoint().unwrap(); // log now empty: nothing above the floor
         let page = crate::page::Page::new_pinned(db.header.page_size, db.buffer.page_overhead());
-        page.add_tuple(Tuple::new(0, &postcard::to_allocvec(&vec![reachable]).unwrap())).unwrap();
-        db.buffer.write_page(crate::constant::FREE_PAGE_TABLE_PAGE.into(), &page).unwrap();
+        page.add_tuple(Tuple::new(
+            0,
+            &postcard::to_allocvec(&vec![reachable]).unwrap(),
+        ))
+        .unwrap();
+        db.buffer
+            .write_page(crate::constant::FREE_PAGE_TABLE_PAGE.into(), &page)
+            .unwrap();
         sync_header_without_truncating_logs(&db);
         let (f, l) = crash_clone(&db);
         let db2 = TestDB::open_using("clean_open_no_reconcile.db", f, l).unwrap();
-        assert_eq!(db2.recovered_records.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            db2.recovered_records
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
         assert!(
             db2.buffer.get_free_pages().contains(&reachable),
             "with nothing to replay the checkpointed list is trusted as-is (no full-table walk)"
@@ -8144,7 +8223,10 @@ mod tests {
         use crate::logger::Operation;
         let (db, tid) = make_db_with_table();
         db.checkpoint().unwrap();
-        assert!(txn_ops_in_wal(&db).is_empty(), "baseline: a fresh checkpoint leaves no txn records");
+        assert!(
+            txn_ops_in_wal(&db).is_empty(),
+            "baseline: a fresh checkpoint leaves no txn records"
+        );
 
         // A dropped read-only guard (what every SELECT ends in) ...
         let t = db.begin().unwrap();
@@ -8165,7 +8247,10 @@ mod tests {
 
         let ops = txn_ops_in_wal(&db);
         assert!(
-            matches!(ops.as_slice(), [Operation::Add { .. }, Operation::Commit(_)]),
+            matches!(
+                ops.as_slice(),
+                [Operation::Add { .. }, Operation::Commit(_)]
+            ),
             "only the writer's Add + Commit may be logged, got {ops:?}"
         );
     }
@@ -8184,7 +8269,10 @@ mod tests {
         db.commit(w2).unwrap();
         wait_for_commit_record(&db);
         let ops = txn_ops_in_wal(&db);
-        assert!(ops.iter().any(|o| matches!(o, Operation::Rollback(_))), "got {ops:?}");
+        assert!(
+            ops.iter().any(|o| matches!(o, Operation::Rollback(_))),
+            "got {ops:?}"
+        );
     }
 
     // The read-only skip must not change what a reader sees: a read-only
@@ -8200,7 +8288,11 @@ mod tests {
         assert_eq!(db.tx_mgr.active_count(), before + 1);
         assert!(db.find(tid, DBIdType::Int(1), &t).unwrap().is_some());
         db.commit(t).unwrap();
-        assert_eq!(db.tx_mgr.active_count(), before, "a committed read-only txn must not stay active");
+        assert_eq!(
+            db.tx_mgr.active_count(),
+            before,
+            "a committed read-only txn must not stay active"
+        );
     }
 
     // --- lazy tail discovery (was: a full decode of every data page at open) ---
@@ -8222,8 +8314,12 @@ mod tests {
     fn insert_rows(db: &Arc<TestDB>, tid: TableIdType, ids: std::ops::Range<u64>) {
         let t = db.begin().unwrap();
         for i in ids {
-            db.insert(tid, row(i, format!("row-{i:06}-padding-to-take-space").as_bytes()), &t)
-                .unwrap();
+            db.insert(
+                tid,
+                row(i, format!("row-{i:06}-padding-to-take-space").as_bytes()),
+                &t,
+            )
+            .unwrap();
         }
         db.commit(t).unwrap();
     }
@@ -8243,11 +8339,19 @@ mod tests {
         let tid = db.create_table("t".to_string()).unwrap();
         insert_rows(&db, tid, 0..400);
         let tail = true_tail(&db, tid);
-        assert_ne!(tail, db.table_by_id(tid).unwrap().table.first_data_page, "needs a multi-page chain");
+        assert_ne!(
+            tail,
+            db.table_by_id(tid).unwrap().table.first_data_page,
+            "needs a multi-page chain"
+        );
 
         let db2 = reopen_after_checkpoint(&db, "tail_lazy_reads.db");
         let tree = db2.table_by_id(tid).unwrap();
-        assert_eq!(tree.tail_state(), (false, tree.table.first_data_page), "open must not walk the chain");
+        assert_eq!(
+            tree.tail_state(),
+            (false, tree.table.first_data_page),
+            "open must not walk the chain"
+        );
 
         // Reads — a scan and point lookups — must not trigger discovery.
         assert_eq!(count_rows(&db2, tid), 400);
@@ -8255,7 +8359,11 @@ mod tests {
         assert!(db2.find(tid, DBIdType::Int(5), &t).unwrap().is_some());
         assert!(db2.find(tid, DBIdType::Int(399), &t).unwrap().is_some());
         drop(t);
-        assert_eq!(tree.tail_state(), (false, tree.table.first_data_page), "reads must not walk the chain");
+        assert_eq!(
+            tree.tail_state(),
+            (false, tree.table.first_data_page),
+            "reads must not walk the chain"
+        );
     }
 
     #[test]
@@ -8269,7 +8377,11 @@ mod tests {
         insert_rows(&db2, tid, 400..401);
         let (known, hint) = tree.tail_state();
         assert!(known);
-        assert_eq!(hint, true_tail(&db2, tid), "the hint must be the chain's real end, not the start");
+        assert_eq!(
+            hint,
+            true_tail(&db2, tid),
+            "the hint must be the chain's real end, not the start"
+        );
         assert_ne!(hint, tree.table.first_data_page);
         assert_eq!(count_rows(&db2, tid), 401);
     }
@@ -8295,9 +8407,15 @@ mod tests {
         assert_eq!(count_rows(&db2, tid), 400 + 800);
         let t = db2.begin().unwrap();
         for id in (0..400).chain(1000..1800) {
-            assert!(db2.find(tid, DBIdType::Int(id), &t).unwrap().is_some(), "row {id} lost");
+            assert!(
+                db2.find(tid, DBIdType::Int(id), &t).unwrap().is_some(),
+                "row {id} lost"
+            );
         }
-        assert_eq!(db2.table_by_id(tid).unwrap().tail_state().1, true_tail(&db2, tid));
+        assert_eq!(
+            db2.table_by_id(tid).unwrap().tail_state().1,
+            true_tail(&db2, tid)
+        );
     }
 
     // STORE_AUDIT.md S7 (part 1): validate_table_name only checks length

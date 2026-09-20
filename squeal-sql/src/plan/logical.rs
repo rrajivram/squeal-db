@@ -3,10 +3,9 @@ use std::{marker::PhantomData, sync::Arc, time::Instant};
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
-    keyword::No,
     query::{
-        self, Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause,
-        SelectItem, SetOperand, TableFactor, TableWithJoins,
+        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
+        SetOperand, TableFactor,
     },
     token::Comma,
     utils::Seq,
@@ -20,7 +19,7 @@ use crate::{
     ds::stack::Stack,
     error::SchemaError,
     optim::table_stats::TableStat,
-    plan::{eval::EvalExpr, funcs::FuncTrait, memory::QueryMemory},
+    plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
         ProjectableField, Source,
@@ -558,7 +557,7 @@ where
                             f.clone(),
                             sid,
                             fid,
-                            EvalExpr::Value(EvalExpr::flat_position(&tables, sid, fid)),
+                            EvalExpr::Value(EvalExpr::flat_position(tables, sid, fid)),
                         ));
                     }
                 }
@@ -578,7 +577,7 @@ where
                             f.clone(),
                             pos,
                             fid,
-                            EvalExpr::Value(EvalExpr::flat_position(&tables, pos, fid)),
+                            EvalExpr::Value(EvalExpr::flat_position(tables, pos, fid)),
                         ));
                     }
                     return Ok(v);

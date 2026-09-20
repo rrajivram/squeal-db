@@ -311,7 +311,7 @@ where
                     validate_identifier(what, &c.name.value)?;
                 }
                 sql_parser::Statement::Insert(insert) => validate_insert(insert)?,
-                sql_parser::Statement::Select(query) => {
+                sql_parser::Statement::Select(_query) => {
                     //parse_select_star(query)?;
                 }
                 sql_parser::Statement::AlterTable(alter) => {
@@ -892,7 +892,7 @@ where
 // LIMIT/OFFSET, set operations, explicit column lists, WHERE, DISTINCT,
 // HAVING, GROUP BY, joins/multiple FROM tables, and subqueries/aliases
 // in FROM.
-fn parse_select_star(query: &sql_parser::Query) -> Result<sql_parser::ObjectName, SchemaError> {
+/* fn parse_select_star(query: &sql_parser::Query) -> Result<sql_parser::ObjectName, SchemaError> {
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
             "SELECT only supports \"SELECT * FROM <table>\" right now — {what} is not supported yet"
@@ -957,7 +957,7 @@ fn parse_select_star(query: &sql_parser::Query) -> Result<sql_parser::ObjectName
         sql_parser::query::TableFactor::Derived { .. } => unsupported("subqueries in FROM"),
     }
 }
-
+ */
 // What Statement::execute's AlterTable arm actually dispatches on —
 // parse_alter_table's own output, carrying just enough to call the
 // matching Schema::add_column/drop_column/rename_column/
@@ -1099,40 +1099,34 @@ mod dummy_tests {
         type Break = ();
 
         fn post_visit_expr(&mut self, _expr: &Expr) -> std::ops::ControlFlow<Self::Break> {
-            println!("post visit expr: {:?}", _expr);
-            println!("");
+            println!("post visit expr: {:?}\n", _expr);
             ControlFlow::Continue(())
         }
 
         fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-            println!("post visit query: {:?}", _query);
-            println!("");
+            println!("post visit query: {:?}\n", _query);
             ControlFlow::Continue(())
         }
 
         fn post_visit_relation(&mut self, _relation: &ObjectName) -> ControlFlow<Self::Break> {
-            println!("post visit rela: {:?}", _relation);
-            println!("");
+            println!("post visit rela: {:?},\n", _relation);
             ControlFlow::Continue(())
         }
 
         fn post_visit_select(&mut self, _select: &SelectCore) -> ControlFlow<Self::Break> {
-            println!("post visit select: {:?}", _select);
-            println!("");
+            println!("post visit select: {:?}\n", _select);
             ControlFlow::Continue(())
         }
 
         fn post_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
-            println!("post visit stmt: {:?}", _statement);
-            println!("");
+            println!("post visit stmt: {:?}\n", _statement);
             ControlFlow::Continue(())
         }
         fn post_visit_table_factor(
             &mut self,
             _table_factor: &TableFactor,
         ) -> ControlFlow<Self::Break> {
-            println!("post visit table_factor: {:?}", _table_factor);
-            println!("");
+            println!("post visit table_factor: {:?}\n", _table_factor);
             ControlFlow::Continue(())
         }
 
@@ -1140,38 +1134,32 @@ mod dummy_tests {
             &mut self,
             _lit: &sql_parser::literal::Literal,
         ) -> ControlFlow<Self::Break> {
-            println!("post visit value: {:?}", _lit);
-            println!("");
+            println!("post visit value: {:?}\n", _lit);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_expr(&mut self, _expr: &Expr) -> ControlFlow<Self::Break> {
-            println!("pre visit expr: {:?}", _expr);
-            println!("");
+            println!("pre visit expr: {:?}\n", _expr);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
-            println!("pre visit query: {:?}", _query);
-            println!("");
+            println!("pre visit query: {:?}\n", _query);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_relation(&mut self, _relation: &ObjectName) -> ControlFlow<Self::Break> {
-            println!("pre visit rela: {:?}", _relation);
-            println!("");
+            println!("pre visit rela: {:?}\n", _relation);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_select(&mut self, _select: &SelectCore) -> ControlFlow<Self::Break> {
-            println!("pre visit select: {:?}", _select);
-            println!("");
+            println!("pre visit select: {:?}\n", _select);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<Self::Break> {
-            println!("pre visit statement: {:?}", _statement);
-            println!("");
+            println!("pre visit statement: {:?}\n", _statement);
             ControlFlow::Continue(())
         }
 
@@ -1179,14 +1167,12 @@ mod dummy_tests {
             &mut self,
             _table_factor: &TableFactor,
         ) -> ControlFlow<Self::Break> {
-            println!("pre visit t_factor: {:?}", _table_factor);
-            println!("");
+            println!("pre visit t_factor: {:?}\n", _table_factor);
             ControlFlow::Continue(())
         }
 
         fn pre_visit_literal(&mut self, _lit: &Literal) -> ControlFlow<Self::Break> {
-            println!("pre visit valye: {:?}", _lit);
-            println!("");
+            println!("pre visit valye: {:?}\n", _lit);
             ControlFlow::Continue(())
         }
     }
@@ -1194,7 +1180,7 @@ mod dummy_tests {
     fn exec(sql: &str) {
         let stmt = sql_parser::parse_sql(sql).unwrap();
         let mut v = V;
-        stmt[0].visit(&mut v);
+        let _ = stmt[0].visit(&mut v);
         println!("\n");
         println!("{:?}", stmt[0]);
     }
@@ -1297,6 +1283,6 @@ mod dummy_tests {
 
     #[test]
     fn test3() {
-        let conn = get_conn();
+        let _conn = get_conn();
     }
 }

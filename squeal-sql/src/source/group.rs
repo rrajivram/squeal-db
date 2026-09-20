@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use sql_parser::keyword::Query;
 use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{

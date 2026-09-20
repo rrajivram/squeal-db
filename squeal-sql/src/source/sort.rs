@@ -2,19 +2,16 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, VecDeque},
     fmt::Debug,
-    iter,
-    slice::Iter,
     sync::Arc,
     time::Instant,
     vec::IntoIter,
 };
 
 use postcard::{from_bytes, to_allocvec};
-use sql_parser::{Expr, keyword::No, query::OrderByClause};
+use sql_parser::{Expr, query::OrderByClause};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
-    error::StoreError,
     run::{Run, RunCursor},
     tuple::Tuple,
     valueitem::{IndexKey, ValueItem},
@@ -60,6 +57,7 @@ struct CrateItem<'a> {
 }
 
 #[derive(Debug)]
+#[allow(unused)]
 struct CrateHeap<'a> {
     heap: BinaryHeap<CrateItem<'a>>,
     source: Vec<SortField>,
@@ -359,7 +357,7 @@ where
         while let Some(r) = self.source.next()? {
             total_count += 1;
             current_run.push(r);
-            if current_run.len() % records_per_page != 0 {
+            if !current_run.len().is_multiple_of(records_per_page) {
                 continue;
             }
             if mem_filled {
@@ -786,7 +784,7 @@ mod tests {
     #[test]
     fn test_sorting_a_vec_end_to_end_matches_expected_order() {
         let order = vec![field(0, true, true)]; // ASC, NULLS FIRST
-        let keys = vec![
+        let keys = [
             key(&[ValueItem::Integer(3)]),
             key(&[ValueItem::Null]),
             key(&[ValueItem::Integer(1)]),

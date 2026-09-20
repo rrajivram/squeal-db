@@ -1457,10 +1457,7 @@ fn test_execute_select_where_filters_by_integer_comparison() {
     let (_, rows) = take_streaming_result(&mut stmt, 0);
     assert_eq!(
         rows,
-        vec![
-            vec![ValueItem::Integer(2)],
-            vec![ValueItem::Integer(3)],
-        ]
+        vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)],]
     );
 }
 
@@ -1495,14 +1492,20 @@ fn test_execute_select_where_with_and_or() {
         .unwrap();
     stmt.execute().unwrap();
     let (_, rows) = take_streaming_result(&mut stmt, 0);
-    assert_eq!(rows, vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]
+    );
 
     let mut stmt = c
         .create_statement("select * from t where id = 1 or id = 5")
         .unwrap();
     stmt.execute().unwrap();
     let (_, rows) = take_streaming_result(&mut stmt, 0);
-    assert_eq!(rows, vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(5)]]);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(5)]]
+    );
 }
 
 #[test]
@@ -1597,7 +1600,12 @@ fn test_execute_select_qualified_columns_across_two_different_tables() {
     let (columns, rows) = take_streaming_result(&mut stmt, 0);
     assert_eq!(
         columns,
-        vec!["id".to_string(), "name".to_string(), "code".to_string(), "label".to_string()]
+        vec![
+            "id".to_string(),
+            "name".to_string(),
+            "code".to_string(),
+            "label".to_string()
+        ]
     );
     assert_eq!(
         rows,
@@ -1631,7 +1639,10 @@ fn test_execute_select_unqualified_ambiguous_column_across_tables_fails() {
     run(&c, "insert into t1 values (1)").unwrap();
     run(&c, "insert into t2 values (2)").unwrap();
     let err = run(&c, "select id from t1, t2").unwrap_err();
-    assert!(matches!(err, SchemaError::AmbiguousFieldError(_)), "got {err:?}");
+    assert!(
+        matches!(err, SchemaError::AmbiguousFieldError(_)),
+        "got {err:?}"
+    );
 }
 
 // ---- LIMIT ----
@@ -1719,7 +1730,11 @@ fn test_show_table_index_lists_primary_key_and_unique_index() {
 #[test]
 fn test_show_table_index_lists_foreign_keys() {
     let c = conn();
-    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table customers (id integer not null, primary key(id))",
+    )
+    .unwrap();
     run(
         &c,
         "create table orders (id integer not null, customer_id integer \
@@ -1735,7 +1750,10 @@ fn test_show_table_index_lists_foreign_keys() {
         .iter()
         .find(|r| matches!(&r[1], ValueItem::Str((s, _)) if s == "FOREIGN KEY"))
         .unwrap_or_else(|| panic!("no FOREIGN KEY row in {rows:?}"));
-    assert_eq!(fk_row[2], ValueItem::Str(("customer_id".into(), DEFAULT_VAR_SIZE as u32)));
+    assert_eq!(
+        fk_row[2],
+        ValueItem::Str(("customer_id".into(), DEFAULT_VAR_SIZE as u32))
+    );
     assert_eq!(
         fk_row[3],
         ValueItem::Str(("-> customers.id".into(), DEFAULT_VAR_SIZE as u32))
@@ -1767,7 +1785,11 @@ fn test_show_table_index_fails_for_a_temp_table() {
 #[test]
 fn test_analyze_table_parses_and_dispatches() {
     let c = conn();
-    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table customers (id integer not null, primary key(id))",
+    )
+    .unwrap();
 
     let mut stmt = c.create_statement("analyze table customers").unwrap();
     stmt.execute().unwrap();
@@ -1795,8 +1817,16 @@ fn test_analyze_table_fails_for_a_temp_table() {
 #[test]
 fn test_analyze_tables_covers_every_table_in_the_current_schema() {
     let c = conn();
-    run(&c, "create table customers (id integer not null, primary key(id))").unwrap();
-    run(&c, "create table orders (id integer not null, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table customers (id integer not null, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "create table orders (id integer not null, primary key(id))",
+    )
+    .unwrap();
 
     let mut stmt = c.create_statement("analyze tables").unwrap();
     stmt.execute().unwrap();
@@ -1811,7 +1841,11 @@ fn test_analyze_tables_covers_every_table_in_the_current_schema() {
 #[test]
 fn test_create_index_unique_succeeds_and_shows_up_in_show_table_index() {
     let c = conn();
-    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, code integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 10)").unwrap();
     run(&c, "insert into t values (2, 20)").unwrap();
     run(&c, "create unique index idx_code on t(code)").unwrap();
@@ -1823,19 +1857,34 @@ fn test_create_index_unique_succeeds_and_shows_up_in_show_table_index() {
         .iter()
         .find(|r| r[0] == ValueItem::Str(("idx_code".into(), DEFAULT_VAR_SIZE as u32)))
         .unwrap_or_else(|| panic!("no idx_code row in {rows:?}"));
-    assert_eq!(row[1], ValueItem::Str(("UNIQUE".into(), DEFAULT_VAR_SIZE as u32)));
+    assert_eq!(
+        row[1],
+        ValueItem::Str(("UNIQUE".into(), DEFAULT_VAR_SIZE as u32))
+    );
 }
 
 #[test]
 fn test_create_unique_index_rejects_existing_duplicate_values() {
     let c = conn();
-    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, code integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 10)").unwrap();
     run(&c, "insert into t values (2, 10)").unwrap();
     let err = run(&c, "create unique index idx_code on t(code)").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
     // Must not leave a half-created index behind.
-    assert!(c.current_schema().unwrap().get_table("t").unwrap().indices.len() == 1);
+    assert!(
+        c.current_schema()
+            .unwrap()
+            .get_table("t")
+            .unwrap()
+            .indices
+            .len()
+            == 1
+    );
 }
 
 #[test]
@@ -1846,7 +1895,11 @@ fn test_create_plain_index_tolerates_and_survives_duplicate_values() {
     // later INSERT adding yet another duplicate must succeed, not hit
     // the backing BPlusTree's own duplicate-key rejection.
     let c = conn();
-    run(&c, "create table t (id integer not null, code integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, code integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 10)").unwrap();
     run(&c, "insert into t values (2, 10)").unwrap();
     run(&c, "create index idx_code on t(code)").unwrap();
@@ -1855,7 +1908,11 @@ fn test_create_plain_index_tolerates_and_survives_duplicate_values() {
     let mut stmt = c.create_statement("select * from t").unwrap();
     stmt.execute().unwrap();
     let (_, rows) = take_streaming_result(&mut stmt, 0);
-    assert_eq!(rows.len(), 3, "all three duplicate-valued rows must survive");
+    assert_eq!(
+        rows.len(),
+        3,
+        "all three duplicate-valued rows must survive"
+    );
 }
 
 #[test]
@@ -1864,7 +1921,15 @@ fn test_create_index_if_not_exists_is_idempotent() {
     run(&c, "create table t (id integer)").unwrap();
     run(&c, "create index idx_id on t(id)").unwrap();
     run(&c, "create index if not exists idx_id on t(id)").unwrap();
-    assert_eq!(c.current_schema().unwrap().get_table("t").unwrap().indices.len(), 1);
+    assert_eq!(
+        c.current_schema()
+            .unwrap()
+            .get_table("t")
+            .unwrap()
+            .indices
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -1909,12 +1974,18 @@ fn test_order_by_without_limit_is_applied() {
     // were a complete no-op. `rank` is deliberately inserted in the
     // OPPOSITE order from `id` so the two orderings can't coincide.
     let c = conn();
-    run(&c, "create table t (id integer not null, rank integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, rank integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 30)").unwrap();
     run(&c, "insert into t values (2, 20)").unwrap();
     run(&c, "insert into t values (3, 10)").unwrap();
 
-    let mut stmt = c.create_statement("select rank from t order by rank").unwrap();
+    let mut stmt = c
+        .create_statement("select rank from t order by rank")
+        .unwrap();
     stmt.execute().unwrap();
     let (_columns, rows) = take_streaming_result(&mut stmt, 0);
     assert_eq!(
@@ -1930,7 +2001,11 @@ fn test_order_by_without_limit_is_applied() {
 #[test]
 fn test_order_by_desc_without_limit_is_applied() {
     let c = conn();
-    run(&c, "create table t (id integer not null, rank integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, rank integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 10)").unwrap();
     run(&c, "insert into t values (2, 20)").unwrap();
     run(&c, "insert into t values (3, 30)").unwrap();
@@ -1955,9 +2030,16 @@ mod join_tests {
     use super::*;
 
     fn setup(c: &Arc<Connection<MemFile>>) {
-        run(c, "create table t1 (id integer not null, name varchar(20), primary key(id))")
-            .unwrap();
-        run(c, "create table t2 (id integer not null, val integer, primary key(id))").unwrap();
+        run(
+            c,
+            "create table t1 (id integer not null, name varchar(20), primary key(id))",
+        )
+        .unwrap();
+        run(
+            c,
+            "create table t2 (id integer not null, val integer, primary key(id))",
+        )
+        .unwrap();
         run(c, "insert into t1 values (1, 'alice')").unwrap();
         run(c, "insert into t1 values (2, 'bob')").unwrap();
         run(c, "insert into t2 values (2, 200)").unwrap();
@@ -2009,7 +2091,10 @@ mod join_tests {
         assert_eq!(columns, vec!["name", "val"]);
         assert_eq!(
             rows,
-            vec![vec![ValueItem::Str(("bob".into(), 20)), ValueItem::Integer(200)]]
+            vec![vec![
+                ValueItem::Str(("bob".into(), 20)),
+                ValueItem::Integer(200)
+            ]]
         );
     }
 
@@ -2018,7 +2103,10 @@ mod join_tests {
         let c = conn();
         setup(&c);
         let err = run(&c, "select id from t1 join t2 on t1.id = t2.id").unwrap_err();
-        assert!(matches!(err, SchemaError::AmbiguousFieldError(_)), "{err:?}");
+        assert!(
+            matches!(err, SchemaError::AmbiguousFieldError(_)),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -2035,7 +2123,10 @@ mod join_tests {
         rows.sort();
         // id=1 has val=50 (excluded); id=2 has val=200 and id=3 has
         // val=300 (both > 100).
-        assert_eq!(rows, vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]);
+        assert_eq!(
+            rows,
+            vec![vec![ValueItem::Integer(2)], vec![ValueItem::Integer(3)]]
+        );
     }
 
     #[test]
@@ -2108,7 +2199,12 @@ mod join_tests {
         assert_eq!(
             rows,
             vec![
-                vec![ValueItem::Null, ValueItem::Null, ValueItem::Integer(3), ValueItem::Integer(300)],
+                vec![
+                    ValueItem::Null,
+                    ValueItem::Null,
+                    ValueItem::Integer(3),
+                    ValueItem::Integer(300)
+                ],
                 vec![
                     ValueItem::Integer(2),
                     ValueItem::Str(("bob".into(), 20)),
@@ -2154,7 +2250,6 @@ mod join_tests {
     // JOIN fails outright instead of falling through to the
     // JoinType::Cross => UnionJoin branch that already exists right
     // below it.
-    #[test]
     // Regression test: JoinSource::new used to call equi_join_fields
     // unconditionally, even for CROSS JOIN (whose on_expr is
     // EvalExpr::None — there's no ON clause) — equi_join_fields has no
@@ -2164,7 +2259,9 @@ mod join_tests {
     fn test_cross_join_produces_the_full_cross_product() {
         let c = conn();
         setup(&c);
-        let mut stmt = c.create_statement("select * from t1 cross join t2").unwrap();
+        let mut stmt = c
+            .create_statement("select * from t1 cross join t2")
+            .unwrap();
         stmt.execute().unwrap();
         let (_columns, mut rows) = take_streaming_result(&mut stmt, 0);
         rows.sort();
@@ -2190,7 +2287,11 @@ mod join_tests {
     fn test_three_way_join_produces_correct_data() {
         let c = conn();
         setup(&c);
-        run(&c, "create table t3 (id integer not null, extra integer, primary key(id))").unwrap();
+        run(
+            &c,
+            "create table t3 (id integer not null, extra integer, primary key(id))",
+        )
+        .unwrap();
         run(&c, "insert into t3 values (2, 7000)").unwrap();
         run(&c, "insert into t3 values (3, 8000)").unwrap();
         let mut stmt = c
@@ -2219,7 +2320,11 @@ mod join_tests {
     fn test_three_way_join_where_the_last_on_clause_references_the_middle_table() {
         let c = conn();
         setup(&c);
-        run(&c, "create table t3 (id integer not null, extra integer, primary key(id))").unwrap();
+        run(
+            &c,
+            "create table t3 (id integer not null, extra integer, primary key(id))",
+        )
+        .unwrap();
         run(&c, "insert into t3 values (200, 7777)").unwrap();
         let mut stmt = c
             .create_statement(
@@ -2239,8 +2344,16 @@ mod join_tests {
 #[test]
 fn test_a_select_over_several_tables_holds_one_statement_transaction() {
     let c = conn();
-    run(&c, "create table a (id integer not null, v integer, primary key(id))").unwrap();
-    run(&c, "create table b (id integer not null, w integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table a (id integer not null, v integer, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "create table b (id integer not null, w integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into a values (1, 10), (2, 20)").unwrap();
     run(&c, "insert into b values (1, 100), (2, 200)").unwrap();
     let db = c.database.read().db.clone();
@@ -2265,7 +2378,11 @@ fn test_a_select_over_several_tables_holds_one_statement_transaction() {
         rows += 1;
     }
     assert_eq!(rows, 2);
-    assert_eq!(db.stats().active_transactions, 1, "still held until the result is dropped");
+    assert_eq!(
+        db.stats().active_transactions,
+        1,
+        "still held until the result is dropped"
+    );
     drop(rs);
     assert_eq!(db.stats().active_transactions, 0);
 
@@ -2279,9 +2396,12 @@ fn test_a_select_over_several_tables_holds_one_statement_transaction() {
     let Some(ResultType::StreamingResult(rs)) = stmt.get_results().unwrap() else {
         panic!("expected a streaming result");
     };
-    assert_eq!(db.stats().active_transactions, 1, "the BEGIN block's transaction only");
+    assert_eq!(
+        db.stats().active_transactions,
+        1,
+        "the BEGIN block's transaction only"
+    );
     drop(rs);
     run(&c, "commit").unwrap();
     assert_eq!(db.stats().active_transactions, 0);
 }
-

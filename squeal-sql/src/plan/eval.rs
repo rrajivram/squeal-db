@@ -1,6 +1,6 @@
 use sql_parser::{
     Expr,
-    expr::{BinaryOp, FunctionArg, UnaryOp},
+    expr::{BinaryOp, UnaryOp},
 };
 use store::{
     db::DBFile,
@@ -10,7 +10,7 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::{
-        funcs::{FuncArgs, FuncObj, FuncTrait},
+        funcs::{FuncObj, FuncTrait},
         logical::TableQuery,
     },
 };
@@ -483,7 +483,7 @@ mod tests {
 
     use super::*;
     use crate::plan::funcs::Count;
-
+    use crate::plan::funcs::FuncArgs;
     fn int(i: i64) -> ValueItem {
         ValueItem::Integer(i)
     }

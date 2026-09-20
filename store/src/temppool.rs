@@ -304,7 +304,9 @@ where
         while done < bytes.len() {
             let n = file.pwrite(&bytes[done..], self.offset(id) + done as u64)?;
             if n == 0 {
-                return Err(StoreError::UnknownError("temp file write made no progress".into()));
+                return Err(StoreError::UnknownError(
+                    "temp file write made no progress".into(),
+                ));
             }
             done += n;
         }
@@ -375,13 +377,7 @@ mod tests {
     }
 
     fn pool(cache_pages: u64) -> TempPool<MemFile> {
-        TempPool::new(
-            "temppool_test.db",
-            MemFile::new(),
-            PS,
-            cache_pages * PS,
-        )
-        .unwrap()
+        TempPool::new("temppool_test.db", MemFile::new(), PS, cache_pages * PS).unwrap()
     }
 
     fn put<F: DBFile<Item = F> + 'static>(pool: &TempPool<F>, id: PageId, data: &[u8]) {
@@ -515,7 +511,10 @@ mod tests {
         }
         for (i, id) in ids.iter().enumerate() {
             let page = p.get_page(*id).unwrap();
-            let t = page.get(crate::tuple::DBIdType::Int(i as u64)).unwrap().unwrap();
+            let t = page
+                .get(crate::tuple::DBIdType::Int(i as u64))
+                .unwrap()
+                .unwrap();
             assert_eq!(t.data(), format!("s{i}").as_bytes());
         }
     }
@@ -601,7 +600,7 @@ mod tests {
     #[test]
     fn test_run_survives_eviction_when_page_count_exceeds_cache_pages() {
         use crate::cursor::Cursor;
-        let buf = make_pool(20 as u64);
+        let buf = make_pool(20);
         let mut run = Run::create_slotted(Arc::new(buf)).unwrap();
         const NUM_PAGES: usize = 50;
         for page in 0..NUM_PAGES {
@@ -639,7 +638,7 @@ mod tests {
     #[test]
     fn test_run_to_run_copy_survives_eviction_when_both_runs_share_a_small_buffer() {
         use crate::cursor::Cursor;
-        let buf = make_pool(20 as u64);
+        let buf = make_pool(20);
         let buf = Arc::new(buf);
         let mut run_a = Run::create_slotted(buf.clone()).unwrap();
         const NUM_PAGES: usize = 50;
@@ -715,7 +714,7 @@ mod tests {
         // setup, not real Db behavior) lets page 0 get freed and reused
         // as an ordinary mid-chain Run page — exactly triggering that
         // ambiguity.
-        let buf = make_pool(20 as u64);
+        let buf = make_pool(20);
         let buf = Arc::new(buf);
 
         let mut run = Run::create_slotted(buf.clone()).unwrap();
@@ -791,7 +790,7 @@ mod tests {
         // where the same chain "works every time"). 1, not 0: reserves
         // PageId(0) the way a real Db does (see the other chained test's
         // own comment on why).
-        let buf = make_pool(128 as u64);
+        let buf = make_pool(128);
         let buf = Arc::new(buf);
 
         let mut run = Run::create_slotted(buf.clone()).unwrap();
@@ -1097,5 +1096,4 @@ mod tests {
             seen.len()
         );
     }
-
 }

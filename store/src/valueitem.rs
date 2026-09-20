@@ -293,7 +293,12 @@ impl IndexKey {
     // range scans (inclusive).
     pub fn lower_bound(&self) -> Self {
         Self {
-            data: Arc::from(self.data.iter().map(|i| i.lower_bound()).collect::<Vec<_>>()),
+            data: Arc::from(
+                self.data
+                    .iter()
+                    .map(|i| i.lower_bound())
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -307,7 +312,9 @@ impl IndexKey {
             .iter()
             .map(|i| i.upper_bound())
             .collect::<Option<Vec<_>>>()?;
-        Some(Self { data: Arc::from(data) })
+        Some(Self {
+            data: Arc::from(data),
+        })
     }
 }
 
@@ -504,7 +511,7 @@ impl ValueItem {
     // per S8, would poison the page lock this runs under on the hot read
     // path).
     pub(super) fn from_bytes_many(bytes: &[u8]) -> Result<(ValueItem, usize), StoreError> {
-        fn take<'a>(bytes: &'a [u8], index: usize, len: usize) -> Result<&'a [u8], StoreError> {
+        fn take(bytes: &[u8], index: usize, len: usize) -> Result<&[u8], StoreError> {
             let end = index.checked_add(len).ok_or_else(|| {
                 StoreError::TruncatedValueItem(format!("offset {index} + {len} overflows"))
             })?;
@@ -1680,7 +1687,10 @@ mod minmax_tests {
         let mut bad = vec![];
         for v in corpus {
             if v.lower_bound().cmp(v) == Ordering::Greater {
-                bad.push(format!("{v:?}: lower_bound() {:?} is ABOVE it", v.lower_bound()));
+                bad.push(format!(
+                    "{v:?}: lower_bound() {:?} is ABOVE it",
+                    v.lower_bound()
+                ));
             }
             if let Some(hi) = v.upper_bound()
                 && hi.cmp(v) == Ordering::Less
@@ -1697,7 +1707,11 @@ mod minmax_tests {
     fn test_bounds_keep_the_variant_of_the_receiver() {
         for (name, corpus) in every_variant() {
             for v in &corpus {
-                assert_eq!(discriminant(&v.lower_bound()), discriminant(v), "{name} {v:?}");
+                assert_eq!(
+                    discriminant(&v.lower_bound()),
+                    discriminant(v),
+                    "{name} {v:?}"
+                );
                 if let Some(hi) = v.upper_bound() {
                     assert_eq!(discriminant(&hi), discriminant(v), "{name} {v:?}");
                 }
@@ -1710,8 +1724,16 @@ mod minmax_tests {
         // "the bound of the type", not "something derived from this value".
         for (name, corpus) in every_variant() {
             for v in &corpus {
-                assert_eq!(v.lower_bound(), corpus[0].lower_bound(), "{name}: varies with {v:?}");
-                assert_eq!(v.upper_bound(), corpus[0].upper_bound(), "{name}: varies with {v:?}");
+                assert_eq!(
+                    v.lower_bound(),
+                    corpus[0].lower_bound(),
+                    "{name}: varies with {v:?}"
+                );
+                assert_eq!(
+                    v.upper_bound(),
+                    corpus[0].upper_bound(),
+                    "{name}: varies with {v:?}"
+                );
             }
         }
     }
@@ -1769,12 +1791,27 @@ mod minmax_tests {
 
     #[test]
     fn test_exact_bound_values() {
-        assert_eq!(ValueItem::Integer(0).lower_bound(), ValueItem::Integer(i64::MIN));
-        assert_eq!(ValueItem::Integer(0).upper_bound(), Some(ValueItem::Integer(i64::MAX)));
+        assert_eq!(
+            ValueItem::Integer(0).lower_bound(),
+            ValueItem::Integer(i64::MIN)
+        );
+        assert_eq!(
+            ValueItem::Integer(0).upper_bound(),
+            Some(ValueItem::Integer(i64::MAX))
+        );
         assert_eq!(ValueItem::Datetime(9).lower_bound(), ValueItem::Datetime(0));
-        assert_eq!(ValueItem::Datetime(9).upper_bound(), Some(ValueItem::Datetime(u64::MAX)));
-        assert_eq!(ValueItem::Boolean(true).lower_bound(), ValueItem::Boolean(false));
-        assert_eq!(ValueItem::Boolean(false).upper_bound(), Some(ValueItem::Boolean(true)));
+        assert_eq!(
+            ValueItem::Datetime(9).upper_bound(),
+            Some(ValueItem::Datetime(u64::MAX))
+        );
+        assert_eq!(
+            ValueItem::Boolean(true).lower_bound(),
+            ValueItem::Boolean(false)
+        );
+        assert_eq!(
+            ValueItem::Boolean(false).upper_bound(),
+            Some(ValueItem::Boolean(true))
+        );
         assert_eq!(ValueItem::Null.lower_bound(), ValueItem::Null);
         assert_eq!(ValueItem::Null.upper_bound(), Some(ValueItem::Null));
         assert_eq!(s("x").lower_bound(), s(""));
@@ -1790,7 +1827,10 @@ mod minmax_tests {
             let mut bounds = vec![v.lower_bound()];
             bounds.extend(v.upper_bound());
             for b in bounds {
-                assert!(IndexKey::new_from(std::slice::from_ref(&b)).is_ok(), "{b:?} rejected");
+                assert!(
+                    IndexKey::new_from(std::slice::from_ref(&b)).is_ok(),
+                    "{b:?} rejected"
+                );
             }
         }
     }
@@ -1805,9 +1845,17 @@ mod minmax_tests {
                 if discriminant(&a[0]) == discriminant(&b[0]) {
                     continue;
                 }
-                let (lo, hi) = if a[0].cmp(&b[0]) == Ordering::Less { (&a[0], &b[0]) } else { (&b[0], &a[0]) };
+                let (lo, hi) = if a[0].cmp(&b[0]) == Ordering::Less {
+                    (&a[0], &b[0])
+                } else {
+                    (&b[0], &a[0])
+                };
                 if let Some(top) = lo.upper_bound() {
-                    assert_eq!(top.cmp(&hi.lower_bound()), Ordering::Less, "{lo:?} upper must sort below {hi:?} lower");
+                    assert_eq!(
+                        top.cmp(&hi.lower_bound()),
+                        Ordering::Less,
+                        "{lo:?} upper must sort below {hi:?} lower"
+                    );
                 }
             }
         }
@@ -1821,7 +1869,12 @@ mod minmax_tests {
 
     #[test]
     fn test_indexkey_bounds_map_every_field_and_keep_the_length() {
-        let k = key(vec![ValueItem::Integer(7), ValueItem::Boolean(true), ValueItem::Datetime(5), ValueItem::Null]);
+        let k = key(vec![
+            ValueItem::Integer(7),
+            ValueItem::Boolean(true),
+            ValueItem::Datetime(5),
+            ValueItem::Null,
+        ]);
         let (lo, hi) = (k.lower_bound(), k.upper_bound().unwrap());
         for (i, orig) in k.values().iter().enumerate() {
             assert_eq!(lo.values()[i], orig.lower_bound());
@@ -1837,8 +1890,14 @@ mod minmax_tests {
     fn test_indexkey_with_a_str_or_blob_field_has_no_upper_bound_but_a_lower_one() {
         let k = key(vec![ValueItem::Integer(7), s("abc")]);
         assert_eq!(k.upper_bound(), None);
-        assert_eq!(k.lower_bound().values(), &[ValueItem::Integer(i64::MIN), s("")]);
-        assert_eq!(key(vec![blob(&[1]), ValueItem::Integer(1)]).upper_bound(), None);
+        assert_eq!(
+            k.lower_bound().values(),
+            &[ValueItem::Integer(i64::MIN), s("")]
+        );
+        assert_eq!(
+            key(vec![blob(&[1]), ValueItem::Integer(1)]).upper_bound(),
+            None
+        );
     }
 
     #[test]
@@ -1849,10 +1908,18 @@ mod minmax_tests {
             for y in &b {
                 for z in &c {
                     let k = key(vec![x.clone(), y.clone(), z.clone()]);
-                    assert_ne!(k.lower_bound().partial_cmp(&k), Some(Ordering::Greater), "{k:?}");
+                    assert_ne!(
+                        k.lower_bound().partial_cmp(&k),
+                        Some(Ordering::Greater),
+                        "{k:?}"
+                    );
                     let hi = k.upper_bound().unwrap();
                     assert_ne!(hi.partial_cmp(&k), Some(Ordering::Less), "{k:?}");
-                    assert_eq!(k.lower_bound().partial_cmp(&hi), Some(Ordering::Less), "{k:?}");
+                    assert_eq!(
+                        k.lower_bound().partial_cmp(&hi),
+                        Some(Ordering::Less),
+                        "{k:?}"
+                    );
                     checked += 1;
                 }
             }
@@ -1883,7 +1950,11 @@ mod minmax_tests {
         for corpus in [strs(), blobs()] {
             for v in &corpus {
                 let k = key(vec![ValueItem::Integer(1), v.clone()]);
-                assert_ne!(k.lower_bound().partial_cmp(&k), Some(Ordering::Greater), "{k:?}");
+                assert_ne!(
+                    k.lower_bound().partial_cmp(&k),
+                    Some(Ordering::Greater),
+                    "{k:?}"
+                );
             }
         }
     }
@@ -1899,17 +1970,32 @@ mod minmax_tests {
             st.finish()
         };
         let pairs = [
-            (ValueItem::Str(("ab".into(), 2)), ValueItem::Str(("ab".into(), 50))),
-            (ValueItem::Blob((Arc::from([1u8, 2]), 2)), ValueItem::Blob((Arc::from([1u8, 2]), 9))),
+            (
+                ValueItem::Str(("ab".into(), 2)),
+                ValueItem::Str(("ab".into(), 50)),
+            ),
+            (
+                ValueItem::Blob((Arc::from([1u8, 2]), 2)),
+                ValueItem::Blob((Arc::from([1u8, 2]), 9)),
+            ),
         ];
         for (a, b) in pairs {
             assert_eq!(a, b);
             assert_eq!(a.cmp(&b), Ordering::Equal);
             assert_eq!(h(&a), h(&b));
         }
-        assert_ne!(ValueItem::Str(("ab".into(), 2)), ValueItem::Str(("ac".into(), 2)));
-        let k1 = key(vec![ValueItem::Integer(1), ValueItem::Str(("ab".into(), 2))]);
-        let k2 = key(vec![ValueItem::Integer(1), ValueItem::Str(("ab".into(), 30))]);
+        assert_ne!(
+            ValueItem::Str(("ab".into(), 2)),
+            ValueItem::Str(("ac".into(), 2))
+        );
+        let k1 = key(vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("ab".into(), 2)),
+        ]);
+        let k2 = key(vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("ab".into(), 30)),
+        ]);
         assert_eq!(k1, k2);
         assert_eq!(k1.partial_cmp(&k2), Some(Ordering::Equal));
     }

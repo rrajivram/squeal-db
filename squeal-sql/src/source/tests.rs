@@ -262,19 +262,19 @@ mod via_logical_plan {
 
     fn setup_two_tables(c: &Arc<Connection<MemFile>>) {
         run(
-            &c,
+            c,
             "create table t1 (id integer not null, name varchar(10), primary key(id))",
         )
         .unwrap();
         run(
-            &c,
+            c,
             "create table t2 (id integer not null, val integer, primary key(id))",
         )
         .unwrap();
-        run(&c, "insert into t1 values (1, 'alice')").unwrap();
-        run(&c, "insert into t1 values (2, 'bob')").unwrap();
-        run(&c, "insert into t2 values (2, 200)").unwrap();
-        run(&c, "insert into t2 values (3, 300)").unwrap();
+        run(c, "insert into t1 values (1, 'alice')").unwrap();
+        run(c, "insert into t1 values (2, 'bob')").unwrap();
+        run(c, "insert into t2 values (2, 200)").unwrap();
+        run(c, "insert into t2 values (3, 300)").unwrap();
     }
 
     #[test]

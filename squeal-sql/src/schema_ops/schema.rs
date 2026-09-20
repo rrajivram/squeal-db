@@ -966,7 +966,7 @@ where
         let mut loaded = 0usize;
         let mut failed = 0usize;
         let mut batch: Vec<Vec<ValueItem>> = Vec::with_capacity(COPY_BATCH_ROWS);
-        let mut flush =
+        let flush =
             |batch: &mut Vec<Vec<ValueItem>>, loaded: &mut usize, failed: &mut usize| {
                 if batch.is_empty() {
                     return;

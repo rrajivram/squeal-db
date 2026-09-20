@@ -65,14 +65,12 @@ impl<'de> Visitor<'de> for DataTypeVisitor {
             0 => Ok(DataType::Integer),
             1 => Ok(DataType::Double),
             2 => Ok(DataType::Datetime),
-            3 => Ok(DataType::Str(
-                seq.next_element()?
-                    .ok_or_else(|| DeError::custom("DataType::Str: missing length"))?,
-            )),
-            4 => Ok(DataType::Blob(
-                seq.next_element()?
-                    .ok_or_else(|| DeError::custom("DataType::Blob: missing length"))?,
-            )),
+            3 => Ok(DataType::Str(seq.next_element()?.ok_or_else(|| {
+                DeError::custom("DataType::Str: missing length")
+            })?)),
+            4 => Ok(DataType::Blob(seq.next_element()?.ok_or_else(|| {
+                DeError::custom("DataType::Blob: missing length")
+            })?)),
             5 => Ok(DataType::Null),
             6 => Ok(DataType::Unsupported),
             7 => Ok(DataType::Boolean),
@@ -129,58 +127,6 @@ impl DataType {
             DataType::Boolean => ValueItem::Boolean(false).size(),
             DataType::Null => 0,
             DataType::Unsupported => 0,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::DataType;
-
-    fn all_variants() -> [DataType; 8] {
-        [
-            DataType::Integer,
-            DataType::Double,
-            DataType::Datetime,
-            DataType::Str(10),
-            DataType::Blob(20),
-            DataType::Null,
-            DataType::Unsupported,
-            DataType::Boolean,
-        ]
-    }
-
-    #[test]
-    fn test_round_trip() {
-        for v in all_variants() {
-            let bytes = postcard::to_allocvec(&v).unwrap();
-            let back: DataType = postcard::from_bytes(&bytes).unwrap();
-            assert_eq!(v, back);
-        }
-    }
-
-    #[test]
-    fn test_unknown_tag_errors() {
-        assert!(postcard::from_bytes::<DataType>(&[99]).is_err());
-    }
-
-    // Fixtures captured from the pre-Stage-1 `#[derive(Serialize,
-    // Deserialize)]` encoding (commit bfbc240), before DataType grew a
-    // hand-rolled codec.
-    #[test]
-    fn test_decodes_pre_stage1_derived_fixtures() {
-        let fixtures: [(&[u8], DataType); 8] = [
-            (&[0], DataType::Integer),
-            (&[1], DataType::Double),
-            (&[2], DataType::Datetime),
-            (&[3, 10], DataType::Str(10)),
-            (&[4, 20], DataType::Blob(20)),
-            (&[5], DataType::Null),
-            (&[6], DataType::Unsupported),
-            (&[7], DataType::Boolean),
-        ];
-        for (bytes, expected) in fixtures {
-            assert_eq!(postcard::from_bytes::<DataType>(bytes).unwrap(), expected);
         }
     }
 }
@@ -250,5 +196,57 @@ impl Display for DataType {
         };
         write!(f, "{s}")?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataType;
+
+    fn all_variants() -> [DataType; 8] {
+        [
+            DataType::Integer,
+            DataType::Double,
+            DataType::Datetime,
+            DataType::Str(10),
+            DataType::Blob(20),
+            DataType::Null,
+            DataType::Unsupported,
+            DataType::Boolean,
+        ]
+    }
+
+    #[test]
+    fn test_round_trip() {
+        for v in all_variants() {
+            let bytes = postcard::to_allocvec(&v).unwrap();
+            let back: DataType = postcard::from_bytes(&bytes).unwrap();
+            assert_eq!(v, back);
+        }
+    }
+
+    #[test]
+    fn test_unknown_tag_errors() {
+        assert!(postcard::from_bytes::<DataType>(&[99]).is_err());
+    }
+
+    // Fixtures captured from the pre-Stage-1 `#[derive(Serialize,
+    // Deserialize)]` encoding (commit bfbc240), before DataType grew a
+    // hand-rolled codec.
+    #[test]
+    fn test_decodes_pre_stage1_derived_fixtures() {
+        let fixtures: [(&[u8], DataType); 8] = [
+            (&[0], DataType::Integer),
+            (&[1], DataType::Double),
+            (&[2], DataType::Datetime),
+            (&[3, 10], DataType::Str(10)),
+            (&[4, 20], DataType::Blob(20)),
+            (&[5], DataType::Null),
+            (&[6], DataType::Unsupported),
+            (&[7], DataType::Boolean),
+        ];
+        for (bytes, expected) in fixtures {
+            assert_eq!(postcard::from_bytes::<DataType>(bytes).unwrap(), expected);
+        }
     }
 }

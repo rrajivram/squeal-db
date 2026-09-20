@@ -29,6 +29,7 @@ pub struct TrackingAllocator {
     realloc_shrank: AtomicUsize,
 }
 
+#[allow(clippy::new_without_default)]
 impl TrackingAllocator {
     pub const fn new() -> Self {
         TrackingAllocator {

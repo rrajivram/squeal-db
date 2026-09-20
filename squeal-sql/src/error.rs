@@ -1,4 +1,3 @@
-use serde::{Deserialize, de};
 use store::{error::StoreError, tuple::DBIdType};
 use thiserror::Error;
 

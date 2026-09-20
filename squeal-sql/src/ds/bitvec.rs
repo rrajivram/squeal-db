@@ -6,7 +6,7 @@ pub struct BitVec {
 
 impl BitVec {
     pub fn with_capacity(capacity: usize) -> Self {
-        let byte_capacity = if capacity % 8 == 0 {
+        let byte_capacity = if capacity.is_multiple_of(8) {
             capacity / 8
         } else {
             capacity / 8 + 1
@@ -17,6 +17,7 @@ impl BitVec {
         }
     }
 
+    #[allow(unused)]
     pub fn len(&self) -> usize {
         self.count
     }
@@ -30,6 +31,7 @@ impl BitVec {
         self.data[byte] |= 1 << bit;
     }
 
+    #[allow(unused)]
     pub fn unset(&mut self, index: usize) {
         if index >= self.count {
             panic!("Index is {index},but count is {}", self.count);
@@ -48,6 +50,7 @@ impl BitVec {
         self.data[byte] & (1 << bit) != 0
     }
 
+    #[allow(clippy::manual_find)]
     pub fn first_available(&self, from: usize) -> Option<usize> {
         for index in from + 1..self.count {
             if !self.is_set(index) {

@@ -49,7 +49,8 @@ pub(crate) struct ColumnStatStored {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableStat {
+#[allow(unused)]
+pub struct TableStat {
     pub(crate) id: TableIdType,
     pub(crate) name: String,
     pub(crate) row_count: usize,
@@ -61,7 +62,8 @@ pub(crate) struct TableStat {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ColumnStat {
+#[allow(unused)]
+pub struct ColumnStat {
     pub(crate) id: u32,
     pub(crate) name: String,
     pub(crate) unique: usize,
@@ -130,9 +132,9 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         }
         for t in schema.list_tables() {
             let table = schema.get_table(&t).unwrap();
-            if !tables.contains_key(&table.db_table_id) {
-                tables.insert(table.db_table_id, Self::table_data(&table)?);
-            }
+            tables
+                .entry(table.db_table_id)
+                .or_insert(Self::table_data(&table)?);
         }
         Self::spawn(schema, tables, sampling_rate)
     }

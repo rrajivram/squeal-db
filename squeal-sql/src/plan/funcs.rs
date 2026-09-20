@@ -1,10 +1,5 @@
-use std::{
-    collections::HashSet,
-    fmt::Debug,
-    sync::{Arc, atomic::AtomicUsize},
-};
+use std::{collections::HashSet, fmt::Debug};
 
-use parking_lot::RwLock;
 use sql_parser::{Expr, Ident, expr::FunctionArg};
 use store::{
     db::DBFile,
@@ -16,6 +11,7 @@ use crate::{
     plan::eval::{EvalExpr, ExprWrapper},
 };
 
+#[allow(unused)]
 pub(crate) trait FuncTrait: Debug {
     fn name(&self) -> String;
     fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError>;
@@ -458,22 +454,26 @@ mod tests {
 
     #[test]
     fn test_avg_rejects_non_numeric_operand() {
-        let mut avg =
-            Avg::new(vec![literal_arg(ValueItem::Str(("x".into(), 1)))], None).unwrap();
+        let mut avg = Avg::new(vec![literal_arg(ValueItem::Str(("x".into(), 1)))], None).unwrap();
         assert!(avg.eval(&[]).is_err());
     }
 
     #[test]
     fn test_avg_rejects_wildcard_argument() {
         let err = Avg::new(vec![FuncArgs::Wildcard], None).unwrap_err();
-        assert!(matches!(err, SchemaError::UnsupportedFeature(_)), "got {err:?}");
+        assert!(
+            matches!(err, SchemaError::UnsupportedFeature(_)),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn test_upper_uppercases_a_string() {
-        let mut upper =
-            Upper::new(vec![literal_arg(ValueItem::Str(("hello".into(), 5)))]).unwrap();
-        assert_eq!(upper.eval(&[]).unwrap(), ValueItem::Str(("HELLO".into(), 5)));
+        let mut upper = Upper::new(vec![literal_arg(ValueItem::Str(("hello".into(), 5)))]).unwrap();
+        assert_eq!(
+            upper.eval(&[]).unwrap(),
+            ValueItem::Str(("HELLO".into(), 5))
+        );
     }
 
     #[test]

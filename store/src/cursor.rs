@@ -125,10 +125,10 @@ where
             if let Some(t) = self.current_iter.next() {
                 return Ok(Some(t));
             }
-            let new_page = self.db.table_by_id(self.table)?.next_data_page(Some((
-                self.current_page_id,
-                Arc::clone(&self.current_page),
-            )))?;
+            let new_page = self
+                .db
+                .table_by_id(self.table)?
+                .next_data_page(Some((self.current_page_id, Arc::clone(&self.current_page))))?;
             match new_page {
                 Some((new_page_id, new_page)) => {
                     self.current_page_id = new_page_id;
@@ -230,7 +230,10 @@ where
         Ok(Bound::Included(DBIdType::Rec(IndexKey::new_from(&full)?)))
     }
 
-    fn start_leaf(table: &Arc<BPlusTree<F>>, start: &Bound<DBIdType>) -> Result<Arc<Page>, StoreError> {
+    fn start_leaf(
+        table: &Arc<BPlusTree<F>>,
+        start: &Bound<DBIdType>,
+    ) -> Result<Arc<Page>, StoreError> {
         match start {
             Bound::Included(k) | Bound::Excluded(k) => table.find_leaf_page(k),
             Bound::Unbounded => table.first_leaf_page(),
@@ -480,7 +483,12 @@ mod tests {
     // (not just within a single starting leaf, like the basic test above).
     #[test]
     fn test_range_scan_spans_multiple_leaf_splits() {
-        let db = Db::<MemFile>::create_with_page_size_and_max_index_key_size("range_multi_leaf.db", 256, 8).unwrap();
+        let db = Db::<MemFile>::create_with_page_size_and_max_index_key_size(
+            "range_multi_leaf.db",
+            256,
+            8,
+        )
+        .unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
 
         let t = db.begin().unwrap();
@@ -841,7 +849,8 @@ mod tests {
         let mut cursor = db
             .range_scan(tid, DBIdType::Int(3), DBIdType::Int(7))
             .unwrap();
-        let first_pass = int_ids(&std::iter::from_fn(|| cursor.next().unwrap()).collect::<Vec<_>>());
+        let first_pass =
+            int_ids(&std::iter::from_fn(|| cursor.next().unwrap()).collect::<Vec<_>>());
         assert_eq!(first_pass, vec![3, 4, 5, 6], "sanity: first pass");
 
         cursor.reset().unwrap();
@@ -977,7 +986,9 @@ mod tests {
 
     fn extreme_grid() -> Vec<(i64, i64)> {
         let vals = [i64::MIN, -1, 0, 1, i64::MAX - 1, i64::MAX];
-        vals.iter().flat_map(|a| vals.iter().map(move |b| (*a, *b))).collect()
+        vals.iter()
+            .flat_map(|a| vals.iter().map(move |b| (*a, *b)))
+            .collect()
     }
 
     // A whole-index scan lower_bound()..=upper_bound() returns EVERY key,
@@ -1013,13 +1024,28 @@ mod tests {
         let rows: Vec<(i64, i64)> = (0..10).map(|a| (a, 0)).collect();
         let (db, tid) = mm_db("bounds_scan_incl.db", &rows);
         let run = |s: Bound<IndexKey>, e: Bound<IndexKey>| -> Vec<i64> {
-            scanned_pairs(&bounded(&db, tid, s, e)).into_iter().map(|p| p.0).collect()
+            scanned_pairs(&bounded(&db, tid, s, e))
+                .into_iter()
+                .map(|p| p.0)
+                .collect()
         };
         let (lo, hi) = (mm_key(3, 0), mm_key(6, 0));
-        assert_eq!(run(Bound::Included(lo.clone()), Bound::Included(hi.clone())), vec![3, 4, 5, 6]);
-        assert_eq!(run(Bound::Included(lo.clone()), Bound::Excluded(hi.clone())), vec![3, 4, 5]);
-        assert_eq!(run(Bound::Excluded(lo.clone()), Bound::Included(hi.clone())), vec![4, 5, 6]);
-        assert_eq!(run(Bound::Excluded(lo.clone()), Bound::Excluded(hi.clone())), vec![4, 5]);
+        assert_eq!(
+            run(Bound::Included(lo.clone()), Bound::Included(hi.clone())),
+            vec![3, 4, 5, 6]
+        );
+        assert_eq!(
+            run(Bound::Included(lo.clone()), Bound::Excluded(hi.clone())),
+            vec![3, 4, 5]
+        );
+        assert_eq!(
+            run(Bound::Excluded(lo.clone()), Bound::Included(hi.clone())),
+            vec![4, 5, 6]
+        );
+        assert_eq!(
+            run(Bound::Excluded(lo.clone()), Bound::Excluded(hi.clone())),
+            vec![4, 5]
+        );
         assert_eq!(run(Bound::Unbounded, Bound::Excluded(lo)), vec![0, 1, 2]);
         assert_eq!(run(Bound::Excluded(hi), Bound::Unbounded), vec![7, 8, 9]);
     }
@@ -1036,7 +1062,12 @@ mod tests {
         let b = ValueItem::Integer(0);
         let start = IndexKey::new_from(&[ValueItem::Integer(5), b.lower_bound()]).unwrap();
         let end = IndexKey::new_from(&[ValueItem::Integer(5), b.upper_bound().unwrap()]).unwrap();
-        let got = scanned_pairs(&bounded(&db, tid, Bound::Included(start), Bound::Included(end)));
+        let got = scanned_pairs(&bounded(
+            &db,
+            tid,
+            Bound::Included(start),
+            Bound::Included(end),
+        ));
         let want: Vec<(i64, i64)> = rows.iter().copied().filter(|(a, _)| *a == 5).collect();
         assert_eq!(want.len(), 5);
         assert_eq!(got, want);
@@ -1047,7 +1078,12 @@ mod tests {
     fn test_range_scan_is_still_start_inclusive_end_exclusive() {
         let rows = vec![(1, 0), (2, 0), (3, 0)];
         let (db, tid) = mm_db("bounds_scan_legacy.db", &rows);
-        let got = scan_range(&db, tid, DBIdType::Rec(mm_key(1, 0)), DBIdType::Rec(mm_key(3, 0)));
+        let got = scan_range(
+            &db,
+            tid,
+            DBIdType::Rec(mm_key(1, 0)),
+            DBIdType::Rec(mm_key(3, 0)),
+        );
         assert_eq!(scanned_pairs(&got), vec![(1, 0), (2, 0)]);
     }
 
@@ -1059,16 +1095,27 @@ mod tests {
         let db = Db::<MemFile>::create("bounds_scan_str.db").unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
         let mk = |x: &str| {
-            IndexKey::new_from(&[ValueItem::Integer(5), ValueItem::Str((x.to_string(), 16))]).unwrap()
+            IndexKey::new_from(&[ValueItem::Integer(5), ValueItem::Str((x.to_string(), 16))])
+                .unwrap()
         };
         let t = db.begin().unwrap();
         for x in strs {
-            db.insert(tid, Tuple::new_with(DBIdType::Rec(mk(x)), b"v", None, None), &t).unwrap();
+            db.insert(
+                tid,
+                Tuple::new_with(DBIdType::Rec(mk(x)), b"v", None, None),
+                &t,
+            )
+            .unwrap();
         }
         db.commit(t).unwrap();
         let probe = mk("q");
         assert_eq!(probe.upper_bound(), None);
-        let got = bounded(&db, tid, Bound::Included(probe.lower_bound()), Bound::Unbounded);
+        let got = bounded(
+            &db,
+            tid,
+            Bound::Included(probe.lower_bound()),
+            Bound::Unbounded,
+        );
         assert_eq!(got.len(), strs.len());
     }
 
@@ -1083,7 +1130,7 @@ mod tests {
                 Bound::Included(DBIdType::Rec(mm_key(5, 0))),
             )
             .unwrap();
-        let mut drain = |c: &mut RangeCursor<MemFile>| {
+        let drain = |c: &mut RangeCursor<MemFile>| {
             let mut n = 0;
             while c.next().unwrap().is_some() {
                 n += 1;
@@ -1111,7 +1158,12 @@ mod tests {
         let tid = db.create_table("rows".to_string()).unwrap();
         let t = db.begin().unwrap();
         for k in keys {
-            db.insert(tid, Tuple::new_with(DBIdType::Rec(k.clone()), b"v", None, None), &t).unwrap();
+            db.insert(
+                tid,
+                Tuple::new_with(DBIdType::Rec(k.clone()), b"v", None, None),
+                &t,
+            )
+            .unwrap();
         }
         db.commit(t).unwrap();
         (db, tid)
@@ -1149,7 +1201,11 @@ mod tests {
         let one = |a: i64| IndexKey::new_from(&[ValueItem::Integer(a)]).unwrap();
         for a in [0, 1, 30, 59, 1000, 1499, i64::MIN, i64::MAX, 5000] {
             let got = drain_keys(&mut db.prefix_scan(tid, one(a)).unwrap());
-            let want: Vec<_> = keys.iter().filter(|k| k.values()[0] == ValueItem::Integer(a)).cloned().collect();
+            let want: Vec<_> = keys
+                .iter()
+                .filter(|k| k.values()[0] == ValueItem::Integer(a))
+                .cloned()
+                .collect();
             let mut want = want;
             want.sort_by(|x, y| x.partial_cmp(y).unwrap());
             assert_eq!(got, want, "prefix ({a})");
@@ -1157,10 +1213,17 @@ mod tests {
         // Two-field prefixes, including the empty string and the strings
         // above char::MAX that a sentinel end bound would have dropped.
         for x in strs {
-            let p = IndexKey::new_from(&[ValueItem::Integer(30), ValueItem::Str((x.to_string(), 16))]).unwrap();
+            let p =
+                IndexKey::new_from(&[ValueItem::Integer(30), ValueItem::Str((x.to_string(), 16))])
+                    .unwrap();
             let got = drain_keys(&mut db.prefix_scan(tid, p).unwrap());
             assert_eq!(got.len(), 3, "prefix (30, {x:?})");
-            assert!(got.iter().all(|k| k.values()[0] == ValueItem::Integer(30) && k.values()[1].cmp(&ValueItem::Str((x.to_string(), 0))).is_eq()));
+            assert!(got.iter().all(|k| {
+                k.values()[0] == ValueItem::Integer(30)
+                    && k.values()[1]
+                        .cmp(&ValueItem::Str((x.to_string(), 0)))
+                        .is_eq()
+            }));
         }
         // The full-length prefix is an exact-key lookup.
         let got = drain_keys(&mut db.prefix_scan(tid, sk(30, "a", 0)).unwrap());
@@ -1185,7 +1248,12 @@ mod tests {
         let db2 = Db::<MemFile>::create("prefix_scan_int.db").unwrap();
         let tid2 = db2.create_table("rows".to_string()).unwrap();
         let t = db2.begin().unwrap();
-        db2.insert(tid2, Tuple::new_with(DBIdType::Int(1), b"v", None, None), &t).unwrap();
+        db2.insert(
+            tid2,
+            Tuple::new_with(DBIdType::Int(1), b"v", None, None),
+            &t,
+        )
+        .unwrap();
         db2.commit(t).unwrap();
         assert!(db2.prefix_scan(tid2, IndexKey::default()).is_err());
     }
@@ -1198,7 +1266,12 @@ mod tests {
         assert!(drain_keys(&mut c).is_empty());
         let t = db.begin().unwrap();
         for (a, x) in [(4, "x"), (5, "x"), (5, "y"), (6, "x")] {
-            db.insert(tid, Tuple::new_with(DBIdType::Rec(sk(a, x, 0)), b"v", None, None), &t).unwrap();
+            db.insert(
+                tid,
+                Tuple::new_with(DBIdType::Rec(sk(a, x, 0)), b"v", None, None),
+                &t,
+            )
+            .unwrap();
         }
         db.commit(t).unwrap();
         // reset keeps the cursor's own (older) snapshot, so it must not

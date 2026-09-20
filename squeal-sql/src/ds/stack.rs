@@ -1,8 +1,9 @@
+#![allow(unused)]
+
 pub(crate) struct Stack<T> {
     head: Option<Box<Stacktem<T>>>,
     count: usize,
 }
-
 struct Stacktem<T> {
     item: T,
     next: Option<Box<Stacktem<T>>>,
