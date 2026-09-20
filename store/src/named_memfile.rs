@@ -50,6 +50,8 @@ impl NamedMemFile {
         reg.remove(name);
         let prefix = format!("{name}.wal");
         reg.retain(|k, _| !k.starts_with(&prefix));
+        // The scratch-page file (`name.tmp`, see temppool.rs).
+        reg.remove(&format!("{name}.tmp"));
     }
 }
 

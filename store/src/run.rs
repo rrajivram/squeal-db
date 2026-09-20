@@ -3,12 +3,11 @@ use std::sync::Arc;
 use log::error;
 
 use crate::{
-    buffer::LockLevel,
-    buffer::PageBuffer,
     cursor::Cursor,
     db::{DBFile, DBSizeType},
     error::StoreError,
     page::{Page, PageId, PageTupleIterator, USABLE_DATA_MARGIN},
+    temppool::TempPool,
     tuple::{DBIdType, Tuple},
 };
 
@@ -26,8 +25,11 @@ use crate::{
 /// gets the same "can't free out from under a live reader" safety via
 /// reference counting instead of a lifetime, without that constraint.
 pub(crate) struct RunPages<F: DBFile + 'static> {
-    buffer: Arc<PageBuffer<F>>,
+    pool: Arc<TempPool<F>>,
     head: PageId,
+    // Every page this run allocated, so freeing needs no chain walk (and
+    // no reads of pages that were spilled out of the pool's cache).
+    ids: parking_lot::Mutex<Vec<PageId>>,
 }
 
 impl<F: DBFile + 'static> Drop for RunPages<F> {
@@ -38,7 +40,7 @@ impl<F: DBFile + 'static> Drop for RunPages<F> {
         // otherwise just be a leak. Freeing a run's pages failing at all
         // should be rare (I/O error, corrupted state); log it and move
         // on rather than lose the failure silently.
-        if let Err(e) = self.buffer.free_page_chain(self.head) {
+        if let Err(e) = self.pool.free_pages(&self.ids.lock()) {
             error!(
                 "failed to free run page chain starting at {:?}: {e:?}",
                 self.head
@@ -77,10 +79,14 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    pub(crate) fn create(buffer: Arc<PageBuffer<F>>) -> Result<Self, StoreError> {
-        let head = buffer.alloc_run_page()?;
+    pub(crate) fn create(pool: Arc<TempPool<F>>) -> Result<Self, StoreError> {
+        let head = pool.alloc_run_page()?;
         Ok(Self {
-            pages: Arc::new(RunPages { buffer, head }),
+            pages: Arc::new(RunPages {
+                pool,
+                head,
+                ids: parking_lot::Mutex::new(vec![head]),
+            }),
             tail: head,
             pg_count: 1,
             page_ids: vec![head],
@@ -96,10 +102,14 @@ where
     // pages within the same run works mechanically (each page tracks its
     // own content kind) but isn't a scenario anything here is designed
     // or tested for.
-    pub(crate) fn create_slotted(buffer: Arc<PageBuffer<F>>) -> Result<Self, StoreError> {
-        let head = buffer.alloc_slotted_page()?;
+    pub(crate) fn create_slotted(pool: Arc<TempPool<F>>) -> Result<Self, StoreError> {
+        let head = pool.alloc_slotted_page()?;
         Ok(Self {
-            pages: Arc::new(RunPages { buffer, head }),
+            pages: Arc::new(RunPages {
+                pool,
+                head,
+                ids: parking_lot::Mutex::new(vec![head]),
+            }),
             tail: head,
             pg_count: 1,
             page_ids: vec![head],
@@ -136,23 +146,24 @@ where
     pub fn append(&mut self, data: &[u8]) -> Result<(), StoreError> {
         let tuple = Tuple::new(0, data);
         loop {
-            let handle = self.pages.buffer.get_page_mut(self.tail, LockLevel::Data)?;
+            let handle = self.pages.pool.get_page_mut(self.tail)?;
             if handle.page.can_store(&tuple) {
                 handle.page.add_tuple(tuple)?;
-                self.pages.buffer.write_locked_page(handle)?;
+                self.pages.pool.write_locked_page(handle)?;
                 return Ok(());
             }
             drop(handle);
-            let new_id = self.pages.buffer.alloc_run_page()?;
+            let new_id = self.pages.pool.alloc_run_page()?;
+            self.pages.ids.lock().push(new_id);
             self.pg_count += 1;
-            self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
+            self.pages.pool.set_data_chain_next(self.tail, new_id)?;
             self.tail = new_id;
             self.page_ids.push(new_id);
         }
     }
 
     pub fn available_size(&self) -> DBSizeType {
-        self.pages.buffer.page_size() - self.pages.buffer.page_overhead() as DBSizeType
+        self.pages.pool.page_size() - self.pages.pool.page_overhead() as DBSizeType
     }
 
     /// The largest single blob `set_content` will accept without erroring.
@@ -173,8 +184,9 @@ where
     /// the new page's id, e.g. to remember alongside whatever chunk gets
     /// written to it next.
     pub fn new_page(&mut self) -> Result<PageId, StoreError> {
-        let new_id = self.pages.buffer.alloc_run_page()?;
-        self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
+        let new_id = self.pages.pool.alloc_run_page()?;
+        self.pages.ids.lock().push(new_id);
+        self.pages.pool.set_data_chain_next(self.tail, new_id)?;
         self.tail = new_id;
         self.pg_count += 1;
         self.page_ids.push(new_id);
@@ -196,8 +208,9 @@ where
     /// whole later," expensive for "mutate one small piece of it, over
     /// and over."
     pub fn new_slotted_page(&mut self) -> Result<PageId, StoreError> {
-        let new_id = self.pages.buffer.alloc_slotted_page()?;
-        self.pages.buffer.set_data_chain_next(self.tail, new_id)?;
+        let new_id = self.pages.pool.alloc_slotted_page()?;
+        self.pages.ids.lock().push(new_id);
+        self.pages.pool.set_data_chain_next(self.tail, new_id)?;
         self.tail = new_id;
         self.pg_count += 1;
         self.page_ids.push(new_id);
@@ -254,10 +267,10 @@ where
         if tuple.size() > max {
             return Err(StoreError::TupleTooLarge(tuple.size(), max as usize));
         }
-        let handle = self.pages.buffer.get_page_mut(page_id, LockLevel::Data)?;
+        let handle = self.pages.pool.get_page_mut(page_id)?;
         handle.page.clear()?;
         handle.page.add_tuple(tuple)?;
-        self.pages.buffer.write_locked_page(handle)?;
+        self.pages.pool.write_locked_page(handle)?;
         Ok(())
     }
 
@@ -268,7 +281,7 @@ where
             .page_ids
             .get(index)
             .ok_or(StoreError::RunPageIndexOutOfRange(index, self.page_ids.len()))?;
-        let page = self.pages.buffer.get_page(page_id)?;
+        let page = self.pages.pool.get_page(page_id)?;
         Ok(page.iter().next().map(|t| t.data().to_vec()))
     }
 
@@ -284,7 +297,7 @@ where
             .page_ids
             .get(page_index)
             .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
-        let page = self.pages.buffer.get_page(page_id)?;
+        let page = self.pages.pool.get_page(page_id)?;
         Ok(page.get(DBIdType::Int(slot))?.map(|t| t.data().to_vec()))
     }
 
@@ -301,9 +314,9 @@ where
             .page_ids
             .get(page_index)
             .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
-        let handle = self.pages.buffer.get_page_mut(page_id, LockLevel::Data)?;
+        let handle = self.pages.pool.get_page_mut(page_id)?;
         handle.page.add_tuple(Tuple::new(slot, data))?;
-        self.pages.buffer.write_locked_page(handle)?;
+        self.pages.pool.write_locked_page(handle)?;
         Ok(())
     }
 
@@ -320,7 +333,7 @@ where
             .page_ids
             .get(page_index)
             .ok_or(StoreError::RunPageIndexOutOfRange(page_index, self.page_ids.len()))?;
-        let page = self.pages.buffer.get_page(page_id)?;
+        let page = self.pages.pool.get_page(page_id)?;
         Ok(page
             .iter()
             .map(|t| {
@@ -368,7 +381,7 @@ where
     F: DBFile<Item = F>,
 {
     pub(crate) fn new(pages: Arc<RunPages<F>>) -> Result<Self, StoreError> {
-        let current_page = pages.buffer.get_page(pages.head)?;
+        let current_page = pages.pool.get_page(pages.head)?;
         let current_iter = current_page.iter();
         Ok(Self {
             pages,
@@ -389,7 +402,7 @@ where
         // TableCursor's own next_tuple relies on.
         let next = self.current_page.get_next_page();
         if next.is_valid_next_page() {
-            self.current_page = self.pages.buffer.get_page(next)?;
+            self.current_page = self.pages.pool.get_page(next)?;
             self.current_iter = self.current_page.iter();
             Ok(self.current_iter.next())
         } else {
@@ -410,7 +423,7 @@ where
 
     // Same lookup `new()` did against this run's own head page.
     fn reset(&mut self) -> Result<(), StoreError> {
-        let current_page = self.pages.buffer.get_page(self.pages.head)?;
+        let current_page = self.pages.pool.get_page(self.pages.head)?;
         self.current_iter = current_page.iter();
         self.current_page = current_page;
         Ok(())

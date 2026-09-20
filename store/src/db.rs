@@ -28,6 +28,7 @@ use crate::page::Page;
 use crate::page::PageId;
 use crate::run::Run;
 use crate::table::Table;
+use crate::temppool::{DEFAULT_TEMP_CACHE_BYTES, TempPool, TempStats};
 use crate::systempages::{self, SystemKind};
 use crate::table::TableIdType;
 use crate::tables::bplustree;
@@ -558,6 +559,10 @@ pub struct Db<F: DBFile + 'static> {
     // systempages.rs. Head pages are the fixed 0/1/2; only continuations
     // are tracked here.
     system_chains: parking_lot::Mutex<[Vec<PageId>; 3]>,
+    // Scratch pages for `Run`s (sort spills, hash joins, temp tables) — see
+    // temppool.rs. Kept out of `buffer` so scratch data never touches the WAL,
+    // checkpoints, the persisted free list or the core cache.
+    temp: Arc<TempPool<F>>,
     #[cfg(test)]
     fail_reverts: std::sync::atomic::AtomicBool,
 }
@@ -619,6 +624,8 @@ pub struct DbStats {
     pub page_count: u64,
     /// Tables currently loaded.
     pub tables: usize,
+    /// Scratch-page pool for runs (sort spills, hash joins, temp tables).
+    pub temp: TempStats,
 }
 
 /// What `Db::open_segments` hands back: the runner's starting state and
@@ -753,6 +760,14 @@ where
             name.as_ref().to_string(),
             wal,
         )?;
+        // Wipes any `<name>.tmp` left by a crash: scratch data never survives
+        // a restart.
+        let temp = Arc::new(TempPool::new(
+            name.as_ref(),
+            file.do_clone()?,
+            header.page_size,
+            DEFAULT_TEMP_CACHE_BYTES,
+        )?);
         let sf = Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
             page_count,
@@ -788,6 +803,7 @@ where
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
+            temp,
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         };
@@ -1047,8 +1063,12 @@ where
             log_file,
             generator,
             name,
+            temp,
             ..
         } = db;
+        // Scratch data dies with the database handle.
+        temp.remove_file()?;
+        drop(temp);
         drop(tables);
         // The generator (shared with callers via get_generator) holds an
         // Arc<Logger> for sequence logging; release it so the logger can be
@@ -1128,6 +1148,7 @@ where
             cached_pages: self.buffer.cached_pages(),
             page_count: self.page_count(),
             tables: self.tables.read().len(),
+            temp: self.temp.stats(),
         }
     }
 
@@ -2083,8 +2104,14 @@ where
     /// query-execution scratch space (sort runs, hash-join/aggregation
     /// spill partitions, ...). Unlike a table, a Run needs no MVCC/txn
     /// machinery, so this only needs `&self`, not `&Arc<Self>`.
+    /// Sets how much memory the scratch-page pool (runs) may hold before it
+    /// spills to `<db>.tmp`. Default `DEFAULT_TEMP_CACHE_BYTES` (64 MiB).
+    pub fn set_temp_cache_bytes(&self, bytes: u64) {
+        self.temp.set_cache_bytes(bytes);
+    }
+
     pub fn create_run(&self) -> Result<Run<F>, StoreError> {
-        Run::create(self.buffer.clone())
+        Run::create(self.temp.clone())
     }
 
     /// Like `create_run`, but every page (see `Run::create_slotted`'s own
@@ -2093,7 +2120,7 @@ where
     /// with a fixed, page-per-bucket-range layout (e.g. a hash index)
     /// that mutates one slot at a time, repeatedly.
     pub fn create_slotted_run(&self) -> Result<Run<F>, StoreError> {
-        Run::create_slotted(self.buffer.clone())
+        Run::create_slotted(self.temp.clone())
     }
 
     pub fn range_scan(
@@ -2526,6 +2553,12 @@ where
             wal,
         )?;
 
+        let temp = Arc::new(TempPool::new(
+            &name,
+            f.do_clone()?,
+            header.page_size,
+            DEFAULT_TEMP_CACHE_BYTES,
+        )?);
         Ok(Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
             name,
@@ -2554,6 +2587,7 @@ where
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
+            temp,
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         })
@@ -2746,6 +2780,14 @@ where
         drop(f);
         remove_file(name.as_ref())?;
         let handle = F::open(OpenOptions::new().read(true).clone(), name.as_ref());
+        let tmp = format!("{}.tmp", name.as_ref());
+        match &handle {
+            Ok(h) => h.remove_sibling(&tmp)?,
+            Err(_) => match remove_file(&tmp) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            },
+        }
         for (_, path) in segments {
             match &handle {
                 Ok(h) => h.remove_sibling(&path)?,
@@ -3384,23 +3426,25 @@ mod tests {
     #[test]
     fn test_dropping_a_run_frees_its_pages_once_nothing_else_references_them() {
         let db: Arc<TestDB> = TestDB::create_with_page_size_and_max_index_key_size("run_drop_frees.db", 512, 8).unwrap();
+        let main_pages = db.page_count();
         let mut run = db.create_run().unwrap();
         for i in 0..50u32 {
             run.append(&i.to_be_bytes()).unwrap();
         }
-        let head = run.head();
-        assert_eq!(db.buffer.get_free_pages().len(), 0);
+        let pages = run.page_count() as u64;
+        assert!(pages >= 2, "a 50-record run at a 512-byte page size must span more than one page");
+        assert_eq!(db.stats().temp.live_pages, pages);
 
         drop(run);
 
-        assert!(
-            db.buffer.get_free_pages().contains(&head),
-            "dropping a run's last reference must reclaim its own head page, not just later ones"
+        assert_eq!(
+            db.stats().temp.live_pages,
+            0,
+            "dropping a run's last reference must reclaim every one of its pages"
         );
-        assert!(
-            db.buffer.get_free_pages().len() >= 2,
-            "a 50-record run at a 512-byte page size must span more than one page"
-        );
+        // Scratch pages never touch the core allocator or its free list.
+        assert_eq!(db.page_count(), main_pages);
+        assert_eq!(db.buffer.get_free_pages().len(), 0);
     }
 
     #[test]
@@ -3414,12 +3458,12 @@ mod tests {
         let mut run = db.create_run().unwrap();
         run.append(b"a").unwrap();
         run.append(b"b").unwrap();
-        let head = run.head();
 
         let mut cursor = run.cursor().unwrap();
         drop(run);
-        assert!(
-            !db.buffer.get_free_pages().contains(&head),
+        assert_eq!(
+            db.stats().temp.live_pages,
+            1,
             "the run's pages must survive as long as a cursor still references them"
         );
 
@@ -3428,10 +3472,69 @@ mod tests {
         assert!(cursor.next().unwrap().is_none());
 
         drop(cursor);
-        assert!(
-            db.buffer.get_free_pages().contains(&head),
+        assert_eq!(
+            db.stats().temp.live_pages,
+            0,
             "once the last cursor referencing it drops too, the run's pages must free"
         );
+    }
+
+    #[test]
+    fn test_runs_spill_to_a_tmp_file_that_is_removed_when_idle_and_at_close() {
+        let name = "run_spill_tmp_file.db";
+        let db: Arc<TestDB> =
+            TestDB::create_with_page_size_and_max_index_key_size(name, 512, 8).unwrap();
+        let main_pages = db.page_count();
+        let tmp = format!("{name}.tmp");
+        let exists = |db: &Arc<TestDB>| !db.file.list_siblings(&tmp).unwrap().is_empty();
+
+        db.set_temp_cache_bytes(4 * 512);
+        let mut run = db.create_run().unwrap();
+        run.append(b"small").unwrap();
+        assert!(!exists(&db), "a run that fits in the cache never creates the file");
+
+        for i in 0..2000u32 {
+            run.append(&i.to_be_bytes()).unwrap();
+        }
+        assert!(exists(&db));
+        let s = db.stats().temp;
+        assert!(s.spills > 0 && s.file_bytes > 0 && s.cached_pages <= 4, "{s:?}");
+        assert_eq!(db.page_count(), main_pages, "scratch pages never grow the database");
+
+        let mut cursor = run.cursor().unwrap();
+        let mut n = 0;
+        while cursor.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 2001);
+
+        drop(cursor);
+        drop(run);
+        assert!(!exists(&db), "the file is removed once no run is live");
+
+        let mut run = db.create_run().unwrap();
+        for i in 0..2000u32 {
+            run.append(&i.to_be_bytes()).unwrap();
+        }
+        assert!(exists(&db));
+        // Closing removes the file even with a run still live.
+        let (file, _log) = db.close().unwrap();
+        assert!(file.list_siblings(&tmp).unwrap().is_empty());
+        drop(run);
+    }
+
+    #[test]
+    fn test_a_leftover_tmp_file_is_removed_at_open() {
+        let name = "run_leftover_tmp.db";
+        let db: Arc<TestDB> = TestDB::create(name).unwrap();
+        let tmp = format!("{name}.tmp");
+        let (file, log) = db.close().unwrap();
+        // As if a crash had left scratch data behind.
+        file.open_sibling(&tmp, std::fs::OpenOptions::new().create(true).write(true).clone()).unwrap();
+        assert_eq!(file.list_siblings(&tmp).unwrap().len(), 1);
+        let db = TestDB::open_using(name, file.do_clone().unwrap(), log).unwrap();
+        assert!(file.list_siblings(&tmp).unwrap().is_empty());
+        drop(db);
     }
 
     // ── transactional insert / find ───────────────────────────────────────────

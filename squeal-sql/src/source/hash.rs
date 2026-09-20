@@ -1506,7 +1506,8 @@ mod tests {
         // Used to create a throwaway one-page run alongside the real one, so
         // every join construction allocated (at least) one page too many.
         let db = make_db();
-        let before = db.page_count();
+        let main_before = db.page_count();
+        let before = db.stats().temp.live_pages;
         let s = HashedSource::new(
             left_source(),
             right_source(),
@@ -1517,9 +1518,12 @@ mod tests {
             JoinType::Inner,
         )
         .unwrap();
-        assert_eq!(db.page_count() - before, (s.capacity / s.records_per_page) as u64);
+        assert_eq!(
+            db.stats().temp.live_pages - before,
+            (s.capacity / s.records_per_page) as u64
+        );
 
-        let before = db.page_count();
+        let before = db.stats().temp.live_pages;
         let big = HashedSource::new(
             Box::new(WithRowCount(left_source(), 5000)),
             Box::new(WithRowCount(right_source(), 10)),
@@ -1532,7 +1536,9 @@ mod tests {
         .unwrap();
         let pages = big.capacity / big.records_per_page;
         assert!(pages > 1);
-        assert_eq!(db.page_count() - before, pages as u64);
+        assert_eq!(db.stats().temp.live_pages - before, pages as u64);
+        // The join's pages are scratch: they never touch the database file.
+        assert_eq!(db.page_count(), main_before);
     }
 
     // The behavior the sizing exists for: a build whose row count was
@@ -1572,5 +1578,42 @@ mod tests {
         while unsized_.next().unwrap().is_some() {}
         assert_eq!(unsized_.count, n);
         assert!(unsized_.capacity > initial, "with no stats the build has to grow by rehashing");
+    }
+
+    // The hash table lives in the database's scratch pool, which spills to its
+    // own file under memory pressure: a join whose table is many times the
+    // cache must still be correct, and must never touch the main file.
+    #[test]
+    fn test_a_join_larger_than_the_temp_cache_spills_and_stays_correct() {
+        let n = 4_000usize;
+        let db = make_db();
+        db.set_temp_cache_bytes(4 * 4096);
+        let main_before = db.page_count();
+        let rows = |n: usize| -> Vec<Vec<ValueItem>> {
+            (0..n as i64)
+                .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
+                .collect()
+        };
+        let mut join = HashedSource::new(
+            Box::new(VecSource::new(&["id", "val"], rows(n))),
+            Box::new(VecSource::new(&["id", "val"], rows(n))),
+            db.clone(),
+            QueryMemory::new(1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+        let mut matched = 0;
+        while join.next().unwrap().is_some() {
+            matched += 1;
+        }
+        assert_eq!(matched, n);
+        let temp = db.stats().temp;
+        assert!(temp.spills > 0 && temp.cached_pages <= 4, "{temp:?}");
+        assert_eq!(db.page_count(), main_before);
+        drop(join);
+        assert_eq!(db.stats().temp.live_pages, 0);
+        assert_eq!(db.stats().temp.file_bytes, 0, "the file is given back once idle");
     }
 }
