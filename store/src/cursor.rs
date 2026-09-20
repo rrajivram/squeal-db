@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Bound, sync::Arc};
 
 use crate::{
     db::{DBFile, Db},
@@ -8,6 +8,7 @@ use crate::{
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple},
     txn::{Transaction, TransactionId},
+    valueitem::IndexKey,
 };
 
 pub trait Cursor {
@@ -73,9 +74,12 @@ pub struct RangeCursor<F: DBFile + 'static> {
     current_leaf: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: Transaction,
-    start: DBIdType,
-    end: DBIdType,
-    // Set once an index entry >= end is seen: ascending leaf-chain order
+    start: Bound<DBIdType>,
+    end: Bound<DBIdType>,
+    // Some for prefix scans (see Db::prefix_scan): the scan ends at the
+    // first entry whose leading fields differ from this key's.
+    prefix: Option<IndexKey>,
+    // Set once an index entry is past end is seen: ascending leaf-chain order
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
     done: bool,
@@ -145,15 +149,15 @@ where
         db: Arc<Db<F>>,
         table: TableIdType,
         transaction: Option<Transaction>,
-        start: DBIdType,
-        end: DBIdType,
+        start: Bound<DBIdType>,
+        end: Bound<DBIdType>,
     ) -> Result<Self, StoreError> {
         let transaction = transaction.unwrap_or(db.begin()?);
         // Positional: finds the leaf that would hold `start` whether or
         // not `start` actually exists as a key (unlike the old
         // find_first_page, which did an exact index lookup and errored
         // with KeyNotFound if `start` wasn't a real row).
-        let current_leaf = db.table_by_id(table)?.find_leaf_page(&start)?;
+        let current_leaf = Self::start_leaf(&db.table_by_id(table)?, &start)?;
         let current_iter = current_leaf.iter();
         Ok(Self {
             db,
@@ -163,8 +167,74 @@ where
             transaction,
             start,
             end,
+            prefix: None,
             done: false,
         })
+    }
+
+    // Every entry whose leading fields equal `prefix`, in key order.
+    //
+    // Deliberately NOT a range over the short key itself: IndexKey's
+    // ordering calls a short key Equal to every longer key that starts with
+    // it, but the tree routes with strict successor() lookups, so a short
+    // start key can land past some of the prefix's entries. Instead the
+    // start is a full-length key — the prefix followed by each remaining
+    // field's lower_bound(), the shape read off an existing entry — and the
+    // end is a leading-field check in next().
+    pub(crate) fn new_prefix(
+        db: Arc<Db<F>>,
+        table: TableIdType,
+        prefix: IndexKey,
+    ) -> Result<Self, StoreError> {
+        let transaction = db.begin()?;
+        let tree = db.table_by_id(table)?;
+        let start = Self::prefix_start(&tree, &prefix)?;
+        let current_leaf = Self::start_leaf(&tree, &start)?;
+        let current_iter = current_leaf.iter();
+        Ok(Self {
+            db,
+            table,
+            current_iter,
+            current_leaf,
+            transaction,
+            start,
+            end: Bound::Unbounded,
+            prefix: Some(prefix),
+            done: false,
+        })
+    }
+
+    fn prefix_start(
+        tree: &Arc<BPlusTree<F>>,
+        prefix: &IndexKey,
+    ) -> Result<Bound<DBIdType>, StoreError> {
+        // Any entry shows the shape (all keys of an index share it). An
+        // empty index has no entries to scan: start at the beginning.
+        let Some(sample) = tree.first_leaf_page()?.iter().next() else {
+            return Ok(Bound::Unbounded);
+        };
+        let DBIdType::Rec(sample) = sample.id else {
+            return Err(StoreError::UnknownError(
+                "prefix_scan needs a table keyed by IndexKey".into(),
+            ));
+        };
+        let n = prefix.values().len();
+        if n > sample.values().len() {
+            return Err(StoreError::UnknownError(format!(
+                "prefix has {n} fields but the key has {}",
+                sample.values().len()
+            )));
+        }
+        let mut full: Vec<_> = prefix.values().to_vec();
+        full.extend(sample.values()[n..].iter().map(|v| v.lower_bound()));
+        Ok(Bound::Included(DBIdType::Rec(IndexKey::new_from(&full)?)))
+    }
+
+    fn start_leaf(table: &Arc<BPlusTree<F>>, start: &Bound<DBIdType>) -> Result<Arc<Page>, StoreError> {
+        match start {
+            Bound::Included(k) | Bound::Excluded(k) => table.find_leaf_page(k),
+            Bound::Unbounded => table.first_leaf_page(),
+        }
     }
 
     // Advances to the next INDEX entry (an (id, Node::Leaf(data_page_id))
@@ -221,13 +291,31 @@ where
                 Some(entry) => {
                     // The leaf containing `start` generally holds entries
                     // both below and at/above it — skip the ones below.
-                    if entry.id < self.start {
+                    let before_start = match &self.start {
+                        Bound::Included(k) => entry.id < *k,
+                        Bound::Excluded(k) => entry.id <= *k,
+                        Bound::Unbounded => false,
+                    };
+                    if before_start {
                         continue;
                     }
                     // Ascending leaf-chain order guarantees everything
                     // from here on is also >= end, so this is a real
                     // early-termination, not just a filter.
-                    if entry.id >= self.end {
+                    let past_end = match &self.end {
+                        Bound::Included(k) => entry.id > *k,
+                        Bound::Excluded(k) => entry.id >= *k,
+                        Bound::Unbounded => false,
+                    };
+                    let off_prefix = match (&self.prefix, &entry.id) {
+                        (Some(p), DBIdType::Rec(k)) => !p
+                            .values()
+                            .iter()
+                            .zip(k.values())
+                            .all(|(a, b)| a.cmp(b) == std::cmp::Ordering::Equal),
+                        _ => false,
+                    };
+                    if past_end || off_prefix {
                         self.done = true;
                         return Ok(None);
                     }
@@ -260,7 +348,12 @@ where
     // which are already stored as fields rather than only consumed once
     // at construction time.
     fn reset(&mut self) -> Result<(), StoreError> {
-        let current_leaf = self.db.table_by_id(self.table)?.find_leaf_page(&self.start)?;
+        let tree = self.db.table_by_id(self.table)?;
+        if let Some(prefix) = &self.prefix {
+            // The index may have been empty when the scan was built.
+            self.start = Self::prefix_start(&tree, prefix)?;
+        }
+        let current_leaf = Self::start_leaf(&tree, &self.start)?;
         self.current_iter = current_leaf.iter();
         self.current_leaf = current_leaf;
         self.done = false;
@@ -822,5 +915,297 @@ mod tests {
         );
 
         drop(noise);
+    }
+
+    // --- ValueItem/IndexKey lower_bound()/upper_bound() as range-scan bounds ---
+
+    use std::ops::Bound;
+
+    fn mm_key(a: i64, b: i64) -> IndexKey {
+        IndexKey::new_from(&[ValueItem::Integer(a), ValueItem::Integer(b)]).unwrap()
+    }
+
+    fn mm_db(name: &str, rows: &[(i64, i64)]) -> (Arc<Db<MemFile>>, TableIdType) {
+        let db = Db::<MemFile>::create(name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        for (a, b) in rows {
+            db.insert(
+                tid,
+                Tuple::new_with(DBIdType::Rec(mm_key(*a, *b)), b"v", None, None),
+                &t,
+            )
+            .unwrap();
+        }
+        db.commit(t).unwrap();
+        (db, tid)
+    }
+
+    fn bounded(
+        db: &Arc<Db<MemFile>>,
+        tid: TableIdType,
+        start: Bound<IndexKey>,
+        end: Bound<IndexKey>,
+    ) -> Vec<Tuple> {
+        let wrap = |b: Bound<IndexKey>| match b {
+            Bound::Included(k) => Bound::Included(DBIdType::Rec(k)),
+            Bound::Excluded(k) => Bound::Excluded(DBIdType::Rec(k)),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let mut cursor = db.range_scan_bounds(tid, wrap(start), wrap(end)).unwrap();
+        let mut out = Vec::new();
+        while let Some(t) = cursor.next().unwrap() {
+            out.push(t);
+        }
+        out
+    }
+
+    fn scanned_pairs(tuples: &[Tuple]) -> Vec<(i64, i64)> {
+        let mut out: Vec<(i64, i64)> = tuples
+            .iter()
+            .map(|t| match &t.id {
+                DBIdType::Rec(k) => match (&k.values()[0], &k.values()[1]) {
+                    (ValueItem::Integer(a), ValueItem::Integer(b)) => (*a, *b),
+                    other => panic!("unexpected key {other:?}"),
+                },
+                other => panic!("unexpected id {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn extreme_grid() -> Vec<(i64, i64)> {
+        let vals = [i64::MIN, -1, 0, 1, i64::MAX - 1, i64::MAX];
+        vals.iter().flat_map(|a| vals.iter().map(move |b| (*a, *b))).collect()
+    }
+
+    // A whole-index scan lower_bound()..=upper_bound() returns EVERY key,
+    // including the ones equal to either bound.
+    #[test]
+    fn test_full_range_from_lower_bound_to_upper_bound_returns_every_key() {
+        let rows = extreme_grid();
+        let (db, tid) = mm_db("bounds_scan_full.db", &rows);
+        let template = mm_key(0, 0);
+        let got = bounded(
+            &db,
+            tid,
+            Bound::Included(template.lower_bound()),
+            Bound::Included(template.upper_bound().unwrap()),
+        );
+        let mut want = rows.clone();
+        want.sort();
+        assert_eq!(scanned_pairs(&got), want);
+    }
+
+    // Unbounded on both sides is the same whole-index scan, with no sentinel.
+    #[test]
+    fn test_unbounded_range_returns_every_key_across_many_leaves() {
+        let rows: Vec<(i64, i64)> = (0..400).flat_map(|a| (0..5).map(move |b| (a, b))).collect();
+        let (db, tid) = mm_db("bounds_scan_unbounded.db", &rows);
+        let got = bounded(&db, tid, Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(scanned_pairs(&got), rows);
+    }
+
+    // Excluded/Included on both ends, against an ordinary middle range.
+    #[test]
+    fn test_all_four_inclusivity_combinations() {
+        let rows: Vec<(i64, i64)> = (0..10).map(|a| (a, 0)).collect();
+        let (db, tid) = mm_db("bounds_scan_incl.db", &rows);
+        let run = |s: Bound<IndexKey>, e: Bound<IndexKey>| -> Vec<i64> {
+            scanned_pairs(&bounded(&db, tid, s, e)).into_iter().map(|p| p.0).collect()
+        };
+        let (lo, hi) = (mm_key(3, 0), mm_key(6, 0));
+        assert_eq!(run(Bound::Included(lo.clone()), Bound::Included(hi.clone())), vec![3, 4, 5, 6]);
+        assert_eq!(run(Bound::Included(lo.clone()), Bound::Excluded(hi.clone())), vec![3, 4, 5]);
+        assert_eq!(run(Bound::Excluded(lo.clone()), Bound::Included(hi.clone())), vec![4, 5, 6]);
+        assert_eq!(run(Bound::Excluded(lo.clone()), Bound::Excluded(hi.clone())), vec![4, 5]);
+        assert_eq!(run(Bound::Unbounded, Bound::Excluded(lo)), vec![0, 1, 2]);
+        assert_eq!(run(Bound::Excluded(hi), Bound::Unbounded), vec![7, 8, 9]);
+    }
+
+    // A prefix scan: first field fixed, second field spanning its full range,
+    // including rows equal to either bound. Other prefixes stay out.
+    #[test]
+    fn test_prefix_scan_between_lower_and_upper_bound_covers_the_prefix_and_nothing_else() {
+        let rows: Vec<(i64, i64)> = [4, 5, 6]
+            .iter()
+            .flat_map(|a| [i64::MIN, -3, 0, 3, i64::MAX].map(move |b| (*a, b)))
+            .collect();
+        let (db, tid) = mm_db("bounds_scan_prefix.db", &rows);
+        let b = ValueItem::Integer(0);
+        let start = IndexKey::new_from(&[ValueItem::Integer(5), b.lower_bound()]).unwrap();
+        let end = IndexKey::new_from(&[ValueItem::Integer(5), b.upper_bound().unwrap()]).unwrap();
+        let got = scanned_pairs(&bounded(&db, tid, Bound::Included(start), Bound::Included(end)));
+        let want: Vec<(i64, i64)> = rows.iter().copied().filter(|(a, _)| *a == 5).collect();
+        assert_eq!(want.len(), 5);
+        assert_eq!(got, want);
+    }
+
+    // The old range_scan contract is unchanged: start inclusive, end exclusive.
+    #[test]
+    fn test_range_scan_is_still_start_inclusive_end_exclusive() {
+        let rows = vec![(1, 0), (2, 0), (3, 0)];
+        let (db, tid) = mm_db("bounds_scan_legacy.db", &rows);
+        let got = scan_range(&db, tid, DBIdType::Rec(mm_key(1, 0)), DBIdType::Rec(mm_key(3, 0)));
+        assert_eq!(scanned_pairs(&got), vec![(1, 0), (2, 0)]);
+    }
+
+    // A Str field has no upper bound: the scan uses Unbounded for the end
+    // and still returns every string, including "" and ones above char::MAX.
+    #[test]
+    fn test_scan_over_a_string_field_with_lower_bound_and_unbounded_end_returns_every_string() {
+        let strs = ["", "\0", "a", "zzz", "\u{10FFFF}", "\u{10FFFF}z"];
+        let db = Db::<MemFile>::create("bounds_scan_str.db").unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let mk = |x: &str| {
+            IndexKey::new_from(&[ValueItem::Integer(5), ValueItem::Str((x.to_string(), 16))]).unwrap()
+        };
+        let t = db.begin().unwrap();
+        for x in strs {
+            db.insert(tid, Tuple::new_with(DBIdType::Rec(mk(x)), b"v", None, None), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        let probe = mk("q");
+        assert_eq!(probe.upper_bound(), None);
+        let got = bounded(&db, tid, Bound::Included(probe.lower_bound()), Bound::Unbounded);
+        assert_eq!(got.len(), strs.len());
+    }
+
+    #[test]
+    fn test_range_cursor_reset_replays_the_same_bounds() {
+        let rows: Vec<(i64, i64)> = (0..10).map(|a| (a, 0)).collect();
+        let (db, tid) = mm_db("bounds_scan_reset.db", &rows);
+        let mut cursor = db
+            .range_scan_bounds(
+                tid,
+                Bound::Excluded(DBIdType::Rec(mm_key(2, 0))),
+                Bound::Included(DBIdType::Rec(mm_key(5, 0))),
+            )
+            .unwrap();
+        let mut drain = |c: &mut RangeCursor<MemFile>| {
+            let mut n = 0;
+            while c.next().unwrap().is_some() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(drain(&mut cursor), 3);
+        cursor.reset().unwrap();
+        assert_eq!(drain(&mut cursor), 3);
+    }
+
+    // --- prefix_scan ---
+
+    fn sk(a: i64, x: &str, c: i64) -> IndexKey {
+        IndexKey::new_from(&[
+            ValueItem::Integer(a),
+            ValueItem::Str((x.to_string(), 16)),
+            ValueItem::Integer(c),
+        ])
+        .unwrap()
+    }
+
+    fn prefix_db(name: &str, keys: &[IndexKey]) -> (Arc<Db<MemFile>>, TableIdType) {
+        let db = Db::<MemFile>::create(name).unwrap();
+        let tid = db.create_table("rows".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        for k in keys {
+            db.insert(tid, Tuple::new_with(DBIdType::Rec(k.clone()), b"v", None, None), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        (db, tid)
+    }
+
+    fn drain_keys(c: &mut RangeCursor<MemFile>) -> Vec<IndexKey> {
+        let mut out = vec![];
+        while let Some(t) = c.next().unwrap() {
+            match t.id {
+                DBIdType::Rec(k) => out.push(k),
+                other => panic!("{other:?}"),
+            }
+        }
+        out
+    }
+
+    // Exactly the rows with the leading field(s) equal to the prefix — for
+    // every prefix length, over a table big enough to span many index
+    // leaves, with Str fields (no upper bound) and extreme ints.
+    #[test]
+    fn test_prefix_scan_returns_exactly_the_rows_under_the_prefix() {
+        let strs = ["", "\0", "a", "b", "zz", "\u{10FFFF}", "\u{10FFFF}z"];
+        let mut keys = vec![];
+        // 1500 leading values (~31k keys): with far fewer, a short-key start
+        // happens to work; at this size it provably drops rows (verified by
+        // mutating the start to the bare prefix).
+        for a in (0..1500).chain([i64::MIN, i64::MAX]) {
+            for x in strs {
+                for c in [i64::MIN, 0, i64::MAX] {
+                    keys.push(sk(a, x, c));
+                }
+            }
+        }
+        let (db, tid) = prefix_db("prefix_scan_exact.db", &keys);
+        let one = |a: i64| IndexKey::new_from(&[ValueItem::Integer(a)]).unwrap();
+        for a in [0, 1, 30, 59, 1000, 1499, i64::MIN, i64::MAX, 5000] {
+            let got = drain_keys(&mut db.prefix_scan(tid, one(a)).unwrap());
+            let want: Vec<_> = keys.iter().filter(|k| k.values()[0] == ValueItem::Integer(a)).cloned().collect();
+            let mut want = want;
+            want.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            assert_eq!(got, want, "prefix ({a})");
+        }
+        // Two-field prefixes, including the empty string and the strings
+        // above char::MAX that a sentinel end bound would have dropped.
+        for x in strs {
+            let p = IndexKey::new_from(&[ValueItem::Integer(30), ValueItem::Str((x.to_string(), 16))]).unwrap();
+            let got = drain_keys(&mut db.prefix_scan(tid, p).unwrap());
+            assert_eq!(got.len(), 3, "prefix (30, {x:?})");
+            assert!(got.iter().all(|k| k.values()[0] == ValueItem::Integer(30) && k.values()[1].cmp(&ValueItem::Str((x.to_string(), 0))).is_eq()));
+        }
+        // The full-length prefix is an exact-key lookup.
+        let got = drain_keys(&mut db.prefix_scan(tid, sk(30, "a", 0)).unwrap());
+        assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn test_prefix_scan_with_no_matches_and_the_empty_prefix() {
+        let keys: Vec<_> = (0..20).map(|a| sk(a, "x", 0)).collect();
+        let (db, tid) = prefix_db("prefix_scan_edges.db", &keys);
+        let none = IndexKey::new_from(&[ValueItem::Integer(99)]).unwrap();
+        assert!(drain_keys(&mut db.prefix_scan(tid, none).unwrap()).is_empty());
+        let all = drain_keys(&mut db.prefix_scan(tid, IndexKey::default()).unwrap());
+        assert_eq!(all.len(), 20);
+    }
+
+    #[test]
+    fn test_prefix_scan_rejects_a_prefix_longer_than_the_key_and_non_record_keys() {
+        let (db, tid) = prefix_db("prefix_scan_err.db", &[sk(1, "x", 0)]);
+        let long = IndexKey::new_from(&[1, 2, 3, 4].map(ValueItem::Integer)).unwrap();
+        assert!(db.prefix_scan(tid, long).is_err());
+        let db2 = Db::<MemFile>::create("prefix_scan_int.db").unwrap();
+        let tid2 = db2.create_table("rows".to_string()).unwrap();
+        let t = db2.begin().unwrap();
+        db2.insert(tid2, Tuple::new_with(DBIdType::Int(1), b"v", None, None), &t).unwrap();
+        db2.commit(t).unwrap();
+        assert!(db2.prefix_scan(tid2, IndexKey::default()).is_err());
+    }
+
+    #[test]
+    fn test_prefix_scan_on_an_empty_table_is_empty_and_reset_sees_later_rows() {
+        let (db, tid) = prefix_db("prefix_scan_empty.db", &[]);
+        let p = IndexKey::new_from(&[ValueItem::Integer(5)]).unwrap();
+        let mut c = db.prefix_scan(tid, p).unwrap();
+        assert!(drain_keys(&mut c).is_empty());
+        let t = db.begin().unwrap();
+        for (a, x) in [(4, "x"), (5, "x"), (5, "y"), (6, "x")] {
+            db.insert(tid, Tuple::new_with(DBIdType::Rec(sk(a, x, 0)), b"v", None, None), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        // reset keeps the cursor's own (older) snapshot, so it must not
+        // error and must re-derive its start from the now non-empty index;
+        // a fresh scan sees the two rows.
+        c.reset().unwrap();
+        let p = IndexKey::new_from(&[ValueItem::Integer(5)]).unwrap();
+        assert_eq!(drain_keys(&mut db.prefix_scan(tid, p).unwrap()).len(), 2);
     }
 }

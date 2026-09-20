@@ -25,6 +25,8 @@ use crate::logger::{Segment, list_segments, segment_path, segment_prefix};
 use crate::maintenance::Maintenance;
 use crate::memfile::MemFile;
 use crate::page::Page;
+use std::ops::Bound;
+use crate::valueitem::IndexKey;
 use crate::page::PageId;
 use crate::run::Run;
 use crate::table::Table;
@@ -2128,6 +2130,30 @@ where
         tid: TableIdType,
         start: DBIdType,
         end: DBIdType,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        self.range_scan_bounds(tid, Bound::Included(start), Bound::Excluded(end))
+    }
+
+    // Every row whose key's leading fields equal `prefix` (a shorter
+    // IndexKey than the table's keys), in key order — including when a
+    // later field is a Str or Blob, which has no upper bound to end a plain
+    // range at. See RangeCursor::new_prefix.
+    pub fn prefix_scan(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        prefix: IndexKey,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        RangeCursor::new_prefix(Arc::clone(self), tid, prefix)
+    }
+
+    // range_scan with explicit bounds: a max-valued key can be scanned with
+    // an Included end, and an open end (Unbounded) covers types with no
+    // largest value (see ValueItem::upper_bound).
+    pub fn range_scan_bounds(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        start: Bound<DBIdType>,
+        end: Bound<DBIdType>,
     ) -> Result<RangeCursor<F>, StoreError> {
         RangeCursor::new(Arc::clone(self), tid, None, start, end)
     }

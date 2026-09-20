@@ -33,7 +33,7 @@ pub enum ValueItem {
 // float`-style crates use. The one deliberate, known consequence: NaN
 // == NaN becomes true and -0.0 == 0.0 becomes false, the opposite of
 // plain IEEE-754 `==` (see test_double_equality_is_bit_pattern_based).
-// Every other variant just does what derive would already do.
+// Str/Blob compare by content only — see the arms below.
 impl PartialEq for ValueItem {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -41,8 +41,11 @@ impl PartialEq for ValueItem {
             (ValueItem::Integer(a), ValueItem::Integer(b)) => a == b,
             (ValueItem::Double(a), ValueItem::Double(b)) => a.to_bits() == b.to_bits(),
             (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a == b,
-            (ValueItem::Str(a), ValueItem::Str(b)) => a == b,
-            (ValueItem::Blob(a), ValueItem::Blob(b)) => a == b,
+            // Content only: the u32 beside a Str/Blob is reserved on-disk
+            // capacity (a sizing hint), not part of the logical value — the
+            // same view Ord and Hash take, so `==`, `cmp` and `hash` agree.
+            (ValueItem::Str(a), ValueItem::Str(b)) => a.0 == b.0,
+            (ValueItem::Blob(a), ValueItem::Blob(b)) => a.0 == b.0,
             (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a == b,
             _ => false,
         }
@@ -106,8 +109,9 @@ impl<'de> serde::de::Visitor<'de> for ValueItemVisitor {
             seq: &mut A,
             what: &'static str,
         ) -> Result<T, A::Error> {
-            seq.next_element()?
-                .ok_or_else(|| serde::de::Error::custom(format!("ValueItem::{what}: missing value")))
+            seq.next_element()?.ok_or_else(|| {
+                serde::de::Error::custom(format!("ValueItem::{what}: missing value"))
+            })
         }
         let tag: u8 = seq
             .next_element()?
@@ -283,6 +287,28 @@ impl IndexKey {
             _ => None,
         }
     }
+
+    // The smallest key of this key's shape under IndexKey's ordering: every
+    // field replaced by its own type's true minimum. A start bound for
+    // range scans (inclusive).
+    pub fn lower_bound(&self) -> Self {
+        Self {
+            data: Arc::from(self.data.iter().map(|i| i.lower_bound()).collect::<Vec<_>>()),
+        }
+    }
+
+    // The largest key of this key's shape, or None if any field's type has
+    // no largest value (Str, Blob — see ValueItem::upper_bound). Inclusive:
+    // pair it with Bound::Included, and fall back to Bound::Unbounded on
+    // None.
+    pub fn upper_bound(&self) -> Option<Self> {
+        let data = self
+            .data
+            .iter()
+            .map(|i| i.upper_bound())
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { data: Arc::from(data) })
+    }
 }
 
 impl Index<usize> for IndexKey {
@@ -357,6 +383,38 @@ impl ValueItem {
             ValueItem::Boolean(_) => Ok(()),
             ValueItem::Null => Ok(()),
         }
+    }
+
+    // The smallest value of this value's type under ValueItem's total order.
+    // (Named lower_bound, not min: ValueItem: Ord makes `v.min()` on an
+    // owned value resolve to Ord::min.)
+    pub fn lower_bound(&self) -> Self {
+        match self {
+            ValueItem::Integer(_) => ValueItem::Integer(i64::MIN),
+            // The negative NaN with every payload bit set: f64::total_cmp
+            // orders it below -inf, and hence below f64::MIN.
+            ValueItem::Double(_) => ValueItem::Double(f64::from_bits(u64::MAX)),
+            ValueItem::Datetime(_) => ValueItem::Datetime(u64::MIN),
+            ValueItem::Str(_) => ValueItem::Str((String::new(), 0)),
+            ValueItem::Blob(_) => ValueItem::Blob((Arc::from([0u8; 0]), 0)),
+            ValueItem::Boolean(_) => ValueItem::Boolean(false),
+            ValueItem::Null => ValueItem::Null,
+        }
+    }
+
+    // The largest value of this value's type, or None where the type has
+    // none: any Str or Blob is beaten by the same bytes with one more
+    // appended, so no finite sentinel bounds them.
+    pub fn upper_bound(&self) -> Option<Self> {
+        Some(match self {
+            ValueItem::Integer(_) => ValueItem::Integer(i64::MAX),
+            // The positive NaN with every payload bit set: above +inf.
+            ValueItem::Double(_) => ValueItem::Double(f64::from_bits(0x7FFF_FFFF_FFFF_FFFF)),
+            ValueItem::Datetime(_) => ValueItem::Datetime(u64::MAX),
+            ValueItem::Boolean(_) => ValueItem::Boolean(true),
+            ValueItem::Null => ValueItem::Null,
+            ValueItem::Str(_) | ValueItem::Blob(_) => return None,
+        })
     }
 
     pub fn size(&self) -> usize {
@@ -465,17 +523,20 @@ impl ValueItem {
         let val = match vtype {
             0 => ValueItem::Null,
             5 => {
-                let v = i64::from_le_bytes(take(bytes, index, size_of::<i64>())?.try_into().unwrap());
+                let v =
+                    i64::from_le_bytes(take(bytes, index, size_of::<i64>())?.try_into().unwrap());
                 index += size_of::<i64>();
                 ValueItem::Integer(v)
             }
             10 => {
-                let v = f64::from_le_bytes(take(bytes, index, size_of::<f64>())?.try_into().unwrap());
+                let v =
+                    f64::from_le_bytes(take(bytes, index, size_of::<f64>())?.try_into().unwrap());
                 index += size_of::<f64>();
                 ValueItem::Double(v)
             }
             15 => {
-                let v = u64::from_le_bytes(take(bytes, index, size_of::<u64>())?.try_into().unwrap());
+                let v =
+                    u64::from_le_bytes(take(bytes, index, size_of::<u64>())?.try_into().unwrap());
                 index += size_of::<u64>();
                 ValueItem::Datetime(v)
             }
@@ -483,12 +544,12 @@ impl ValueItem {
                 let len =
                     u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
                 index += size_of::<u32>();
-                let real_len = u32::from_le_bytes(
-                    take(bytes, index, size_of::<u32>())?.try_into().unwrap(),
-                ) as usize;
+                let real_len =
+                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap())
+                        as usize;
                 index += size_of::<u32>();
-                let str = String::from_utf8(take(bytes, index, real_len)?.to_vec())
-                    .unwrap_or_default();
+                let str =
+                    String::from_utf8(take(bytes, index, real_len)?.to_vec()).unwrap_or_default();
                 // to_bytes() pads the content out to `len` bytes when the
                 // real content is shorter than the reserved capacity — skip
                 // that padding too, not just the real content, or the next
@@ -500,9 +561,9 @@ impl ValueItem {
                 let len =
                     u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
                 index += size_of::<u32>();
-                let real_len = u32::from_le_bytes(
-                    take(bytes, index, size_of::<u32>())?.try_into().unwrap(),
-                ) as usize;
+                let real_len =
+                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap())
+                        as usize;
                 index += size_of::<u32>();
                 let arc = Arc::from(take(bytes, index, real_len)?);
                 // See the Str case above: skip trailing padding too.
@@ -536,10 +597,10 @@ impl Hash for ValueItem {
             ValueItem::Double(f) => {
                 f.to_bits().hash(state);
             }
-            ValueItem::Blob(b) => b.hash(state),
+            ValueItem::Blob(b) => b.0.hash(state),
             ValueItem::Datetime(d) => d.hash(state),
             ValueItem::Integer(i) => i.hash(state),
-            ValueItem::Str(s) => s.hash(state),
+            ValueItem::Str(s) => s.0.hash(state),
             ValueItem::Boolean(b) => b.hash(state),
             ValueItem::Null => {}
         }
@@ -757,25 +818,15 @@ mod valueitem_tests {
         );
     }
 
-    // Surfaces a real inconsistency: derived PartialEq (used by `==`)
-    // compares the *whole* (String, u32) tuple including reserved capacity,
-    // but partial_cmp (used by `<`/`>`/sort) only compares the string
-    // content. Two Str values can therefore be `!=` while also comparing
-    // as `Equal` under partial_cmp — violating the usual expectation that
-    // `a == b` iff `a.partial_cmp(&b) == Some(Equal)`. Documented here so
-    // it's not accidentally relied upon either way (e.g. a BTree that
-    // dedupes by ordering-equality could conflate two structurally
-    // distinct values).
+    // Reserved capacity is a sizing hint, not part of the value, so `==`
+    // agrees with partial_cmp (and Hash): Str values differing only in
+    // capacity are equal under all three.
     #[test]
-    fn test_str_eq_and_partial_cmp_disagree_on_reserved_capacity() {
+    fn test_str_eq_and_partial_cmp_agree_on_reserved_capacity() {
         let a = ValueItem::Str(("apple".into(), 5));
         let b = ValueItem::Str(("apple".into(), 500));
-        assert_ne!(a, b, "derived PartialEq compares the reserved capacity too");
-        assert_eq!(
-            a.partial_cmp(&b),
-            Some(std::cmp::Ordering::Equal),
-            "but partial_cmp only compares content, so it disagrees with =="
-        );
+        assert_eq!(a, b, "PartialEq ignores the reserved capacity");
+        assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Equal));
     }
 
     #[test]
@@ -784,7 +835,9 @@ mod valueitem_tests {
         let b = ValueItem::Blob((Arc::from(&b"same"[..]), 10));
         assert_eq!(a, b, "distinct Arcs with equal content must be ==");
         let c = ValueItem::Blob((Arc::from(&b"same"[..]), 999));
-        assert_ne!(a, c, "differing reserved capacity makes them !=, like Str");
+        assert_eq!(a, c, "reserved capacity is not part of the value, like Str");
+        let d = ValueItem::Blob((Arc::from(&b"diff"[..]), 10));
+        assert_ne!(a, d);
     }
 
     // STORE_AUDIT.md S7: Blob is now genuinely comparable — same-variant
@@ -912,7 +965,10 @@ mod valueitem_tests {
         }
 
         let junk = vec![b'A'; 10];
-        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk).unwrap());
+        assert_eq!(
+            ValueItem::Null,
+            ValueItem::from_bytes_single(&junk).unwrap()
+        );
     }
 
     #[test]
@@ -1072,9 +1128,18 @@ mod valueitem_tests {
         let a = ValueItem::Double(1.1).hash();
         let b = ValueItem::Double(1.5).hash();
         let c = ValueItem::Double(1.9).hash();
-        assert_ne!(a, b, "1.1 and 1.5 must not collide under a bit-pattern hash");
-        assert_ne!(b, c, "1.5 and 1.9 must not collide under a bit-pattern hash");
-        assert_ne!(a, c, "1.1 and 1.9 must not collide under a bit-pattern hash");
+        assert_ne!(
+            a, b,
+            "1.1 and 1.5 must not collide under a bit-pattern hash"
+        );
+        assert_ne!(
+            b, c,
+            "1.5 and 1.9 must not collide under a bit-pattern hash"
+        );
+        assert_ne!(
+            a, c,
+            "1.1 and 1.9 must not collide under a bit-pattern hash"
+        );
 
         // Hash/Eq consistency (Hash's own contract: a == b must imply
         // hash(a) == hash(b)) for the two cases where this type's
@@ -1082,7 +1147,10 @@ mod valueitem_tests {
         // IEEE-754 `==` — see test_double_equality_is_bit_pattern_based.
         let nan1 = ValueItem::Double(f64::NAN);
         let nan2 = ValueItem::Double(f64::NAN);
-        assert_eq!(nan1, nan2, "sanity: bit-identical NaNs are equal under this type's PartialEq");
+        assert_eq!(
+            nan1, nan2,
+            "sanity: bit-identical NaNs are equal under this type's PartialEq"
+        );
         assert_eq!(
             nan1.hash(),
             nan2.hash(),
@@ -1147,7 +1215,10 @@ mod valueitem_tests {
         // 15/20/25); from_bytes_many's fallback logs and returns Null
         // instead of panicking on malformed/corrupt input.
         let junk = vec![b'A'; 10];
-        assert_eq!(ValueItem::Null, ValueItem::from_bytes_single(&junk).unwrap());
+        assert_eq!(
+            ValueItem::Null,
+            ValueItem::from_bytes_single(&junk).unwrap()
+        );
     }
 }
 
@@ -1506,5 +1577,340 @@ mod indexkey_tests {
         let bytes = [0x01, 0x04, 0x03, b'a', b'b', b'c', 0x01];
         let k = postcard::from_bytes::<IndexKey>(&bytes).unwrap();
         assert_eq!(k.values().len(), 1);
+    }
+}
+
+// ValueItem::lower_bound / upper_bound and IndexKey's: for use as range-scan
+// bounds. lower_bound must be <= every value of the same variant and
+// upper_bound (where the type has one) >= every such value, under
+// ValueItem's own Ord (type rank first, then i64 / f64::total_cmp / u64 /
+// byte-lexicographic String and Blob / false<true).
+#[cfg(test)]
+mod minmax_tests {
+    use std::cmp::Ordering;
+    use std::mem::discriminant;
+    use std::sync::Arc;
+
+    use crate::valueitem::{IndexKey, ValueItem};
+
+    fn s(x: &str) -> ValueItem {
+        ValueItem::Str((x.to_string(), x.len() as u32))
+    }
+    fn blob(b: &[u8]) -> ValueItem {
+        ValueItem::Blob((Arc::from(b), b.len() as u32))
+    }
+    fn dbl(f: f64) -> ValueItem {
+        ValueItem::Double(f)
+    }
+    // f64::total_cmp's true extremes: the NaN payloads with the sign bit set /
+    // clear and every mantissa bit set.
+    const NEG_NAN_BITS: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    const POS_NAN_BITS: u64 = 0x7FFF_FFFF_FFFF_FFFF;
+
+    fn ints() -> Vec<ValueItem> {
+        [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX]
+            .into_iter()
+            .map(ValueItem::Integer)
+            .collect()
+    }
+    fn datetimes() -> Vec<ValueItem> {
+        [0u64, 1, 86_400, u64::MAX - 1, u64::MAX]
+            .into_iter()
+            .map(ValueItem::Datetime)
+            .collect()
+    }
+    fn bools() -> Vec<ValueItem> {
+        vec![ValueItem::Boolean(false), ValueItem::Boolean(true)]
+    }
+    fn doubles() -> Vec<ValueItem> {
+        vec![
+            dbl(f64::from_bits(NEG_NAN_BITS)),
+            dbl(f64::NEG_INFINITY),
+            dbl(f64::MIN),
+            dbl(-1.5),
+            dbl(-0.0),
+            dbl(0.0),
+            dbl(f64::MIN_POSITIVE),
+            dbl(1.5),
+            dbl(f64::MAX),
+            dbl(f64::INFINITY),
+            dbl(f64::NAN),
+            dbl(f64::from_bits(POS_NAN_BITS)),
+        ]
+    }
+    fn strs() -> Vec<ValueItem> {
+        vec![
+            s(""),
+            s("\0"),
+            s("\0\0"),
+            s("a"),
+            s("zzz"),
+            s("é"),
+            s("\u{10FFFF}"),
+            s("\u{10FFFF}a"),
+            s("\u{10FFFF}\u{10FFFF}"),
+        ]
+    }
+    fn blobs() -> Vec<ValueItem> {
+        vec![
+            blob(&[]),
+            blob(&[0]),
+            blob(&[0, 0]),
+            blob(&[1]),
+            blob(&[255]),
+            blob(&[255, 0]),
+            blob(&[255, 255]),
+        ]
+    }
+    fn every_variant() -> Vec<(&'static str, Vec<ValueItem>)> {
+        vec![
+            ("Integer", ints()),
+            ("Datetime", datetimes()),
+            ("Boolean", bools()),
+            ("Double", doubles()),
+            ("Str", strs()),
+            ("Blob", blobs()),
+            ("Null", vec![ValueItem::Null]),
+        ]
+    }
+
+    // Every value in `corpus` that is NOT within [lower_bound, upper_bound]
+    // of its own type (an absent upper bound excludes nothing).
+    fn bound_violations(corpus: &[ValueItem]) -> Vec<String> {
+        let mut bad = vec![];
+        for v in corpus {
+            if v.lower_bound().cmp(v) == Ordering::Greater {
+                bad.push(format!("{v:?}: lower_bound() {:?} is ABOVE it", v.lower_bound()));
+            }
+            if let Some(hi) = v.upper_bound()
+                && hi.cmp(v) == Ordering::Less
+            {
+                bad.push(format!("{v:?}: upper_bound() {hi:?} is BELOW it"));
+            }
+        }
+        bad
+    }
+
+    // ---- structural guarantees, every variant ----
+
+    #[test]
+    fn test_bounds_keep_the_variant_of_the_receiver() {
+        for (name, corpus) in every_variant() {
+            for v in &corpus {
+                assert_eq!(discriminant(&v.lower_bound()), discriminant(v), "{name} {v:?}");
+                if let Some(hi) = v.upper_bound() {
+                    assert_eq!(discriminant(&hi), discriminant(v), "{name} {v:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_bounds_do_not_depend_on_the_receivers_value() {
+        // "the bound of the type", not "something derived from this value".
+        for (name, corpus) in every_variant() {
+            for v in &corpus {
+                assert_eq!(v.lower_bound(), corpus[0].lower_bound(), "{name}: varies with {v:?}");
+                assert_eq!(v.upper_bound(), corpus[0].upper_bound(), "{name}: varies with {v:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_bounds_are_idempotent() {
+        for (name, corpus) in every_variant() {
+            let v = &corpus[0];
+            assert_eq!(v.lower_bound().lower_bound(), v.lower_bound(), "{name}");
+            if let Some(hi) = v.upper_bound() {
+                assert_eq!(hi.upper_bound(), Some(hi.clone()), "{name}");
+                assert_eq!(hi.lower_bound(), v.lower_bound(), "{name}");
+                assert_eq!(v.lower_bound().upper_bound(), Some(hi), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_bound_never_exceeds_upper_bound() {
+        for (name, corpus) in every_variant() {
+            let v = &corpus[0];
+            if let Some(hi) = v.upper_bound() {
+                assert_ne!(v.lower_bound().cmp(&hi), Ordering::Greater, "{name}");
+            }
+        }
+    }
+
+    // ---- true bounds, every variant ----
+
+    #[test]
+    fn test_every_variants_lower_bound_is_a_true_lower_bound() {
+        for (name, corpus) in every_variant() {
+            assert_eq!(bound_violations(&corpus), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_types_with_a_maximum_have_a_true_upper_bound() {
+        for (name, corpus) in every_variant() {
+            let has_max = !matches!(corpus[0], ValueItem::Str(_) | ValueItem::Blob(_));
+            for v in &corpus {
+                assert_eq!(v.upper_bound().is_some(), has_max, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_str_and_blob_have_no_upper_bound_because_none_exists() {
+        // Whatever a caller might pick as a maximum, appending a byte beats it.
+        assert_eq!(s("").upper_bound(), None);
+        assert_eq!(blob(&[]).upper_bound(), None);
+        assert_eq!(s("\u{10FFFF}").cmp(&s("\u{10FFFF}\0")), Ordering::Less);
+        assert_eq!(blob(&[255]).cmp(&blob(&[255, 0])), Ordering::Less);
+    }
+
+    #[test]
+    fn test_exact_bound_values() {
+        assert_eq!(ValueItem::Integer(0).lower_bound(), ValueItem::Integer(i64::MIN));
+        assert_eq!(ValueItem::Integer(0).upper_bound(), Some(ValueItem::Integer(i64::MAX)));
+        assert_eq!(ValueItem::Datetime(9).lower_bound(), ValueItem::Datetime(0));
+        assert_eq!(ValueItem::Datetime(9).upper_bound(), Some(ValueItem::Datetime(u64::MAX)));
+        assert_eq!(ValueItem::Boolean(true).lower_bound(), ValueItem::Boolean(false));
+        assert_eq!(ValueItem::Boolean(false).upper_bound(), Some(ValueItem::Boolean(true)));
+        assert_eq!(ValueItem::Null.lower_bound(), ValueItem::Null);
+        assert_eq!(ValueItem::Null.upper_bound(), Some(ValueItem::Null));
+        assert_eq!(s("x").lower_bound(), s(""));
+        assert_eq!(blob(&[1]).lower_bound(), blob(&[]));
+    }
+
+    // A bound used as a real key must survive IndexKey::new_from's capacity
+    // check (content length <= the reserved capacity), like any other key.
+    #[test]
+    fn test_bounds_pass_key_validation() {
+        for (_, corpus) in every_variant() {
+            let v = &corpus[0];
+            let mut bounds = vec![v.lower_bound()];
+            bounds.extend(v.upper_bound());
+            for b in bounds {
+                assert!(IndexKey::new_from(std::slice::from_ref(&b)).is_ok(), "{b:?} rejected");
+            }
+        }
+    }
+
+    // Composite keys sort field by field, so each field's own bounds must
+    // stay inside its type-rank band — a bound never leaks into another
+    // variant's range.
+    #[test]
+    fn test_bounds_stay_inside_their_own_type_band() {
+        for (_, a) in every_variant() {
+            for (_, b) in every_variant() {
+                if discriminant(&a[0]) == discriminant(&b[0]) {
+                    continue;
+                }
+                let (lo, hi) = if a[0].cmp(&b[0]) == Ordering::Less { (&a[0], &b[0]) } else { (&b[0], &a[0]) };
+                if let Some(top) = lo.upper_bound() {
+                    assert_eq!(top.cmp(&hi.lower_bound()), Ordering::Less, "{lo:?} upper must sort below {hi:?} lower");
+                }
+            }
+        }
+    }
+
+    // ---- IndexKey ----
+
+    fn key(v: Vec<ValueItem>) -> IndexKey {
+        IndexKey::new_from(&v).unwrap()
+    }
+
+    #[test]
+    fn test_indexkey_bounds_map_every_field_and_keep_the_length() {
+        let k = key(vec![ValueItem::Integer(7), ValueItem::Boolean(true), ValueItem::Datetime(5), ValueItem::Null]);
+        let (lo, hi) = (k.lower_bound(), k.upper_bound().unwrap());
+        for (i, orig) in k.values().iter().enumerate() {
+            assert_eq!(lo.values()[i], orig.lower_bound());
+            assert_eq!(hi.values()[i], orig.upper_bound().unwrap());
+        }
+        assert_eq!(lo.values().len(), k.values().len());
+        assert_eq!(k.values()[0], ValueItem::Integer(7), "receiver untouched");
+        assert_eq!(IndexKey::default().lower_bound().values().len(), 0);
+        assert_eq!(IndexKey::default().upper_bound().unwrap().values().len(), 0);
+    }
+
+    #[test]
+    fn test_indexkey_with_a_str_or_blob_field_has_no_upper_bound_but_a_lower_one() {
+        let k = key(vec![ValueItem::Integer(7), s("abc")]);
+        assert_eq!(k.upper_bound(), None);
+        assert_eq!(k.lower_bound().values(), &[ValueItem::Integer(i64::MIN), s("")]);
+        assert_eq!(key(vec![blob(&[1]), ValueItem::Integer(1)]).upper_bound(), None);
+    }
+
+    #[test]
+    fn test_indexkey_bounds_bound_every_composite_of_well_behaved_types() {
+        let (a, b, c) = (ints(), datetimes(), bools());
+        let mut checked = 0;
+        for x in &a {
+            for y in &b {
+                for z in &c {
+                    let k = key(vec![x.clone(), y.clone(), z.clone()]);
+                    assert_ne!(k.lower_bound().partial_cmp(&k), Some(Ordering::Greater), "{k:?}");
+                    let hi = k.upper_bound().unwrap();
+                    assert_ne!(hi.partial_cmp(&k), Some(Ordering::Less), "{k:?}");
+                    assert_eq!(k.lower_bound().partial_cmp(&hi), Some(Ordering::Less), "{k:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, a.len() * b.len() * c.len());
+    }
+
+    #[test]
+    fn test_indexkey_bounds_bound_all_pairs_of_integer_keys() {
+        let vals = ints();
+        for a in &vals {
+            for b in &vals {
+                let k = key(vec![a.clone(), b.clone()]);
+                let (lo, hi) = (k.lower_bound(), k.upper_bound().unwrap());
+                for a2 in &vals {
+                    for b2 in &vals {
+                        let other = key(vec![a2.clone(), b2.clone()]);
+                        assert_ne!(lo.partial_cmp(&other), Some(Ordering::Greater));
+                        assert_ne!(hi.partial_cmp(&other), Some(Ordering::Less));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_indexkey_lower_bound_of_str_and_blob_fields_bounds_every_corpus_value() {
+        for corpus in [strs(), blobs()] {
+            for v in &corpus {
+                let k = key(vec![ValueItem::Integer(1), v.clone()]);
+                assert_ne!(k.lower_bound().partial_cmp(&k), Some(Ordering::Greater), "{k:?}");
+            }
+        }
+    }
+
+    // Capacity is a storage hint, not part of the value: ==, cmp and hash
+    // must all ignore it.
+    #[test]
+    fn test_equality_and_hash_ignore_reserved_capacity() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let h = |v: &ValueItem| {
+            let mut st = DefaultHasher::new();
+            Hash::hash(v, &mut st);
+            st.finish()
+        };
+        let pairs = [
+            (ValueItem::Str(("ab".into(), 2)), ValueItem::Str(("ab".into(), 50))),
+            (ValueItem::Blob((Arc::from([1u8, 2]), 2)), ValueItem::Blob((Arc::from([1u8, 2]), 9))),
+        ];
+        for (a, b) in pairs {
+            assert_eq!(a, b);
+            assert_eq!(a.cmp(&b), Ordering::Equal);
+            assert_eq!(h(&a), h(&b));
+        }
+        assert_ne!(ValueItem::Str(("ab".into(), 2)), ValueItem::Str(("ac".into(), 2)));
+        let k1 = key(vec![ValueItem::Integer(1), ValueItem::Str(("ab".into(), 2))]);
+        let k2 = key(vec![ValueItem::Integer(1), ValueItem::Str(("ab".into(), 30))]);
+        assert_eq!(k1, k2);
+        assert_eq!(k1.partial_cmp(&k2), Some(Ordering::Equal));
     }
 }

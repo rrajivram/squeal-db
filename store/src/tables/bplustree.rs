@@ -898,6 +898,28 @@ where
         self.route_to_leaf(id, self.table.first_index_page)
     }
 
+    // The leftmost leaf: where an unbounded-start range scan begins. Follows
+    // each inner node's first routing entry down (its smallest separator
+    // covers everything below it).
+    pub(crate) fn first_leaf_page(&self) -> Result<Arc<Page>, StoreError> {
+        let mut page = self.buffer.get_page(self.table.first_index_page)?;
+        while page.is_flag_set(INNER_NODE) {
+            let Some(entry) = page.iter().next() else {
+                return Ok(page);
+            };
+            page = match from_bytes::<Node>(&entry.data)? {
+                Node::Inner(page_num) => self.buffer.get_page(page_num)?,
+                Node::Leaf(_) => {
+                    return Err(StoreError::Corruption(format!(
+                        "expected an inner routing entry, found a leaf entry at {:?}",
+                        entry.id
+                    )));
+                }
+            };
+        }
+        Ok(page)
+    }
+
     // Given a leaf index page, returns its sibling in the leaf chain (see
     // split_non_root_page/split_root_page, which wire up next_page on
     // every leaf split), or None once the walk reaches the last leaf.
