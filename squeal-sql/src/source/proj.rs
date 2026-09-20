@@ -62,7 +62,7 @@ impl Source for Projection {
     // swallow every child's stats for any query with an explicit
     // column list, and eval() cost (the one thing Projection actually
     // does per row) would go unmeasured entirely.
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let this_stats = vec![(
             "Projection".to_string(),
             QueryStats {
@@ -73,7 +73,7 @@ impl Source for Projection {
                 level: 0,
             },
         )];
-        Some(merge_stats(this_stats, self.source.stats()))
+        Some(merge_stats(this_stats, self.source.query_stats()))
     }
 }
 

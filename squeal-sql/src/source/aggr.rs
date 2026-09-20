@@ -58,13 +58,13 @@ impl Source for AggregatingSource {
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
         let time_spent = self.time_spent as f64;
         let this_query = QueryStats {
             stats: HashMap::from([("time_ns".into(), time_spent)]),
             level: 0,
         };
         let this_stats = vec![("AggegatingSource".to_string(), this_query)];
-        Some(merge_stats(this_stats, self.source.stats()))
+        Some(merge_stats(this_stats, self.source.query_stats()))
     }
 }

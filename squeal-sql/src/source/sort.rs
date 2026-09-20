@@ -137,17 +137,18 @@ where
     // projected field's display_name — the position found is directly
     // the row position, since `fields` IS the projected row's own field
     // list, one for one.
-    fn resolve_order_by_index(expr: &Expr, fields: &[ProjectableField]) -> Result<usize, SchemaError> {
+    fn resolve_order_by_index(
+        expr: &Expr,
+        fields: &[ProjectableField],
+    ) -> Result<usize, SchemaError> {
         let Expr::Column(c) = expr else {
             return Err(SchemaError::UnknownError(
                 "Do not know how to process non-value sort value".into(),
             ));
         };
-        let name = c
-            .idents()
-            .last()
-            .map(|i| i.value.clone())
-            .ok_or_else(|| SchemaError::UnknownError("empty column reference in ORDER BY".into()))?;
+        let name = c.idents().last().map(|i| i.value.clone()).ok_or_else(|| {
+            SchemaError::UnknownError("empty column reference in ORDER BY".into())
+        })?;
         let mut found = None;
         for (i, f) in fields.iter().enumerate() {
             if f.display_name.eq_ignore_ascii_case(&name) {
@@ -370,7 +371,12 @@ where
                 page_count_in_run += 1;
                 if page_count_in_run == pages_per_run {
                     page_count_in_run = 0;
-                    Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+                    Self::close_run(
+                        &self.sort_fields,
+                        &mut run,
+                        &mut current_run,
+                        records_per_page,
+                    )?;
                     runs.push(run);
                     run = self.db.create_run()?;
                 }
@@ -381,7 +387,12 @@ where
                     // reached max buffers , create a new run
                     pages_per_run = mems.len();
                     page_count_in_run = 0;
-                    Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+                    Self::close_run(
+                        &self.sort_fields,
+                        &mut run,
+                        &mut current_run,
+                        records_per_page,
+                    )?;
                     runs.push(run);
                     run = self.db.create_run()?;
                 } else {
@@ -391,7 +402,12 @@ where
             }
         }
         if !current_run.is_empty() {
-            Self::close_run(&self.sort_fields, &mut run, &mut current_run, records_per_page)?;
+            Self::close_run(
+                &self.sort_fields,
+                &mut run,
+                &mut current_run,
+                records_per_page,
+            )?;
             runs.push(run);
         }
 
@@ -523,7 +539,7 @@ where
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let this_stats = vec![(
             "SortSource".to_string(),
             QueryStats {
@@ -534,7 +550,7 @@ where
                 level: 0,
             },
         )];
-        Some(merge_stats(this_stats, self.source.stats()))
+        Some(merge_stats(this_stats, self.source.query_stats()))
     }
 }
 

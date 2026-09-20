@@ -803,7 +803,19 @@ where
         // `self.tables` populated to walk them) but before load_logs
         // (replay's own insert_if_needed/alloc_page calls must never see a
         // free list that still lists a live page as available).
-        sf.reconcile_free_list()?;
+        //
+        // Only when there IS something to replay. The stale-list hazard needs
+        // a durable commit after the last checkpoint — a transaction that
+        // took a page off the free list — and that always leaves records
+        // above the checkpoint's floor. With none, the persisted free list is
+        // exactly what the last checkpoint wrote (allocations that write no
+        // log record — run pages, DDL — either die with the process or
+        // checkpoint immediately), so trust it: reconciling walks EVERY page
+        // of every table, which made a clean open of a large database cost
+        // tens of seconds for nothing.
+        if !records.is_empty() {
+            sf.reconcile_free_list()?;
+        }
         let count = sf.process_log(records)?;
         info!("{count} log record(s) replayed (floor {floor})");
         sf.recovered_records
@@ -1445,6 +1457,27 @@ where
         // AbortOnConflict may already have aborted this transaction; a
         // commit of a finished id must not report success.
         self.require_active(&id)?;
+        // A transaction that never wrote (every SELECT) has nothing of its own
+        // to make durable and nothing recovery needs to hear about: no Commit
+        // record and nothing for vacuum to do. It still needs a commit
+        // timestamp to leave the active set; take one from the same clock a
+        // logged commit uses (TxnSink::commit_id does exactly this). This
+        // used to append a record for every read-only transaction, so a
+        // read-heavy session grew the WAL.
+        //
+        // What it must still do is keep the guarantee callers have always
+        // had from commit(): when it returns, everything logged BEFORE it is
+        // durable (non-transactional records, e.g. sequence chunks, are only
+        // made durable by a later commit's wait). sync() is exactly that
+        // barrier, without appending anything.
+        if !self.versions.has_writes(&id) {
+            let ts = self.logger.next_lsn().0;
+            self.tx_mgr.commit(id, ts)?;
+            if durability == Durability::Sync {
+                self.logger.sync()?;
+            }
+            return Ok(());
+        }
         let commit_lsn = self.logger.log_new(Operation::Commit(id))?;
         // THE commit point for every other thread. Versions are never
         // discarded here — retention is the horizon's decision — so there
@@ -1494,8 +1527,16 @@ where
 
     /// The second half of `abort`, also what the maintenance thread retries.
     fn finish_abort(&self, id: TransactionId) -> Result<(), StoreError> {
+        // Decided BEFORE revert/discard. A transaction that never wrote (a
+        // dropped SELECT guard) has nothing to undo, and recovery only needs
+        // a Rollback record to close out records it has already seen — of
+        // which there are none. Logging one anyway appended a record for
+        // every read-only statement.
+        let wrote = self.versions.has_writes(&id);
         self.revert(id)?;
-        self.logger.log_new(Operation::Rollback(id))?;
+        if wrote {
+            self.logger.log_new(Operation::Rollback(id))?;
+        }
         self.versions.discard(&id);
         self.tx_mgr.abort_complete(&id);
         Ok(())
@@ -7908,6 +7949,226 @@ mod tests {
             .err()
             .expect("a cyclic chain must not open");
         assert!(err.to_string().contains("cycle"), "got {err}");
+    }
+
+    // A clean open (nothing to replay) must not walk every table to rebuild
+    // the reachable set. Observable through what the reconcile is FOR: a
+    // free list that lies about a live page is only corrected when there is
+    // a log to replay (see test_audit_t16_..., which does have one).
+    #[test]
+    fn test_a_clean_open_trusts_the_checkpointed_free_list_instead_of_reconciling() {
+        let db = TestDB::create("clean_open_no_reconcile.db").unwrap();
+        let tid = db.create_table("t".to_string()).unwrap();
+        let reachable = db.table_by_id(tid).unwrap().table.first_data_page;
+        db.checkpoint().unwrap(); // log now empty: nothing above the floor
+        let page = crate::page::Page::new_pinned(db.header.page_size, db.buffer.page_overhead());
+        page.add_tuple(Tuple::new(0, &postcard::to_allocvec(&vec![reachable]).unwrap())).unwrap();
+        db.buffer.write_page(crate::constant::FREE_PAGE_TABLE_PAGE.into(), &page).unwrap();
+        sync_header_without_truncating_logs(&db);
+        let (f, l) = crash_clone(&db);
+        let db2 = TestDB::open_using("clean_open_no_reconcile.db", f, l).unwrap();
+        assert_eq!(db2.recovered_records.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(
+            db2.buffer.get_free_pages().contains(&reachable),
+            "with nothing to replay the checkpointed list is trusted as-is (no full-table walk)"
+        );
+    }
+
+    // --- read-only transactions log nothing ---
+
+    // Every transactional record (Add/Mod/Del/Commit/Rollback) in the
+    // current WAL segment, in log order.
+    fn txn_ops_in_wal(db: &TestDB) -> Vec<crate::logger::Operation> {
+        use crate::logger::Operation;
+        let (_, data) = current_segment(db);
+        let hdr = LogHeader::encoded_len();
+        if data.len() < hdr {
+            return vec![];
+        }
+        crate::logger::scan_log(crate::logger::CURRENT_LOG_VERSION, &data[hdr..])
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|r| r.operation)
+            .filter(|o| !matches!(o, Operation::Sequence { .. } | Operation::Purge { .. }))
+            .collect()
+    }
+
+    // The log writer is asynchronous, so wait for a record we KNOW is coming
+    // (the closing writer transaction's Commit) before asserting on what else
+    // did or didn't land ahead of it.
+    fn wait_for_commit_record(db: &TestDB) {
+        for _ in 0..2000 {
+            if txn_ops_in_wal(db)
+                .iter()
+                .any(|o| matches!(o, crate::logger::Operation::Commit(_)))
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("timed out waiting for the writer's Commit record");
+    }
+
+    #[test]
+    fn test_read_only_transactions_add_nothing_to_the_wal() {
+        use crate::logger::Operation;
+        let (db, tid) = make_db_with_table();
+        db.checkpoint().unwrap();
+        assert!(txn_ops_in_wal(&db).is_empty(), "baseline: a fresh checkpoint leaves no txn records");
+
+        // A dropped read-only guard (what every SELECT ends in) ...
+        let t = db.begin().unwrap();
+        assert!(db.find(tid, DBIdType::Int(1), &t).unwrap().is_none());
+        drop(t);
+        // ... and an explicit read-only commit and rollback.
+        let t = db.begin().unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.rollback(t).unwrap();
+
+        // One real write transaction after them, so there is a record we know
+        // to wait for and everything queued ahead of it has landed.
+        let w = db.begin().unwrap();
+        db.insert(tid, row(1, b"v"), &w).unwrap();
+        db.commit(w).unwrap();
+        wait_for_commit_record(&db);
+
+        let ops = txn_ops_in_wal(&db);
+        assert!(
+            matches!(ops.as_slice(), [Operation::Add { .. }, Operation::Commit(_)]),
+            "only the writer's Add + Commit may be logged, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_transaction_that_wrote_still_logs_its_rollback() {
+        use crate::logger::Operation;
+        let (db, tid) = make_db_with_table();
+        db.checkpoint().unwrap();
+        let w = db.begin().unwrap();
+        db.insert(tid, row(1, b"v"), &w).unwrap();
+        db.rollback(w).unwrap();
+        // A later committed writer gives us a record to wait for.
+        let w2 = db.begin().unwrap();
+        db.insert(tid, row(2, b"v"), &w2).unwrap();
+        db.commit(w2).unwrap();
+        wait_for_commit_record(&db);
+        let ops = txn_ops_in_wal(&db);
+        assert!(ops.iter().any(|o| matches!(o, Operation::Rollback(_))), "got {ops:?}");
+    }
+
+    // The read-only skip must not change what a reader sees: a read-only
+    // commit still leaves the active set, and a snapshot still works.
+    #[test]
+    fn test_a_read_only_commit_still_finishes_the_transaction() {
+        let (db, tid) = make_db_with_table();
+        let w = db.begin().unwrap();
+        db.insert(tid, row(1, b"v"), &w).unwrap();
+        db.commit(w).unwrap();
+        let before = db.tx_mgr.active_count();
+        let t = db.begin().unwrap();
+        assert_eq!(db.tx_mgr.active_count(), before + 1);
+        assert!(db.find(tid, DBIdType::Int(1), &t).unwrap().is_some());
+        db.commit(t).unwrap();
+        assert_eq!(db.tx_mgr.active_count(), before, "a committed read-only txn must not stay active");
+    }
+
+    // --- lazy tail discovery (was: a full decode of every data page at open) ---
+
+    // Walks the data chain to its real end the slow, obviously-correct way.
+    fn true_tail(db: &TestDB, tid: TableIdType) -> crate::page::PageId {
+        let tree = db.table_by_id(tid).unwrap();
+        let mut id = tree.table.first_data_page;
+        loop {
+            let page = db.buffer.get_page(id).unwrap();
+            let next = db.buffer.data_chain_next(&page, id).unwrap();
+            if !next.is_valid_next_page() {
+                return id;
+            }
+            id = next;
+        }
+    }
+
+    fn insert_rows(db: &Arc<TestDB>, tid: TableIdType, ids: std::ops::Range<u64>) {
+        let t = db.begin().unwrap();
+        for i in ids {
+            db.insert(tid, row(i, format!("row-{i:06}-padding-to-take-space").as_bytes()), &t)
+                .unwrap();
+        }
+        db.commit(t).unwrap();
+    }
+
+    fn count_rows(db: &Arc<TestDB>, tid: TableIdType) -> usize {
+        let mut cursor = db.table_scan(tid).unwrap();
+        let mut n = 0;
+        while cursor.next().unwrap().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    #[test]
+    fn test_reopen_does_not_discover_the_tail_and_reads_never_do() {
+        let db = small_page_db("tail_lazy_reads.db");
+        let tid = db.create_table("t".to_string()).unwrap();
+        insert_rows(&db, tid, 0..400);
+        let tail = true_tail(&db, tid);
+        assert_ne!(tail, db.table_by_id(tid).unwrap().table.first_data_page, "needs a multi-page chain");
+
+        let db2 = reopen_after_checkpoint(&db, "tail_lazy_reads.db");
+        let tree = db2.table_by_id(tid).unwrap();
+        assert_eq!(tree.tail_state(), (false, tree.table.first_data_page), "open must not walk the chain");
+
+        // Reads — a scan and point lookups — must not trigger discovery.
+        assert_eq!(count_rows(&db2, tid), 400);
+        let t = db2.begin().unwrap();
+        assert!(db2.find(tid, DBIdType::Int(5), &t).unwrap().is_some());
+        assert!(db2.find(tid, DBIdType::Int(399), &t).unwrap().is_some());
+        drop(t);
+        assert_eq!(tree.tail_state(), (false, tree.table.first_data_page), "reads must not walk the chain");
+    }
+
+    #[test]
+    fn test_the_first_write_after_reopen_finds_the_real_tail() {
+        let db = small_page_db("tail_lazy_write.db");
+        let tid = db.create_table("t".to_string()).unwrap();
+        insert_rows(&db, tid, 0..400);
+        let db2 = reopen_after_checkpoint(&db, "tail_lazy_write.db");
+        let tree = db2.table_by_id(tid).unwrap();
+
+        insert_rows(&db2, tid, 400..401);
+        let (known, hint) = tree.tail_state();
+        assert!(known);
+        assert_eq!(hint, true_tail(&db2, tid), "the hint must be the chain's real end, not the start");
+        assert_ne!(hint, tree.table.first_data_page);
+        assert_eq!(count_rows(&db2, tid), 401);
+    }
+
+    // Two writers racing to be first must neither lose rows nor orphan pages
+    // by extending the chain from a stale start.
+    #[test]
+    fn test_concurrent_first_writers_after_reopen_lose_nothing() {
+        let db = small_page_db("tail_lazy_race.db");
+        let tid = db.create_table("t".to_string()).unwrap();
+        insert_rows(&db, tid, 0..400);
+        let db2 = reopen_after_checkpoint(&db, "tail_lazy_race.db");
+
+        let handles: Vec<_> = (0..8u64)
+            .map(|w| {
+                let db = db2.clone();
+                thread::spawn(move || insert_rows(&db, tid, 1000 + w * 100..1000 + (w + 1) * 100))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(count_rows(&db2, tid), 400 + 800);
+        let t = db2.begin().unwrap();
+        for id in (0..400).chain(1000..1800) {
+            assert!(db2.find(tid, DBIdType::Int(id), &t).unwrap().is_some(), "row {id} lost");
+        }
+        assert_eq!(db2.table_by_id(tid).unwrap().tail_state().1, true_tail(&db2, tid));
     }
 
     // STORE_AUDIT.md S7 (part 1): validate_table_name only checks length

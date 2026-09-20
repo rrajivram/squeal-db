@@ -901,6 +901,32 @@ where
         }
     }
 
+    /// Same answer as `data_chain_next`, but without needing (or building) a
+    /// decoded `Page` for `page_id`: a page already in the cache is asked
+    /// directly (it is always current — see `free_page_chain`'s comment on
+    /// why the raw on-disk header can briefly lag the cache), and otherwise
+    /// only its header is read from disk, never its tuples. Meant for long
+    /// chain walks (e.g. finding a table's tail at first write) where fully
+    /// decoding every page just to read one pointer costs orders of
+    /// magnitude more than the walk itself.
+    pub(crate) fn data_chain_next_cheap(&self, page_id: PageId) -> Result<PageId, StoreError> {
+        let cached = match self.shard_for(&page_id).read().get(&page_id) {
+            Some(PageEntry::Strong(arc)) => Some(arc.clone()),
+            Some(PageEntry::Weak(weak)) => weak.upgrade(),
+            None => None,
+        };
+        if let Some(page) = cached {
+            return self.data_chain_next(&page, page_id);
+        }
+        let header = self.read_page_header(page_id)?;
+        if header.has_overflow() {
+            let term = self.overflow_terminator(page_id)?;
+            Ok(self.read_page_header(term)?.next_page())
+        } else {
+            Ok(header.next_page())
+        }
+    }
+
     /// Link `from_id → to_id` in the data page chain. If `from_id` already has
     /// overflow, writes `to_id` into the overflow terminator's next_page so the
     /// link survives overflow re-setup. Otherwise updates the page normally.

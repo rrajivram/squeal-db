@@ -19,6 +19,7 @@ use crate::{
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     ds::stack::Stack,
     error::SchemaError,
+    optim::table_stats::TableStat,
     plan::{eval::EvalExpr, funcs::FuncTrait, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
@@ -121,6 +122,7 @@ trait OpenSource<F: DBFile + 'static> {
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
+        stat: Option<TableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError>;
 }
@@ -133,9 +135,10 @@ where
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
+        stats: Option<TableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
-        let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn)?;
+        let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn, stats)?;
         Ok(Box::new(ts) as Box<dyn Source>)
     }
 }
@@ -152,6 +155,7 @@ where
     fn open_source(
         &self,
         _conn: &Arc<Connection<F>>,
+        _stat: Option<TableStat>,
         _txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         let guard = self.read();
@@ -193,11 +197,12 @@ where
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
+        stat: Option<TableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         match self {
-            TableRef::Real(_, t) => t.open_source(conn, txn),
-            TableRef::Temp(_, t) => t.open_source(conn, txn),
+            TableRef::Real(_, t) => t.open_source(conn, stat, txn),
+            TableRef::Temp(_, t) => t.open_source(conn, stat, txn),
             TableRef::Derived => todo!(),
         }
     }
@@ -223,6 +228,7 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     // this lookup will succeed" as two separate, unwrap-worthy facts.
     pub(crate) resolved: TableRef<F>,
     pub(crate) joins: Vec<JoinRelation<F>>,
+    pub(crate) stats: Option<TableStat>,
 }
 
 pub(crate) struct JoinRelation<F: DBFile + 'static> {
@@ -374,9 +380,14 @@ where
 
     /// Opens a FROM item under the statement's transaction: the explicit
     /// block if one is open, else `stmt_txn`.
-    fn open(&self, item: &TableRef<F>) -> Result<Box<dyn Source>, SchemaError> {
-        self.conn
-            .with_current_txn(|explicit| item.open_source(&self.conn, explicit.or(self.stmt_txn.as_ref())))
+    fn open(
+        &self,
+        item: &TableRef<F>,
+        stats: Option<TableStat>,
+    ) -> Result<Box<dyn Source>, SchemaError> {
+        self.conn.with_current_txn(|explicit| {
+            item.open_source(&self.conn, stats, explicit.or(self.stmt_txn.as_ref()))
+        })
     }
 
     fn handle_select(
@@ -428,9 +439,10 @@ where
         // back holding a string value from an unrelated table).
         let mut sources = vec![];
         for table in tables.iter() {
-            let mut combined = self.open(&table.resolved)?;
+            let mut combined = self.open(&table.resolved, table.stats.clone())?;
             for j in &table.joins {
-                let relation = self.open(&j.relation.resolved)?;
+                let relation = self.open(&j.relation.resolved, j.relation.stats.clone())?;
+
                 combined = Box::new(JoinSource::new(
                     combined,
                     relation,
@@ -716,6 +728,11 @@ where
             let (table, field) = self.conn.resolve_object_name_ref(name)?;
             crate::stmt::reject_qualified_field("a FROM target", field)?;
             if let TableRef::Real(schema, sqltable) = &table {
+                let stats = self
+                    .conn
+                    .schema(&schema.name)
+                    .unwrap()
+                    .get_table_stats(sqltable.db_table_id)?;
                 TableQuery {
                     alias: alias
                         .clone()
@@ -726,6 +743,7 @@ where
                     schema: schema.name.clone(),
                     table: sqltable.name.clone(),
                     joins: vec![],
+                    stats,
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
                 TableQuery {
@@ -738,6 +756,7 @@ where
                     fields: temptable.resolved_fields(),
                     resolved: table.clone(),
                     joins: vec![],
+                    stats: None,
                 }
             } else {
                 todo!()
@@ -881,6 +900,7 @@ impl<F: DBFile + 'static> Clone for TableQuery<F> {
             resolved: self.resolved.clone(),
             schema: self.schema.clone(),
             table: self.table.clone(),
+            stats: self.stats.clone(),
         }
     }
 }

@@ -74,7 +74,7 @@ impl StreamingResultSet {
     }
 
     pub fn get_query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
-        self.begin.stats()
+        self.begin.query_stats()
     }
 }
 

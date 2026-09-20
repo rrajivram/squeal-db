@@ -183,8 +183,12 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
         self.source.reset()
     }
 
-    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
-        self.source.stats()
+    fn query_stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+        self.source.query_stats()
+    }
+
+    fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
+        self.source.table_stats()
     }
 }
 
@@ -290,7 +294,7 @@ impl Source for UnionJoin {
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let mut res = vec![(
             "UnionJoin".to_string(),
             QueryStats {
@@ -307,7 +311,7 @@ impl Source for UnionJoin {
         // same convention HashedSource uses for its own left/right
         // children.
         for s in &self.sources {
-            res = merge_stats(res, s.stats());
+            res = merge_stats(res, s.query_stats());
         }
         Some(res)
     }

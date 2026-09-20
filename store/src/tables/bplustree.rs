@@ -128,9 +128,9 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // total for N sequential inserts — confirmed empirically: throughput
     // dropped from ~1300 to ~200 rows/sec between row 15k and row 20k with a
     // small page size). Not persisted: on a fresh table it starts at
-    // first_data_page (nothing to discover); on reopen it's rebuilt once by
-    // walking the chain to its actual end (see from_bytes) — a one-time,
-    // load-time cost instead of a per-insert one.
+    // first_data_page (nothing to discover); after a reopen it is rebuilt
+    // lazily, by the first write, walking the chain to its actual end (see
+    // ensure_tail_known) — once per table per open, and only if written to.
     //
     // This is purely a hint, not a correctness-bearing value: write_data
     // still calls can_store on whatever page it starts from and walks
@@ -139,6 +139,12 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // why a plain Relaxed store (not a CAS/fetch_max) is fine even though
     // concurrent writers can race to extend the chain — see write_data.
     last_data_page: AtomicU64,
+    // Whether `last_data_page` is trustworthy yet. False right after a
+    // reopen (see from_table): the real tail is found lazily, by the first
+    // write that needs it (ensure_tail_known), so a session that only reads
+    // never pays for walking a table's whole data chain. True for a table
+    // this process created (its chain is one page long).
+    tail_known: std::sync::atomic::AtomicBool,
     // STORE_AUDIT.md T14: find()'s "read the index, then read the data page
     // it points to" is two separate lock acquisitions, not one atomic step
     // — see find()'s and relocate_tuple's own comments. A concurrent
@@ -225,6 +231,7 @@ where
             txn_mgr,
             logger,
             last_data_page: AtomicU64::new(first_data_page.into()),
+            tail_known: std::sync::atomic::AtomicBool::new(true),
             relocation_lock: std::sync::RwLock::new(()),
         })
     }
@@ -247,15 +254,19 @@ where
         txn_mgr: Arc<TransactionManager>,
         logger: Arc<Logger>,
     ) -> Result<Self, StoreError> {
-        // One-time cost, not per-insert: walk the chain to its real end so
-        // write_data doesn't have to rediscover it on every call after reopen.
-        let tail = Self::discover_tail_data_page(&buffer, t.first_data_page)?;
+        // The tail is NOT discovered here. Walking a table's whole data chain
+        // at open made opening cost O(every page of every table) — and it
+        // used to decode each page in full just to read one pointer. Only a
+        // write ever consults the hint, so the first write finds it (see
+        // ensure_tail_known); until then it points at the first page, which
+        // is always a valid, if far-behind, place to start.
         Ok(Self {
+            last_data_page: AtomicU64::new(t.first_data_page.into()),
+            tail_known: std::sync::atomic::AtomicBool::new(false),
             table: t,
             buffer,
             txn_mgr,
             logger,
-            last_data_page: AtomicU64::new(tail.into()),
             relocation_lock: std::sync::RwLock::new(()),
         })
     }
@@ -560,30 +571,56 @@ where
         Ok(())
     }
 
+    // Finds the real end of the data chain the first time a write needs it
+    // (once per BPlusTree, i.e. per open of a table that is written to) —
+    // see last_data_page's doc comment for why the hint exists at all.
+    // Header-only where the page isn't cached (data_chain_next_cheap), so
+    // this is a run of small reads, not a decode of every page.
+    //
+    // Safe to race: two first writers may both walk. The result is only
+    // installed if `last_data_page` still holds the initial value, so a
+    // writer that already extended the chain (and stored a newer tail) is
+    // never overwritten with an older one; and the hint is advisory anyway
+    // (write_data re-checks can_store and walks forward).
+    fn ensure_tail_known(&self) -> Result<(), StoreError> {
+        if self.tail_known.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let first = self.table.first_data_page;
+        let mut page_id = first;
+        loop {
+            let next = self.buffer.data_chain_next_cheap(page_id)?;
+            if next.is_valid_next_page() {
+                page_id = next;
+            } else {
+                break;
+            }
+        }
+        let _ = self.last_data_page.compare_exchange(
+            first.into(),
+            page_id.into(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.tail_known.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Test hook: (has the tail been discovered yet, the current hint).
+    #[cfg(test)]
+    pub(crate) fn tail_state(&self) -> (bool, PageId) {
+        (
+            self.tail_known.load(Ordering::Acquire),
+            PageId::from(self.last_data_page.load(Ordering::Relaxed)),
+        )
+    }
+
     /// Place `tuple` on a data page and return that page's id. Locks each
     /// candidate page before checking capacity (no unlocked scan), and always
     /// terminates: a freshly allocated page's `can_store` is unconditionally
     /// true, so the walk ends by appending a new page if none has room.
-    // One-time (per BPlusTree::from_bytes, i.e. per Db open) walk to the real
-    // end of the data chain — see last_data_page's doc comment for why this
-    // is only ever paid once instead of on every insert.
-    fn discover_tail_data_page(
-        buffer: &PageBuffer<F>,
-        start: PageId,
-    ) -> Result<PageId, StoreError> {
-        let mut page_id = start;
-        loop {
-            let page = buffer.get_page(page_id)?;
-            let next = buffer.data_chain_next(&page, page_id)?;
-            if next.is_valid_next_page() {
-                page_id = next;
-            } else {
-                return Ok(page_id);
-            }
-        }
-    }
-
     fn write_data(&self, tuple: &Tuple, lsn: LsnId) -> Result<PageId, StoreError> {
+        self.ensure_tail_known()?;
         let mut data_page_id = PageId::from(self.last_data_page.load(Ordering::Relaxed));
         loop {
             let handle = self.buffer.get_page_mut(data_page_id, LockLevel::Data)?;

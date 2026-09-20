@@ -184,7 +184,7 @@ impl Source for GroupSource {
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
         let query_stats = QueryStats {
             stats: HashMap::from([
                 ("eval_ns".to_string(), self.eval_time as f64),
@@ -194,7 +194,7 @@ impl Source for GroupSource {
         };
         Some(merge_stats(
             vec![("GroupSource".into(), query_stats)],
-            self.source.stats(),
+            self.source.query_stats(),
         ))
     }
 }
@@ -388,11 +388,17 @@ mod tests {
     #[test]
     fn test_grand_total_with_scalar_function_alongside_aggregate_over_empty_table() {
         let source: Box<dyn Source> = Box::new(VecSource::new(&["id"], vec![]));
-        let fields = vec![count_star_field("count"), upper_literal_field("shout", "hello")];
+        let fields = vec![
+            count_star_field("count"),
+            upper_literal_field("shout", "hello"),
+        ];
         let mut group = GroupSource::new(source, fields, vec![]);
         assert_eq!(
             drain(&mut group),
-            vec![vec![ValueItem::Integer(0), ValueItem::Str(("HELLO".into(), 5))]]
+            vec![vec![
+                ValueItem::Integer(0),
+                ValueItem::Str(("HELLO".into(), 5))
+            ]]
         );
     }
 }

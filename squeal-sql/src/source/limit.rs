@@ -44,7 +44,7 @@ impl Source for Limit {
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let this_stats = vec![(
             "Limit".to_string(),
             QueryStats {
@@ -52,7 +52,7 @@ impl Source for Limit {
                 level: 0,
             },
         )];
-        Some(merge_stats(this_stats, self.source.stats()))
+        Some(merge_stats(this_stats, self.source.query_stats()))
     }
 }
 

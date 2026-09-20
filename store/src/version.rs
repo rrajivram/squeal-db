@@ -79,6 +79,14 @@ impl VersionStore {
             .unwrap_or_default()
     }
 
+    /// Whether `txn` has registered any write. False for a read-only
+    /// transaction (every SELECT). Writes register here BEFORE they are
+    /// logged (see Db::insert & co.), so `false` means nothing was ever
+    /// logged for this transaction either.
+    pub(crate) fn has_writes(&self, txn: &TransactionId) -> bool {
+        self.by_txn.get(txn).is_some()
+    }
+
     /// Forget a transaction's records outright (aborted and reverted).
     pub(crate) fn discard(&self, txn: &TransactionId) -> usize {
         let mut n = 0;

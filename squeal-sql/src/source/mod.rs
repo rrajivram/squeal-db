@@ -2,7 +2,9 @@ use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use store::valueitem::IndexKey;
 
-use crate::{error::SchemaError, plan::eval::EvalExpr, table::Field};
+use crate::{
+    error::SchemaError, optim::table_stats::TableStat, plan::eval::EvalExpr, table::Field,
+};
 
 pub mod aggr;
 pub(crate) mod group;
@@ -60,7 +62,10 @@ pub trait Source: Debug {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
+        None
+    }
+    fn table_stats(&self) -> Option<TableStat> {
         None
     }
 }

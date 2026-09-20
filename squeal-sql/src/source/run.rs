@@ -59,7 +59,7 @@ where
         Ok(self.cursor.reset()?)
     }
 
-    fn stats(&self) -> Option<Vec<(String, QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         Some(vec![(
             "RunScan".to_string(),
             QueryStats {

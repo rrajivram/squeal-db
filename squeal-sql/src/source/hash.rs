@@ -10,12 +10,14 @@ use store::{
     cursor::Cursor,
     db::{DBFile, Db},
     run::Run,
+    table::TableIdType,
     valueitem::{IndexKey, ValueItem},
 };
 
 use crate::{
     ds::bitvec::BitVec,
     error::SchemaError,
+    optim::table_stats::TableStat,
     plan::memory::QueryMemory,
     source::{ProjectableField, QueryStats, Source, join::JoinType, merge_stats},
 };
@@ -40,6 +42,12 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     records_per_page: usize,
     mem: Arc<QueryMemory>,
     join_type: JoinType,
+    // True when new() swapped the two sources (build on the smaller side).
+    // Everything ABOVE this source — `fields`, JoinSource, the ON/SELECT
+    // positions built against them — still sees the ORIGINAL left ++ right
+    // column order, so `emit` has to put the rows back in that order, and
+    // `join_type` (see new()) already describes the swapped, physical sides.
+    swapped: bool,
     // All-NULL rows shaped like the left/right side's own columns —
     // what LEFT/RIGHT/FULL pair an unmatched row from the OTHER side
     // with (e.g. RIGHT JOIN: a right row with no matching left row is
@@ -126,12 +134,51 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
+        // ONE run, created up front only to learn how many slots a page holds,
+        // then grown in place to the size chosen below — not a throwaway run
+        // plus a second real one.
+        let mut run = db.create_slotted_run()?;
+        let records_per_page = Self::slots_per_page(&run, record_size);
+        // Put the side with MORE rows on the left, i.e. make it the build
+        // (hash-table) side. Deliberate, and the opposite of the textbook
+        // "build the smaller side": measured on the retail 4-way join it is
+        // ~3.5x faster (~330 ms vs ~1140 ms with the comparison flipped), so
+        // don't "correct" it without re-measuring. Inner/Full joins are
+        // symmetric, so swapping is free; Left/Right are not — "preserve
+        // every LEFT row" must keep meaning the ORIGINAL left table, which
+        // after a swap is the physical right (probe) side, so the type is
+        // mirrored along with the sources.
+        let (left_source, left_fields, right_source, right_fields, join_type, swapped) = {
+            if let Some(left_stat) = left_source.table_stats()
+                && let Some(right_stat) = right_source.table_stats()
+                && right_stat.row_count > left_stat.row_count
+            {
+                let mirrored = match join_type {
+                    JoinType::Left => JoinType::Right,
+                    JoinType::Right => JoinType::Left,
+                    other => other,
+                };
+                (right_source, right_fields, left_source, left_fields, mirrored, true)
+            } else {
+                (left_source, left_fields, right_source, right_fields, join_type, false)
+            }
+        };
+        // Size the table from the BUILD side — `left_source` here, whichever
+        // branch above produced it. Sizing only inside the swap branch left
+        // the ordinary (unswapped) case at one page, and a 30,000-row build
+        // side then rehashed its way up from 77 slots by repeated doubling.
+        // No stats for the build side means no basis for a guess: one page.
+        let wanted = left_source
+            .table_stats()
+            .map(|s| (s.row_count as f64 * Self::INITIAL_CAPACITY_FACTOR) as usize)
+            .unwrap_or(1);
+        let num_pages = Self::grow_run(&mut run, records_per_page, wanted)?;
+        // Always a whole number of pages' worth of slots (see allocate_run).
+        let capacity = records_per_page * num_pages;
         let left_null =
             IndexKey::new_from_owned(vec![ValueItem::Null; left_source.fields().len()])?;
         let right_null =
             IndexKey::new_from_owned(vec![ValueItem::Null; right_source.fields().len()])?;
-        let (run, records_per_page, num_pages) = Self::allocate_run(&db, record_size, 1)?;
-        let capacity = records_per_page * num_pages;
         Ok(Self {
             sources: vec![left_source, right_source],
             fields,
@@ -147,6 +194,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             records_per_page,
             mem,
             join_type,
+            swapped,
             left_null,
             right_null,
             built: false,
@@ -177,6 +225,12 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // add() is the real, authoritative check either way.
     const SLOTTED_OVERHEAD_BYTES: usize = 40;
 
+    // Initial slots per expected build-side row. Rehash fires only at 100%
+    // load (see insert_left), so this is not about avoiding a rehash — any
+    // factor >= 1.0 does that — but about keeping linear-probe chains short:
+    // 1.9 ends a full build at ~0.53 load.
+    const INITIAL_CAPACITY_FACTOR: f64 = 1.9;
+
     // Creates a Run (backed by SlottedPage — STORE_AUDIT.md P6) with
     // enough pages to hold at least `min_capacity` slots. Unlike the
     // prior plain-blob-per-page design, pages need no upfront
@@ -196,24 +250,40 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // `0..capacity` maps to a page index in `0..num_pages` — never out
     // of range — which is what lets probe_matches/insert_with_hash use
     // plain division without any bounds juggling.
+    // Slots per page for a run of this record size; the run only supplies
+    // its page data size. Asserts at least one fits.
+    fn slots_per_page(run: &Run<F>, record_size: usize) -> usize {
+        let records_per_page = run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
+        assert!(
+            records_per_page > 0,
+            "a single page must be able to hold at least one hash slot"
+        );
+        records_per_page
+    }
+
+    // Grows `run` (which already has its first page — create_slotted_run
+    // allocates one) to hold at least `min_capacity` slots; returns the
+    // resulting page count.
+    fn grow_run(
+        run: &mut Run<F>,
+        records_per_page: usize,
+        min_capacity: usize,
+    ) -> Result<usize, SchemaError> {
+        let num_pages = min_capacity.max(1).div_ceil(records_per_page).max(1);
+        for _ in 1..num_pages {
+            run.new_slotted_page()?;
+        }
+        Ok(num_pages)
+    }
+
     fn allocate_run(
         db: &Arc<Db<F>>,
         record_size: usize,
         min_capacity: usize,
     ) -> Result<(Run<F>, usize, usize), SchemaError> {
         let mut run = db.create_slotted_run()?;
-        let records_per_page =
-            run.data_size() as usize / (record_size + Self::SLOTTED_OVERHEAD_BYTES);
-        assert!(
-            records_per_page > 0,
-            "a single page must be able to hold at least one hash slot"
-        );
-        let num_pages = min_capacity.max(1).div_ceil(records_per_page).max(1);
-        // create_slotted_run() already allocated page 0 — only need
-        // num_pages - 1 more.
-        for _ in 1..num_pages {
-            run.new_slotted_page()?;
-        }
+        let records_per_page = Self::slots_per_page(&run, record_size);
+        let num_pages = Self::grow_run(&mut run, records_per_page, min_capacity)?;
         Ok((run, records_per_page, num_pages))
     }
 
@@ -503,14 +573,23 @@ impl<F: DBFile + 'static> HashedSource<F> {
             self.sweep_row += 1;
             if !self.matched.is_set(slot_index) {
                 self.next_time += start.elapsed().as_nanos();
-                return Ok(Some(Self::combine(&value.left_value, &self.right_null)?));
+                return Ok(Some(self.emit(&value.left_value, &self.right_null)?));
             }
         }
     }
 
-    fn combine(left: &IndexKey, right: &IndexKey) -> Result<IndexKey, SchemaError> {
-        let mut values = left.values().to_vec();
-        values.extend_from_slice(right.values());
+    // `build` is a row from the physical left (hash-table) side, `probe`
+    // from the physical right (streamed) side. The output is always in the
+    // ORIGINAL left ++ right order the rest of the plan was built against:
+    // if the sources were swapped, the probe side is the original left.
+    fn emit(&self, build: &IndexKey, probe: &IndexKey) -> Result<IndexKey, SchemaError> {
+        let (first, second) = if self.swapped {
+            (probe, build)
+        } else {
+            (build, probe)
+        };
+        let mut values = first.values().to_vec();
+        values.extend_from_slice(second.values());
         Ok(IndexKey::new_from_owned(values)?)
     }
 }
@@ -542,7 +621,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
                     .current_right
                     .as_ref()
                     .expect("pending_matches is only ever populated alongside current_right");
-                return Ok(Some(Self::combine(&left, right)?));
+                return Ok(Some(self.emit(&left, right)?));
             }
 
             if self.right_exhausted {
@@ -555,7 +634,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
                     if matches.is_empty() {
                         if matches!(self.join_type, JoinType::Right | JoinType::Full) {
                             let left_null = self.left_null.clone();
-                            return Ok(Some(Self::combine(&left_null, &right)?));
+                            return Ok(Some(self.emit(&left_null, &right)?));
                         }
                         // INNER/LEFT: an unmatched right row contributes
                         // nothing — try the next right row.
@@ -596,7 +675,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         Ok(())
     }
 
-    fn stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
+    fn query_stats(&self) -> Option<Vec<(String, super::QueryStats)>> {
         let mut stats = HashMap::new();
         stats.insert("probe_ns".to_string(), self.probe_time as f64);
         stats.insert("rehash_ns".into(), self.rehash_time as f64);
@@ -607,9 +686,18 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         let name = format!("HashJoin:({:?})", self.join_type);
         let mut res = vec![(name, this_stats)];
         for s in &self.sources {
-            res = merge_stats(res, s.stats())
+            res = merge_stats(res, s.query_stats())
         }
         Some(res)
+    }
+
+    fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
+        Some(TableStat {
+            col_stats: HashMap::new(),
+            id: TableIdType::none(),
+            name: "".into(),
+            row_count: self.count,
+        })
     }
 }
 
@@ -1241,5 +1329,248 @@ mod tests {
         // Triggers the lazy build_left phase in full (see next()'s own
         // doc comment).
         let _ = source.next().unwrap();
+    }
+
+    // --- build-side selection by table stats ---
+
+    // Delegates to a VecSource but reports a chosen row_count, standing in
+    // for a TableSource whose table has that many rows.
+    #[derive(Debug)]
+    struct WithRowCount(Box<dyn Source>, usize);
+
+    impl Source for WithRowCount {
+        fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+            self.0.next()
+        }
+        fn fields(&self) -> Arc<[ProjectableField]> {
+            self.0.fields()
+        }
+        fn reset(&mut self) -> Result<(), SchemaError> {
+            self.0.reset()
+        }
+        fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
+            Some(crate::optim::table_stats::TableStat {
+                id: store::table::TableIdType::none(),
+                name: "t".into(),
+                row_count: self.1,
+                col_stats: HashMap::new(),
+            })
+        }
+    }
+
+    fn drain_sorted(mut source: HashedSource<MemFile>) -> Vec<Vec<ValueItem>> {
+        let mut rows = vec![];
+        while let Some(r) = source.next().unwrap() {
+            rows.push(r.values().to_vec());
+        }
+        rows.sort();
+        rows
+    }
+
+    // left_rows() has 3 rows and right_rows() has 3; report the RIGHT as far
+    // bigger so new() swaps, or the reverse so it must not.
+    fn join_with_counts(join_type: JoinType, left: usize, right: usize) -> HashedSource<MemFile> {
+        HashedSource::new(
+            Box::new(WithRowCount(left_source(), left)),
+            Box::new(WithRowCount(right_source(), right)),
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+            &[0],
+            &[0],
+            join_type,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_a_larger_right_side_is_swapped_and_a_larger_left_is_not() {
+        assert!(join_with_counts(JoinType::Inner, 1, 1000).swapped);
+        assert!(!join_with_counts(JoinType::Inner, 1000, 1).swapped);
+        assert!(
+            !join_with_counts(JoinType::Inner, 5, 5).swapped,
+            "ties keep the order"
+        );
+        // Without stats on both sides there is nothing to decide with.
+        assert!(!make_source().swapped);
+    }
+
+    // The point of the whole thing: swapping must not change the RESULT —
+    // same rows, same column order (original left ++ original right), and the
+    // same side preserved by an outer join — for every join type.
+    #[test]
+    fn test_swapping_sides_never_changes_the_join_result() {
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let baseline = drain_sorted(make_source_with(join_type));
+            let swapped_source = join_with_counts(join_type, 1, 1000);
+            assert!(swapped_source.swapped);
+            assert_eq!(
+                drain_sorted(swapped_source),
+                baseline,
+                "{join_type:?}: a swapped join must return exactly what the unswapped one does"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_swapped_join_keeps_declared_column_order_in_its_rows() {
+        // left = (id, val) 1..3 with val 100s; right = (id, val) with val
+        // 9000s. Whatever side was built, columns 0-1 are LEFT's, 2-3 RIGHT's.
+        let rows = drain_sorted(join_with_counts(JoinType::Inner, 1, 1000));
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    ValueItem::Integer(2),
+                    ValueItem::Integer(200),
+                    ValueItem::Integer(2),
+                    ValueItem::Integer(9002)
+                ],
+                vec![
+                    ValueItem::Integer(3),
+                    ValueItem::Integer(300),
+                    ValueItem::Integer(3),
+                    ValueItem::Integer(9003)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_swapped_left_join_still_preserves_the_original_left_side() {
+        // Original LEFT JOIN: left id=1 has no right match and must appear
+        // with a NULL right half; right id=99 must NOT appear at all.
+        let rows = drain_sorted(join_with_counts(JoinType::Left, 1, 1000));
+        assert!(rows.contains(&vec![
+            ValueItem::Integer(1),
+            ValueItem::Integer(100),
+            ValueItem::Null,
+            ValueItem::Null
+        ]));
+        assert!(!rows.iter().any(|r| r[2] == ValueItem::Integer(99)));
+        assert_eq!(rows.len(), 3);
+    }
+
+    // --- initial sizing from the build side's stats ---
+
+    fn wanted_slots(rows: usize) -> usize {
+        (rows as f64 * HashedSource::<MemFile>::INITIAL_CAPACITY_FACTOR) as usize
+    }
+
+    #[test]
+    fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_not_swapped() {
+        // Left (build) is the big table: 30,271 rows vs 10,000 — the ordinary
+        // order-details-joins-orders shape. This used to stay at one page.
+        let s = join_with_counts(JoinType::Inner, 30271, 10000);
+        assert!(!s.swapped);
+        assert!(s.capacity >= wanted_slots(30271), "capacity {}", s.capacity);
+        assert_eq!(s.capacity % s.records_per_page, 0, "whole pages of slots");
+        // ...and not wildly more than asked for: at most one extra page.
+        assert!(s.capacity < wanted_slots(30271) + s.records_per_page);
+    }
+
+    #[test]
+    fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_swapped() {
+        // Right is bigger, so it becomes the build side: same table, same size.
+        let swapped = join_with_counts(JoinType::Inner, 10000, 30271);
+        assert!(swapped.swapped);
+        let plain = join_with_counts(JoinType::Inner, 30271, 10000);
+        assert_eq!(swapped.capacity, plain.capacity);
+    }
+
+    #[test]
+    fn test_a_build_side_without_stats_starts_at_one_page() {
+        let s = make_source();
+        assert_eq!(s.capacity, s.records_per_page);
+        // Only the (post-swap) build side's stats matter; a probe side that
+        // reports none must not stop it being sized.
+        let build_only = HashedSource::new(
+            Box::new(WithRowCount(left_source(), 5000)),
+            right_source(),
+            make_db(),
+            QueryMemory::new(1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert!(build_only.capacity >= wanted_slots(5000));
+    }
+
+    #[test]
+    fn test_construction_allocates_only_the_pages_the_run_needs() {
+        // Used to create a throwaway one-page run alongside the real one, so
+        // every join construction allocated (at least) one page too many.
+        let db = make_db();
+        let before = db.page_count();
+        let s = HashedSource::new(
+            left_source(),
+            right_source(),
+            db.clone(),
+            QueryMemory::new(1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+        assert_eq!(db.page_count() - before, (s.capacity / s.records_per_page) as u64);
+
+        let before = db.page_count();
+        let big = HashedSource::new(
+            Box::new(WithRowCount(left_source(), 5000)),
+            Box::new(WithRowCount(right_source(), 10)),
+            db.clone(),
+            QueryMemory::new(1024 * 1024),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap();
+        let pages = big.capacity / big.records_per_page;
+        assert!(pages > 1);
+        assert_eq!(db.page_count() - before, pages as u64);
+    }
+
+    // The behavior the sizing exists for: a build whose row count was
+    // reported up front never rehashes, while the same build with no stats
+    // has to grow by doubling.
+    #[test]
+    fn test_a_build_sized_from_stats_does_not_rehash_but_an_unsized_one_does() {
+        let n = 1000usize;
+        let rows = |n: usize| -> Vec<Vec<ValueItem>> {
+            (0..n as i64)
+                .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
+                .collect()
+        };
+        let build = |with_stats: bool| -> HashedSource<MemFile> {
+            let left: Box<dyn Source> = Box::new(VecSource::new(&["id", "val"], rows(n)));
+            let left: Box<dyn Source> = if with_stats { Box::new(WithRowCount(left, n)) } else { left };
+            HashedSource::new(
+                left,
+                Box::new(VecSource::new(&["id", "val"], rows(1))),
+                make_db(),
+                QueryMemory::new(1024 * 1024),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap()
+        };
+
+        let mut sized = build(true);
+        let initial = sized.capacity;
+        while sized.next().unwrap().is_some() {}
+        assert_eq!(sized.count, n);
+        assert_eq!(sized.capacity, initial, "a correctly pre-sized build must never rehash");
+
+        let mut unsized_ = build(false);
+        let initial = unsized_.capacity;
+        while unsized_.next().unwrap().is_some() {}
+        assert_eq!(unsized_.count, n);
+        assert!(unsized_.capacity > initial, "with no stats the build has to grow by rehashing");
     }
 }
