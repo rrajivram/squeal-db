@@ -1,3 +1,4 @@
+use crate::source::{column_names, output_label, planinfo::PlanNode};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::{IndexKey, ValueItem};
@@ -122,6 +123,30 @@ impl GroupSource {
 }
 
 impl Source for GroupSource {
+    fn plan(&self) -> PlanNode {
+        let names = column_names(&self.source.fields());
+        let outputs = self
+            .fields
+            .iter()
+            .map(|f| output_label(f, &names))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.key_positions.is_empty() {
+            PlanNode::new("Aggregate").detail(outputs).child(self.source.plan())
+        } else {
+            let keys = self
+                .key_positions
+                .iter()
+                .map(|k| names.get(*k).cloned().unwrap_or_else(|| format!("#{k}")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            PlanNode::new("GroupAggregate")
+                .detail(format!("by {keys}: {outputs}"))
+                .child(self.source.plan())
+        }
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         Arc::from(self.fields.clone())
     }

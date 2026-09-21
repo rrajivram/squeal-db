@@ -3,6 +3,7 @@ use std::{marker::PhantomData, sync::Arc, time::Instant};
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
+    expr::BinaryOp,
     query::{
         Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
         SetOperand, TableFactor,
@@ -14,13 +15,14 @@ use sql_parser::{
 use store::{db::DBFile, txn::Transaction};
 
 use crate::{
-    conn::connection::{Connection, TableRef},
+    conn::connection::{Connection, DerivedSource, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     error::SchemaError,
     plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
         ComputedTableStat, ProjectableField, Source,
+        planinfo::PlanNode,
         aggr::AggregatingSource,
         compute_table_stats,
         group::GroupSource,
@@ -32,6 +34,7 @@ use crate::{
         table::TableSource,
         where_source::WhereSource,
     },
+    datatype::DataType,
     table::{Field, SqlTable},
     temp::TempTable,
 };
@@ -188,7 +191,12 @@ where
         match self {
             TableRef::Real(_, t) => t.resolved_fields(),
             TableRef::Temp(_, t) => t.resolved_fields(),
-            TableRef::Derived => todo!(),
+            TableRef::Derived(_, d) => Arc::from(
+                d.fields()
+                    .iter()
+                    .map(|f| f.field.clone())
+                    .collect::<Vec<_>>(),
+            ),
         }
     }
 
@@ -201,7 +209,7 @@ where
         match self {
             TableRef::Real(_, t) => t.open_source(conn, stat, txn),
             TableRef::Temp(_, t) => t.open_source(conn, stat, txn),
-            TableRef::Derived => todo!(),
+            TableRef::Derived(name, d) => d.take(name),
         }
     }
 }
@@ -246,6 +254,12 @@ struct QueryVisitor<F: DBFile> {
     // and handing each entry to LogicalPlan::add_step below doesn't
     // need anything more than that.
     steps: Vec<Option<Box<dyn Source>>>,
+    // How many Query nodes deep the walk currently is. Only the outermost
+    // query is planned from the walk's post_visit_query; a FROM subquery is
+    // planned by get_table when it reaches that FROM item (it needs the
+    // outer query's transaction/budget, and its output becomes a table
+    // reference), so the walk must not plan it a second time.
+    depth: usize,
     mem: Arc<QueryMemory>,
     // TXN_SIMPLIFICATION_PLAN.md phase 7: outside an explicit BEGIN block,
     // one transaction for the whole statement, so a multi-table SELECT
@@ -254,6 +268,115 @@ struct QueryVisitor<F: DBFile> {
     // long as the client holds the result; dropping it ends the
     // transaction.
     stmt_txn: Option<Transaction>,
+}
+
+// The WHERE equalities that turn a comma join into a real join: each
+// conjunct of the form `col = col` whose two columns live in DIFFERENT
+// top-level FROM items, keyed by the later of the two items (the one being
+// joined in when the items are folded left to right).
+//
+// Only same-type columns qualify (a varchar(5) and a varchar(20) count as
+// the same type). Comparing different types is an error in the comparison
+// itself (see plan::eval's same_type), so such an equality is left as a
+// cross join + filter, which is what reports that error — a join would just
+// find no matches and hide it. The equalities also stay in
+// the WHERE filter afterwards: WHERE treats a NULL operand as "no match"
+// while the join matches NULL keys to each other, and re-checking keeps the
+// result exactly what cross-join-then-filter gave.
+#[derive(Default)]
+struct WhereJoins {
+    // (later item, position a, position b) — a and b are flat positions.
+    equalities: Vec<(usize, usize, usize)>,
+}
+
+impl WhereJoins {
+    fn find<F: DBFile + 'static>(
+        where_expr: &EvalExpr,
+        item_widths: &[usize],
+        flat_tables: &[TableQuery<F>],
+    ) -> Self {
+        // item index of a flat position
+        let item_of = |pos: usize| -> Option<usize> {
+            let mut start = 0;
+            for (i, w) in item_widths.iter().enumerate() {
+                if pos < start + w {
+                    return Some(i);
+                }
+                start += w;
+            }
+            None
+        };
+        // datatype of a flat position, via the flattened tables' fields
+        let datatype_of = |pos: usize| -> Option<&DataType> {
+            let mut start = 0;
+            for t in flat_tables {
+                if pos < start + t.fields.len() {
+                    return Some(&t.fields[pos - start].datatype);
+                }
+                start += t.fields.len();
+            }
+            None
+        };
+        let same_kind = |a: &DataType, b: &DataType| {
+            matches!(
+                (a, b),
+                (DataType::Integer, DataType::Integer)
+                    | (DataType::Double, DataType::Double)
+                    | (DataType::Datetime, DataType::Datetime)
+                    | (DataType::Str(_), DataType::Str(_))
+                    | (DataType::Boolean, DataType::Boolean)
+            )
+        };
+        let mut conjuncts = vec![];
+        split_conjuncts(where_expr, &mut conjuncts);
+        let mut equalities = vec![];
+        for c in conjuncts {
+            if let EvalExpr::Binary { lhs, op: BinaryOp::Eq, rhs } = c
+                && let (EvalExpr::Value(a), EvalExpr::Value(b)) = (lhs.as_ref(), rhs.as_ref())
+                && let (Some(ia), Some(ib)) = (item_of(*a), item_of(*b))
+                && ia != ib
+                && let (Some(da), Some(db)) = (datatype_of(*a), datatype_of(*b))
+                && same_kind(da, db)
+            {
+                equalities.push((ia.max(ib), *a, *b));
+            }
+        }
+        Self { equalities }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.equalities.is_empty()
+    }
+
+    // The ON expression joining item `k` to items 0..k: every equality keyed
+    // to `k`, AND-ed. Positions are already relative to the combined
+    // (items 0..k, then k) row, which is the flat layout itself.
+    fn on_expr_for(&self, k: usize) -> Option<EvalExpr> {
+        self.equalities
+            .iter()
+            .filter(|(item, _, _)| *item == k)
+            .map(|(_, a, b)| EvalExpr::Binary {
+                lhs: Box::new(EvalExpr::Value(*a)),
+                op: BinaryOp::Eq,
+                rhs: Box::new(EvalExpr::Value(*b)),
+            })
+            .reduce(|l, r| EvalExpr::Binary {
+                lhs: Box::new(l),
+                op: BinaryOp::And,
+                rhs: Box::new(r),
+            })
+    }
+}
+
+// The top-level AND-chain of an expression, one entry per conjunct.
+fn split_conjuncts<'a>(expr: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
+    match expr {
+        EvalExpr::Binary { lhs, op: BinaryOp::And, rhs } => {
+            split_conjuncts(lhs, out);
+            split_conjuncts(rhs, out);
+        }
+        other => out.push(other),
+    }
 }
 
 struct SourceHolder {
@@ -268,7 +391,10 @@ where
     type Break = SchemaError;
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        self.steps.push(None);
+        self.depth += 1;
+        if self.depth == 1 {
+            self.steps.push(None);
+        }
         std::ops::ControlFlow::Continue(())
     }
 
@@ -290,54 +416,15 @@ where
     }
 
     fn post_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        if let SetOperand::Select(select) = &query.body {
-            let holder = self.handle_select(select);
-            if let Err(e) = holder {
-                return std::ops::ControlFlow::Break(e);
-            }
-            let holder = holder.unwrap();
-            let mut step = holder.source;
-
-            // Resolved once, up front, and used by BOTH the ORDER BY and
-            // no-ORDER-BY paths below — previously this was only ever
-            // computed (and therefore ORDER BY only ever applied) inside
-            // the `if let Some(limit) = ...` branch, so a bare `ORDER BY`
-            // with no `LIMIT` at all silently did nothing: the query
-            // still succeeded, just returned rows in scan order.
-            let limit_count = match &query.limit {
-                Some(limit) => match limit.count_i64() {
-                    Some(n) if n < 0 => {
-                        return std::ops::ControlFlow::Break(SchemaError::InvalidLimitValue(n));
-                    }
-                    Some(n) => Some(n as usize),
-                    // A LIMIT that isn't a literal count (e.g. a bound
-                    // parameter) can't be resolved here — pre-existing
-                    // behavior, unchanged: treated as no limit rather
-                    // than erroring.
-                    None => None,
-                },
-                None => None,
-            };
-
-            if let Some(order) = &query.order_by {
-                let order = SortSource::create_from(
-                    step,
-                    order,
-                    limit_count,
-                    self.conn.database.read().db.clone(),
-                    self.mem.clone(),
-                );
-                step = match order {
-                    Ok(s) => Box::new(s),
-                    Err(e) => return std::ops::ControlFlow::Break(e),
-                };
-            } else if let Some(limit_count) = limit_count {
-                step = Box::new(Limit::new(step, limit_count));
-            }
-
-            self.steps.push(Some(step));
+        let outermost = self.depth == 1;
+        self.depth -= 1;
+        if !outermost {
+            return std::ops::ControlFlow::Continue(());
         }
-
+        match self.plan_query(query) {
+            Ok(step) => self.steps.push(Some(step)),
+            Err(e) => return std::ops::ControlFlow::Break(e),
+        }
         std::ops::ControlFlow::Continue(())
     }
 }
@@ -356,9 +443,54 @@ where
         Ok(Self {
             conn,
             steps: vec![],
+            depth: 0,
             mem,
             stmt_txn,
         })
+    }
+
+    // Plans one query into the Source that produces its rows: the SELECT,
+    // then ORDER BY / LIMIT. Used for the statement's own (outermost) query
+    // and for every FROM subquery.
+    fn plan_query(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
+        let SetOperand::Select(select) = &query.body else {
+            return Err(SchemaError::UnsupportedFeature(
+                "a query body other than a plain SELECT".into(),
+            ));
+        };
+        let mut step = self.handle_select(select)?.source;
+
+        // Resolved once, up front, and used by BOTH the ORDER BY and
+        // no-ORDER-BY paths below — previously this was only ever
+        // computed (and therefore ORDER BY only ever applied) inside
+        // the `if let Some(limit) = ...` branch, so a bare `ORDER BY`
+        // with no `LIMIT` at all silently did nothing: the query
+        // still succeeded, just returned rows in scan order.
+        let limit_count = match &query.limit {
+            Some(limit) => match limit.count_i64() {
+                Some(n) if n < 0 => return Err(SchemaError::InvalidLimitValue(n)),
+                Some(n) => Some(n as usize),
+                // A LIMIT that isn't a literal count (e.g. a bound
+                // parameter) can't be resolved here — pre-existing
+                // behavior, unchanged: treated as no limit rather
+                // than erroring.
+                None => None,
+            },
+            None => None,
+        };
+
+        if let Some(order) = &query.order_by {
+            step = Box::new(SortSource::create_from(
+                step,
+                order,
+                limit_count,
+                self.conn.database.read().db.clone(),
+                self.mem.clone(),
+            )?);
+        } else if let Some(limit_count) = limit_count {
+            step = Box::new(Limit::new(step, limit_count));
+        }
+        Ok(step)
     }
 
     /// Opens a FROM item under the statement's transaction: the explicit
@@ -437,20 +569,49 @@ where
             }
             sources.push(combined);
         }
-        // UnionJoin only does real work (cross-producting) when there's
-        // more than one top-level FROM item to combine — a comma-joined
-        // list (`FROM a, b`) or, degenerately, no FROM at all (`SELECT
-        // 1+2`, sources empty). The overwhelmingly common case is
-        // exactly one top-level item (every query using only proper
-        // JOIN...ON clauses, however many, still folds into a single
-        // `combined` chain above) — there, UnionJoin would just
-        // re-flatten that one source's own row into a fresh IndexKey on
-        // every call for no reason, so skip it and use the sole chain
-        // directly instead of wrapping it.
+        // Top-level FROM items (`FROM a, b, c`) are implicitly cross joined,
+        // but a WHERE equality between two of them (`a.id = b.id`) is
+        // really an inner equi-join: fold the items left to right, joining
+        // each to everything before it with a hash join on whichever WHERE
+        // equalities link it to those, and only fall back to a cross join
+        // where nothing links them. The combined row layout is unchanged
+        // (items in FROM order), so every resolved column position stays
+        // valid. See WhereJoins.
+        let item_widths: Vec<usize> = tables
+            .iter()
+            .map(|t| t.fields.len() + t.joins.iter().map(|j| j.relation.fields.len()).sum::<usize>())
+            .collect();
+        let links = match &wh_expr {
+            Some(w) if sources.len() > 1 => WhereJoins::find(w, &item_widths, &flat_tables),
+            _ => WhereJoins::default(),
+        };
         let union: Box<dyn Source> = if let [_] = sources.as_slice() {
             sources.pop().unwrap()
-        } else {
+        } else if links.is_empty() {
+            // UnionJoin only does real work (cross-producting) when there's
+            // more than one top-level FROM item to combine, and no FROM at
+            // all (`SELECT 1+2`, sources empty) is the degenerate case; the
+            // overwhelmingly common single-item case skips it entirely
+            // rather than re-flattening one source's rows for nothing.
             Box::new(UnionJoin::new(sources)?)
+        } else {
+            let mut items = sources.into_iter();
+            let mut combined = items.next().expect("more than one source");
+            for (k, next) in items.enumerate() {
+                let k = k + 1;
+                combined = match links.on_expr_for(k) {
+                    Some(on_expr) => Box::new(JoinSource::new(
+                        combined,
+                        next,
+                        on_expr,
+                        JoinType::Inner,
+                        self.conn.database.read().db.clone(),
+                        self.mem.clone(),
+                    )?),
+                    None => Box::new(UnionJoin::new(vec![combined, next])?),
+                };
+            }
+            combined
         };
         let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
             Box::new(WhereSource::new(union, wh_expr)?)
@@ -631,7 +792,7 @@ where
         flat
     }
 
-    fn get_tables(&self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {
+    fn get_tables(&mut self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {
         if from.is_none() {
             return Ok(vec![]);
         }
@@ -706,7 +867,7 @@ where
         Ok(tables)
     }
 
-    fn get_table(&self, factor: &TableFactor) -> Result<TableQuery<F>, SchemaError> {
+    fn get_table(&mut self, factor: &TableFactor) -> Result<TableQuery<F>, SchemaError> {
         let tq = if let TableFactor::Table { name, alias } = &factor {
             let (table, field) = self.conn.resolve_object_name_ref(name)?;
             crate::stmt::reject_qualified_field("a FROM target", field)?;
@@ -739,8 +900,31 @@ where
             } else {
                 todo!()
             }
+        } else if let TableFactor::Derived { query, alias, .. } = factor {
+            // Planned right here, as a self-contained inner query whose
+            // rows the outer query then reads like a table. It shares this
+            // statement's transaction (one snapshot) and memory budget.
+            let alias = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .ok_or_else(|| {
+                    SchemaError::UserError("every table in FROM needs an alias".into())
+                })?;
+            let inner = self.plan_query(query)?;
+            let fields: Arc<[Arc<Field>]> =
+                inner.fields().iter().map(|f| f.field.clone()).collect();
+            let stats = inner.table_stats();
+            TableQuery {
+                schema: String::new(),
+                table: alias.clone(),
+                alias: alias.clone(),
+                fields,
+                resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
+                joins: vec![],
+                stats,
+            }
         } else {
-            todo!()
+            unreachable!("TableFactor is Table or Derived")
         };
         Ok(tq)
     }
@@ -858,6 +1042,16 @@ where
     // wiring against.
     pub(crate) fn memory(&self) -> Arc<QueryMemory> {
         self.mem.clone()
+    }
+
+    // The plan this query would run, as a tree — without running it. Built
+    // from the same Source tree execute() would hand to the result set, so
+    // EXPLAIN cannot drift from what really executes.
+    pub(crate) fn explain(&self) -> Result<PlanNode, SchemaError> {
+        self.tail
+            .as_ref()
+            .map(|t| t.plan())
+            .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))
     }
 
     pub(crate) fn execute(&mut self) -> Result<StreamingResultSet, SchemaError> {

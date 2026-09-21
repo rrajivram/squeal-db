@@ -62,6 +62,10 @@ impl JoinMatcher {
         Ordering::Equal
     }
 
+    pub(crate) fn join_type(&self) -> JoinType {
+        self.join_type
+    }
+
     pub(crate) fn keeps_unmatched_left(&self) -> bool {
         matches!(self.join_type, JoinType::Left | JoinType::Full)
     }

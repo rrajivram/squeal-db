@@ -1,3 +1,4 @@
+use crate::source::{column_names, planinfo::PlanNode};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, VecDeque},
@@ -488,6 +489,29 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    fn plan(&self) -> PlanNode {
+        let names = column_names(&self.source.fields());
+        let keys = self
+            .sort_fields
+            .iter()
+            .map(|f| {
+                format!(
+                    "{} {}{}",
+                    names.get(f.index).cloned().unwrap_or_else(|| format!("#{}", f.index)),
+                    if f.asc { "ASC" } else { "DESC" },
+                    if f.null_first { " NULLS FIRST" } else { "" },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self.limit {
+            Some(n) => PlanNode::new("TopN").detail(format!("{n} by {keys}")),
+            None => PlanNode::new("Sort").detail(keys),
+        }
+        .child(self.source.plan())
+    }
+
+
     fn fields(&self) -> Arc<[super::ProjectableField]> {
         self.source.fields()
     }

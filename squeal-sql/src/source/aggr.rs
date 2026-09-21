@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, time::Instant};
 
 use store::valueitem::IndexKey;
@@ -25,6 +26,11 @@ impl AggregatingSource {
 }
 
 impl Source for AggregatingSource {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new("Distinct").child(self.source.plan())
+    }
+
+
     fn fields(&self) -> std::sync::Arc<[super::ProjectableField]> {
         self.source.fields()
     }

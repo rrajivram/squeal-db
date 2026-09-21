@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use postcard::from_bytes;
@@ -66,6 +67,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new("TableScan")
+            .detail(self.table.name.clone())
+            .rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
+    }
+
+
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
         if let Some(tuple) = self.cursor.next()? {

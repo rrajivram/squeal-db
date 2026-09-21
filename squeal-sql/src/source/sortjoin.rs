@@ -1,3 +1,4 @@
+use crate::source::{column_names, planinfo::PlanNode};
 use std::{
     cmp::Ordering,
     collections::HashMap,
@@ -374,6 +375,47 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    fn plan(&self) -> PlanNode {
+        let side = |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| {
+            match (raw, sorted) {
+                (Some(s), _) => Some(s.plan()),
+                (None, Some(s)) => Some(s.plan()),
+                _ => None,
+            }
+        };
+        let names = |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| {
+            match (raw, sorted) {
+                (Some(s), _) => column_names(&s.fields()),
+                (None, Some(s)) => column_names(&s.fields()),
+                _ => vec![],
+            }
+        };
+        let (left, right) = (
+            names(&self.left_source, &self.left_sorted),
+            names(&self.right_source, &self.right_sorted),
+        );
+        let name = |cols: &[String], i: &usize| cols.get(*i).cloned().unwrap_or_else(|| format!("#{i}"));
+        let keys = self
+            .left_fields
+            .iter()
+            .zip(&self.right_fields)
+            .map(|(l, r)| format!("left({}) = right({})", name(&left, l), name(&right, r)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let mut node = PlanNode::new("SortMergeJoin").detail(format!("{:?} on {keys}", self.matcher.join_type()));
+        for child in [
+            side(&self.left_source, &self.left_sorted),
+            side(&self.right_source, &self.right_sorted),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            node = node.child(child);
+        }
+        node
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }

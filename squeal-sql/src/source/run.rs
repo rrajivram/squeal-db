@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
@@ -35,6 +36,11 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new("RunScan").detail("(temp table)")
+    }
+
+
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         // A Run's own Tuple bytes ARE an IndexKey's to_bytes() encoding
         // (see TempTable::insert_rows) — no VersionedRow/reproject step

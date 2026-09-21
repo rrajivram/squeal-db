@@ -2405,3 +2405,516 @@ fn test_a_select_over_several_tables_holds_one_statement_transaction() {
     run(&c, "commit").unwrap();
     assert_eq!(db.stats().active_transactions, 0);
 }
+
+
+// ---- subqueries in FROM, end to end ----
+
+fn ints(rows: &[&[i64]]) -> Vec<Vec<ValueItem>> {
+    rows.iter()
+        .map(|r| r.iter().map(|i| ValueItem::Integer(*i)).collect())
+        .collect()
+}
+
+fn select_rows(c: &Arc<Connection<MemFile>>, sql: &str) -> (Vec<String>, Vec<Vec<ValueItem>>) {
+    let mut stmt = c.clone().create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    take_streaming_result(&mut stmt, 0)
+}
+
+fn select_sorted(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<Vec<ValueItem>> {
+    let mut rows = select_rows(c, sql).1;
+    rows.sort();
+    rows
+}
+
+// t1(id, cat): (1,0) (2,1) (3,0) (4,1) (5,0);  t2(id, val): (1,10) (2,20) (3,30) (4,40)
+fn subquery_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(&c, "create table t1 (id integer not null, cat integer, primary key(id))").unwrap();
+    run(&c, "create table t2 (id integer not null, val integer, primary key(id))").unwrap();
+    for (id, cat) in [(1, 0), (2, 1), (3, 0), (4, 1), (5, 0)] {
+        run(&c, &format!("insert into t1 values ({id}, {cat})")).unwrap();
+    }
+    for (id, val) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+        run(&c, &format!("insert into t2 values ({id}, {val})")).unwrap();
+    }
+    c
+}
+
+#[test]
+fn test_select_star_from_a_subquery() {
+    let c = subquery_conn();
+    let (cols, rows) = select_rows(&c, "select * from (select id, cat from t1) x");
+    assert_eq!(cols, ["id", "cat"]);
+    let mut rows = rows;
+    rows.sort();
+    assert_eq!(rows, ints(&[&[1, 0], &[2, 1], &[3, 0], &[4, 1], &[5, 0]]));
+}
+
+#[test]
+fn test_the_outer_query_filters_and_projects_the_subquery() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(&c, "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"),
+        ints(&[&[3], &[5]])
+    );
+}
+
+#[test]
+fn test_a_subquery_column_alias_is_what_the_outer_query_sees() {
+    let c = subquery_conn();
+    let (cols, rows) = select_rows(&c, "select renamed from (select id as renamed from t1 where id = 4) x");
+    assert_eq!(cols, ["renamed"]);
+    assert_eq!(rows, ints(&[&[4]]));
+}
+
+#[test]
+fn test_aggregating_inside_a_subquery_and_using_it_outside() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(&c, "select c from (select count(*) as c from t1) x"),
+        ints(&[&[5]])
+    );
+    assert_eq!(
+        select_sorted(
+            &c,
+            "select cat, n from (select cat, count(*) as n from t1 group by cat) g where n > 2"
+        ),
+        ints(&[&[0, 3]])
+    );
+}
+
+#[test]
+fn test_order_by_and_limit_inside_a_subquery() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(&c, "select id from (select id from t1 order by id desc limit 2) x"),
+        ints(&[&[4], &[5]])
+    );
+}
+
+#[test]
+fn test_order_by_on_the_outer_query_of_a_subquery() {
+    let c = subquery_conn();
+    let (_, rows) = select_rows(&c, "select id from (select id from t1 where cat = 1) x order by id desc");
+    assert_eq!(rows, ints(&[&[4], &[2]]));
+}
+
+#[test]
+fn test_subqueries_nest() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(
+            &c,
+            "select b from (select a as b from (select id as a from t1 where id < 3) i) j"
+        ),
+        ints(&[&[1], &[2]])
+    );
+}
+
+#[test]
+fn test_joining_a_subquery_to_a_real_table() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(
+            &c,
+            "select x.id, t2.val from (select id, cat from t1 where cat = 1) x join t2 on x.id = t2.id"
+        ),
+        ints(&[&[2, 20], &[4, 40]])
+    );
+}
+
+#[test]
+fn test_joining_a_real_table_to_a_subquery() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(
+            &c,
+            "select t2.val, x.cat from t2 join (select id, cat from t1) x on t2.id = x.id where x.cat = 0"
+        ),
+        ints(&[&[10, 0], &[30, 0]])
+    );
+}
+
+#[test]
+fn test_joining_two_subqueries() {
+    let c = subquery_conn();
+    assert_eq!(
+        select_sorted(
+            &c,
+            "select a.id, b.val from (select id from t1 where cat = 0) a \
+             join (select id, val from t2 where val > 10) b on a.id = b.id"
+        ),
+        ints(&[&[3, 30]])
+    );
+}
+
+#[test]
+fn test_left_join_from_a_subquery_keeps_unmatched_rows() {
+    let c = subquery_conn();
+    let rows = select_sorted(
+        &c,
+        "select x.id, t2.val from (select id from t1) x left join t2 on x.id = t2.id",
+    );
+    assert_eq!(rows.len(), 5);
+    assert!(rows.contains(&vec![ValueItem::Integer(5), ValueItem::Null]));
+}
+
+#[test]
+fn test_a_subquery_in_from_needs_an_alias() {
+    let c = subquery_conn();
+    let err = c
+        .clone()
+        .create_statement("select id from (select id from t1)")
+        .and_then(|mut s| s.execute())
+        .unwrap_err();
+    assert!(err.to_string().contains("alias"), "{err}");
+}
+
+#[test]
+fn test_a_subquery_over_an_empty_table_yields_no_rows() {
+    let c = subquery_conn();
+    run(&c, "create table empty (id integer not null, primary key(id))").unwrap();
+    assert!(select_rows(&c, "select id from (select id from empty) e").1.is_empty());
+}
+
+#[test]
+fn test_a_subquery_sees_the_same_snapshot_as_the_outer_query_inside_a_transaction() {
+    let c = subquery_conn();
+    run(&c, "begin").unwrap();
+    run(&c, "insert into t1 values (99, 9)").unwrap();
+    assert_eq!(
+        select_sorted(&c, "select id from (select id from t1 where id = 99) x"),
+        ints(&[&[99]]),
+        "the subquery reads the open transaction's own uncommitted row"
+    );
+    run(&c, "rollback").unwrap();
+}
+
+// ---- EXPLAIN ----
+
+fn explain(c: &Arc<Connection<MemFile>>, sql: &str) -> String {
+    let mut stmt = c.clone().create_statement(&format!("explain {sql}")).unwrap();
+    stmt.execute().unwrap();
+    match stmt.get_results().unwrap().expect("EXPLAIN must produce a result") {
+        ResultType::ResultString(s) => s,
+        other => panic!("expected the rendered plan, got {other:?}"),
+    }
+}
+
+// Whole plans, not fragments: a wrong column name, indentation or shape has
+// to fail. (Row estimates appear because the retail tables here have stats.)
+#[test]
+fn test_explain_a_plain_scan() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select * from t1"),
+        "Projection id, cat\n  TableScan t1 (~5 rows)"
+    );
+}
+
+#[test]
+fn test_explain_shows_the_filter_predicate_with_column_names() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select id from t1 where cat = 1 and id > 2"),
+        "Projection id\n  Filter ((cat = 1) AND (id > 2))\n    TableScan t1 (~5 rows)"
+    );
+}
+
+#[test]
+fn test_explain_a_join_shows_the_algorithm_keys_and_both_inputs() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select t1.id, t2.val from t1 join t2 on t1.id = t2.id"),
+        "Projection id#0, val\n  HashJoin Inner on build(id) = probe(id)\n    \
+         [build] TableScan t1 (~5 rows)\n    [probe] TableScan t2 (~4 rows)"
+    );
+}
+
+#[test]
+fn test_explain_names_the_join_type() {
+    let c = subquery_conn();
+    let plan = explain(&c, "select t1.id from t1 left join t2 on t1.id = t2.id");
+    assert!(plan.contains("HashJoin Left on"), "{plan}");
+}
+
+#[test]
+fn test_explain_shows_sort_topn_limit() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select id from t1 order by id desc"),
+        "Sort id DESC\n  Projection id\n    TableScan t1 (~5 rows)"
+    );
+    assert_eq!(
+        explain(&c, "select id from t1 order by id limit 2"),
+        "TopN 2 by id ASC\n  Projection id\n    TableScan t1 (~5 rows)"
+    );
+    assert_eq!(
+        explain(&c, "select id from t1 limit 3"),
+        "Limit 3\n  Projection id\n    TableScan t1 (~5 rows)"
+    );
+}
+
+#[test]
+fn test_explain_shows_aggregation_grouping_and_distinct() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select count(*) as n from t1"),
+        "Aggregate count(*) AS n\n  TableScan t1 (~5 rows)"
+    );
+    assert_eq!(
+        explain(&c, "select cat, count(*) as n from t1 group by cat"),
+        "GroupAggregate by cat: cat, count(*) AS n\n  Sort cat ASC NULLS FIRST\n    TableScan t1 (~5 rows)"
+    );
+    assert_eq!(
+        explain(&c, "select distinct cat from t1"),
+        "Distinct\n  Sort cat ASC NULLS FIRST\n    Projection cat\n      TableScan t1 (~5 rows)"
+    );
+}
+
+#[test]
+fn test_explain_shows_a_subquery_as_a_nested_plan() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(&c, "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"),
+        "Projection id\n  Filter (id > 1)\n    Projection id, cat\n      Filter (cat = 0)\n        TableScan t1 (~5 rows)"
+    );
+}
+
+#[test]
+fn test_explain_a_join_of_subqueries_keeps_each_side_a_full_plan() {
+    let c = subquery_conn();
+    let plan = explain(
+        &c,
+        "select a.id, b.val from (select id from t1 where cat = 0) a \
+         join (select id, val from t2 where val > 10) b on a.id = b.id",
+    );
+    assert!(plan.starts_with("Projection id#0, val\n  HashJoin Inner on"), "{plan}");
+    assert!(plan.contains("Filter (cat = 0)") && plan.contains("Filter (val > 10)"), "{plan}");
+}
+
+#[test]
+fn test_explain_row_estimates_follow_analyze() {
+    let c = conn();
+    run(&c, "create table w (id integer not null, primary key(id))").unwrap();
+    for i in 0..7 {
+        run(&c, &format!("insert into w values ({i})")).unwrap();
+    }
+    run(&c, "analyze table w").unwrap();
+    assert_eq!(explain(&c, "select * from w"), "Projection id\n  TableScan w (~7 rows)");
+}
+
+#[test]
+fn test_explain_does_not_run_the_query_or_change_anything() {
+    let c = subquery_conn();
+    let before = select_sorted(&c, "select id from t1");
+    let _ = explain(&c, "select id from t1 where id > 2");
+    assert_eq!(select_sorted(&c, "select id from t1"), before);
+}
+
+#[test]
+fn test_explain_of_something_other_than_a_select_is_rejected() {
+    let c = subquery_conn();
+    let err = c
+        .clone()
+        .create_statement("explain insert into t1 values (100, 1)")
+        .and_then(|mut s| s.execute())
+        .unwrap_err();
+    assert!(err.to_string().contains("EXPLAIN"), "{err}");
+    // ...and it did not execute the insert.
+    assert_eq!(select_sorted(&c, "select id from t1 where id = 100").len(), 0);
+}
+
+#[test]
+fn test_explain_reports_a_bad_query_like_the_query_would() {
+    let c = subquery_conn();
+    let mut stmt = c.clone().create_statement("explain select nope from t1").unwrap();
+    assert!(stmt.execute().is_err());
+    let mut stmt = c.clone().create_statement("explain select * from missing").unwrap();
+    assert!(stmt.execute().is_err());
+}
+
+// ---- WHERE equalities across FROM items become joins ----
+
+// Whether some plan line is the step `what` (ignoring indentation and a
+// leading `[build]`/`[probe]` role).
+fn has(plan: &str, what: &str) -> bool {
+    plan.lines().any(|l| {
+        let l = l.trim_start();
+        let l = l.strip_prefix('[').and_then(|r| r.split_once("] ")).map_or(l, |(_, r)| r);
+        l.starts_with(what)
+    })
+}
+
+// a(id, x): (1,10) (2,20) (3,30) (4,NULL) (5,20); b(id, y): (1,100) (2,200) (2,201) (6,600); c(id, z): (2,7) (5,8)
+fn where_join_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(&c, "create table a (id integer not null, x integer, primary key(id))").unwrap();
+    run(&c, "create table b (id integer not null, y integer)").unwrap();
+    run(&c, "create table c (id integer not null, z integer)").unwrap();
+    for (id, x) in [("1", "10"), ("2", "20"), ("3", "30"), ("4", "null"), ("5", "20")] {
+        run(&c, &format!("insert into a values ({id}, {x})")).unwrap();
+    }
+    for (id, y) in [(1, 100), (2, 200), (2, 201), (6, 600)] {
+        run(&c, &format!("insert into b values ({id}, {y})")).unwrap();
+    }
+    for (id, z) in [(2, 7), (5, 8)] {
+        run(&c, &format!("insert into c values ({id}, {z})")).unwrap();
+    }
+    c
+}
+
+#[test]
+fn test_a_where_equality_between_comma_joined_tables_plans_a_hash_join_not_a_cross_join() {
+    let c = where_join_conn();
+    let plan = explain(&c, "select a.id, b.y from a, b where a.id = b.id");
+    eprintln!("{plan}");
+    assert!(has(&plan, "HashJoin Inner on"), "{plan}");
+    assert!(!has(&plan, "CrossJoin"), "{plan}");
+    assert_eq!(
+        select_sorted(&c, "select a.id, b.y from a, b where a.id = b.id"),
+        ints(&[&[1, 100], &[2, 200], &[2, 201]])
+    );
+}
+
+#[test]
+fn test_the_join_gives_exactly_the_rows_cross_join_then_filter_gives() {
+    let c = where_join_conn();
+    // `a.id + 0` is not a bare column, so this cannot become a join and runs
+    // as a true cross join + filter: an independent path to compare against.
+    for (joined, crossed) in [
+        (
+            "select a.id, b.y from a, b where a.id = b.id",
+            "select a.id, b.y from a, b where a.id + 0 = b.id",
+        ),
+        (
+            "select a.id, b.y from a, b where b.id = a.id and b.y > 100",
+            "select a.id, b.y from a, b where b.id = a.id + 0 and b.y > 100",
+        ),
+        (
+            "select a.id, a.x, b.y from a, b where a.x = b.y",
+            "select a.id, a.x, b.y from a, b where a.x + 0 = b.y",
+        ),
+    ] {
+        assert_eq!(select_sorted(&c, joined), select_sorted(&c, crossed), "{joined}");
+    }
+}
+
+#[test]
+fn test_a_null_join_key_matches_nothing() {
+    let c = where_join_conn();
+    // a.x has a NULL row; no other table has a NULL to pair with either.
+    let rows = select_sorted(&c, "select a.id from a, c where a.x = c.z");
+    assert!(rows.is_empty());
+    // NULL on both sides must not match each other in the join.
+    run(&c, "insert into b values (7, null)").unwrap();
+    run(&c, "insert into c values (8, null)").unwrap();
+    assert!(select_sorted(&c, "select b.id, c.id from b, c where b.y = c.z and b.y > 1000").is_empty());
+    assert_eq!(
+        select_sorted(&c, "select b.id from b, c where b.id = c.id"),
+        ints(&[&[2], &[2]])
+    );
+}
+
+#[test]
+fn test_three_tables_chain_into_two_joins() {
+    let c = where_join_conn();
+    let sql = "select a.id, b.y, c.z from a, b, c where a.id = b.id and b.id = c.id";
+    let plan = explain(&c, sql);
+    eprintln!("{plan}");
+    assert_eq!(plan.matches("HashJoin").count(), 2, "{plan}");
+    assert!(!has(&plan, "CrossJoin"), "{plan}");
+    assert_eq!(select_sorted(&c, sql), ints(&[&[2, 200, 7], &[2, 201, 7]]));
+}
+
+#[test]
+fn test_an_item_with_no_linking_equality_is_cross_joined_and_the_rest_still_join() {
+    let c = where_join_conn();
+    let sql = "select a.id, b.id, c.id from a, b, c where a.id = b.id";
+    let plan = explain(&c, sql);
+    eprintln!("{plan}");
+    assert!(has(&plan, "CrossJoin"), "{plan}");
+    assert!(plan.contains("HashJoin Inner"), "{plan}");
+    // 3 matching (a,b) pairs x 2 rows of c.
+    assert_eq!(select_rows(&c, sql).1.len(), 3 * 2);
+}
+
+#[test]
+fn test_conditions_that_are_not_a_cross_table_column_equality_stay_a_cross_join() {
+    let c = where_join_conn();
+    for sql in [
+        "select a.id from a, b where a.id = b.id or a.id = 1",
+        "select a.id from a, b where a.id > b.id",
+        "select a.id from a, b where a.id = a.x",
+        "select a.id from a, b where a.id = 1",
+        "select a.id from a, b",
+    ] {
+        let plan = explain(&c, sql);
+        assert!(has(&plan, "CrossJoin"), "{sql}\n{plan}");
+        assert!(!plan.contains("HashJoin"), "{sql}\n{plan}");
+    }
+    // ...and still compute the right answer: a.id = 1 pairs with all four b
+    // rows, and a.id = 2 with the two b rows of id 2.
+    assert_eq!(
+        select_sorted(&c, "select a.id, b.id from a, b where a.id = b.id or a.id = 1"),
+        ints(&[&[1, 1], &[1, 2], &[1, 2], &[1, 6], &[2, 2], &[2, 2]])
+    );
+}
+
+// Comparing columns of different data types is an error (see plan::eval's
+// same_type), and such an equality is not planned as a join — the
+// comparison itself is what rejects it.
+#[test]
+fn test_comparing_columns_of_different_types_is_an_error_not_a_join() {
+    let c = conn();
+    run(&c, "create table i (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table d (v double)").unwrap();
+    run(&c, "insert into i values (1)").unwrap();
+    run(&c, "insert into d values (1.0)").unwrap();
+    let sql = "select i.id from i, d where i.id = d.v";
+    let plan = explain(&c, sql);
+    assert!(has(&plan, "CrossJoin") && !plan.contains("HashJoin"), "{plan}");
+    let mut stmt = c.clone().create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    let ResultType::StreamingResult(mut s) = stmt.results[0].take().unwrap() else {
+        panic!("expected a stream")
+    };
+    let err = s.next_result().unwrap_err().to_string();
+    assert!(err.contains("different data types"), "{err}");
+}
+
+#[test]
+fn test_string_keys_join_across_different_varchar_lengths() {
+    let c = conn();
+    run(&c, "create table s1 (k varchar(5) not null, v integer)").unwrap();
+    run(&c, "create table s2 (k varchar(20) not null, w integer)").unwrap();
+    run(&c, "insert into s1 values ('ann', 1)").unwrap();
+    run(&c, "insert into s1 values ('bob', 2)").unwrap();
+    run(&c, "insert into s2 values ('bob', 20)").unwrap();
+    run(&c, "insert into s2 values ('cy', 30)").unwrap();
+    let sql = "select s1.v, s2.w from s1, s2 where s1.k = s2.k";
+    assert!(explain(&c, sql).contains("HashJoin Inner"));
+    assert_eq!(select_sorted(&c, sql), ints(&[&[2, 20]]));
+}
+
+#[test]
+fn test_a_join_between_a_table_and_an_outer_join_chain_uses_the_equality() {
+    let c = where_join_conn();
+    let sql = "select a.id, b.y, c.z from a left join b on a.id = b.id, c where a.id = c.id";
+    let plan = explain(&c, sql);
+    eprintln!("{plan}");
+    assert!(plan.contains("HashJoin Left") && plan.contains("HashJoin Inner"), "{plan}");
+    // a=2 matches b twice; a=5 has no b row (NULL y) but does match c.
+    let mut want = ints(&[&[2, 200, 7], &[2, 201, 7]]);
+    want.push(vec![ValueItem::Integer(5), ValueItem::Null, ValueItem::Integer(8)]);
+    want.sort();
+    assert_eq!(select_sorted(&c, sql), want);
+}
+
+#[test]
+fn test_where_null_predicates_filter_the_row_instead_of_erroring() {
+    let c = where_join_conn();
+    assert_eq!(select_sorted(&c, "select id from a where x = 20"), ints(&[&[2], &[5]]));
+    assert_eq!(select_sorted(&c, "select id from a where x > 15 and x < 100"), ints(&[&[2], &[3], &[5]]));
+}

@@ -1,3 +1,4 @@
+use crate::source::{column_names, output_label, planinfo::PlanNode};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::IndexKey;
@@ -32,6 +33,18 @@ impl Projection {
 }
 
 impl Source for Projection {
+    fn plan(&self) -> PlanNode {
+        let names = column_names(&self.source.fields());
+        let cols = self
+            .fields
+            .iter()
+            .map(|f| output_label(f, &names))
+            .collect::<Vec<_>>()
+            .join(", ");
+        PlanNode::new("Projection").detail(cols).child(self.source.plan())
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         Arc::from(self.fields.clone())
     }

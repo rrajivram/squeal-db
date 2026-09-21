@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Instant};
 
 use sql_parser::expr::BinaryOp;
@@ -173,6 +174,12 @@ fn collect_equi_join_fields(
 }
 
 impl<F: DBFile + 'static> Source for JoinSource<F> {
+    // A pass-through: the join algorithm underneath is the plan step.
+    fn plan(&self) -> PlanNode {
+        self.source.plan()
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }
@@ -221,6 +228,11 @@ impl UnionJoin {
 }
 
 impl Source for UnionJoin {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new("CrossJoin").children(self.sources.iter().map(|s| s.plan()).collect())
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }

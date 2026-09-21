@@ -1,3 +1,4 @@
+use crate::source::{column_names, planinfo::PlanNode};
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::ValueItem;
@@ -13,7 +14,6 @@ use crate::{
 pub(crate) struct WhereSource {
     source: Box<dyn Source>,
     expr: EvalExpr,
-    field: Arc<Field>,
     time_spent: u128,
 }
 
@@ -22,20 +22,26 @@ impl WhereSource {
         Ok(Self {
             source,
             expr,
-            field: Arc::new(Field::new(
-                "where".into(),
-                crate::datatype::DataType::Boolean,
-                false,
-                None,
-            )?),
             time_spent: 0,
         })
     }
 }
 
 impl Source for WhereSource {
+    fn plan(&self) -> PlanNode {
+        let names = column_names(&self.source.fields());
+        PlanNode::new("Filter")
+            .detail(self.expr.describe(&names))
+            .child(self.source.plan())
+    }
+
+
     fn fields(&self) -> std::sync::Arc<[ProjectableField]> {
-        Arc::from([ProjectableField::from_field(self.field.clone(), 0, 0)])
+        // A filter passes its input's rows through unchanged, so its row
+        // layout IS its input's (it used to report one made-up boolean
+        // "where" column, which nothing could resolve a real column
+        // position against).
+        self.source.fields()
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
@@ -52,6 +58,9 @@ impl Source for WhereSource {
                         continue;
                     }
                 }
+                // A NULL predicate (`k = 5` where k is NULL) is "not true":
+                // the row is filtered out, it is not an error.
+                ValueItem::Null => continue,
                 _ => {
                     return Err(SchemaError::InternalSchemaError(
                         "Output of where is not boolean.".into(),
@@ -132,21 +141,22 @@ mod tests {
 
     #[test]
     fn test_where_source_errors_when_the_predicate_is_not_boolean() {
-        // Current, documented limitation: a predicate that evaluates to
-        // something other than a boolean (including NULL — there's no
-        // three-valued WHERE logic yet, see CrateValueItem::binary's own
-        // doc comment) surfaces as an error rather than silently
-        // filtering the row out.
+        // A predicate that evaluates to something other than a boolean or
+        // NULL is a planning bug and surfaces as an error rather than
+        // silently filtering the row out. (NULL is different: see the next
+        // test.)
         let not_boolean = EvalExpr::Literal(ValueItem::Integer(1));
         let mut w = WhereSource::new(src(), not_boolean).unwrap();
         assert!(w.next().is_err());
     }
 
     #[test]
-    fn test_where_source_errors_on_a_null_predicate_result() {
+    fn test_where_source_filters_out_rows_whose_predicate_is_null() {
+        // `k = 5` with a NULL k is NULL, which is "not true": no row passes,
+        // and it is not an error.
         let null_result = EvalExpr::Literal(ValueItem::Null);
         let mut w = WhereSource::new(src(), null_result).unwrap();
-        assert!(w.next().is_err());
+        assert!(w.next().unwrap().is_none());
     }
 
     #[test]

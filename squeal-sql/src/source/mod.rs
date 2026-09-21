@@ -16,6 +16,7 @@ pub mod hash;
 mod index;
 pub(crate) mod join;
 mod joinmatch;
+pub mod planinfo;
 pub mod limit;
 pub mod proj;
 pub(crate) mod run;
@@ -89,6 +90,31 @@ pub trait Source: Debug + Send {
     }
     fn table_stats(&self) -> Option<ComputedTableStat> {
         None
+    }
+    // What EXPLAIN shows for this step and (through its own children) the
+    // steps feeding it. The default is a bare leaf named by Debug; every
+    // real operator overrides it.
+    fn plan(&self) -> planinfo::PlanNode {
+        planinfo::PlanNode::new(format!("{self:?}"))
+    }
+}
+
+// Column names of a source's output row, in order — what a `Value(i)` in an
+// expression reading that row refers to (see EvalExpr::describe).
+pub(crate) fn column_names(fields: &[ProjectableField]) -> Vec<String> {
+    fields.iter().map(|f| f.display_name.clone()).collect()
+}
+
+// How a Projection/GroupAggregate step shows one of its output columns:
+// the expression, plus `AS name` when the name adds information (it does not
+// for a bare column, or an unnamed expression).
+pub(crate) fn output_label(f: &ProjectableField, names: &[String]) -> String {
+    let expr = f.expr.describe(names);
+    let bare_column = expr.split('#').next() == Some(f.display_name.as_str());
+    if f.display_name == expr || f.display_name == "none" || bare_column {
+        expr
+    } else {
+        format!("{expr} AS {}", f.display_name)
     }
 }
 

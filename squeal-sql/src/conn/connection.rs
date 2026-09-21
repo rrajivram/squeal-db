@@ -13,6 +13,7 @@ use crate::{
     error::SchemaError,
     plan::logical::HasFields,
     schema_ops::{database::Database, schema::Schema},
+    source::{ProjectableField, Source, run::RunSource},
     stmt::{PreparedStatement, Statement},
     table::SqlTable,
     temp::{TEMP_SCHEMA_NAME, TempTable, TempTables},
@@ -147,70 +148,6 @@ impl ConnectionManager<File> {
     }
 }
 
-// What a FROM-clause-style reference resolves to — the one shared
-// answer for every statement kind that needs to turn a parsed table
-// name into something to act on (INSERT, ALTER TABLE, COPY INTO,
-// SELECT's own table resolution in plan::logical), instead of each
-// reimplementing the same schema-vs-temp classification (see
-// Connection::resolve_table_ref's own doc comment for why that used to
-// drift).
-//
-// Real carries the already-resolved Arc<SqlTable> (not just its name) —
-// resolve_table_ref does that lookup itself, once, rather than every
-// caller (INSERT and plan::logical::QueryVisitor::validate_table both
-// used to) re-deriving the same "look it up, error if missing" step
-// immediately after getting a schema+name pair back. The Schema handle
-// is kept alongside it since the schema-level operations (insert_rows,
-// add_column, copy_csv_into, ...) still live on Schema, not SqlTable.
-//
-// Derived (a FROM-clause subquery, `(SELECT ...) AS x` — carries
-// nothing yet, see plan::logical's own TODO on actually planning one)
-// lives here too, not as a separate enum one layer up: it's another
-// answer to the exact same question ("what is this FROM item"), and
-// keeping it here means a future non-subquery producer of the same
-// shape — a VIEW, most plausibly, a stored query resolved by name the
-// same way a real table is — has one obvious place to plug into instead
-// of two enums to keep in sync.
-
-pub(crate) enum TableRef<F: DBFile + 'static> {
-    Real(Arc<Schema<F>>, Arc<SqlTable>),
-    // Carries the (lowercased) name alongside the handle, not just the
-    // handle — callers still want it for error messages/further lookups
-    // the way TableRef::Real's own Arc<SqlTable> carries its name via
-    // `.name`, and a TempTable has no separate "schema" object to get
-    // one from otherwise.
-    Temp(String, Arc<RwLock<TempTable<F>>>),
-    Derived,
-}
-
-// TempTable (via store::run::Run) doesn't implement Debug, so this can't
-// be derived — a minimal manual impl (variant + the name each carries)
-// is enough for {:?} logging and for
-// Result<(TableRef<F>, _), _>::unwrap_err() in tests.
-impl<F: DBFile + 'static> std::fmt::Debug for TableRef<F> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TableRef::Real(schema, table) => f
-                .debug_tuple("Real")
-                .field(&schema.name)
-                .field(&table.name)
-                .finish(),
-            TableRef::Temp(name, _) => f.debug_tuple("Temp").field(name).finish(),
-            TableRef::Derived => f.debug_tuple("Derived").finish(),
-        }
-    }
-}
-
-impl<F: DBFile + 'static> Clone for TableRef<F> {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Real(s, t) => Self::Real(s.clone(), t.clone()),
-            Self::Temp(s, t) => Self::Temp(s.clone(), t.clone()),
-            Self::Derived => Self::Derived,
-        }
-    }
-}
-
 impl<F> Connection<F>
 where
     F: DBFile + 'static,
@@ -242,16 +179,16 @@ where
     // uses rather than exposing TableStat/ColumnStat (both pub(crate))
     // directly.
     pub fn table_stats_report(&self) -> Result<crate::rslt::resultset::ResultSet, SchemaError> {
-        let schema = self
-            .current_schema()
-            .ok_or(SchemaError::NoSchemaSelected)?;
+        let schema = self.current_schema().ok_or(SchemaError::NoSchemaSelected)?;
         let columns = ["Table", "Column", "Rows", "Unique", "Nulls", "Min", "Max"]
             .iter()
             .map(|s| s.to_string())
             .collect();
         let rows = schema.table_stats_rows();
         let message = format!("{} row(s)", rows.len());
-        Ok(crate::rslt::resultset::ResultSet::new(columns, rows, message))
+        Ok(crate::rslt::resultset::ResultSet::new(
+            columns, rows, message,
+        ))
     }
 
     // Looks up any named schema in this connection's current database —
@@ -545,3 +482,224 @@ where
 }
 
 impl<F> Eq for Connection<F> where F: DBFile + 'static {}
+
+pub(crate) enum TableRef<F: DBFile + 'static> {
+    Real(Arc<Schema<F>>, Arc<SqlTable>),
+    // Carries the (lowercased) name alongside the handle, not just the
+    // handle — callers still want it for error messages/further lookups
+    // the way TableRef::Real's own Arc<SqlTable> carries its name via
+    // `.name`, and a TempTable has no separate "schema" object to get
+    // one from otherwise.
+    Temp(String, Arc<RwLock<TempTable<F>>>),
+    // A FROM-clause subquery: the already-built output of an inner query.
+    // See DerivedSource for why this is a shared one-shot handle.
+    Derived(String, DerivedSource),
+}
+
+// The output of a previous query used as a FROM item. A Source is a live,
+// stateful stream — it can be neither cloned nor read twice — but TableRef
+// is cloned freely (the planner keeps one in the TableQuery and one in its
+// join bookkeeping). So the Source sits in a shared slot: every clone of the
+// handle refers to the SAME stream, and take() hands it out, once.
+//
+// A derived table that must be read MORE than once (a CTE or view referenced
+// twice, say) calls materialize() first: the rows are drained into a temp
+// Run, and every take() after that opens a fresh scan of it.
+// The field list is copied out up front so it stays answerable either way.
+#[derive(Clone)]
+pub(crate) struct DerivedSource {
+    fields: Arc<[ProjectableField]>,
+    backing: Arc<parking_lot::Mutex<DerivedBacking>>,
+}
+
+enum DerivedBacking {
+    // The live stream, until the first take().
+    Stream(Option<Box<dyn Source>>),
+    // Rows saved in a temp Run; each call opens a new scan of them.
+    Replayable(Box<dyn Fn() -> Result<Box<dyn Source>, SchemaError> + Send>),
+}
+
+impl DerivedSource {
+    pub(crate) fn new(source: Box<dyn Source>) -> Self {
+        Self {
+            fields: source.fields(),
+            backing: Arc::new(parking_lot::Mutex::new(DerivedBacking::Stream(Some(source)))),
+        }
+    }
+
+    pub(crate) fn fields(&self) -> Arc<[ProjectableField]> {
+        self.fields.clone()
+    }
+
+    // A stream to read the rows from. Un-materialized: the first caller
+    // (across all clones) gets the stream and later ones get an error.
+    // Materialized: every call gets its own fresh scan.
+    pub(crate) fn take(&self, name: &str) -> Result<Box<dyn Source>, SchemaError> {
+        match &mut *self.backing.lock() {
+            DerivedBacking::Stream(slot) => slot.take().ok_or_else(|| {
+                SchemaError::InternalSchemaError(format!(
+                    "derived table {name} was already opened; a subquery result can only be read \
+                     once unless it is materialized"
+                ))
+            }),
+            DerivedBacking::Replayable(open) => open(),
+        }
+    }
+
+    // Drains the stream into a temp Run so it can be opened any number of
+    // times (by every clone of this handle). A no-op if already
+    // materialized; an error if the stream was already handed out.
+    pub(crate) fn materialize<F>(&self, db: &Arc<store::db::Db<F>>) -> Result<(), SchemaError>
+    where
+        F: DBFile + 'static,
+        F: DBFile<Item = F>,
+    {
+        let mut backing = self.backing.lock();
+        let DerivedBacking::Stream(slot) = &mut *backing else {
+            return Ok(());
+        };
+        let Some(mut source) = slot.take() else {
+            return Err(SchemaError::InternalSchemaError(
+                "cannot materialize a derived table that was already opened".into(),
+            ));
+        };
+        let mut run = db.create_run()?;
+        while let Some(row) = source.next()? {
+            run.append(&row.to_bytes())?;
+        }
+        let run = Arc::new(run);
+        let fields = self.fields.clone();
+        *backing = DerivedBacking::Replayable(Box::new(move || {
+            Ok(Box::new(RunSource::new(run.cursor()?, &fields)) as Box<dyn Source>)
+        }));
+        Ok(())
+    }
+}
+
+// TempTable (via store::run::Run) doesn't implement Debug, so this can't
+// be derived — a minimal manual impl (variant + the name each carries)
+// is enough for {:?} logging and for
+// Result<(TableRef<F>, _), _>::unwrap_err() in tests.
+impl<F: DBFile + 'static> std::fmt::Debug for TableRef<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableRef::Real(schema, table) => f
+                .debug_tuple("Real")
+                .field(&schema.name)
+                .field(&table.name)
+                .finish(),
+            TableRef::Temp(name, _) => f.debug_tuple("Temp").field(name).finish(),
+            TableRef::Derived(n, _s) => f.debug_tuple("Derived").field(n).finish(),
+        }
+    }
+}
+
+impl<F: DBFile + 'static> Clone for TableRef<F> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Real(s, t) => Self::Real(s.clone(), t.clone()),
+            Self::Temp(s, t) => Self::Temp(s.clone(), t.clone()),
+            // Shares the one-shot stream — see DerivedSource.
+            Self::Derived(n, d) => Self::Derived(n.clone(), d.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod derived_tests {
+    use store::{memfile::MemFile, valueitem::ValueItem};
+
+    use super::*;
+    use crate::source::test_support::VecSource;
+
+    fn derived() -> DerivedSource {
+        DerivedSource::new(Box::new(VecSource::new(
+            &["a", "b"],
+            vec![vec![ValueItem::Integer(1), ValueItem::Integer(2)]],
+        )))
+    }
+
+    #[test]
+    fn test_the_stream_can_be_taken_once_and_returns_its_rows() {
+        let d = derived();
+        let mut s = d.take("x").unwrap();
+        assert_eq!(s.next().unwrap().unwrap().values().len(), 2);
+        assert!(s.next().unwrap().is_none());
+        let err = d.take("x").err().expect("second take must fail");
+        assert!(err.to_string().contains("already opened"), "{err}");
+    }
+
+    #[test]
+    fn test_clones_share_one_stream_so_only_one_of_them_can_open_it() {
+        let d = derived();
+        let copy = d.clone();
+        assert!(copy.take("x").is_ok());
+        assert!(d.take("x").is_err(), "the original sees the same, already-taken slot");
+    }
+
+    #[test]
+    fn test_fields_stay_available_after_the_stream_is_taken() {
+        let d = derived();
+        let names = |d: &DerivedSource| -> Vec<String> {
+            d.fields().iter().map(|f| f.display_name.clone()).collect()
+        };
+        assert_eq!(names(&d), ["a", "b"]);
+        let _ = d.take("x").unwrap();
+        assert_eq!(names(&d), ["a", "b"]);
+    }
+
+    #[test]
+    fn test_a_cloned_derived_table_ref_keeps_its_name() {
+        let r: TableRef<MemFile> = TableRef::Derived("sub".into(), derived());
+        let c = r.clone();
+        assert!(matches!(&c, TableRef::Derived(n, _) if n == "sub"));
+        assert!(format!("{c:?}").contains("sub"));
+    }
+
+    fn many_rows(n: i64) -> DerivedSource {
+        DerivedSource::new(Box::new(VecSource::new(
+            &["a", "b"],
+            (0..n).map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)]).collect(),
+        )))
+    }
+
+    fn count(mut s: Box<dyn Source>) -> usize {
+        let mut n = 0;
+        while s.next().unwrap().is_some() {
+            n += 1;
+        }
+        n
+    }
+
+    // The case the plain one-shot handle cannot serve: the same derived
+    // table opened more than once (a CTE/view referenced twice).
+    #[test]
+    fn test_a_materialized_derived_table_can_be_opened_repeatedly_by_every_clone() {
+        let db = store::db::Db::<MemFile>::create("derived_materialize.db").unwrap();
+        let d = many_rows(1000);
+        let copy = d.clone();
+        d.materialize(&db).unwrap();
+        assert_eq!(count(d.take("x").unwrap()), 1000);
+        assert_eq!(count(d.take("x").unwrap()), 1000, "a second open of the same handle");
+        assert_eq!(count(copy.take("x").unwrap()), 1000, "and through a clone");
+        // Two scans open at once do not interfere.
+        let (mut a, mut b) = (d.take("x").unwrap(), d.take("x").unwrap());
+        assert_eq!(a.next().unwrap().unwrap().values()[0], ValueItem::Integer(0));
+        assert_eq!(b.next().unwrap().unwrap().values()[0], ValueItem::Integer(0));
+        assert_eq!(a.next().unwrap().unwrap().values()[0], ValueItem::Integer(1));
+        assert_eq!(b.next().unwrap().unwrap().values()[0], ValueItem::Integer(1));
+    }
+
+    #[test]
+    fn test_materialize_is_idempotent_and_refuses_an_already_opened_stream() {
+        let db = store::db::Db::<MemFile>::create("derived_materialize2.db").unwrap();
+        let d = many_rows(10);
+        d.materialize(&db).unwrap();
+        d.materialize(&db).unwrap();
+        assert_eq!(count(d.take("x").unwrap()), 10);
+
+        let used = many_rows(10);
+        let _ = used.take("x").unwrap();
+        assert!(used.materialize(&db).is_err());
+    }
+}

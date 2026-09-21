@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use postcard::from_bytes;
@@ -70,6 +71,11 @@ impl<F: DBFile + 'static> IndexSource<F> {
 }
 
 impl<F: DBFile + 'static> Source for IndexSource<F> {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new(self.name.clone()).rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
+    }
+
+
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
     }

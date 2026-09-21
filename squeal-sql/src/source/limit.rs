@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{collections::HashMap, time::Instant};
 
 use crate::source::{QueryStats, Source, merge_stats};
@@ -22,6 +23,13 @@ impl Limit {
 }
 
 impl Source for Limit {
+    fn plan(&self) -> PlanNode {
+        PlanNode::new("Limit")
+            .detail(self.limit.to_string())
+            .child(self.source.plan())
+    }
+
+
     fn fields(&self) -> std::sync::Arc<[super::ProjectableField]> {
         self.source.as_ref().fields()
     }

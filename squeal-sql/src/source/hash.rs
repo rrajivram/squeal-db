@@ -1,3 +1,4 @@
+use crate::source::{planinfo::PlanNode};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -605,6 +606,31 @@ impl<F: DBFile + 'static> std::fmt::Debug for HashedSource<F> {
 }
 
 impl<F: DBFile + 'static> Source for HashedSource<F> {
+    fn plan(&self) -> PlanNode {
+        let (left, right) = (self.sources[0].fields(), self.sources[1].fields());
+        let name = |fields: &[ProjectableField], i: &usize| {
+            fields
+                .get(*i)
+                .map(|f| f.display_name.clone())
+                .unwrap_or_else(|| format!("#{i}"))
+        };
+        let keys = self
+            .left_fields
+            .iter()
+            .zip(&self.right_fields)
+            .map(|(l, r)| format!("build({}) = probe({})", name(&left, l), name(&right, r)))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // `join_type` already describes the physical sides (see new()); say
+        // so when they were swapped relative to the query text.
+        let swapped = if self.swapped { ", sides swapped" } else { "" };
+        PlanNode::new("HashJoin")
+            .detail(format!("{:?} on {keys}{swapped}", self.join_type))
+            .child(self.sources[0].plan().with_role("build"))
+            .child(self.sources[1].plan().with_role("probe"))
+    }
+
+
     fn fields(&self) -> Arc<[super::ProjectableField]> {
         self.fields.clone()
     }

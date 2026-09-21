@@ -455,7 +455,7 @@ where
                         // plan::logical's own FROM-item resolution (see its
                         // own doc comment), so every match on it has to stay
                         // exhaustive.
-                        TableRef::Derived => {
+                        TableRef::Derived(..) => {
                             return Err(SchemaError::InternalSchemaError(
                                 "resolve_table_ref unexpectedly returned Derived".into(),
                             ));
@@ -608,7 +608,7 @@ where
                                 "temp.{name} has no indices or foreign keys"
                             )));
                         }
-                        TableRef::Derived => {
+                        TableRef::Derived(..) => {
                             return Err(SchemaError::UnknownError(
                                 "Can't show indices for a derived table".into(),
                             ));
@@ -657,6 +657,19 @@ where
                 // Schema::analyze_table (schema_ops/schema.rs) does a real,
                 // synchronous full-table scan and rebuilds that table's
                 // stats from it (see its own doc comment).
+                // The plan a SELECT would run, rendered as an indented tree.
+                // Planning opens the sources but reads no rows; the plan is
+                // then dropped, never executed.
+                sql_parser::Statement::Explain(_, inner) => {
+                    let sql_parser::Statement::Select(query) = inner.as_ref() else {
+                        return Err(SchemaError::UnsupportedFeature(
+                            "EXPLAIN is only supported for SELECT".into(),
+                        ));
+                    };
+                    let plan = LogicalPlan::build(self.conn.clone(), query)?;
+                    self.results
+                        .push(Some(ResultType::ResultString(plan.explain()?.render())));
+                }
                 sql_parser::Statement::AnalyzeTable(a) => {
                     let (table_ref, field) = self.conn.resolve_object_name_ref(&a.name)?;
                     reject_qualified_field("ANALYZE TABLE", field)?;
@@ -880,7 +893,7 @@ where
         TableRef::Temp(name, _) => Err(SchemaError::UserError(format!(
             "{what} is not supported on temp tables (temp.{name})"
         ))),
-        TableRef::Derived => Err(SchemaError::InternalSchemaError(format!(
+        TableRef::Derived(..) => Err(SchemaError::InternalSchemaError(format!(
             "resolve_table_ref unexpectedly returned Derived for {what}"
         ))),
     }

@@ -49,6 +49,74 @@ pub enum EvalExpr {
 }
 
 impl EvalExpr {
+    // A readable rendering for EXPLAIN. `Value(i)` is a flat position into
+    // the row this expression reads, so `names` (that row's column names,
+    // in order) turns it back into a column name; a position past the end
+    // shows as `#i`.
+    // A column's name, or `name#position` when another column of the same
+    // row has the same name (a join of two tables that both have an `id`),
+    // or `#position` when there is no such column.
+    fn column_label(names: &[String], i: usize) -> String {
+        match names.get(i) {
+            Some(n) if names.iter().filter(|o| *o == n).count() > 1 => format!("{n}#{i}"),
+            Some(n) => n.clone(),
+            None => format!("#{i}"),
+        }
+    }
+
+    pub(crate) fn describe(&self, names: &[String]) -> String {
+        use sql_parser::expr::{BinaryOp, UnaryOp};
+        match self {
+            Self::None => String::new(),
+            Self::Literal(v) => match v {
+                ValueItem::Str((s, _)) => format!("'{s}'"),
+                other => other.to_string(),
+            },
+            Self::Value(i) => Self::column_label(names, *i),
+            Self::Unary { op, field } => {
+                let f = field.describe(names);
+                match op {
+                    UnaryOp::Plus => format!("+{f}"),
+                    UnaryOp::Minus => format!("-{f}"),
+                    UnaryOp::Not => format!("NOT {f}"),
+                }
+            }
+            Self::Binary { lhs, op, rhs } => {
+                let sym = match op {
+                    BinaryOp::Plus => "+",
+                    BinaryOp::Minus => "-",
+                    BinaryOp::Multiply => "*",
+                    BinaryOp::Divide => "/",
+                    BinaryOp::Modulo => "%",
+                    BinaryOp::Concat => "||",
+                    BinaryOp::Eq => "=",
+                    BinaryOp::NotEq => "<>",
+                    BinaryOp::Lt => "<",
+                    BinaryOp::LtEq => "<=",
+                    BinaryOp::Gt => ">",
+                    BinaryOp::GtEq => ">=",
+                    BinaryOp::And => "AND",
+                    BinaryOp::Or => "OR",
+                };
+                format!("({} {sym} {})", lhs.describe(names), rhs.describe(names))
+            }
+            Self::Function(f) => {
+                use crate::plan::funcs::FuncTrait;
+                let cols = f.fields();
+                // No column arguments is the count(*) form.
+                let args = if cols.is_empty() {
+                    "*".to_string()
+                } else {
+                    cols.iter()
+                        .map(|i| Self::column_label(names, *i))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                format!("{}({args})", f.name())
+            }
+        }
+    }
+
     pub(crate) fn has_aggregate(&self) -> bool {
         match self {
             Self::Unary { field, .. } => field.has_aggregate(),
@@ -360,8 +428,8 @@ impl CrateValueItem {
                 }
                 _ => operand_error_msg(&format!("{op:?}"), "non-string operand"),
             },
-            BinaryOp::Eq => Ok(ValueItem::Boolean(values_equal(lhs, rhs))),
-            BinaryOp::NotEq => Ok(ValueItem::Boolean(!values_equal(lhs, rhs))),
+            BinaryOp::Eq => Ok(ValueItem::Boolean(values_equal(lhs, rhs, op)?)),
+            BinaryOp::NotEq => Ok(ValueItem::Boolean(!values_equal(lhs, rhs, op)?)),
             BinaryOp::Lt => Ok(ValueItem::Boolean(compare(lhs, rhs, op)?.is_lt())),
             BinaryOp::LtEq => Ok(ValueItem::Boolean(compare(lhs, rhs, op)?.is_le())),
             BinaryOp::Gt => Ok(ValueItem::Boolean(compare(lhs, rhs, op)?.is_gt())),
@@ -414,29 +482,51 @@ fn numeric(
     }
 }
 
-// Eq/NotEq's own notion of equality — deliberately more lenient than
-// `compare` below: comparing two genuinely incompatible types (a Str and an
-// Integer, say) is `false`, not an error, matching how `==` behaves in most
-// general-purpose languages. The one type-pair `compare` treats as
-// comparable-with-promotion (mixed Integer/Double) is handled the same way
-// here for consistency — `1 = 1.0` and `1 < 1.5` should agree on whether
-// Integer/Double are the "same kind of thing", not use two different
-// rules. Everything else falls back to ValueItem's own derived, structural
-// (and panic-free) PartialEq.
-fn values_equal(lhs: &ValueItem, rhs: &ValueItem) -> bool {
-    match (lhs, rhs) {
-        (ValueItem::Integer(a), ValueItem::Double(b)) => (*a as f64) == *b,
-        (ValueItem::Double(a), ValueItem::Integer(b)) => *a == (*b as f64),
-        // Content only, not the reserved on-disk capacity riding along
-        // with it — same reason `compare` below (and ValueItem's own
-        // PartialOrd) ignore it: a `'raj'` literal (capacity 3, its own
-        // length) and a `raj` read out of a `varchar(10)` column
-        // (capacity 10) are the same *value* despite derived PartialEq on
-        // the whole tuple calling them unequal because 3 != 10.
+// Every comparison (= <> < <= > >=) needs both operands to be the SAME data
+// type: comparing an Integer with a Double, a Str with an Integer, and so on
+// is an error, not a silent false or an implicit conversion. (Deliberately
+// strict for now, and simple: it lets a comparison between two columns be
+// planned as a join on their values — see plan::logical's WhereJoins.
+// Arithmetic still promotes Integer to Double; see `numeric`.)
+fn same_type(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<(), SchemaError> {
+    if std::mem::discriminant(lhs) == std::mem::discriminant(rhs) {
+        return Ok(());
+    }
+    Err(SchemaError::InvalidOperationOnOperand(
+        format!("{op:?}"),
+        format!(
+            "cannot compare different data types ({} and {})",
+            type_name(lhs),
+            type_name(rhs)
+        ),
+    ))
+}
+
+fn type_name(v: &ValueItem) -> &'static str {
+    match v {
+        ValueItem::Null => "null",
+        ValueItem::Integer(_) => "integer",
+        ValueItem::Double(_) => "double",
+        ValueItem::Datetime(_) => "datetime",
+        ValueItem::Str(_) => "string",
+        ValueItem::Blob(_) => "blob",
+        ValueItem::Boolean(_) => "boolean",
+    }
+}
+
+// Eq/NotEq's equality, over two operands of the same type. Strings and
+// blobs compare by content only, not the reserved on-disk capacity riding
+// along with it — same reason `compare` below (and ValueItem's own
+// PartialOrd) ignore it: a `'raj'` literal (capacity 3, its own length) and
+// a `raj` read out of a `varchar(10)` column (capacity 10) are the same
+// *value*.
+fn values_equal(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<bool, SchemaError> {
+    same_type(lhs, rhs, op)?;
+    Ok(match (lhs, rhs) {
         (ValueItem::Str((a, _)), ValueItem::Str((b, _))) => a == b,
         (ValueItem::Blob((a, _)), ValueItem::Blob((b, _))) => a == b,
         _ => lhs == rhs,
-    }
+    })
 }
 
 // Lt/LtEq/Gt/GtEq's shared ordering logic. Unlike ValueItem's own
@@ -444,15 +534,15 @@ fn values_equal(lhs: &ValueItem, rhs: &ValueItem) -> bool {
 // store::valueitem), this returns a proper Result: a query evaluator
 // hitting a bad `<` in a WHERE clause should fail that statement, not crash
 // the whole engine. Only the types that have an unambiguous order are
-// handled (with the same Integer/Double promotion `numeric` and
-// `values_equal` use); Blob, mismatched types, and anything else fall
-// through to the same InvalidOperationOnOperand every other invalid case
-// here produces.
+// handled, and only between two operands of the same type (see
+// `same_type`); Blob and anything else fall through to the same
+// InvalidOperationOnOperand every other invalid case here produces.
 fn compare(
     lhs: &ValueItem,
     rhs: &ValueItem,
     op: &BinaryOp,
 ) -> Result<std::cmp::Ordering, SchemaError> {
+    same_type(lhs, rhs, op)?;
     match (lhs, rhs) {
         (ValueItem::Integer(a), ValueItem::Integer(b)) => Ok(a.cmp(b)),
         (ValueItem::Datetime(a), ValueItem::Datetime(b)) => Ok(a.cmp(b)),
@@ -460,12 +550,6 @@ fn compare(
         (ValueItem::Boolean(a), ValueItem::Boolean(b)) => Ok(a.cmp(b)),
         (ValueItem::Double(a), ValueItem::Double(b)) => a
             .partial_cmp(b)
-            .ok_or_else(|| SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into())),
-        (ValueItem::Integer(a), ValueItem::Double(b)) => (*a as f64)
-            .partial_cmp(b)
-            .ok_or_else(|| SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into())),
-        (ValueItem::Double(a), ValueItem::Integer(b)) => a
-            .partial_cmp(&(*b as f64))
             .ok_or_else(|| SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into())),
         _ => Err(SchemaError::InvalidOperationOnOperand(
             format!("{op:?}"),
@@ -656,28 +740,44 @@ mod tests {
         );
     }
 
+    // Every comparison needs both operands to be the same data type: no
+    // Integer/Double promotion, and no silent false for unlike types.
     #[test]
-    fn test_binary_eq_promotes_mixed_integer_and_double() {
-        assert_eq!(
-            bin(&int(1), BinaryOp::Eq, &dbl(1.0)).unwrap(),
-            ValueItem::Boolean(true)
-        );
-        assert_eq!(
-            bin(&dbl(1.5), BinaryOp::Eq, &int(1)).unwrap(),
-            ValueItem::Boolean(false)
-        );
+    fn test_binary_comparisons_reject_operands_of_different_types() {
+        let ops = [
+            BinaryOp::Eq,
+            BinaryOp::NotEq,
+            BinaryOp::Lt,
+            BinaryOp::LtEq,
+            BinaryOp::Gt,
+            BinaryOp::GtEq,
+        ];
+        let pairs = [
+            (int(1), dbl(1.0)),
+            (dbl(1.5), int(1)),
+            (int(1), str_val("1")),
+            (str_val("1"), int(1)),
+            (ValueItem::Boolean(true), int(1)),
+        ];
+        for op in ops {
+            for (l, r) in &pairs {
+                let err = bin(l, op, r).unwrap_err().to_string();
+                assert!(err.contains("different data types"), "{op:?} {l:?} {r:?}: {err}");
+            }
+        }
     }
 
     #[test]
-    fn test_binary_eq_across_mismatched_types_is_false_not_an_error() {
-        assert_eq!(
-            bin(&int(1), BinaryOp::Eq, &str_val("1")).unwrap(),
-            ValueItem::Boolean(false)
-        );
-        assert_eq!(
-            bin(&int(1), BinaryOp::NotEq, &str_val("1")).unwrap(),
-            ValueItem::Boolean(true)
-        );
+    fn test_binary_comparisons_of_the_same_type_still_work() {
+        assert_eq!(bin(&int(1), BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&dbl(1.5), BinaryOp::Gt, &dbl(1.0)).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(bin(&str_val("a"), BinaryOp::NotEq, &str_val("b")).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_a_null_operand_is_still_null_whatever_the_other_type() {
+        assert_eq!(bin(&ValueItem::Null, BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Null);
+        assert_eq!(bin(&str_val("x"), BinaryOp::Lt, &ValueItem::Null).unwrap(), ValueItem::Null);
     }
 
     #[test]
@@ -754,18 +854,6 @@ mod tests {
     fn test_binary_ordering_ignores_str_reserved_capacity() {
         assert_eq!(
             bin(&str_cap("apple", 5), BinaryOp::Lt, &str_cap("banana", 500)).unwrap(),
-            ValueItem::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_binary_ordering_promotes_mixed_integer_and_double() {
-        assert_eq!(
-            bin(&int(1), BinaryOp::Lt, &dbl(1.5)).unwrap(),
-            ValueItem::Boolean(true)
-        );
-        assert_eq!(
-            bin(&dbl(1.5), BinaryOp::Gt, &int(1)).unwrap(),
             ValueItem::Boolean(true)
         );
     }
