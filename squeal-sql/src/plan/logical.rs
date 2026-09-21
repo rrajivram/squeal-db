@@ -16,14 +16,13 @@ use store::{db::DBFile, txn::Transaction};
 use crate::{
     conn::connection::{Connection, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
-    ds::stack::Stack,
     error::SchemaError,
-    optim::table_stats::TableStat,
     plan::{eval::EvalExpr, memory::QueryMemory},
     rslt::resultset::StreamingResultSet,
     source::{
-        ProjectableField, Source,
+        ComputedTableStat, ProjectableField, Source,
         aggr::AggregatingSource,
+        compute_table_stats,
         group::GroupSource,
         join::{JoinSource, JoinType, UnionJoin},
         limit::Limit,
@@ -121,7 +120,7 @@ trait OpenSource<F: DBFile + 'static> {
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
-        stat: Option<TableStat>,
+        stat: Option<ComputedTableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError>;
 }
@@ -134,7 +133,7 @@ where
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
-        stats: Option<TableStat>,
+        stats: Option<ComputedTableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn, stats)?;
@@ -154,7 +153,7 @@ where
     fn open_source(
         &self,
         _conn: &Arc<Connection<F>>,
-        _stat: Option<TableStat>,
+        _stat: Option<ComputedTableStat>,
         _txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         let guard = self.read();
@@ -196,7 +195,7 @@ where
     fn open_source(
         &self,
         conn: &Arc<Connection<F>>,
-        stat: Option<TableStat>,
+        stat: Option<ComputedTableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         match self {
@@ -227,7 +226,7 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     // this lookup will succeed" as two separate, unwrap-worthy facts.
     pub(crate) resolved: TableRef<F>,
     pub(crate) joins: Vec<JoinRelation<F>>,
-    pub(crate) stats: Option<TableStat>,
+    pub(crate) stats: Option<ComputedTableStat>,
 }
 
 pub(crate) struct JoinRelation<F: DBFile + 'static> {
@@ -237,8 +236,6 @@ pub(crate) struct JoinRelation<F: DBFile + 'static> {
 }
 
 struct QueryVisitor<F: DBFile> {
-    tables: Stack<Frame<TableQuery<F>>>, // None means frame is done
-    projections: Stack<Frame<SelectItem>>,
     conn: Arc<Connection<F>>,
     // Box<dyn Source>, not a generic Vec<S> — a Vec needs one uniform
     // element type, but different table references (and later, joins/
@@ -248,9 +245,7 @@ struct QueryVisitor<F: DBFile> {
     // already owns the heap-allocated Source, so building this Vec here
     // and handing each entry to LogicalPlan::add_step below doesn't
     // need anything more than that.
-    steps: Vec<Box<dyn Source>>,
-    limit: Option<usize>,
-    order: Option<OrderByClause>,
+    steps: Vec<Option<Box<dyn Source>>>,
     mem: Arc<QueryMemory>,
     // TXN_SIMPLIFICATION_PLAN.md phase 7: outside an explicit BEGIN block,
     // one transaction for the whole statement, so a multi-table SELECT
@@ -273,12 +268,7 @@ where
     type Break = SchemaError;
 
     fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
-        if let Some(limit) = &query.limit
-            && let Some(order) = &query.order_by
-        {
-            self.limit = limit.count_i64().map(|l| l as usize);
-            self.order = Some(order.clone());
-        }
+        self.steps.push(None);
         std::ops::ControlFlow::Continue(())
     }
 
@@ -292,8 +282,6 @@ where
         &mut self,
         _select: &sql_parser::query::SelectCore,
     ) -> std::ops::ControlFlow<Self::Break> {
-        self.tables.push(Frame::Empty);
-        self.projections.push(Frame::Empty);
         std::ops::ControlFlow::Continue(())
     }
 
@@ -347,7 +335,7 @@ where
                 step = Box::new(Limit::new(step, limit_count));
             }
 
-            self.steps.push(step);
+            self.steps.push(Some(step));
         }
 
         std::ops::ControlFlow::Continue(())
@@ -368,10 +356,6 @@ where
         Ok(Self {
             conn,
             steps: vec![],
-            tables: Stack::new(),
-            projections: Stack::new(),
-            limit: None,
-            order: None,
             mem,
             stmt_txn,
         })
@@ -382,7 +366,7 @@ where
     fn open(
         &self,
         item: &TableRef<F>,
-        stats: Option<TableStat>,
+        stats: Option<ComputedTableStat>,
     ) -> Result<Box<dyn Source>, SchemaError> {
         self.conn.with_current_txn(|explicit| {
             item.open_source(&self.conn, stats, explicit.or(self.stmt_txn.as_ref()))
@@ -727,11 +711,6 @@ where
             let (table, field) = self.conn.resolve_object_name_ref(name)?;
             crate::stmt::reject_qualified_field("a FROM target", field)?;
             if let TableRef::Real(schema, sqltable) = &table {
-                let stats = self
-                    .conn
-                    .schema(&schema.name)
-                    .unwrap()
-                    .get_table_stats(sqltable.db_table_id)?;
                 TableQuery {
                     alias: alias
                         .clone()
@@ -742,7 +721,7 @@ where
                     schema: schema.name.clone(),
                     table: sqltable.name.clone(),
                     joins: vec![],
-                    stats,
+                    stats: compute_table_stats(&self.conn, &schema.name, sqltable)?,
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
                 TableQuery {
@@ -861,8 +840,8 @@ where
             start,
             _phanton: PhantomData,
         };
-        assert!(visitor.steps.len() == 1);
-        for step in visitor.steps.into_iter().rev() {
+        assert!(visitor.steps.len() == 2);
+        if let Some(Some(step)) = visitor.steps.into_iter().last() {
             //this.add_step(step);
             this.tail = Some(step)
         }

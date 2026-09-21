@@ -8,7 +8,7 @@ use crate::{
     buffer::{LockLevel, PageBuffer, WritePageHandle},
     db::{DBFile, DBSizeType},
     error::StoreError,
-    logger::{LsnId, Logger},
+    logger::{Logger, LsnId},
     page::{Page, PageId},
     table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple},
@@ -271,6 +271,27 @@ where
         })
     }
 
+    pub fn table_btree_params(&self) -> Result<(usize, usize), StoreError> {
+        let mut level = 0usize;
+        let mut start = self.buffer.get_page(self.table.first_index_page)?;
+        loop {
+            if start.is_flag_set(LEAF_NODE) {
+                return Ok((level, self.table.nodes_per_page));
+            } else {
+                if let Some(tuple) = start.iter().next() {
+                    level += 1;
+                    let page = from_bytes::<Node>(&tuple.data)?;
+                    match page {
+                        Node::Inner(p) => start = self.buffer.get_page(p)?,
+                        Node::Leaf(_) => return Ok((level, self.table.nodes_per_page)),
+                    }
+                } else {
+                    panic!("Should not come here!");
+                }
+            }
+        }
+    }
+
     pub fn id(&self) -> TableIdType {
         self.table.id
     }
@@ -312,7 +333,9 @@ where
         match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
             Ok(match cur {
                 None => Decision::Insert(t),
-                Some(c) if c.data == t.data && c.is_tombstoned() == t.is_tombstoned() => Decision::Skip,
+                Some(c) if c.data == t.data && c.is_tombstoned() == t.is_tombstoned() => {
+                    Decision::Skip
+                }
                 Some(_) => Decision::Replace(t),
             })
         })? {
@@ -501,8 +524,7 @@ where
                     _ => break,
                 }
             }
-            if handle.page.count()? < self.table.nodes_per_page - 1
-                && handle.page.can_store(probe)
+            if handle.page.count()? < self.table.nodes_per_page - 1 && handle.page.can_store(probe)
             {
                 return Ok(handle);
             }
@@ -511,7 +533,9 @@ where
         }
         let mut retries = 0u32;
         loop {
-            let handle = self.buffer.get_page_mut(self.table.first_index_page, LockLevel::Index)?;
+            let handle = self
+                .buffer
+                .get_page_mut(self.table.first_index_page, LockLevel::Index)?;
             if handle.page.count()? == self.table.nodes_per_page - 1 {
                 self.split_root_page(handle, &probe.id, lsn)?;
             } else {
@@ -554,7 +578,8 @@ where
                 self.buffer.write_locked_page_with_lsn(h, lsn)?;
                 let p = self.write_data(&new, lsn)?;
                 if p != old_dp {
-                    let entry = Tuple::new_with(id.clone(), &to_allocvec(&Node::Leaf(p))?, None, None);
+                    let entry =
+                        Tuple::new_with(id.clone(), &to_allocvec(&Node::Leaf(p))?, None, None);
                     leaf.page.replace_tuple(&id, entry)?;
                 }
                 self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
@@ -1431,7 +1456,8 @@ where
         new_vals
             .iter()
             .try_for_each(|t| new_page.add_tuple(t.clone()))?;
-        self.buffer.write_locked_page_with_lsn(current_handle, lsn)?;
+        self.buffer
+            .write_locked_page_with_lsn(current_handle, lsn)?;
         self.buffer.write_locked_page_with_lsn(new_handle, lsn)?;
         Ok((separator_id, new_page_id))
     }
@@ -1443,7 +1469,9 @@ where
         right_page: PageId,
         lsn: LsnId,
     ) -> Result<(), StoreError> {
-        let mut handle = self.buffer.get_page_mut(self.table.first_index_page, LockLevel::Index)?;
+        let mut handle = self
+            .buffer
+            .get_page_mut(self.table.first_index_page, LockLevel::Index)?;
         // Mutate flags and data together on the COW copy. Flipping LEAF→INNER on
         // the shared cached Arc before rewriting the entries would let a
         // concurrent find_page see INNER_NODE set while the entries are still the
@@ -1549,7 +1577,12 @@ where
         Ok(())
     }
 
-    fn write_page(&self, handle: WritePageHandle, tuple: Tuple, lsn: LsnId) -> Result<(), StoreError> {
+    fn write_page(
+        &self,
+        handle: WritePageHandle,
+        tuple: Tuple,
+        lsn: LsnId,
+    ) -> Result<(), StoreError> {
         handle.page.add_tuple(tuple)?;
         self.buffer.write_locked_page_with_lsn(handle, lsn)?;
         Ok(())
@@ -1580,7 +1613,10 @@ mod tests {
 
     #[test]
     fn test_node_round_trip() {
-        for v in [Node::Inner(PageId::from(3u64)), Node::Leaf(PageId::from(9u64))] {
+        for v in [
+            Node::Inner(PageId::from(3u64)),
+            Node::Leaf(PageId::from(9u64)),
+        ] {
             let bytes = to_allocvec(&v).unwrap();
             let back: Node = from_bytes(&bytes).unwrap();
             assert_eq!(v, back);
@@ -1599,8 +1635,14 @@ mod tests {
     fn test_node_decodes_pre_stage1_derived_fixture() {
         const INNER_BYTES: &[u8] = &[0, 3];
         const LEAF_BYTES: &[u8] = &[1, 9];
-        assert_eq!(from_bytes::<Node>(INNER_BYTES).unwrap(), Node::Inner(PageId::from(3u64)));
-        assert_eq!(from_bytes::<Node>(LEAF_BYTES).unwrap(), Node::Leaf(PageId::from(9u64)));
+        assert_eq!(
+            from_bytes::<Node>(INNER_BYTES).unwrap(),
+            Node::Inner(PageId::from(3u64))
+        );
+        assert_eq!(
+            from_bytes::<Node>(LEAF_BYTES).unwrap(),
+            Node::Leaf(PageId::from(9u64))
+        );
     }
 
     fn make_header(page_size: u64) -> Arc<Header> {
@@ -1934,7 +1976,10 @@ mod tests {
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(ip.is_flag_set(INNER_NODE), "sanity: root must have split");
         let entries: Vec<_> = ip.iter().collect();
-        assert!(!entries.is_empty(), "sanity: root must have routing entries");
+        assert!(
+            !entries.is_empty(),
+            "sanity: root must have routing entries"
+        );
         for entry in &entries {
             assert!(
                 entry.txn_id.is_none(),
@@ -1961,12 +2006,8 @@ mod tests {
         // TransactionId costs little over None; a large one costs much more,
         // and only None ever costs the same 1 byte regardless.
         let with_small_txn = Tuple::new_with(id.clone(), &data, Some(txn()), None);
-        let with_large_txn = Tuple::new_with(
-            id,
-            &data,
-            Some(TransactionId::from(50_000_000u64)),
-            None,
-        );
+        let with_large_txn =
+            Tuple::new_with(id, &data, Some(TransactionId::from(50_000_000u64)), None);
         assert!(
             without_txn.size() < with_small_txn.size(),
             "dropping the dead txn_id must shrink the entry even for a small id: \
@@ -2580,9 +2621,7 @@ mod tests {
                     // a silent lost update: another racer filled the page first and
                     // this insert correctly saw that fresh (not stale) state and
                     // refused to write, rather than silently overwriting.
-                    Err(StoreError::PageCapacityError) => {
-                        total_contention_errors += 1
-                    }
+                    Err(StoreError::PageCapacityError) => total_contention_errors += 1,
                     Err(e) => panic!("unexpected insert error: {e:?}"),
                 }
             }
@@ -3133,8 +3172,11 @@ mod tests {
         let page_size = 4096;
         let tree = make_tree(page_size);
 
-        let corrupt_root =
-            Page::new_indexed(page_size, MAX_ENTRY_BYTES as usize, tree.buffer.page_overhead());
+        let corrupt_root = Page::new_indexed(
+            page_size,
+            MAX_ENTRY_BYTES as usize,
+            tree.buffer.page_overhead(),
+        );
         corrupt_root.set_page_flags(INNER_NODE).unwrap();
         corrupt_root
             .add_tuple(Tuple::new_with(
@@ -3144,7 +3186,10 @@ mod tests {
                 None,
             ))
             .unwrap();
-        let mut handle = tree.buffer.get_page_mut(tree.table.first_index_page, crate::buffer::LockLevel::Index).unwrap();
+        let mut handle = tree
+            .buffer
+            .get_page_mut(tree.table.first_index_page, crate::buffer::LockLevel::Index)
+            .unwrap();
         handle.page = Arc::new(corrupt_root);
         tree.buffer.write_locked_page(handle).unwrap();
 

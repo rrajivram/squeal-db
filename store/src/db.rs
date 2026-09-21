@@ -2102,16 +2102,16 @@ where
         TableCursor::new(Arc::clone(self), tid, Some(txn.id()))
     }
 
-    /// Starts a new, empty Run — an append-only, unkeyed page chain for
-    /// query-execution scratch space (sort runs, hash-join/aggregation
-    /// spill partitions, ...). Unlike a table, a Run needs no MVCC/txn
-    /// machinery, so this only needs `&self`, not `&Arc<Self>`.
     /// Sets how much memory the scratch-page pool (runs) may hold before it
     /// spills to `<db>.tmp`. Default `DEFAULT_TEMP_CACHE_BYTES` (64 MiB).
     pub fn set_temp_cache_bytes(&self, bytes: u64) {
         self.temp.set_cache_bytes(bytes);
     }
 
+    /// Starts a new, empty Run — an append-only, unkeyed page chain for
+    /// query-execution scratch space (sort runs, hash-join/aggregation
+    /// spill partitions, ...). Unlike a table, a Run needs no MVCC/txn
+    /// machinery, so this only needs `&self`, not `&Arc<Self>`.
     pub fn create_run(&self) -> Result<Run<F>, StoreError> {
         Run::create(self.temp.clone())
     }
@@ -2134,18 +2134,6 @@ where
         self.range_scan_bounds(tid, Bound::Included(start), Bound::Excluded(end))
     }
 
-    // Every row whose key's leading fields equal `prefix` (a shorter
-    // IndexKey than the table's keys), in key order — including when a
-    // later field is a Str or Blob, which has no upper bound to end a plain
-    // range at. See RangeCursor::new_prefix.
-    pub fn prefix_scan(
-        self: &Arc<Self>,
-        tid: TableIdType,
-        prefix: IndexKey,
-    ) -> Result<RangeCursor<F>, StoreError> {
-        RangeCursor::new_prefix(Arc::clone(self), tid, prefix)
-    }
-
     // range_scan with explicit bounds: a max-valued key can be scanned with
     // an Included end, and an open end (Unbounded) covers types with no
     // largest value (see ValueItem::upper_bound).
@@ -2156,6 +2144,49 @@ where
         end: Bound<DBIdType>,
     ) -> Result<RangeCursor<F>, StoreError> {
         RangeCursor::new(Arc::clone(self), tid, None, start, end)
+    }
+
+    pub fn btree_range_params(
+        self: &Arc<Self>,
+        tid: TableIdType,
+    ) -> Result<(usize, usize), StoreError> {
+        self.table_by_id(tid)?.table_btree_params()
+    }
+    // Like range_scan_bounds, but reads under `txn` (seeing its own
+    // uncommitted writes) instead of a fresh transaction. Same contract as
+    // table_scan_in_txn: `txn` must stay open while the cursor is used.
+    pub fn range_scan_bounds_in_txn(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        txn: &Transaction,
+        start: Bound<DBIdType>,
+        end: Bound<DBIdType>,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        self.require_active(&txn.id())?;
+        RangeCursor::new(Arc::clone(self), tid, Some(txn.id()), start, end)
+    }
+
+    // Every row whose key's leading fields equal `prefix` (a shorter
+    // IndexKey than the table's keys), in key order — including when a
+    // later field is a Str or Blob, which has no upper bound to end a plain
+    // range at. See RangeCursor::new_prefix.
+    pub fn prefix_scan(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        prefix: IndexKey,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        RangeCursor::new_prefix(Arc::clone(self), tid, None, prefix)
+    }
+
+    // prefix_scan under `txn`; same contract as range_scan_bounds_in_txn.
+    pub fn prefix_scan_in_txn(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        txn: &Transaction,
+        prefix: IndexKey,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        self.require_active(&txn.id())?;
+        RangeCursor::new_prefix(Arc::clone(self), tid, Some(txn.id()), prefix)
     }
 
     // Shared undo-chain walk: returns the first version (this tuple, or an

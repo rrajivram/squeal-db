@@ -11,7 +11,7 @@ use store::{
     db::{DBFile, Db},
     run::Run,
     table::TableIdType,
-    valueitem::{IndexKey, ValueItem},
+    valueitem::IndexKey,
 };
 
 use crate::{
@@ -19,7 +19,10 @@ use crate::{
     error::SchemaError,
     optim::table_stats::TableStat,
     plan::memory::QueryMemory,
-    source::{ProjectableField, QueryStats, Source, join::JoinType, merge_stats},
+    source::{
+        ComputedTableStat, ProjectableField, QueryStats, Source, join::JoinType,
+        joinmatch::JoinMatcher, merge_stats,
+    },
 };
 
 #[allow(unused)]
@@ -49,12 +52,10 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     // column order, so `emit` has to put the rows back in that order, and
     // `join_type` (see new()) already describes the swapped, physical sides.
     swapped: bool,
-    // All-NULL rows shaped like the left/right side's own columns —
-    // what LEFT/RIGHT/FULL pair an unmatched row from the OTHER side
-    // with (e.g. RIGHT JOIN: a right row with no matching left row is
-    // still emitted, paired with `left_null`).
-    left_null: IndexKey,
-    right_null: IndexKey,
+    // The match rules shared with every other join algorithm (key
+    // equality, which unmatched side the join type keeps, the NULL-padding
+    // rows, output assembly) — built from the PHYSICAL (post-swap) sides.
+    matcher: JoinMatcher,
     // Whether the left source has been fully drained into the table yet
     // — done lazily on the first next() call rather than in new(), so
     // constructing a HashedSource stays cheap even if it's never
@@ -152,7 +153,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
         let (left_source, left_fields, right_source, right_fields, join_type, swapped) = {
             if let Some(left_stat) = left_source.table_stats()
                 && let Some(right_stat) = right_source.table_stats()
-                && right_stat.row_count > left_stat.row_count
+                && right_stat.table_stat.row_count > left_stat.table_stat.row_count
             {
                 let mirrored = match join_type {
                     JoinType::Left => JoinType::Right,
@@ -185,15 +186,18 @@ impl<F: DBFile + 'static> HashedSource<F> {
         // No stats for the build side means no basis for a guess: one page.
         let wanted = left_source
             .table_stats()
-            .map(|s| (s.row_count as f64 * Self::INITIAL_CAPACITY_FACTOR) as usize)
+            .map(|s| (s.table_stat.row_count as f64 * Self::INITIAL_CAPACITY_FACTOR) as usize)
             .unwrap_or(1);
         let num_pages = Self::grow_run(&mut run, records_per_page, wanted)?;
         // Always a whole number of pages' worth of slots (see allocate_run).
         let capacity = records_per_page * num_pages;
-        let left_null =
-            IndexKey::new_from_owned(vec![ValueItem::Null; left_source.fields().len()])?;
-        let right_null =
-            IndexKey::new_from_owned(vec![ValueItem::Null; right_source.fields().len()])?;
+        let matcher = JoinMatcher::new(
+            join_type,
+            left_fields,
+            right_fields,
+            left_source.fields().len(),
+            right_source.fields().len(),
+        )?;
         Ok(Self {
             sources: vec![left_source, right_source],
             fields,
@@ -210,8 +214,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             mem,
             join_type,
             swapped,
-            left_null,
-            right_null,
+            matcher,
             built: false,
             pending_matches: VecDeque::new(),
             current_right: None,
@@ -351,19 +354,6 @@ impl<F: DBFile + 'static> HashedSource<F> {
         Ok(())
     }
 
-    fn are_keys_equal(
-        &self,
-        lhs: &IndexKey,
-        rhs: &IndexKey,
-        left_fields: &[usize],
-        right_fields: &[usize],
-    ) -> bool {
-        left_fields
-            .iter()
-            .zip(right_fields.iter())
-            .all(|(l, r)| lhs.values()[*l] == rhs.values()[*r])
-    }
-
     // Finds every left row matching `right`'s join key, walking the
     // FULL open-addressing probe chain starting at its hash's natural
     // slot — not stopping at the first hit, since more than one left
@@ -401,12 +391,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             match self.run.get_slot_at(page_index, row_index)? {
                 Some(bytes) => {
                     let v: HashValue = from_bytes(&bytes)?;
-                    if self.are_keys_equal(
-                        &v.left_value,
-                        right,
-                        &self.left_fields,
-                        &self.right_fields,
-                    ) {
+                    if self.matcher.keys_match(&v.left_value, right) {
                         matches.push_back(v.left_value);
                         self.matched.set(index);
                     }
@@ -589,7 +574,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             self.sweep_row += 1;
             if !self.matched.is_set(slot_index) {
                 self.next_time += start.elapsed().as_nanos();
-                return Ok(Some(self.emit(&value.left_value, &self.right_null)?));
+                return Ok(Some(self.emit(&value.left_value, self.matcher.right_null())?));
             }
         }
     }
@@ -604,9 +589,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
         } else {
             (build, probe)
         };
-        let mut values = first.values().to_vec();
-        values.extend_from_slice(second.values());
-        Ok(IndexKey::new_from_owned(values)?)
+        self.matcher.combine(first, second)
     }
 }
 
@@ -648,9 +631,8 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
                 Some(right) => {
                     let matches = self.probe_matches(&right)?;
                     if matches.is_empty() {
-                        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-                            let left_null = self.left_null.clone();
-                            return Ok(Some(self.emit(&left_null, &right)?));
+                        if self.matcher.keeps_unmatched_right() {
+                            return Ok(Some(self.emit(self.matcher.left_null(), &right)?));
                         }
                         // INNER/LEFT: an unmatched right row contributes
                         // nothing — try the next right row.
@@ -662,7 +644,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
                 }
                 None => {
                     self.right_exhausted = true;
-                    if !matches!(self.join_type, JoinType::Left | JoinType::Full) {
+                    if !self.matcher.keeps_unmatched_left() {
                         return Ok(None);
                     }
                     // loop back around; next_unmatched_left takes over
@@ -707,12 +689,16 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         Some(res)
     }
 
-    fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
-        Some(TableStat {
-            col_stats: HashMap::new(),
-            id: TableIdType::none(),
-            name: "".into(),
-            row_count: self.count,
+    fn table_stats(&self) -> Option<ComputedTableStat> {
+        Some(ComputedTableStat {
+            table_stat: TableStat {
+                col_stats: HashMap::new(),
+                id: TableIdType::none(),
+                name: "".into(),
+                row_count: self.count,
+            },
+            indices: None,
+            self_index: None,
         })
     }
 }
@@ -1364,12 +1350,16 @@ mod tests {
         fn reset(&mut self) -> Result<(), SchemaError> {
             self.0.reset()
         }
-        fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
-            Some(crate::optim::table_stats::TableStat {
-                id: store::table::TableIdType::none(),
-                name: "t".into(),
-                row_count: self.1,
-                col_stats: HashMap::new(),
+        fn table_stats(&self) -> Option<ComputedTableStat> {
+            Some(ComputedTableStat {
+                table_stat: crate::optim::table_stats::TableStat {
+                    id: store::table::TableIdType::none(),
+                    name: "t".into(),
+                    row_count: self.1,
+                    col_stats: HashMap::new(),
+                },
+                indices: None,
+                self_index: None,
             })
         }
     }

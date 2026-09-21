@@ -9,7 +9,9 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::{eval::EvalExpr, memory::QueryMemory},
-    source::{ProjectableField, QueryStats, Source, hash::HashedSource, merge_stats},
+    source::{
+        ComputedTableStat, ProjectableField, QueryStats, Source, hash::HashedSource, merge_stats,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -187,7 +189,7 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
         self.source.query_stats()
     }
 
-    fn table_stats(&self) -> Option<crate::optim::table_stats::TableStat> {
+    fn table_stats(&self) -> Option<ComputedTableStat> {
         self.source.table_stats()
     }
 }

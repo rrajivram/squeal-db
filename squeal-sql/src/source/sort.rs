@@ -25,9 +25,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub(crate) struct SortField {
-    asc: bool,
-    null_first: bool,
-    index: usize,
+    pub(crate) asc: bool,
+    pub(crate) null_first: bool,
+    pub(crate) index: usize,
 }
 
 pub(crate) struct SortSource<F: DBFile + 'static> {
@@ -113,8 +113,18 @@ where
                 index,
             });
         }
+        Self::new(source, &items, limit, db, mem)
+    }
+
+    pub fn new(
+        source: Box<dyn Source>,
+        fields: &[SortField],
+        limit: Option<usize>,
+        db: Arc<Db<F>>,
+        mem: Arc<QueryMemory>,
+    ) -> Result<Self, SchemaError> {
         Ok(Self {
-            sort_fields: items,
+            sort_fields: fields.to_vec(),
             source,
             limit,
             results: None,
@@ -186,7 +196,8 @@ where
         })
     }
 
-    fn build_sort(&mut self) -> Result<SortProgress<F>, SchemaError> {
+    // None when the input had no rows at all (there is nothing to merge).
+    fn build_sort(&mut self) -> Result<Option<SortProgress<F>>, SchemaError> {
         let record_size = self
             .source
             .fields()
@@ -197,6 +208,9 @@ where
             return Err(SchemaError::UnknownError("Record size is 0".into()));
         }
         let mut run = self.build_initial_runs(record_size)?;
+        if run.runs.is_empty() {
+            return Ok(None);
+        }
         // merge_runs is strictly 2-way (see its own pairwise pop loop), so
         // reducing `run.runs.len()` initial runs down to 1 always takes
         // ceil(log2(run.runs.len())) rounds — computed directly from the
@@ -216,7 +230,7 @@ where
             .map(|t| Self::from_tuple(t).map(|v| v.into_iter()))
             .transpose()?;
 
-        Ok(SortProgress { run: cursor, iter })
+        Ok(Some(SortProgress { run: cursor, iter }))
     }
 
     fn merge_runs(
@@ -527,13 +541,22 @@ where
             out
         } else {
             let start = Instant::now();
-            self.progress = Some(self.build_sort()?);
+            match self.build_sort()? {
+                Some(progress) => self.progress = Some(progress),
+                None => self.results = Some(vec![]),
+            }
             self.sort_time += start.elapsed().as_nanos();
             self.next()
         }
     }
 
+    // Rewinds the input and discards the sorted output, so the next call
+    // to next() re-reads and re-sorts. (This used to be a no-op, which left
+    // an already-drained sort returning nothing on a second scan.)
     fn reset(&mut self) -> Result<(), SchemaError> {
+        self.source.reset()?;
+        self.results = None;
+        self.progress = None;
         Ok(())
     }
 
@@ -1248,5 +1271,30 @@ mod tests {
                 "key {key}: expected {count} rows, got {actual}"
             );
         }
+    }
+
+    // An empty input used to trip build_sort's `assert!(runs.len() == 1)`.
+    #[test]
+    fn test_an_unlimited_sort_of_an_empty_input_yields_nothing() {
+        let mut sort = unlimited_sort_source(vec![], 1 << 20);
+        assert!(sort.next().unwrap().is_none());
+        assert!(sort.next().unwrap().is_none(), "and stays exhausted");
+    }
+
+    #[test]
+    fn test_reset_makes_a_drained_sort_yield_its_rows_again() {
+        let rows: Vec<Vec<ValueItem>> = [3, 1, 2].iter().map(|n| vec![ValueItem::Integer(*n)]).collect();
+        let mut sort = unlimited_sort_source(rows, 1 << 20);
+        let mut drain = |s: &mut SortSource<store::memfile::MemFile>| {
+            let mut out = vec![];
+            while let Some(r) = s.next().unwrap() {
+                out.push(r.values().to_vec());
+            }
+            out
+        };
+        let first = drain(&mut sort);
+        assert_eq!(first.len(), 3);
+        sort.reset().unwrap();
+        assert_eq!(drain(&mut sort), first);
     }
 }

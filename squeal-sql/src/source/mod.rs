@@ -1,19 +1,26 @@
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use store::valueitem::IndexKey;
+use store::{db::DBFile, valueitem::IndexKey};
 
 use crate::{
-    error::SchemaError, optim::table_stats::TableStat, plan::eval::EvalExpr, table::Field,
+    conn::connection::Connection,
+    error::SchemaError,
+    optim::table_stats::TableStat,
+    plan::eval::EvalExpr,
+    table::{Field, SqlTable},
 };
 
 pub mod aggr;
 pub(crate) mod group;
 pub mod hash;
+mod index;
 pub(crate) mod join;
+mod joinmatch;
 pub mod limit;
 pub mod proj;
 pub(crate) mod run;
 pub mod sort;
+mod sortjoin;
 pub mod table;
 #[cfg(test)]
 mod tests;
@@ -27,6 +34,21 @@ pub struct ProjectableField {
     pub(crate) source_id: usize,
     pub(crate) field_id: usize,
     pub(crate) expr: EvalExpr,
+}
+
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub struct ComputedTableStat {
+    pub table_stat: TableStat,
+    pub indices: Option<Vec<IndexStat>>,
+    pub self_index: Option<IndexStat>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStat {
+    pub levels: usize,
+    pub nodes_per_page: usize,
+    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -58,16 +80,55 @@ impl QueryStats {
     }
 }
 
-pub trait Source: Debug {
+pub trait Source: Debug + Send {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         None
     }
-    fn table_stats(&self) -> Option<TableStat> {
+    fn table_stats(&self) -> Option<ComputedTableStat> {
         None
     }
+}
+
+pub(crate) fn compute_table_stats<F: DBFile + 'static>(
+    conn: &Arc<Connection<F>>,
+    schema: &str,
+    table: &Arc<SqlTable>,
+) -> Result<Option<ComputedTableStat>, SchemaError> {
+    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.db_table_id)? {
+        let (levels, nodes_per_page) = conn
+            .database
+            .read()
+            .db
+            .btree_range_params(table.db_table_id)?;
+        let mut indices = vec![];
+        for index in &table.indices {
+            let unique = index.is_primary || index.is_unique;
+            let (levels, nodes_per_page) = conn
+                .database
+                .read()
+                .db
+                .btree_range_params(index.db_table_id)?;
+            indices.push(IndexStat {
+                levels,
+                nodes_per_page,
+                unique,
+            })
+        }
+        return Ok(Some(ComputedTableStat {
+            table_stat,
+            indices: Some(indices),
+            self_index: Some(IndexStat {
+                levels,
+                nodes_per_page,
+                unique: true,
+            }),
+        }));
+    }
+
+    Ok(None)
 }
 
 // Folds a child Source's own stats() result into `this_stats` (the

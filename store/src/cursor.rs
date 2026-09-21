@@ -43,6 +43,18 @@ enum ScanTxn {
 }
 
 impl ScanTxn {
+    // Some(id): borrow the caller's open transaction; None: begin one that
+    // this cursor owns (lazily — never begun when one was supplied).
+    fn new<F>(db: &Arc<Db<F>>, txn: Option<TransactionId>) -> Result<Self, StoreError>
+    where
+        F: DBFile<Item = F> + 'static,
+    {
+        Ok(match txn {
+            Some(id) => ScanTxn::Borrowed(id),
+            None => ScanTxn::Owned(db.begin()?),
+        })
+    }
+
     fn id(&self) -> TransactionId {
         match self {
             ScanTxn::Owned(t) => t.id(),
@@ -73,7 +85,7 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // next() resolves to the real row via resolve_index_entry.
     current_leaf: Arc<Page>,
     current_iter: PageTupleIterator,
-    transaction: Transaction,
+    transaction: ScanTxn,
     start: Bound<DBIdType>,
     end: Bound<DBIdType>,
     // Some for prefix scans (see Db::prefix_scan): the scan ends at the
@@ -94,10 +106,7 @@ where
         table: TableIdType,
         transaction: Option<TransactionId>,
     ) -> Result<Self, StoreError> {
-        let transaction = match transaction {
-            Some(id) => ScanTxn::Borrowed(id),
-            None => ScanTxn::Owned(db.begin()?),
-        };
+        let transaction = ScanTxn::new(&db, transaction)?;
         let (current_page_id, current_page) = db
             .table_by_id(table)?
             .next_data_page(None)?
@@ -148,11 +157,11 @@ where
     pub(crate) fn new(
         db: Arc<Db<F>>,
         table: TableIdType,
-        transaction: Option<Transaction>,
+        transaction: Option<TransactionId>,
         start: Bound<DBIdType>,
         end: Bound<DBIdType>,
     ) -> Result<Self, StoreError> {
-        let transaction = transaction.unwrap_or(db.begin()?);
+        let transaction = ScanTxn::new(&db, transaction)?;
         // Positional: finds the leaf that would hold `start` whether or
         // not `start` actually exists as a key (unlike the old
         // find_first_page, which did an exact index lookup and errored
@@ -184,9 +193,10 @@ where
     pub(crate) fn new_prefix(
         db: Arc<Db<F>>,
         table: TableIdType,
+        transaction: Option<TransactionId>,
         prefix: IndexKey,
     ) -> Result<Self, StoreError> {
-        let transaction = db.begin()?;
+        let transaction = ScanTxn::new(&db, transaction)?;
         let tree = db.table_by_id(table)?;
         let start = Self::prefix_start(&tree, &prefix)?;
         let current_leaf = Self::start_leaf(&tree, &start)?;
@@ -1280,5 +1290,42 @@ mod tests {
         c.reset().unwrap();
         let p = IndexKey::new_from(&[ValueItem::Integer(5)]).unwrap();
         assert_eq!(drain_keys(&mut db.prefix_scan(tid, p).unwrap()).len(), 2);
+    }
+
+    // --- range/prefix scans under a caller's transaction ---
+
+    #[test]
+    fn test_scans_in_txn_see_the_transactions_own_uncommitted_rows() {
+        let (db, tid) = prefix_db("scan_in_txn.db", &[sk(1, "a", 0), sk(2, "a", 0)]);
+        let txn = db.begin().unwrap();
+        db.insert(tid, Tuple::new_with(DBIdType::Rec(sk(2, "b", 0)), b"v", None, None), &txn).unwrap();
+        let p = IndexKey::new_from(&[ValueItem::Integer(2)]).unwrap();
+
+        let mut c = db.prefix_scan_in_txn(tid, &txn, p.clone()).unwrap();
+        assert_eq!(drain_keys(&mut c).len(), 2, "prefix scan sees its own insert");
+        c.reset().unwrap();
+        assert_eq!(drain_keys(&mut c).len(), 2, "and still does after reset");
+
+        let mut c = db
+            .range_scan_bounds_in_txn(tid, &txn, Bound::Unbounded, Bound::Unbounded)
+            .unwrap();
+        assert_eq!(drain_keys(&mut c).len(), 3);
+
+        // Scans that own their transaction do not see the uncommitted row.
+        assert_eq!(drain_keys(&mut db.prefix_scan(tid, p).unwrap()).len(), 1);
+        db.commit(txn).unwrap();
+    }
+
+    // The cursor only borrows the id, so its transaction can end under it;
+    // next() must then error (like table scans do), not read stale state.
+    #[test]
+    fn test_a_scan_in_txn_errors_once_its_transaction_has_finished() {
+        let (db, tid) = prefix_db("scan_in_txn_done.db", &[sk(1, "a", 0)]);
+        let txn = db.begin().unwrap();
+        let mut c = db
+            .prefix_scan_in_txn(tid, &txn, IndexKey::new_from(&[ValueItem::Integer(1)]).unwrap())
+            .unwrap();
+        db.commit(txn).unwrap();
+        assert!(c.next().is_err());
     }
 }

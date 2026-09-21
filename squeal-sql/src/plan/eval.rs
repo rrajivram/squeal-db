@@ -211,6 +211,7 @@ impl EvalExpr {
             Expr::Function { .. } => {
                 Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
             }
+            Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables)?,
 
             _ => panic!("Oops here {:?}", expr),
         };

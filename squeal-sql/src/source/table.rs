@@ -10,8 +10,7 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    optim::table_stats::TableStat,
-    source::{ProjectableField, QueryStats, Source},
+    source::{ComputedTableStat, ProjectableField, QueryStats, Source},
     table::{SqlTable, VersionedRow},
 };
 
@@ -20,7 +19,7 @@ pub struct TableSource<F: DBFile> {
     table: Arc<SqlTable>,
     fields: Arc<[ProjectableField]>,
     next_time: u128,
-    stats: Option<TableStat>,
+    stats: Option<ComputedTableStat>,
 }
 
 impl<F> TableSource<F>
@@ -39,7 +38,7 @@ where
         db: Arc<Db<F>>,
         table: Arc<SqlTable>,
         txn: Option<&Transaction>,
-        stats: Option<TableStat>,
+        stats: Option<ComputedTableStat>,
     ) -> Result<Self, SchemaError> {
         let cursor = match txn {
             Some(txn) => db.table_scan_in_txn(table.db_table_id, txn)?,
@@ -88,7 +87,7 @@ where
         Ok(self.cursor.reset()?)
     }
 
-    fn table_stats(&self) -> Option<TableStat> {
+    fn table_stats(&self) -> Option<ComputedTableStat> {
         self.stats.clone()
     }
 

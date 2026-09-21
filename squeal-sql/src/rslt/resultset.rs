@@ -60,16 +60,17 @@ impl StreamingResultSet {
     }
 
     pub fn next_result(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        self.count += 1;
-        self.begin.as_mut().next()
+        if let Some(res) = self.begin.as_mut().next()? {
+            self.count += 1;
+            Ok(Some(res))
+        } else {
+            Ok(None)
+        }
     }
 
     pub fn next_result_as_strings(&mut self) -> Result<Option<Vec<String>>, SchemaError> {
-        self.count += 1;
         Ok(self
-            .begin
-            .as_mut()
-            .next()?
+            .next_result()?
             .map(|i| i.values().iter().map(|n| n.to_string()).collect::<Vec<_>>()))
     }
 
