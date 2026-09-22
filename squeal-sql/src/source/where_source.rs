@@ -1,5 +1,5 @@
 use crate::source::{column_names, planinfo::PlanNode};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, time::Instant};
 
 use store::valueitem::ValueItem;
 
@@ -7,7 +7,6 @@ use crate::{
     error::SchemaError,
     plan::eval::EvalExpr,
     source::{ProjectableField, QueryStats, Source, merge_stats},
-    table::Field,
 };
 
 #[derive(Debug)]

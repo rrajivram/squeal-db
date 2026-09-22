@@ -2918,3 +2918,104 @@ fn test_where_null_predicates_filter_the_row_instead_of_erroring() {
     assert_eq!(select_sorted(&c, "select id from a where x = 20"), ints(&[&[2], &[5]]));
     assert_eq!(select_sorted(&c, "select id from a where x > 15 and x < 100"), ints(&[&[2], &[3], &[5]]));
 }
+
+// ---- pushdown safety, checked against the engine ----
+//
+// For each outer/inner join and each side, apply a predicate two ways:
+//   WHERE above the join, versus
+//   pushed into that table (wrapped as a derived table filtered by it).
+// plan::conjuncts says the second is equivalent exactly when the table is not
+// NULL-extended by a join in its chain. Both directions are asserted: where
+// it says pushable the results must be identical, and where it says not, they
+// must really differ on this data (so the rule is not just timid).
+fn pushdown_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(&c, "create table a (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table b (id integer not null, y integer)").unwrap();
+    run(&c, "create table c (id integer not null, z integer)").unwrap();
+    for id in [1, 2, 3] {
+        run(&c, &format!("insert into a values ({id})")).unwrap();
+    }
+    // b(9) matches no a; a(3) matches no b; b(2)'s y fails the predicate
+    for (id, y) in [(1, 100), (2, 5), (9, 7)] {
+        run(&c, &format!("insert into b values ({id}, {y})")).unwrap();
+    }
+    for (id, z) in [(1, 10), (2, 1), (3, 10)] {
+        run(&c, &format!("insert into c values ({id}, {z})")).unwrap();
+    }
+    c
+}
+
+// (table, its columns, qualified predicate, unqualified predicate)
+const PUSHDOWN_TABLES: [(&str, &str, &str, &str); 3] = [
+    ("a", "id", "a.id > 1", "id > 1"),
+    ("b", "id, y", "b.y > 50", "y > 50"),
+    ("c", "id, z", "c.z > 5", "z > 5"),
+];
+
+#[test]
+fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is_not_null_supplied() {
+    use crate::plan::conjuncts::null_supplied_tables;
+    use crate::source::join::JoinType;
+    let c = pushdown_conn();
+    // (FROM-clause text, the chain's join types, tables in chain order)
+    let chains: [(&str, Vec<JoinType>, Vec<usize>); 8] = [
+        ("{a} join {b} on a.id = b.id", vec![JoinType::Inner], vec![0, 1]),
+        ("{a} left join {b} on a.id = b.id", vec![JoinType::Left], vec![0, 1]),
+        ("{a} right join {b} on a.id = b.id", vec![JoinType::Right], vec![0, 1]),
+        ("{a} full join {b} on a.id = b.id", vec![JoinType::Full], vec![0, 1]),
+        (
+            "{a} left join {b} on a.id = b.id join {c} on a.id = c.id",
+            vec![JoinType::Left, JoinType::Inner],
+            vec![0, 1, 2],
+        ),
+        (
+            "{a} join {b} on a.id = b.id right join {c} on a.id = c.id",
+            vec![JoinType::Inner, JoinType::Right],
+            vec![0, 1, 2],
+        ),
+        (
+            "{a} left join {b} on a.id = b.id full join {c} on a.id = c.id",
+            vec![JoinType::Left, JoinType::Full],
+            vec![0, 1, 2],
+        ),
+        (
+            "{a} join {b} on a.id = b.id join {c} on a.id = c.id",
+            vec![JoinType::Inner, JoinType::Inner],
+            vec![0, 1, 2],
+        ),
+    ];
+    let mut differing = 0;
+    for (from, joins, in_chain) in chains {
+        let supplied = null_supplied_tables(&joins);
+        for (pos, &t) in in_chain.iter().enumerate() {
+            let (_, _, qualified, unqualified) = PUSHDOWN_TABLES[t];
+            let render = |wrapped: Option<usize>| {
+                let mut f = from.to_string();
+                for (i, (name, cols, _, plain)) in PUSHDOWN_TABLES.iter().enumerate() {
+                    let text = if Some(i) == wrapped {
+                        format!("(select {cols} from {name} where {plain}) {name}")
+                    } else {
+                        name.to_string()
+                    };
+                    f = f.replace(&format!("{{{name}}}"), &text);
+                }
+                f
+            };
+            let select = "select a.id, b.id, c.id";
+            let cols_available: Vec<&str> = ["a", "b", "c"][..in_chain.len()].to_vec();
+            let list = cols_available.iter().map(|n| format!("{n}.id")).collect::<Vec<_>>().join(", ");
+            let _ = select;
+            let above = select_sorted(&c, &format!("select {list} from {} where {qualified}", render(None)));
+            let pushed = select_sorted(&c, &format!("select {list} from {}", render(Some(t))));
+            let ctx = format!("{from}  [{} on {}, {joins:?}]", qualified, ["a", "b", "c"][t]);
+            if supplied[pos] {
+                assert_ne!(above, pushed, "NULL-extended table: pushing must change the result — {ctx}");
+                differing += 1;
+            } else {
+                assert_eq!(above, pushed, "pushable table: pushing must not change the result — {ctx}");
+            }
+        }
+    }
+    assert!(differing >= 6, "the unsafe cases were actually exercised ({differing})");
+}

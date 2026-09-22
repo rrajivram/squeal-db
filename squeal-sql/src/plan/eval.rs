@@ -53,6 +53,48 @@ impl EvalExpr {
     // the row this expression reads, so `names` (that row's column names,
     // in order) turns it back into a column name; a position past the end
     // shows as `#i`.
+    // Every flat column position this expression reads, in order of
+    // appearance (repeats included; a function contributes its arguments').
+    pub(crate) fn column_positions(&self) -> Vec<usize> {
+        match self {
+            Self::None | Self::Literal(_) => vec![],
+            Self::Value(i) => vec![*i],
+            Self::Unary { field, .. } => field.column_positions(),
+            Self::Binary { lhs, rhs, .. } => {
+                let mut v = lhs.column_positions();
+                v.extend(rhs.column_positions());
+                v
+            }
+            Self::Function(f) => {
+                use crate::plan::funcs::FuncTrait;
+                f.fields()
+            }
+        }
+    }
+
+    // A copy reading a row that starts `offset` positions later than this
+    // one's (every column position lowered by `offset`) — how a predicate
+    // over the combined row becomes one over a single table's own row. None
+    // if it contains a function call, whose arguments are not rewritten, or
+    // reads a column before `offset`.
+    pub(crate) fn shifted(&self, offset: usize) -> Option<EvalExpr> {
+        Some(match self {
+            Self::None => Self::None,
+            Self::Literal(v) => Self::Literal(v.clone()),
+            Self::Value(i) => Self::Value(i.checked_sub(offset)?),
+            Self::Unary { op, field } => Self::Unary {
+                op: *op,
+                field: Box::new(field.shifted(offset)?),
+            },
+            Self::Binary { lhs, op, rhs } => Self::Binary {
+                lhs: Box::new(lhs.shifted(offset)?),
+                op: *op,
+                rhs: Box::new(rhs.shifted(offset)?),
+            },
+            Self::Function(_) => return Option::None,
+        })
+    }
+
     // A column's name, or `name#position` when another column of the same
     // row has the same name (a join of two tables that both have an `id`),
     // or `#position` when there is no such column.

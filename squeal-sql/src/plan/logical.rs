@@ -18,7 +18,11 @@ use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     error::SchemaError,
-    plan::{eval::EvalExpr, memory::QueryMemory},
+    plan::{
+        conjuncts::{Conjuncts, TableShape, null_supplied_tables},
+        eval::EvalExpr,
+        memory::QueryMemory,
+    },
     rslt::resultset::StreamingResultSet,
     source::{
         ComputedTableStat, ProjectableField, Source,
@@ -290,57 +294,17 @@ struct WhereJoins {
 }
 
 impl WhereJoins {
-    fn find<F: DBFile + 'static>(
-        where_expr: &EvalExpr,
-        item_widths: &[usize],
-        flat_tables: &[TableQuery<F>],
-    ) -> Self {
-        // item index of a flat position
-        let item_of = |pos: usize| -> Option<usize> {
-            let mut start = 0;
-            for (i, w) in item_widths.iter().enumerate() {
-                if pos < start + w {
-                    return Some(i);
-                }
-                start += w;
-            }
-            None
-        };
-        // datatype of a flat position, via the flattened tables' fields
-        let datatype_of = |pos: usize| -> Option<&DataType> {
-            let mut start = 0;
-            for t in flat_tables {
-                if pos < start + t.fields.len() {
-                    return Some(&t.fields[pos - start].datatype);
-                }
-                start += t.fields.len();
-            }
-            None
-        };
-        let same_kind = |a: &DataType, b: &DataType| {
-            matches!(
-                (a, b),
-                (DataType::Integer, DataType::Integer)
-                    | (DataType::Double, DataType::Double)
-                    | (DataType::Datetime, DataType::Datetime)
-                    | (DataType::Str(_), DataType::Str(_))
-                    | (DataType::Boolean, DataType::Boolean)
-            )
-        };
-        let mut conjuncts = vec![];
-        split_conjuncts(where_expr, &mut conjuncts);
-        let mut equalities = vec![];
-        for c in conjuncts {
-            if let EvalExpr::Binary { lhs, op: BinaryOp::Eq, rhs } = c
-                && let (EvalExpr::Value(a), EvalExpr::Value(b)) = (lhs.as_ref(), rhs.as_ref())
-                && let (Some(ia), Some(ib)) = (item_of(*a), item_of(*b))
-                && ia != ib
-                && let (Some(da), Some(db)) = (datatype_of(*a), datatype_of(*b))
-                && same_kind(da, db)
-            {
-                equalities.push((ia.max(ib), *a, *b));
-            }
-        }
+    // `conjuncts` were analyzed over the flattened tables; `table_item[t]` is
+    // the top-level FROM item flat table `t` belongs to.
+    fn find(conjuncts: &Conjuncts, table_item: &[usize]) -> Self {
+        let equalities = conjuncts
+            .equi()
+            .filter_map(|(_, left, right)| {
+                let (ia, ib) = (table_item[left.table], table_item[right.table]);
+                // Both columns in one FROM item: already joined inside it.
+                (ia != ib).then_some((ia.max(ib), left.pos, right.pos))
+            })
+            .collect();
         Self { equalities }
     }
 
@@ -365,17 +329,6 @@ impl WhereJoins {
                 op: BinaryOp::And,
                 rhs: Box::new(r),
             })
-    }
-}
-
-// The top-level AND-chain of an expression, one entry per conjunct.
-fn split_conjuncts<'a>(expr: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
-    match expr {
-        EvalExpr::Binary { lhs, op: BinaryOp::And, rhs } => {
-            split_conjuncts(lhs, out);
-            split_conjuncts(rhs, out);
-        }
-        other => out.push(other),
     }
 }
 
@@ -577,13 +530,33 @@ where
         // where nothing links them. The combined row layout is unchanged
         // (items in FROM order), so every resolved column position stays
         // valid. See WhereJoins.
-        let item_widths: Vec<usize> = tables
-            .iter()
-            .map(|t| t.fields.len() + t.joins.iter().map(|j| j.relation.fields.len()).sum::<usize>())
-            .collect();
-        let links = match &wh_expr {
-            Some(w) if sources.len() > 1 => WhereJoins::find(w, &item_widths, &flat_tables),
-            _ => WhereJoins::default(),
+        let links = if sources.len() > 1 {
+            // Which tables an outer join in their FROM item NULL-extends,
+            // in flat order (each item is a table followed by its joins).
+            let supplied: Vec<bool> = tables
+                .iter()
+                .flat_map(|t| {
+                    null_supplied_tables(&t.joins.iter().map(|j| j.join_type).collect::<Vec<_>>())
+                })
+                .collect();
+            let shapes: Vec<TableShape> = flat_tables
+                .iter()
+                .zip(supplied)
+                .map(|(t, null_supplied)| TableShape {
+                    columns: t.fields.iter().map(|f| f.datatype).collect(),
+                    null_supplied,
+                })
+                .collect();
+            // flat_tables is each top-level item followed by its joins.
+            let table_item: Vec<usize> = tables
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| std::iter::repeat_n(i, 1 + t.joins.len()))
+                .collect();
+            let conjuncts = Conjuncts::analyze(wh_expr.as_ref(), &shapes);
+            WhereJoins::find(&conjuncts, &table_item)
+        } else {
+            WhereJoins::default()
         };
         let union: Box<dyn Source> = if let [_] = sources.as_slice() {
             sources.pop().unwrap()
