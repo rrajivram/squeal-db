@@ -19,7 +19,7 @@ use crate::{
     ds::bitvec::BitVec,
     error::SchemaError,
     optim::table_stats::TableStat,
-    plan::memory::QueryMemory,
+    plan::memory::{MemReservation, QueryMemory},
     source::{
         ComputedTableStat, ProjectableField, QueryStats, Source, join::JoinType,
         joinmatch::JoinMatcher, merge_stats,
@@ -29,22 +29,23 @@ use crate::{
 #[allow(unused)]
 pub(crate) struct HashedSource<F: DBFile + 'static> {
     sources: Vec<Box<dyn Source>>,
-    capacity: usize,
     db: Arc<Db<F>>,
-    run: Run<F>,
+    // The build (left, post-swap) side's table: in memory (no Run, no
+    // postcard) until it outgrows `mem`'s budget, at which point it
+    // migrates to the Run-backed open-addressing table once and for all
+    // (see migrate_to_run) — the shape every build used to be, and still
+    // is once a build genuinely doesn't fit. See BuildTable's own doc
+    // comment.
+    table: BuildTable<F>,
     record_size: usize,
+    // Sizing hint for the build side, computed once in new() from its
+    // table_stats() — used only if/when this ever migrates to Run (see
+    // migrate_to_run); a Mem table needs no such hint, it just grows.
+    initial_capacity_hint: usize,
     left_fields: Vec<usize>,
     right_fields: Vec<usize>,
     fields: Arc<[ProjectableField]>,
     count: usize,
-    bitmask: BitVec,
-    // Parallel to `bitmask` (same size, recreated alongside it in
-    // new()/rehash()/reset()): has this OCCUPIED slot ever been matched
-    // by a probing right row? Only meaningful for LEFT/FULL, which need
-    // to emit every left row that never matched anything once the right
-    // source is exhausted — see `next_unmatched_left`.
-    matched: BitVec,
-    records_per_page: usize,
     mem: Arc<QueryMemory>,
     join_type: JoinType,
     // True when new() swapped the two sources (build on the smaller side).
@@ -93,6 +94,10 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     // to make it.
     sweep_row: usize,
     sweep_page_data: Option<Vec<(u64, HashValue)>>,
+    // next_unmatched_left's resume position for a Mem table — an index
+    // into MemTable::entries/matched. Trivial compared to the Run sweep
+    // above (no pages to walk), since everything's already one flat Vec.
+    mem_sweep_pos: usize,
     left_time: u128,
     next_time: u128,
     probe_time: u128,
@@ -111,6 +116,192 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
 struct HashValue {
     hash: u64,
     left_value: IndexKey,
+}
+
+// Per-entry memory-accounting overhead charged against QueryMemory for a
+// Mem-backed entry: the Vec<HashValue> slot, the HashMap bucket, and the
+// Vec<usize> index entry it lives in. Deliberately generous, like
+// SLOTTED_OVERHEAD_BYTES below is for a Run page — getting it a little
+// wrong only means migrating to Run a bit earlier or later than the true
+// byte count would, never a correctness problem.
+const MEM_ENTRY_OVERHEAD_BYTES: usize = 48;
+
+// The build side kept as plain owned values — no Run, no SlottedPage, no
+// postcard. Every left row lives twice: once in `entries` (insertion
+// order, needed for the LEFT/FULL unmatched sweep) and once via `index`
+// (hash -> positions in `entries`, needed for probing). `matched` is
+// parallel to `entries`, same purpose as RunTable's `matched` bitmask.
+struct MemTable {
+    entries: Vec<HashValue>,
+    matched: Vec<bool>,
+    index: HashMap<u64, Vec<usize>>,
+    mem: Vec<MemReservation>,
+}
+
+impl MemTable {
+    fn new() -> Self {
+        Self {
+            entries: vec![],
+            matched: vec![],
+            index: HashMap::new(),
+            mem: vec![],
+        }
+    }
+
+    // On success, `value` is absorbed into the table. On failure (the
+    // budget is exhausted), `value` comes back unowned so the caller can
+    // hand it to whatever the table migrates to instead of re-cloning it.
+    fn try_insert(
+        &mut self,
+        budget: &Arc<QueryMemory>,
+        value: HashValue,
+    ) -> Result<(), (SchemaError, HashValue)> {
+        let bytes = value.left_value.size() + MEM_ENTRY_OVERHEAD_BYTES;
+        match budget.try_reserve(bytes) {
+            Ok(reservation) => {
+                self.mem.push(reservation);
+                self.index.entry(value.hash).or_default().push(self.entries.len());
+                self.entries.push(value);
+                self.matched.push(false);
+                Ok(())
+            }
+            Err(e) => Err((e, value)),
+        }
+    }
+
+    // Same matching semantics as RunTable::probe (see its own doc
+    // comment) — every entry sharing `hash`, checked with the real
+    // equality (a hash match is necessary, not sufficient), each marked
+    // matched as found.
+    fn probe(&mut self, matcher: &JoinMatcher, right: &IndexKey, hash: u64) -> VecDeque<IndexKey> {
+        let mut matches = VecDeque::new();
+        let Some(positions) = self.index.get(&hash) else {
+            return matches;
+        };
+        for &i in positions {
+            if matcher.keys_match(&self.entries[i].left_value, right) {
+                matches.push_back(self.entries[i].left_value.clone());
+                self.matched[i] = true;
+            }
+        }
+        matches
+    }
+}
+
+// The build side once it has spilled: today's open-addressing table over a
+// Run of SlottedPages, unchanged in every particular from before this
+// module also had a Mem-backed option — same probe-chain, same rehash-at-
+// 100%-load policy (see insert_with_hash's own comment), same raw-bytes
+// rehash replay (see HashedSource::rehash). Bundles exactly the fields
+// HashedSource itself used to hold directly.
+struct RunTable<F: DBFile + 'static> {
+    run: Run<F>,
+    capacity: usize,
+    bitmask: BitVec,
+    // Parallel to `bitmask` (same size, recreated alongside it): has this
+    // OCCUPIED slot ever been matched by a probing right row? Only
+    // meaningful for LEFT/FULL, which need to emit every left row that
+    // never matched anything once the right source is exhausted — see
+    // HashedSource::next_unmatched_left.
+    matched: BitVec,
+    records_per_page: usize,
+}
+
+impl<F: DBFile + 'static> RunTable<F> {
+    #[inline(always)]
+    fn slot_available(&self, index: usize) -> bool {
+        !self.bitmask.is_set(index)
+    }
+
+    fn find_next_slot(&self, index: usize) -> Result<usize, SchemaError> {
+        self.bitmask
+            .first_available(index)
+            .ok_or(SchemaError::UnknownError("Could not find any slots".into()))
+    }
+
+    fn claim_slot(&mut self, index: usize) -> Result<(), SchemaError> {
+        self.bitmask.set(index);
+        assert!(!self.slot_available(index));
+        Ok(())
+    }
+
+    fn insert_with_hash(&mut self, item: IndexKey, hash: u64) -> Result<(), SchemaError> {
+        let mut index = (hash % self.capacity as u64) as usize;
+        if !self.slot_available(index) {
+            index = self.find_next_slot(index)?;
+        }
+        self.claim_slot(index)?;
+        let page_index = index / self.records_per_page;
+        let row_index = (index % self.records_per_page) as u64;
+        let value = HashValue {
+            hash,
+            left_value: item,
+        };
+        self.run
+            .set_slot_at(page_index, row_index, &to_allocvec(&value)?)?;
+        Ok(())
+    }
+
+    // Rehash-replay fast path — see HashedSource::rehash's own comment for
+    // why this exists apart from insert_with_hash: `raw` is a prior
+    // entry's already-encoded bytes (hash prefix included), placed at its
+    // new slot verbatim, no IndexKey decode/re-encode needed.
+    fn insert_raw(&mut self, hash: u64, raw: &[u8]) -> Result<(), SchemaError> {
+        let mut index = (hash % self.capacity as u64) as usize;
+        if !self.slot_available(index) {
+            index = self.find_next_slot(index)?;
+        }
+        self.claim_slot(index)?;
+        let page_index = index / self.records_per_page;
+        let row_index = (index % self.records_per_page) as u64;
+        self.run.set_slot_at(page_index, row_index, raw)?;
+        Ok(())
+    }
+
+    // Finds every left row matching `right`'s join key — see
+    // HashedSource::probe_matches's own (former) doc comment for why this
+    // walks the FULL probe chain instead of stopping at the first hit,
+    // and why an empty slot is a reliable chain-end signal.
+    fn probe(
+        &mut self,
+        matcher: &JoinMatcher,
+        right: &IndexKey,
+        hash: u64,
+    ) -> Result<VecDeque<IndexKey>, SchemaError> {
+        let start = (hash % self.capacity as u64) as usize;
+        let mut matches = VecDeque::new();
+        let mut index = start;
+        loop {
+            let page_index = index / self.records_per_page;
+            let row_index = (index % self.records_per_page) as u64;
+            match self.run.get_slot_at(page_index, row_index)? {
+                Some(bytes) => {
+                    let v: HashValue = from_bytes(&bytes)?;
+                    if matcher.keys_match(&v.left_value, right) {
+                        matches.push_back(v.left_value);
+                        self.matched.set(index);
+                    }
+                }
+                None => break,
+            }
+            index = (index + 1) % self.capacity;
+            if index == start {
+                break;
+            }
+        }
+        Ok(matches)
+    }
+}
+
+// The build side's storage: in memory until it doesn't fit, then the
+// Run-backed table — a one-way transition (see HashedSource::migrate_to_run),
+// same as SortJoinSource::GroupBuf's own Vec-then-Run spill. Every method
+// on HashedSource that needs the table dispatches on this once, at the top
+// (see e.g. probe_matches) — RunTable/MemTable know nothing about each
+// other or about HashedSource itself.
+enum BuildTable<F: DBFile + 'static> {
+    Mem(MemTable),
+    Run(RunTable<F>),
 }
 
 impl<F: DBFile + 'static> HashedSource<F> {
@@ -137,11 +328,6 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 .cloned()
                 .collect::<Vec<_>>(),
         );
-        // ONE run, created up front only to learn how many slots a page holds,
-        // then grown in place to the size chosen below — not a throwaway run
-        // plus a second real one.
-        let mut run = db.create_slotted_run()?;
-        let records_per_page = Self::slots_per_page(&run, record_size);
         // Put the side with MORE rows on the left, i.e. make it the build
         // (hash-table) side. Deliberate, and the opposite of the textbook
         // "build the smaller side": measured on the retail 4-way join it is
@@ -180,18 +366,15 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 )
             }
         };
-        // Size the table from the BUILD side — `left_source` here, whichever
-        // branch above produced it. Sizing only inside the swap branch left
-        // the ordinary (unswapped) case at one page, and a 30,000-row build
-        // side then rehashed its way up from 77 slots by repeated doubling.
-        // No stats for the build side means no basis for a guess: one page.
-        let wanted = left_source
+        // Sized from the BUILD side — `left_source` here, whichever branch
+        // above produced it — but only USED if this build ever migrates to
+        // Run (see migrate_to_run); a Mem table needs no upfront sizing at
+        // all. No stats for the build side means no basis for a guess: one
+        // page's worth, same fallback as before this table could be Mem.
+        let initial_capacity_hint = left_source
             .table_stats()
             .map(|s| (s.table_stat.row_count as f64 * Self::INITIAL_CAPACITY_FACTOR) as usize)
             .unwrap_or(1);
-        let num_pages = Self::grow_run(&mut run, records_per_page, wanted)?;
-        // Always a whole number of pages' worth of slots (see allocate_run).
-        let capacity = records_per_page * num_pages;
         let matcher = JoinMatcher::new(
             join_type,
             left_fields,
@@ -202,16 +385,17 @@ impl<F: DBFile + 'static> HashedSource<F> {
         Ok(Self {
             sources: vec![left_source, right_source],
             fields,
-            capacity,
-            run,
+            // No Run, no page, allocated yet — see BuildTable's own doc
+            // comment. The overwhelmingly common case (a join whose build
+            // side fits the query's memory budget) never allocates one at
+            // all.
+            table: BuildTable::Mem(MemTable::new()),
+            initial_capacity_hint,
             record_size,
             db,
             left_fields: left_fields.to_vec(),
             right_fields: right_fields.to_vec(),
             count: 0,
-            bitmask: BitVec::with_capacity(capacity),
-            matched: BitVec::with_capacity(capacity),
-            records_per_page,
             mem,
             join_type,
             swapped,
@@ -223,6 +407,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             sweep_page: 0,
             sweep_row: 0,
             sweep_page_data: None,
+            mem_sweep_pos: 0,
             next_time: 0,
             left_time: 0,
             probe_time: 0,
@@ -307,24 +492,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
         Ok((run, records_per_page, num_pages))
     }
 
-    #[inline(always)]
-    fn slot_available(&self, index: usize) -> Result<bool, SchemaError> {
-        Ok(!self.bitmask.is_set(index))
-    }
-
-    fn find_next_slot(&self, index: usize) -> Result<usize, SchemaError> {
-        self.bitmask
-            .first_available(index)
-            .ok_or(SchemaError::UnknownError("Could not find any slots".into()))
-    }
-
-    fn claim_slot(&mut self, index: usize) -> Result<(), SchemaError> {
-        self.bitmask.set(index);
-        assert!(!self.slot_available(index)?);
-        Ok(())
-    }
-
-    // Rehashes at 100% load, deliberately, despite find_next_slot
+    // Rehashes at 100% load, deliberately, despite RunTable::find_next_slot
     // (BitVec::first_available) being a plain linear probe with no
     // clustering mitigation — Knuth's classic linear-probing analysis
     // makes filling all the way to 100% load a textbook Theta(n^1.5)
@@ -340,133 +508,118 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // rehash time from 806ms to 1438ms (+78%) and total build_left time
     // from 18.1s to 19.4s (+7%). See
     // bench_insert_left_scaling_isolates_load_factor_effects to
-    // reproduce either way.
+    // reproduce either way. (All Run-specific — a Mem table has no
+    // capacity/load-factor concept at all; std HashMap grows on its own.)
     fn insert_left(&mut self, item: IndexKey) -> Result<(), SchemaError> {
-        if self.count == self.capacity {
-            self.rehash(self.capacity * 2)?;
-        }
         let start = Instant::now();
         let hash = self.get_hash(&item, &self.left_fields);
-
-        self.insert_with_hash(item, hash)?;
-        self.count += 1;
+        match &mut self.table {
+            BuildTable::Mem(mt) => match mt.try_insert(&self.mem, HashValue { hash, left_value: item }) {
+                Ok(()) => self.count += 1,
+                // Doesn't fit the budget: migrate every already-accumulated
+                // entry to a Run-backed table (see migrate_to_run), then
+                // insert the row that didn't fit through that table instead
+                // — from here on this HashedSource behaves exactly as it
+                // did before it could ever be Mem-backed.
+                Err((SchemaError::QueryMemoryExceeded { .. }, value)) => {
+                    self.migrate_to_run()?;
+                    self.insert_into_run(value.left_value, value.hash)?;
+                }
+                Err((e, _)) => return Err(e),
+            },
+            BuildTable::Run(_) => self.insert_into_run(item, hash)?,
+        }
         self.insert_left += start.elapsed().as_nanos();
-
         Ok(())
     }
 
-    // Finds every left row matching `right`'s join key, walking the
-    // FULL open-addressing probe chain starting at its hash's natural
-    // slot — not stopping at the first hit, since more than one left
-    // row can legitimately share the same key. The chain ends the
-    // moment an empty slot is reached: this table never deletes
-    // entries, so (standard open-addressing property) if a slot were
-    // ever empty, any insert whose probe sequence passes through it
-    // would have claimed it directly rather than skipping past — an
-    // empty slot is therefore a reliable "nothing further on this
-    // chain" signal, not just "nothing here." The `index == start`
-    // check guards the degenerate case where the table is 100% full
-    // (right before insert_left's next call would rehash) and would
-    // otherwise wrap forever.
-    //
-    // Marks every match found in `matched` as it goes — LEFT/FULL's
-    // final unmatched-left sweep (next_unmatched_left) relies on this
-    // to know which occupied slots were never claimed by any right row.
-    //
-    // STORE_AUDIT.md P6: reads exactly the slots this probe chain
-    // actually visits, one at a time (`Run::get_slot_at`), instead of
-    // decoding a whole page's `records_per_page` slots up front just to
-    // index into it for however many of them the chain happens to touch
-    // — typically far fewer, especially at a healthy (well under 100%)
-    // load factor. An empty slot is `None` directly (no `Option`-inside-
-    // the-payload indirection to check on top of it).
+    // The Run-backed insert path: rehash first if this insert would land on
+    // a full table (see insert_left's own comment on the 100%-load
+    // trigger), then place it. Shared by insert_left's already-Run branch
+    // and migrate_to_run's replay loop — both need the exact same
+    // rehash-before-inserting behavior, so `self.count` (bumped here, the
+    // one thing both callers rely on) stays accurate throughout either.
+    fn insert_into_run(&mut self, item: IndexKey, hash: u64) -> Result<(), SchemaError> {
+        let capacity = match &self.table {
+            BuildTable::Run(rt) => rt.capacity,
+            BuildTable::Mem(_) => unreachable!("insert_into_run requires a Run table"),
+        };
+        if self.count == capacity {
+            self.rehash(capacity * 2)?;
+        }
+        let BuildTable::Run(rt) = &mut self.table else {
+            unreachable!("insert_into_run requires a Run table")
+        };
+        rt.insert_with_hash(item, hash)?;
+        self.count += 1;
+        Ok(())
+    }
+
+    // Moves every entry MemTable has accumulated so far into a fresh
+    // Run-backed table, sized from `initial_capacity_hint` (the same
+    // stats-based guess new() always used to size the Run up front with —
+    // see its own comment) or the entry count, whichever asks for more.
+    // Only ever called from insert_left, strictly before any right-side
+    // probing starts, so (like rehash) nothing here needs to replay a
+    // `matched` bit — nothing has been matched yet. A one-way trip: once
+    // Run, always Run for the rest of this HashedSource's life (until
+    // reset() — see its own comment).
+    fn migrate_to_run(&mut self) -> Result<(), SchemaError> {
+        let BuildTable::Mem(mt) = std::mem::replace(&mut self.table, BuildTable::Mem(MemTable::new()))
+        else {
+            unreachable!("migrate_to_run requires a Mem table")
+        };
+        let (run, records_per_page, num_pages) = Self::allocate_run(
+            &self.db,
+            self.record_size,
+            self.initial_capacity_hint.max(mt.entries.len()),
+        )?;
+        let capacity = records_per_page * num_pages;
+        self.table = BuildTable::Run(RunTable {
+            run,
+            capacity,
+            bitmask: BitVec::with_capacity(capacity),
+            matched: BitVec::with_capacity(capacity),
+            records_per_page,
+        });
+        self.count = 0;
+        // mt.mem (this table's QueryMemory reservations) drops here,
+        // giving the budget back — the same rows now live in Run pages
+        // instead, which draw from the database's own temp pool, not
+        // QueryMemory.
+        for value in mt.entries {
+            self.insert_into_run(value.left_value, value.hash)?;
+        }
+        Ok(())
+    }
+
+    // Finds every left row matching `right`'s join key — dispatches to
+    // whichever table backs the build side; see MemTable::probe/
+    // RunTable::probe for the matching itself (identical semantics either
+    // way — every match found, not just the first, each marked as matched
+    // for LEFT/FULL's later unmatched-left sweep).
     fn probe_matches(&mut self, right: &IndexKey) -> Result<VecDeque<IndexKey>, SchemaError> {
         let start_time = Instant::now();
         let hash = self.get_hash(right, &self.right_fields);
-        let start = (hash % self.capacity as u64) as usize;
-        let mut matches = VecDeque::new();
-        let mut index = start;
-        loop {
-            let page_index = index / self.records_per_page;
-            let row_index = (index % self.records_per_page) as u64;
-            match self.run.get_slot_at(page_index, row_index)? {
-                Some(bytes) => {
-                    let v: HashValue = from_bytes(&bytes)?;
-                    if self.matcher.keys_match(&v.left_value, right) {
-                        matches.push_back(v.left_value);
-                        self.matched.set(index);
-                    }
-                }
-                None => break,
-            }
-            index = (index + 1) % self.capacity;
-            if index == start {
-                break;
-            }
-        }
+        let matches = match &mut self.table {
+            BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash),
+            BuildTable::Run(rt) => rt.probe(&self.matcher, right, hash)?,
+        };
         self.probe_time += start_time.elapsed().as_nanos();
         Ok(matches)
-    }
-
-    // STORE_AUDIT.md P6: writes exactly this one slot's own bytes
-    // (`Run::set_slot_at`), not the whole page's worth — the fix for the
-    // pattern this file used to hit on every single call: decode the
-    // whole page's `Vec<Option<HashValue>>`, mutate one element, then
-    // re-encode and rewrite the WHOLE thing, even for a page already
-    // holding hundreds of other slots untouched by this insert.
-    fn insert_with_hash(&mut self, item: IndexKey, hash: u64) -> Result<(), SchemaError> {
-        let mut index = (hash % self.capacity as u64) as usize;
-        if !self.slot_available(index)? {
-            index = self.find_next_slot(index)?;
-        }
-        self.claim_slot(index)?;
-        let page_index = index / self.records_per_page;
-        let row_index = (index % self.records_per_page) as u64;
-        let value = HashValue {
-            hash,
-            left_value: item,
-        };
-        self.run
-            .set_slot_at(page_index, row_index, &to_allocvec(&value)?)?;
-        Ok(())
     }
 
     fn get_hash(&self, key: &IndexKey, fields: &[usize]) -> u64 {
         IndexKey::hash_fields(fields.iter().map(|f| &key.values()[*f]))
     }
 
-    // Rehash-replay fast path: an old run's tuple bytes are already a
-    // valid postcard-encoded `HashValue { hash, left_value }` — re-placing
-    // one into the new table needs the `hash` (to compute the new
-    // placement index) but nothing about the left_value's own bytes
-    // needs to change, so there's no reason to decode the IndexKey (often
-    // the most expensive part, with its own variable-length fields) just
-    // to re-encode an identical one moments later, the way going through
-    // insert_with_hash would. `raw` is the tuple's complete original
-    // bytes (hash prefix included) and is written back verbatim; `hash`
-    // must already be decoded by the caller since it's needed before this
-    // call to compute the index. See rehash()'s own comment for why this
-    // exists as a separate path from insert_with_hash rather than a
-    // parameter on it: insert_with_hash's callers always have a fresh,
-    // not-yet-hashed IndexKey, never a pre-encoded blob.
-    fn insert_raw(&mut self, hash: u64, raw: &[u8]) -> Result<(), SchemaError> {
-        let mut index = (hash % self.capacity as u64) as usize;
-        if !self.slot_available(index)? {
-            index = self.find_next_slot(index)?;
-        }
-        self.claim_slot(index)?;
-        let page_index = index / self.records_per_page;
-        let row_index = (index % self.records_per_page) as u64;
-        self.run.set_slot_at(page_index, row_index, raw)?;
-        Ok(())
-    }
-
     // STORE_AUDIT.md P6: `run_cursor` (a plain sequential walk over every
     // tuple in the old run, page by page) now yields exactly one
     // HashValue per step, not a whole page's Vec to flatten — a
     // SlottedPage only ever stores tuples for slots that are actually
-    // occupied (see insert_with_hash), so there's no `None` filler to
-    // skip over the way the old `Vec<Option<HashValue>>` scheme needed.
+    // occupied (see RunTable::insert_with_hash), so there's no `None`
+    // filler to skip over the way the old `Vec<Option<HashValue>>` scheme
+    // needed.
     //
     // FIXED (was a KNOWN BUG in this loop): "Did not expect empty run
     // tuple" — self.count claiming more entries than the old run
@@ -486,35 +639,47 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // repro of the underlying store-level bug, and
     // bug_repro_rehash_past_272384_rows_loses_entries (this file) for
     // the original real-code-level repro, now passing reliably.
-
     fn rehash(&mut self, new_capacity: usize) -> Result<(), SchemaError> {
         let start = Instant::now();
         let count = self.count;
-        let mut run_cursor = self.run.cursor()?;
+        let mut run_cursor = {
+            let BuildTable::Run(rt) = &self.table else {
+                unreachable!("rehash requires a Run table")
+            };
+            rt.run.cursor()?
+        };
         let (run, records_per_page, num_pages) =
             Self::allocate_run(&self.db, self.record_size, new_capacity)?;
-        self.run = run;
-        self.records_per_page = records_per_page;
-        self.capacity = records_per_page * num_pages;
-        self.bitmask = BitVec::with_capacity(self.capacity);
-        self.matched = BitVec::with_capacity(self.capacity);
+        let capacity = records_per_page * num_pages;
+        let mut new_table = RunTable {
+            run,
+            capacity,
+            bitmask: BitVec::with_capacity(capacity),
+            matched: BitVec::with_capacity(capacity),
+            records_per_page,
+        };
         self.count = 0;
         let mut added = 0;
         while added < count {
             let data = run_cursor.next()?.ok_or(SchemaError::UnknownError(format!(
                 "Did not expect empty run tuple: added={added} count={count} \
-                 new_capacity={new_capacity} self.capacity={}, records_per_page={},record_size={}",
-                self.capacity, self.records_per_page, self.record_size
+                 new_capacity={new_capacity} capacity={capacity}, records_per_page={records_per_page},\
+                 record_size={}",
+                self.record_size
             )))?;
             let raw = data.data();
-            // Only the hash prefix needs decoding — see insert_raw's own
-            // comment. take_from_bytes decodes just that one leading field
-            // and hands back the (unexamined, unmodified) remaining bytes.
+            // Only the hash prefix needs decoding — see RunTable::
+            // insert_raw's own comment. take_from_bytes decodes just that
+            // one leading field and hands back the (unexamined,
+            // unmodified) remaining bytes.
             let (hash, _rest): (u64, &[u8]) = postcard::take_from_bytes(raw)?;
-            self.insert_raw(hash, raw)?;
+            new_table.insert_raw(hash, raw)?;
             self.count += 1;
             added += 1;
         }
+        // The old RunTable (still owned by self.table until this line)
+        // drops here, freeing its pages.
+        self.table = BuildTable::Run(new_table);
         self.rehash_time = start.elapsed().as_nanos();
         Ok(())
     }
@@ -549,34 +714,63 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // used to be wasted decode work here).
     fn next_unmatched_left(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
-        loop {
-            if self.sweep_page >= self.run.page_count() {
-                self.next_time += start.elapsed().as_nanos();
-                return Ok(None);
-            }
-            if self.sweep_page_data.is_none() {
-                let slots = self.run.slots_at(self.sweep_page)?;
-                let mut decoded = Vec::with_capacity(slots.len());
-                for (slot, bytes) in slots {
-                    decoded.push((slot, from_bytes::<HashValue>(&bytes)?));
+        // Finds the next never-matched entry, if any, without calling back
+        // into `self.emit` (a &self method — would conflict with the
+        // in-progress mutable borrow of self.table below) until after the
+        // table borrow has ended.
+        let found = match &mut self.table {
+            BuildTable::Mem(mt) => {
+                let mut found = None;
+                while self.mem_sweep_pos < mt.entries.len() {
+                    let i = self.mem_sweep_pos;
+                    self.mem_sweep_pos += 1;
+                    if !mt.matched[i] {
+                        found = Some(mt.entries[i].left_value.clone());
+                        break;
+                    }
                 }
-                self.sweep_page_data = Some(decoded);
-                self.sweep_row = 0;
+                found
             }
-            let page_data = self.sweep_page_data.as_ref().unwrap();
-            if self.sweep_row >= page_data.len() {
-                self.sweep_page += 1;
-                self.sweep_row = 0;
-                self.sweep_page_data = None;
-                continue;
+            BuildTable::Run(rt) => {
+                let mut found = None;
+                'sweep: loop {
+                    if self.sweep_page >= rt.run.page_count() {
+                        break;
+                    }
+                    if self.sweep_page_data.is_none() {
+                        let slots = rt.run.slots_at(self.sweep_page)?;
+                        let mut decoded = Vec::with_capacity(slots.len());
+                        for (slot, bytes) in slots {
+                            decoded.push((slot, from_bytes::<HashValue>(&bytes)?));
+                        }
+                        self.sweep_page_data = Some(decoded);
+                        self.sweep_row = 0;
+                    }
+                    let page_data = self.sweep_page_data.as_ref().unwrap();
+                    if self.sweep_row >= page_data.len() {
+                        self.sweep_page += 1;
+                        self.sweep_row = 0;
+                        self.sweep_page_data = None;
+                        continue;
+                    }
+                    let (slot, value) = &page_data[self.sweep_row];
+                    let slot_index = self.sweep_page * rt.records_per_page + *slot as usize;
+                    self.sweep_row += 1;
+                    if !rt.matched.is_set(slot_index) {
+                        found = Some(value.left_value.clone());
+                        break 'sweep;
+                    }
+                }
+                found
             }
-            let (slot, value) = &page_data[self.sweep_row];
-            let slot_index = self.sweep_page * self.records_per_page + *slot as usize;
-            self.sweep_row += 1;
-            if !self.matched.is_set(slot_index) {
-                self.next_time += start.elapsed().as_nanos();
-                return Ok(Some(self.emit(&value.left_value, self.matcher.right_null())?));
+        };
+        self.next_time += start.elapsed().as_nanos();
+        match found {
+            Some(left) => {
+                let right_null = self.matcher.right_null().clone();
+                Ok(Some(self.emit(&left, &right_null)?))
             }
+            None => Ok(None),
         }
     }
 
@@ -682,12 +876,12 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.sources[0].reset()?;
         self.sources[1].reset()?;
-        let (run, records_per_page, num_pages) = Self::allocate_run(&self.db, self.record_size, 1)?;
-        self.run = run;
-        self.records_per_page = records_per_page;
-        self.capacity = records_per_page * num_pages;
-        self.bitmask = BitVec::with_capacity(self.capacity);
-        self.matched = BitVec::with_capacity(self.capacity);
+        // Back to Mem — the same starting state new() itself builds, so a
+        // reset join gets the same in-memory-first chance the first build
+        // did, rather than staying Run-backed (with its now-empty, already
+        // appropriately-sized table) just because the first pass happened
+        // to spill.
+        self.table = BuildTable::Mem(MemTable::new());
         self.count = 0;
         self.built = false;
         self.pending_matches = VecDeque::new();
@@ -696,6 +890,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         self.sweep_page = 0;
         self.sweep_row = 0;
         self.sweep_page_data = None;
+        self.mem_sweep_pos = 0;
         Ok(())
     }
 
@@ -784,8 +979,39 @@ mod tests {
         make_source_with(JoinType::Inner)
     }
 
+    // Test-only access into whichever table is currently backing a
+    // HashedSource — panics with a clear message if a test that expects
+    // (and wants to exercise) the Run-backed table's own sizing/rehash
+    // behavior got a Mem table instead, e.g. because it forgot to force a
+    // spill (see QueryMemory::new(0) below).
+    impl<F: DBFile + 'static> HashedSource<F> {
+        fn run_table(&self) -> &RunTable<F> {
+            match &self.table {
+                BuildTable::Run(rt) => rt,
+                BuildTable::Mem(_) => panic!(
+                    "expected a Run-backed table — force one with QueryMemory::new(0) \
+                     (see spill()) before asserting on Run-specific sizing"
+                ),
+            }
+        }
+        fn is_mem(&self) -> bool {
+            matches!(self.table, BuildTable::Mem(_))
+        }
+    }
+
+    // Drives HashedSource::build_left directly (bypassing next()'s probe
+    // phase) with a QueryMemory budget of 0 — any Mem reservation attempt
+    // fails immediately, so the very first left row forces a migration to
+    // Run. For tests that specifically want the Run-backed table's own
+    // sizing/rehash behavior, the same thing every HashedSource always did
+    // before it could be Mem-backed at all.
+    fn spill(mut source: HashedSource<MemFile>) -> HashedSource<MemFile> {
+        source.build_left().unwrap();
+        source
+    }
+
     // Reads every slot across every page of the run — mirrors the exact
-    // per-page decode insert_with_hash/probe_matches use internally,
+    // per-page decode RunTable::insert_with_hash/probe uses internally,
     // just exposed here so a test can inspect the whole table's final
     // state directly.
     // STORE_AUDIT.md P6: `slots_at` returns only occupied slots directly
@@ -793,9 +1019,10 @@ mod tests {
     // so this is a plain flatten now instead of decoding a whole
     // `Vec<Option<HashValue>>` per page.
     fn dump_slots(source: &HashedSource<MemFile>) -> Vec<HashValue> {
+        let rt = source.run_table();
         let mut out = vec![];
-        for page in 0..source.run.page_count() {
-            for (_, bytes) in source.run.slots_at(page).unwrap() {
+        for page in 0..rt.run.page_count() {
+            for (_, bytes) in rt.run.slots_at(page).unwrap() {
                 out.push(from_bytes(&bytes).unwrap());
             }
         }
@@ -847,9 +1074,12 @@ mod tests {
     #[test]
     fn test_insert_left_triggers_a_rehash_once_capacity_is_reached() {
         // Small page size so `capacity` is small enough to actually fill
-        // in a test, instead of needing hundreds of rows.
+        // in a test, instead of needing hundreds of rows. QueryMemory::
+        // new(0) forces this build onto the Run-backed table (see
+        // run_table()'s own comment) — this specifically tests THAT
+        // table's rehash-at-100%-load behavior.
         let db = Db::<MemFile>::create_with_page_size("hash_rehash_test.db", 1024).unwrap();
-        let mem = QueryMemory::new(1024 * 1024);
+        let mem = QueryMemory::new(0);
         let mut source = HashedSource::new(
             Box::new(VecSource::new(&["id", "val"], vec![])),
             Box::new(VecSource::new(&["id", "val"], vec![])),
@@ -861,21 +1091,28 @@ mod tests {
         )
         .unwrap();
 
-        let initial_capacity = source.capacity;
+        // The first insert forces the Mem->Run migration (any reservation
+        // fails immediately against a 0 budget); capacity is only known
+        // once that has happened.
+        source
+            .insert_left(IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)]).unwrap())
+            .unwrap();
+        let initial_capacity = source.run_table().capacity;
         // The count==capacity check runs at the START of insert_left, so
         // it only fires on the (capacity+1)th call — insert one more than
-        // capacity, not exactly capacity, to actually trigger it.
-        for i in 0..=initial_capacity as i64 {
+        // capacity in total, not exactly capacity (one row already went
+        // in above, so this loop covers the rest), to actually trigger it.
+        for i in 1..=initial_capacity as i64 {
             let row = IndexKey::new_from_owned(vec![ValueItem::Integer(i), ValueItem::Integer(0)])
                 .unwrap();
             source.insert_left(row).unwrap();
         }
 
         assert!(
-            source.capacity > initial_capacity,
+            source.run_table().capacity > initial_capacity,
             "inserting capacity+1 distinct rows should have triggered a rehash that grows \
              capacity — it stayed at {initial_capacity}, meaning self.count never actually \
-             reached self.capacity"
+             reached capacity"
         );
     }
 
@@ -891,7 +1128,7 @@ mod tests {
     #[test]
     fn test_rehash_preserves_every_left_row_across_multiple_pages() {
         let db = Db::<MemFile>::create_with_page_size("hash_rehash_test2.db", 1024).unwrap();
-        let mem = QueryMemory::new(1024 * 1024);
+        let mem = QueryMemory::new(0);
         let mut source = HashedSource::new(
             Box::new(VecSource::new(&["id", "val"], vec![])),
             Box::new(VecSource::new(&["id", "val"], vec![])),
@@ -903,20 +1140,27 @@ mod tests {
         )
         .unwrap();
 
-        let initial_capacity = source.capacity;
+        // id=0 forces the Mem->Run migration; capacity is only known once
+        // that has happened. The rest of the sequence (1..n below) picks
+        // up where it left off, so the final present-ids set is still
+        // exactly 0..n.
+        source
+            .insert_left(IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)]).unwrap())
+            .unwrap();
+        let initial_capacity = source.run_table().capacity;
         // Enough distinct rows to force at least one rehash, landing the
         // table on more than one page.
         let n = initial_capacity as i64 * 3 + 1;
-        for i in 0..n {
+        for i in 1..n {
             let row =
                 IndexKey::new_from_owned(vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
                     .unwrap();
             source.insert_left(row).unwrap();
         }
         assert!(
-            source.run.page_count() > 1,
+            source.run_table().run.page_count() > 1,
             "expected growth to span multiple pages; page_count={}",
-            source.run.page_count()
+            source.run_table().run.page_count()
         );
 
         let slots = dump_slots(&source);
@@ -1291,7 +1535,11 @@ mod tests {
     // inserted at several scales to see whether that's actually showing
     // up here (flat ns/row = healthy amortized O(1); growing ns/row = the
     // theory confirmed). One next() call is enough to trigger the full
-    // (lazy) build_left phase without spending time probing. Run with:
+    // (lazy) build_left phase without spending time probing.
+    // QueryMemory::new(0) forces the Run-backed table from the start (this
+    // benchmark is about ITS load-factor scaling specifically — at these
+    // row counts a generous budget would just stay in memory and never
+    // touch it at all). Run with:
     //   cargo test -p squeal-sql --lib --release -- --ignored --nocapture \
     //     source::hash::tests::bench_insert_left_scaling_isolates_load_factor_effects
     #[test]
@@ -1307,7 +1555,7 @@ mod tests {
                 left,
                 right,
                 make_db(),
-                QueryMemory::new(256 * 1024 * 1024),
+                QueryMemory::new(0),
                 &[0],
                 &[0],
                 JoinType::Inner,
@@ -1344,11 +1592,13 @@ mod tests {
         let right_rows: Vec<Vec<ValueItem>> = vec![vec![ValueItem::Integer(0)]];
         let left = Box::new(VecSource::new(&["id"], left_rows));
         let right = Box::new(VecSource::new(&["id"], right_rows));
+        // QueryMemory::new(0) forces the Run-backed table this regression
+        // is about — 800K rows would otherwise just stay in memory.
         let mut source = HashedSource::new(
             left,
             right,
             make_db(),
-            QueryMemory::new(256 * 1024 * 1024),
+            QueryMemory::new(0),
             &[0],
             &[0],
             JoinType::Inner,
@@ -1412,6 +1662,23 @@ mod tests {
             join_type,
         )
         .unwrap()
+    }
+
+    // Like join_with_counts, but forced onto the Run-backed table (budget
+    // 0) and built — for tests checking that table's own sizing, which
+    // (unlike swapped/join-result tests) only exists once something has
+    // actually been inserted into it.
+    fn spilled_join_with_counts(join_type: JoinType, left: usize, right: usize) -> HashedSource<MemFile> {
+        spill(HashedSource::new(
+            Box::new(WithRowCount(left_source(), left)),
+            Box::new(WithRowCount(right_source(), right)),
+            make_db(),
+            QueryMemory::new(0),
+            &[0],
+            &[0],
+            join_type,
+        )
+        .unwrap())
     }
 
     #[test]
@@ -1497,50 +1764,68 @@ mod tests {
     fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_not_swapped() {
         // Left (build) is the big table: 30,271 rows vs 10,000 — the ordinary
         // order-details-joins-orders shape. This used to stay at one page.
-        let s = join_with_counts(JoinType::Inner, 30271, 10000);
+        // Forced onto the Run-backed table (QueryMemory::new(0)) — this is
+        // specifically testing THAT table's own sizing, which today's
+        // in-memory-first build only reaches once it has spilled.
+        let s = spilled_join_with_counts(JoinType::Inner, 30271, 10000);
         assert!(!s.swapped);
-        assert!(s.capacity >= wanted_slots(30271), "capacity {}", s.capacity);
-        assert_eq!(s.capacity % s.records_per_page, 0, "whole pages of slots");
+        let rt = s.run_table();
+        assert!(rt.capacity >= wanted_slots(30271), "capacity {}", rt.capacity);
+        assert_eq!(rt.capacity % rt.records_per_page, 0, "whole pages of slots");
         // ...and not wildly more than asked for: at most one extra page.
-        assert!(s.capacity < wanted_slots(30271) + s.records_per_page);
+        assert!(rt.capacity < wanted_slots(30271) + rt.records_per_page);
     }
 
     #[test]
     fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_swapped() {
         // Right is bigger, so it becomes the build side: same table, same size.
-        let swapped = join_with_counts(JoinType::Inner, 10000, 30271);
+        let swapped = spilled_join_with_counts(JoinType::Inner, 10000, 30271);
         assert!(swapped.swapped);
-        let plain = join_with_counts(JoinType::Inner, 30271, 10000);
-        assert_eq!(swapped.capacity, plain.capacity);
+        let plain = spilled_join_with_counts(JoinType::Inner, 30271, 10000);
+        assert_eq!(swapped.run_table().capacity, plain.run_table().capacity);
     }
 
     #[test]
     fn test_a_build_side_without_stats_starts_at_one_page() {
-        let s = make_source();
-        assert_eq!(s.capacity, s.records_per_page);
-        // Only the (post-swap) build side's stats matter; a probe side that
-        // reports none must not stop it being sized.
-        let build_only = HashedSource::new(
-            Box::new(WithRowCount(left_source(), 5000)),
+        // A generous budget never spills a table this small (confirmed by
+        // test_construction_allocates_only_the_pages_the_run_needs) — force
+        // it via 0 to see what the Run-backed table would have started at.
+        let s = spill(HashedSource::new(
+            left_source(),
             right_source(),
             make_db(),
-            QueryMemory::new(1024 * 1024),
+            QueryMemory::new(0),
             &[0],
             &[0],
             JoinType::Inner,
         )
-        .unwrap();
-        assert!(build_only.capacity >= wanted_slots(5000));
+        .unwrap());
+        let rt = s.run_table();
+        assert_eq!(rt.capacity, rt.records_per_page);
+        // Only the (post-swap) build side's stats matter; a probe side that
+        // reports none must not stop it being sized.
+        let build_only = spill(HashedSource::new(
+            Box::new(WithRowCount(left_source(), 5000)),
+            right_source(),
+            make_db(),
+            QueryMemory::new(0),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap());
+        assert!(build_only.run_table().capacity >= wanted_slots(5000));
     }
 
     #[test]
     fn test_construction_allocates_only_the_pages_the_run_needs() {
-        // Used to create a throwaway one-page run alongside the real one, so
-        // every join construction allocated (at least) one page too many.
+        // A generous budget never touches a Run at all — construction, and
+        // even the whole build, stays in memory (see BuildTable's own doc
+        // comment).
         let db = make_db();
         let main_before = db.page_count();
         let before = db.stats().temp.live_pages;
-        let s = HashedSource::new(
+        let mut s = HashedSource::new(
             left_source(),
             right_source(),
             db.clone(),
@@ -1550,23 +1835,49 @@ mod tests {
             JoinType::Inner,
         )
         .unwrap();
+        s.build_left().unwrap();
+        assert!(s.is_mem(), "a small build under a generous budget must never spill");
         assert_eq!(
-            db.stats().temp.live_pages - before,
-            (s.capacity / s.records_per_page) as u64
+            db.stats().temp.live_pages,
+            before,
+            "and so must not allocate a single Run page"
         );
 
+        // Forced to spill (budget 0): used to create a throwaway one-page
+        // run alongside the real one, so every join construction allocated
+        // (at least) one page too many. Now nothing is allocated until (and
+        // unless) a build actually needs it, so this checks the page count
+        // right where that now happens.
         let before = db.stats().temp.live_pages;
-        let big = HashedSource::new(
-            Box::new(WithRowCount(left_source(), 5000)),
-            Box::new(WithRowCount(right_source(), 10)),
+        let small = spill(HashedSource::new(
+            left_source(),
+            right_source(),
             db.clone(),
-            QueryMemory::new(1024 * 1024),
+            QueryMemory::new(0),
             &[0],
             &[0],
             JoinType::Inner,
         )
-        .unwrap();
-        let pages = big.capacity / big.records_per_page;
+        .unwrap());
+        let rt = small.run_table();
+        assert_eq!(
+            db.stats().temp.live_pages - before,
+            (rt.capacity / rt.records_per_page) as u64
+        );
+
+        let before = db.stats().temp.live_pages;
+        let big = spill(HashedSource::new(
+            Box::new(WithRowCount(left_source(), 5000)),
+            Box::new(WithRowCount(right_source(), 10)),
+            db.clone(),
+            QueryMemory::new(0),
+            &[0],
+            &[0],
+            JoinType::Inner,
+        )
+        .unwrap());
+        let rt = big.run_table();
+        let pages = rt.capacity / rt.records_per_page;
         assert!(pages > 1);
         assert_eq!(db.stats().temp.live_pages - before, pages as u64);
         // The join's pages are scratch: they never touch the database file.
@@ -1575,7 +1886,8 @@ mod tests {
 
     // The behavior the sizing exists for: a build whose row count was
     // reported up front never rehashes, while the same build with no stats
-    // has to grow by doubling.
+    // has to grow by doubling. Forced onto the Run-backed table throughout
+    // (QueryMemory::new(0)) — this specifically tests THAT table's sizing.
     #[test]
     fn test_a_build_sized_from_stats_does_not_rehash_but_an_unsized_one_does() {
         let n = 1000usize;
@@ -1595,7 +1907,7 @@ mod tests {
                 left,
                 Box::new(VecSource::new(&["id", "val"], rows(1))),
                 make_db(),
-                QueryMemory::new(1024 * 1024),
+                QueryMemory::new(0),
                 &[0],
                 &[0],
                 JoinType::Inner,
@@ -1603,22 +1915,27 @@ mod tests {
             .unwrap()
         };
 
+        // next()'s own lazy build (not the spill() helper, which would
+        // build a second time on top and double-count nothing meaningful
+        // but is unnecessary here) drains the build side in full.
         let mut sized = build(true);
-        let initial = sized.capacity;
         while sized.next().unwrap().is_some() {}
         assert_eq!(sized.count, n);
-        assert_eq!(
-            sized.capacity, initial,
-            "a correctly pre-sized build must never rehash"
+        let rt = sized.run_table();
+        assert!(
+            rt.capacity >= wanted_slots(n) && rt.capacity < wanted_slots(n) + rt.records_per_page,
+            "a correctly pre-sized build must never rehash past its initial stats-based size: \
+             capacity={}",
+            rt.capacity
         );
 
         let mut unsized_ = build(false);
-        let initial = unsized_.capacity;
         while unsized_.next().unwrap().is_some() {}
         assert_eq!(unsized_.count, n);
+        let rt = unsized_.run_table();
         assert!(
-            unsized_.capacity > initial,
-            "with no stats the build has to grow by rehashing"
+            rt.capacity > rt.records_per_page,
+            "with no stats the build has to grow past its one-page start by rehashing"
         );
     }
 
@@ -1636,11 +1953,16 @@ mod tests {
                 .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
                 .collect()
         };
+        // Forced onto the Run-backed table (budget 0) — this test is about
+        // THAT table's own pages spilling to the temp file under the pool's
+        // cache pressure, a different mechanism from (and downstream of)
+        // QueryMemory: a build this size would otherwise just stay in
+        // memory and never touch the temp pool at all.
         let mut join = HashedSource::new(
             Box::new(VecSource::new(&["id", "val"], rows(n))),
             Box::new(VecSource::new(&["id", "val"], rows(n))),
             db.clone(),
-            QueryMemory::new(1024 * 1024),
+            QueryMemory::new(0),
             &[0],
             &[0],
             JoinType::Inner,
@@ -1663,3 +1985,4 @@ mod tests {
         );
     }
 }
+

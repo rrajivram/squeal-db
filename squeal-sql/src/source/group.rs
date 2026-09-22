@@ -341,6 +341,56 @@ mod tests {
         assert_eq!(drain(&mut group), vec![vec![ValueItem::Integer(0)]]);
     }
 
+    // Regression: SortSource::reset() used to be a no-op — since
+    // GroupSource::reset() delegates straight to its (sorting) source, a
+    // re-scanned GROUP BY silently returned zero rows on the second pass
+    // (results/progress were never cleared, and the first pass had already
+    // drained them). Wires GroupSource over a real SortSource, the same
+    // shape plan::logical actually builds for GROUP BY (SortSource::
+    // with_fields, then GroupSource::new over it) — the group.rs tests
+    // above all feed GroupSource pre-sorted data directly, which never
+    // touches SortSource::reset() at all.
+    #[test]
+    fn test_group_by_over_a_real_sort_can_be_reset_and_rescanned() {
+        use crate::plan::memory::QueryMemory;
+        use crate::source::sort::{SortField, SortSource};
+
+        let raw: Box<dyn Source> = Box::new(VecSource::new(
+            &["cat"],
+            vec![
+                vec![ValueItem::Integer(1)],
+                vec![ValueItem::Integer(0)],
+                vec![ValueItem::Integer(1)],
+                vec![ValueItem::Integer(0)],
+                vec![ValueItem::Integer(0)],
+            ],
+        ));
+        let db = store::db::Db::<store::memfile::MemFile>::create("group_reset_test.db").unwrap();
+        let sorted = SortSource::new(
+            raw,
+            &[SortField { asc: true, null_first: true, index: 0 }],
+            None,
+            db,
+            QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let fields = vec![key_field("cat", 0), count_star_field("count")];
+        let mut group = GroupSource::new(Box::new(sorted), fields, vec![0]);
+
+        let first = drain(&mut group);
+        assert_eq!(
+            first,
+            vec![
+                vec![ValueItem::Integer(0), ValueItem::Integer(3)],
+                vec![ValueItem::Integer(1), ValueItem::Integer(2)],
+            ]
+        );
+
+        group.reset().unwrap();
+        let second = drain(&mut group);
+        assert_eq!(second, first, "a reset GROUP BY over a real sort must reproduce the same groups");
+    }
+
     #[test]
     fn test_group_by_resets_between_groups_not_just_at_the_very_start() {
         // Guards against a reset-once-at-construction bug: the second

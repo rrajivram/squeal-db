@@ -77,6 +77,25 @@ struct SortedRuns<F: DBFile + 'static> {
     record_size: usize,
 }
 
+// What build_initial_runs produced.
+enum InitialBuild<F: DBFile + 'static> {
+    // No rows at all.
+    Empty,
+    // The whole input fit in the memory budget: already sorted, ascending.
+    // Never touched a Run.
+    InMemory(Vec<IndexKey>),
+    // Didn't fit: today's Run-backed runs, ready for merge_runs.
+    Spilled(SortedRuns<F>),
+}
+
+// What build_sort produced — BuildOutcome::InMemory carries the same
+// ascending order InitialBuild::InMemory does.
+enum BuildOutcome<F: DBFile + 'static> {
+    Empty,
+    InMemory(Vec<IndexKey>),
+    Spilled(SortProgress<F>),
+}
+
 impl<F> SortSource<F>
 where
     F: DBFile + 'static,
@@ -197,8 +216,12 @@ where
         })
     }
 
-    // None when the input had no rows at all (there is nothing to merge).
-    fn build_sort(&mut self) -> Result<Option<SortProgress<F>>, SchemaError> {
+    // What sorting the whole input produced. InMemory is the common case: the
+    // input never exceeded the memory budget, so it was sorted with a plain
+    // Vec — no Run, no postcard — see build_initial_runs' own doc comment.
+    // Spilled is today's external-merge-sort path, unchanged, for when it
+    // didn't fit.
+    fn build_sort(&mut self) -> Result<BuildOutcome<F>, SchemaError> {
         let record_size = self
             .source
             .fields()
@@ -208,10 +231,12 @@ where
         if record_size == 0 {
             return Err(SchemaError::UnknownError("Record size is 0".into()));
         }
-        let mut run = self.build_initial_runs(record_size)?;
-        if run.runs.is_empty() {
-            return Ok(None);
-        }
+        let built = self.build_initial_runs(record_size)?;
+        let mut run = match built {
+            InitialBuild::Empty => return Ok(BuildOutcome::Empty),
+            InitialBuild::InMemory(sorted) => return Ok(BuildOutcome::InMemory(sorted)),
+            InitialBuild::Spilled(runs) => runs,
+        };
         // merge_runs is strictly 2-way (see its own pairwise pop loop), so
         // reducing `run.runs.len()` initial runs down to 1 always takes
         // ceil(log2(run.runs.len())) rounds — computed directly from the
@@ -231,7 +256,7 @@ where
             .map(|t| Self::from_tuple(t).map(|v| v.into_iter()))
             .transpose()?;
 
-        Ok(Some(SortProgress { run: cursor, iter }))
+        Ok(BuildOutcome::Spilled(SortProgress { run: cursor, iter }))
     }
 
     fn merge_runs(
@@ -342,7 +367,16 @@ where
         Ok(from_bytes(tuple.data())?)
     }
 
-    fn build_initial_runs(&mut self, record_size: usize) -> Result<SortedRuns<F>, SchemaError> {
+    // Reads the whole input, sorted, ready for build_sort. The common case
+    // — the input never exceeds the memory budget reserved along the way —
+    // returns InMemory: nothing beyond `run` (kept only to learn
+    // records_per_page/data_size; never written to) ever touches a Run
+    // page or postcard. Only once a reservation actually fails does this
+    // fall back to closing what's accumulated so far into a real Run and
+    // continuing the existing page/run-budgeted accumulation — from that
+    // point on this is unchanged from before this in-memory fast path
+    // existed.
+    fn build_initial_runs(&mut self, record_size: usize) -> Result<InitialBuild<F>, SchemaError> {
         let mut run = self.db.create_run()?;
         let mut runs = vec![];
         let mut mems = vec![];
@@ -414,6 +448,16 @@ where
                 }
             }
         }
+        // Never had to spill: the whole input is still sitting in
+        // `current_run`, and `runs` never got a single entry written to it.
+        // Sort it in memory and hand it back directly — `run` (never
+        // written to) and `mems` (the reservations) both just drop here.
+        if !mem_filled && runs.is_empty() {
+            if current_run.is_empty() {
+                return Ok(InitialBuild::Empty);
+            }
+            return Ok(InitialBuild::InMemory(Self::sort_rows(&self.sort_fields, current_run)));
+        }
         if !current_run.is_empty() {
             Self::close_run(
                 &self.sort_fields,
@@ -424,12 +468,12 @@ where
             runs.push(run);
         }
 
-        Ok(SortedRuns {
+        Ok(InitialBuild::Spilled(SortedRuns {
             runs,
             count: total_count,
             mem: mems,
             record_size,
-        })
+        }))
     }
 
     // Sorts every row accumulated for the run currently being built —
@@ -444,14 +488,7 @@ where
         rows: &mut Vec<IndexKey>,
         records_per_page: usize,
     ) -> Result<(), SchemaError> {
-        let mut heap = BinaryHeap::with_capacity(rows.len());
-        for r in rows.drain(..) {
-            heap.push(CrateItem {
-                key: r,
-                order: sort_fields,
-            });
-        }
-        let sorted: Vec<IndexKey> = heap.into_sorted_vec().into_iter().map(|i| i.key).collect();
+        let sorted = Self::sort_rows(sort_fields, std::mem::take(rows));
         let chunks: Vec<&[IndexKey]> = sorted.chunks(records_per_page.max(1)).collect();
         for (i, chunk) in chunks.iter().enumerate() {
             let data = to_allocvec(&chunk.to_vec())?;
@@ -462,6 +499,17 @@ where
             }
         }
         Ok(())
+    }
+
+    // Sorts `rows` as one whole batch (not per chunk — see
+    // build_initial_runs' own comment on why that distinction is
+    // load-bearing for a Run spanning more than one page), ascending by
+    // `sort_fields`. Shared by close_run (about to split the result across
+    // Run pages) and the in-memory fast path (which just keeps it).
+    fn sort_rows(sort_fields: &[SortField], rows: Vec<IndexKey>) -> Vec<IndexKey> {
+        let mut rows = rows;
+        rows.sort_unstable_by(|a, b| cmp_by_fields(a, b, sort_fields));
+        rows
     }
 }
 
@@ -566,8 +614,15 @@ where
         } else {
             let start = Instant::now();
             match self.build_sort()? {
-                Some(progress) => self.progress = Some(progress),
-                None => self.results = Some(vec![]),
+                BuildOutcome::Empty => self.results = Some(vec![]),
+                // `results` is read back with .pop() (from the end), so the
+                // already-ascending sort is reversed here — same convention
+                // the limited/CrateHeap path above uses.
+                BuildOutcome::InMemory(mut sorted) => {
+                    sorted.reverse();
+                    self.results = Some(sorted);
+                }
+                BuildOutcome::Spilled(progress) => self.progress = Some(progress),
             }
             self.sort_time += start.elapsed().as_nanos();
             self.next()
@@ -635,59 +690,69 @@ impl<'a> CrateHeap<'a> {
     }
 }
 
+// Was, inline in CrateItem::cmp: push every field's Ordering into a Vec (a
+// heap allocation on every single comparison — O(n log n) of them for a
+// sort of n rows), then loop back over the Vec to find the first non-Equal.
+// Returning as soon as a field decides (a tie still falls through to the
+// next field either way) does the same job with no allocation — the
+// dominant cost of a full ORDER BY (found while quantifying the Run/
+// postcard cost this same sort was also paying — see plan/eval's same
+// investigation). A free function, not just CrateItem::cmp's body, so
+// sort_rows can sort a plain `Vec<IndexKey>` directly (sort_unstable_by)
+// without wrapping every row in a CrateItem first.
+fn cmp_by_fields(lhs_key: &IndexKey, rhs_key: &IndexKey, order: &[SortField]) -> Ordering {
+    // Iterate the ORDER BY clauses themselves, in their own order — not
+    // lhs_key.values() — and use each one's own `index` (its flat position
+    // in the row, resolved back in create_from) to pull its value out of
+    // the row. `ORDER BY name` on a 3-column `SELECT *` has exactly one
+    // sort field but a 3-value row; the two lengths only ever coincide when
+    // every projected column is also an ORDER BY key, which isn't the
+    // general case.
+    for field in order {
+        let lhs = &lhs_key.values()[field.index];
+        let rhs = &rhs_key.values()[field.index];
+        let ord = match (lhs, rhs) {
+            // Both NULL on this column is a tie — fall through to the next
+            // sort key, not a forced Less/Greater.
+            (ValueItem::Null, ValueItem::Null) => Ordering::Equal,
+            // Only one side is NULL: which side it's on decides the
+            // verdict, not just null_first alone — self holding NULL and
+            // other holding NULL need opposite answers for the same
+            // null_first setting, or cmp(a,b)/cmp(b,a) stop being exact
+            // opposites (a real Ord violation: sort()/BinaryHeap both
+            // assume that).
+            (ValueItem::Null, _) => {
+                if field.null_first {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (_, ValueItem::Null) => {
+                if field.null_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            _ => {
+                if field.asc {
+                    lhs.cmp(rhs)
+                } else {
+                    rhs.cmp(lhs)
+                }
+            }
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 impl<'a> Ord for CrateItem<'a> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let mut results = vec![];
-        // Iterate the ORDER BY clauses themselves, in their own order —
-        // not self.key.values() — and use each one's own `index` (its
-        // flat position in the row, resolved back in create_from) to
-        // pull its value out of the row. `ORDER BY name` on a 3-column
-        // `SELECT *` has exactly one sort field but a 3-value row; the
-        // two lengths only ever coincide when every projected column is
-        // also an ORDER BY key, which isn't the general case.
-        for field in self.order.iter() {
-            let lhs = &self.key.values()[field.index];
-            let rhs = &other.key.values()[field.index];
-            match (lhs, rhs) {
-                // Both NULL on this column is a tie — fall through to the
-                // next sort key, not a forced Less/Greater.
-                (ValueItem::Null, ValueItem::Null) => results.push(Ordering::Equal),
-                // Only one side is NULL: which side it's on decides the
-                // verdict, not just null_first alone — self holding NULL
-                // and other holding NULL need opposite answers for the
-                // same null_first setting, or cmp(a,b)/cmp(b,a) stop being
-                // exact opposites (a real Ord violation: sort()/BinaryHeap
-                // both assume that).
-                (ValueItem::Null, _) => {
-                    if field.null_first {
-                        results.push(Ordering::Less);
-                    } else {
-                        results.push(Ordering::Greater);
-                    }
-                }
-                (_, ValueItem::Null) => {
-                    if field.null_first {
-                        results.push(Ordering::Greater);
-                    } else {
-                        results.push(Ordering::Less);
-                    }
-                }
-                _ => {
-                    if field.asc {
-                        results.push(lhs.cmp(rhs));
-                    } else {
-                        results.push(rhs.cmp(lhs));
-                    }
-                }
-            }
-        }
-        let iter = results.iter();
-        for order in iter {
-            if !matches!(order, Ordering::Equal) {
-                return *order;
-            }
-        }
-        Ordering::Equal
+        cmp_by_fields(&self.key, &other.key, self.order)
     }
 }
 
@@ -1067,19 +1132,39 @@ mod tests {
     }
 
     #[test]
-    fn test_build_initial_runs_single_run_when_budget_is_generous() {
+    fn test_build_initial_runs_stays_in_memory_when_budget_is_generous() {
         let record_size = probe_record_size();
         let mut sort = unlimited_sort_source(int_rows(5), 10_000_000);
-        let runs = sort.build_initial_runs(record_size).unwrap();
-        assert_eq!(runs.runs.len(), 1);
-        assert_eq!(runs.count, 5);
+        let built = sort.build_initial_runs(record_size).unwrap();
+        let InitialBuild::InMemory(sorted) = built else {
+            panic!("a generous budget must never spill to a Run");
+        };
         assert_eq!(
-            run_contents(&runs.runs[0])
-                .iter()
-                .map(|k| k.values()[0].clone())
-                .collect::<Vec<_>>(),
+            sorted.iter().map(|k| k.values()[0].clone()).collect::<Vec<_>>(),
             (0..5).map(ValueItem::Integer).collect::<Vec<_>>(),
-            "the one run's own content must already be sorted ascending"
+            "the in-memory result must already be sorted ascending"
+        );
+        // The one throwaway Run created just to learn data_size()/
+        // records_per_page (never written to) is dropped before returning
+        // — nothing this path does allocates a page that outlives the call.
+        assert_eq!(
+            sort.db.stats().temp.live_pages,
+            0,
+            "the in-memory path must not leave any Run page allocated"
+        );
+    }
+
+    #[test]
+    fn test_build_initial_runs_falls_back_to_a_run_once_the_budget_is_exceeded() {
+        let record_size = probe_record_size();
+        let data_size = probe_data_size();
+        // One page's worth of reservation room: the initial reservation
+        // succeeds, but growing past it must fail and force a spill.
+        let mut sort = unlimited_sort_source(int_rows(9_999), data_size);
+        let built = sort.build_initial_runs(record_size).unwrap();
+        assert!(
+            matches!(built, InitialBuild::Spilled(_)),
+            "exceeding the budget must spill to a Run, not stay in memory"
         );
     }
 
@@ -1096,7 +1181,9 @@ mod tests {
 
         // A budget of exactly one page forces a new run on every flush.
         let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
-        let runs = sort.build_initial_runs(record_size).unwrap();
+        let InitialBuild::Spilled(runs) = sort.build_initial_runs(record_size).unwrap() else {
+            panic!("a one-page budget over 4 pages of rows must spill");
+        };
 
         let total_recovered: usize = runs.runs.iter().map(|r| run_contents(r).len()).sum();
         assert_eq!(
@@ -1122,7 +1209,9 @@ mod tests {
         let total_rows = records_per_page * 4;
 
         let mut sort = unlimited_sort_source(int_rows(total_rows as i64), data_size);
-        let runs = sort.build_initial_runs(record_size).unwrap();
+        let InitialBuild::Spilled(runs) = sort.build_initial_runs(record_size).unwrap() else {
+            panic!("a one-page budget over 4 pages of rows must spill");
+        };
 
         // Every run except a possible smaller trailing leftover should
         // hold exactly one page's worth (the budget here is one page).
@@ -1322,3 +1411,4 @@ mod tests {
         assert_eq!(drain(&mut sort), first);
     }
 }
+

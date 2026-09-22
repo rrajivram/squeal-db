@@ -369,20 +369,24 @@ fn test_execute_select_group_by_collapses_rows_sharing_a_group_key() {
 
 #[test]
 fn test_execute_select_group_by_collapses_correctly_at_a_scale_spanning_multiple_pages() {
-    // Regression test: GROUP BY silently fragmented into far more
-    // groups than actually existed once the sort behind it (SortSource,
-    // via GroupSource -> SortSource::with_fields in logical.rs) had
-    // enough rows for a single run to span more than one page —
-    // build_initial_runs used to sort and flush one page's worth at a
-    // time, in a fresh heap per page, so each PAGE came out internally
-    // sorted but consecutive pages within the same run were never
-    // ordered relative to each other. Invisible at the tiny scale of
-    // test_execute_select_group_by_collapses_rows_sharing_a_group_key
-    // above (3 rows never even fills one page); reproduces reliably
-    // once row count actually forces multiple pages, well within
-    // DEFAULT_QUERY_MEMORY_LIMIT's real 64 MiB budget (single run, no
-    // run-to-run merge needed — this is purely about ordering within
-    // one run).
+    // Originally a regression test for GROUP BY silently fragmenting into
+    // far more groups than actually existed once the sort behind it
+    // (SortSource, via GroupSource -> SortSource::with_fields in
+    // logical.rs) had enough rows for a single Run to span more than one
+    // page — build_initial_runs used to sort and flush one page's worth
+    // at a time, in a fresh heap per page, so each PAGE came out
+    // internally sorted but consecutive pages within the same run were
+    // never ordered relative to each other.
+    //
+    // At this data size (well within DEFAULT_QUERY_MEMORY_LIMIT's 64 MiB
+    // budget) that bug can no longer reproduce here at all: SortSource now
+    // sorts a build this small entirely in memory (one plain Vec, no Run,
+    // no page split — see build_initial_runs' own doc comment), so this
+    // now mainly checks GROUP BY correctness at a few thousand rows. The
+    // original multi-page-run regression is still covered, at the
+    // SortSource level (forcing a real spill via a tight memory budget),
+    // by test_a_run_spanning_multiple_pages_is_globally_sorted_not_just_
+    // page_locally in source/sort.rs.
     const N: i64 = 5_000;
     const NUM_CATEGORIES: i64 = 5;
     let c = conn();
@@ -3018,4 +3022,27 @@ fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is
         }
     }
     assert!(differing >= 6, "the unsafe cases were actually exercised ({differing})");
+}
+
+
+// DISTINCT and GROUP BY both sort via SortSource::with_fields, the same
+// unlimited path ORDER BY/the merge join use (see plan::logical's two call
+// sites) — this confirms they actually take the in-memory fast path (no
+// Run, no temp page) for data that fits the query's memory budget, not just
+// that the SQL happens to still return the right rows.
+#[test]
+fn test_distinct_and_group_by_use_the_in_memory_sort_fast_path_when_they_fit() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, cat integer, primary key(id))").unwrap();
+    for i in 0..200 {
+        run(&c, &format!("insert into t values ({i}, {})", i % 5)).unwrap();
+    }
+    let db = c.database.read().db.clone();
+
+    let before = db.stats().temp;
+    run(&c, "select distinct cat from t").unwrap();
+    assert_eq!(db.stats().temp, before, "DISTINCT must not touch a Run page here");
+
+    run(&c, "select cat, count(*) from t group by cat").unwrap();
+    assert_eq!(db.stats().temp, before, "GROUP BY must not touch a Run page here");
 }
