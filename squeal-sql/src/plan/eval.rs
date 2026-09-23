@@ -143,17 +143,21 @@ impl EvalExpr {
                 format!("({} {sym} {})", lhs.describe(names), rhs.describe(names))
             }
             Self::Function(f) => {
-                use crate::plan::funcs::FuncTrait;
-                let cols = f.fields();
-                // No column arguments is the count(*) form.
-                let args = if cols.is_empty() {
-                    "*".to_string()
-                } else {
-                    cols.iter()
-                        .map(|i| Self::column_label(names, *i))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
+                use crate::plan::funcs::{FuncArgs, FuncTrait};
+                // Each argument recursively describes itself — not just
+                // f.fields()'s flat column positions, which can't express
+                // an argument that is itself a call (concat(name,
+                // upper(name)) used to render as concat(name, name),
+                // collapsing to the column upper() ultimately reads).
+                let args = f
+                    .args()
+                    .iter()
+                    .map(|a| match a {
+                        FuncArgs::Wildcard => "*".to_string(),
+                        FuncArgs::Field(e) => e.describe(names),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 format!("{}({args})", f.name())
             }
         }

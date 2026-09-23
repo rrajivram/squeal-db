@@ -3046,3 +3046,101 @@ fn test_distinct_and_group_by_use_the_in_memory_sort_fast_path_when_they_fit() {
     run(&c, "select cat, count(*) from t group by cat").unwrap();
     assert_eq!(db.stats().temp, before, "GROUP BY must not touch a Run page here");
 }
+
+// ---- new SQL functions: min, max, sum, lower, concat ----
+
+fn new_funcs_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(&c, "create table t (id integer not null, cat integer, name varchar(20), primary key(id))").unwrap();
+    for (id, cat, name) in [(1, 0, "Bob"), (2, 1, "alice"), (3, 0, "Cy"), (4, 1, "Dee")] {
+        run(&c, &format!("insert into t values ({id}, {cat}, '{name}')")).unwrap();
+    }
+    c
+}
+
+#[test]
+fn test_min_max_sum_as_bare_aggregates() {
+    let c = new_funcs_conn();
+    assert_eq!(select_sorted(&c, "select min(id) from t"), ints(&[&[1]]));
+    assert_eq!(select_sorted(&c, "select max(id) from t"), ints(&[&[4]]));
+    assert_eq!(select_sorted(&c, "select sum(id) from t"), ints(&[&[10]]));
+}
+
+#[test]
+fn test_min_max_sum_grouped_by_category() {
+    let c = new_funcs_conn();
+    assert_eq!(
+        select_sorted(&c, "select cat, min(id), max(id), sum(id) from t group by cat"),
+        ints(&[&[0, 1, 3, 4], &[1, 2, 4, 6]])
+    );
+}
+
+#[test]
+fn test_min_max_sum_over_an_empty_table_report_null() {
+    let c = conn();
+    run(&c, "create table e (id integer not null, primary key(id))").unwrap();
+    let (_, rows) = select_rows(&c, "select min(id), max(id), sum(id) from e");
+    assert_eq!(rows, vec![vec![ValueItem::Null, ValueItem::Null, ValueItem::Null]]);
+}
+
+#[test]
+fn test_lower_and_upper_as_scalar_functions() {
+    let c = new_funcs_conn();
+    let mut rows = select_rows(&c, "select lower(name), upper(name) from t").1;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Str(("alice".into(), 20)), ValueItem::Str(("ALICE".into(), 20))],
+            vec![ValueItem::Str(("bob".into(), 20)), ValueItem::Str(("BOB".into(), 20))],
+            vec![ValueItem::Str(("cy".into(), 20)), ValueItem::Str(("CY".into(), 20))],
+            vec![ValueItem::Str(("dee".into(), 20)), ValueItem::Str(("DEE".into(), 20))],
+        ]
+    );
+}
+
+#[test]
+fn test_concat_as_a_scalar_function() {
+    let c = new_funcs_conn();
+    let mut rows = select_rows(&c, "select concat(name, '-', id) from t").1;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Str(("Bob-1".into(), 6))],
+            vec![ValueItem::Str(("Cy-3".into(), 5))],
+            vec![ValueItem::Str(("Dee-4".into(), 6))],
+            vec![ValueItem::Str(("alice-2".into(), 8))],
+        ]
+    );
+}
+
+#[test]
+fn test_min_max_work_on_strings_through_sql() {
+    let c = new_funcs_conn();
+    let (_, rows) = select_rows(&c, "select min(name), max(name) from t");
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Str(("Bob".into(), 20)), ValueItem::Str(("alice".into(), 20))]]
+    );
+}
+
+#[test]
+fn test_explain_shows_min_max_sum_and_scalar_functions() {
+    let c = new_funcs_conn();
+    let plan = explain(&c, "select cat, min(id), sum(id) from t group by cat");
+    assert!(plan.contains("min(id)") && plan.contains("sum(id)"), "{plan}");
+    // A variadic argument list, literal included (describe() renders each
+    // argument via its own describe(), not just the columns it reads —
+    // see EvalExpr::describe's own comment).
+    let plan = explain(&c, "select concat(name, '-', id) from t");
+    assert!(plan.contains("concat(name, '-', id)"), "{plan}");
+    let plan = explain(&c, "select upper(name), lower(name) from t");
+    assert!(plan.contains("upper(name)") && plan.contains("lower(name)"), "{plan}");
+    // A call nested inside another function's argument list renders as
+    // itself, not the column it ultimately reads (this used to collapse
+    // to `concat(name, name)` — see FuncTrait::args' own doc comment on
+    // the fix).
+    let plan = explain(&c, "select concat(name, upper(name)) from t");
+    assert!(plan.contains("concat(name, upper(name))"), "{plan}");
+}
