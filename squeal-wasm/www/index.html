@@ -6,47 +6,78 @@
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
   h1 { font-size: 1.3rem; }
-  textarea { width: 100%; height: 8rem; font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; }
-  button { padding: 0.5rem 1.2rem; font-size: 0.95rem; margin-top: 0.5rem; cursor: pointer; }
-  #status { color: #666; font-size: 0.85rem; margin-left: 1rem; }
-  #output { margin-top: 1rem; }
-  table { border-collapse: collapse; margin: 0.5rem 0 1rem; }
+  .hint { color: #888; font-size: 0.8rem; }
+  #status { color: #666; font-size: 0.85rem; }
+
+  #cells { margin-top: 1.5rem; }
+  .cell { border-left: 3px solid #ddd; padding: 0.2rem 0 0.2rem 0.8rem; margin-bottom: 1rem; }
+  .cell .idx { color: #999; font-size: 0.75rem; font-family: ui-monospace, Menlo, monospace; }
+  .cell .in { font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; white-space: pre-wrap; background: #f7f7f7; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.2rem 0 0.5rem; cursor: pointer; }
+  .cell .in:hover { background: #efefef; }
+  .cell .in::before { content: '↩ click to re-run in prompt below'; display: block; font-size: 0.7rem; color: #aaa; margin-bottom: 0.15rem; }
+
+  table { border-collapse: collapse; margin: 0.3rem 0 0.6rem; }
   th, td { border: 1px solid #ccc; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
   th { background: #f0f0f0; }
-  .msg { font-size: 0.85rem; color: #444; padding: 0.4rem 0; }
-  .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; }
-  .hint { color: #888; font-size: 0.8rem; }
+  .msg { font-size: 0.85rem; color: #444; padding: 0.2rem 0; }
+  .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 4px; }
+
+  #prompt { position: sticky; bottom: 0; background: #fff; padding-top: 0.8rem; border-top: 1px solid #ddd; }
+  textarea { width: 100%; height: 5rem; font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; }
+  .controls { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.4rem; }
+  button { padding: 0.5rem 1.2rem; font-size: 0.95rem; cursor: pointer; }
+  button.secondary { background: none; border: 1px solid #ccc; }
 </style>
 </head>
 <body>
 
 <h1>squeal-db, running entirely in this tab (WebAssembly, in-memory, no server)</h1>
-<p class="hint">Everything below runs in your browser's wasm sandbox. The database is created fresh on page load and disappears when you close/reload the tab — nothing is written to disk.</p>
+<p class="hint">
+  Everything runs in your browser's wasm sandbox — the database is created fresh on page load and
+  disappears on reload; nothing is written to disk. Each run below becomes its own block, like a
+  notebook cell, so earlier results stay on screen. Click any past command to load it back into the
+  prompt. In the prompt: <b>Enter</b> runs once the statement ends with <code>;</code> (otherwise it
+  just starts a new line, so multi-line statements keep typing), <b>Shift+Enter</b> always inserts a
+  newline, <b>⌘/Ctrl+Enter</b> always runs regardless, and <b>↑/↓</b> at the start/end of the text
+  recalls command history (persisted across reloads, though the database itself is not).
+</p>
 
-<textarea id="sql">create table t (id integer not null, name varchar(20), primary key(id));
+<div id="cells"></div>
+
+<div id="prompt">
+  <textarea id="sql" spellcheck="false">create table t (id integer not null, name varchar(20), primary key(id));
 insert into t values (1, 'alice'), (2, 'bob'), (3, 'carol');
 select * from t order by id;</textarea>
-<br>
-<button id="run" disabled>Run</button>
-<span id="status">loading wasm…</span>
-
-<div id="output"></div>
+  <div class="controls">
+    <button id="run" disabled>Run</button>
+    <button id="clear" class="secondary">Clear notebook</button>
+    <span id="status">loading wasm…</span>
+  </div>
+</div>
 
 <script type="module">
   import init, { SquealDb } from './pkg/squeal_wasm.js';
 
   const runBtn = document.getElementById('run');
+  const clearBtn = document.getElementById('clear');
   const statusEl = document.getElementById('status');
   const sqlEl = document.getElementById('sql');
-  const outEl = document.getElementById('output');
+  const cellsEl = document.getElementById('cells');
+
+  const HISTORY_KEY = 'squeal-wasm-demo-history';
+  let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
+  let historyPos = history.length; // one past the end = "not browsing history"
+  let draft = '';
 
   let db;
+  let cellCount = 0;
 
   async function boot() {
     await init();
     db = new SquealDb('browser-demo');
     statusEl.textContent = 'ready';
     runBtn.disabled = false;
+    sqlEl.focus();
   }
 
   function renderResult(r) {
@@ -83,26 +114,99 @@ select * from t order by id;</textarea>
     return wrap;
   }
 
+  function addCell(sql, body) {
+    cellCount += 1;
+    const cell = document.createElement('div');
+    cell.className = 'cell';
+
+    const idx = document.createElement('div');
+    idx.className = 'idx';
+    idx.textContent = `[${cellCount}]`;
+    cell.appendChild(idx);
+
+    const inEl = document.createElement('div');
+    inEl.className = 'in';
+    inEl.textContent = sql;
+    inEl.title = 'click to load into the prompt below';
+    inEl.addEventListener('click', () => {
+      sqlEl.value = sql;
+      sqlEl.focus();
+      historyPos = history.length;
+    });
+    cell.appendChild(inEl);
+
+    cell.appendChild(body);
+    cellsEl.appendChild(cell);
+    cell.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }
+
+  function pushHistory(sql) {
+    if (history[history.length - 1] !== sql) {
+      history.push(sql);
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    }
+    historyPos = history.length;
+  }
+
   function run() {
-    outEl.innerHTML = '';
     const sql = sqlEl.value;
+    if (!sql.trim()) return;
+
+    const body = document.createElement('div');
     try {
       const json = db.execute(sql);
       const results = JSON.parse(json);
       for (const r of results) {
-        outEl.appendChild(renderResult(r));
+        body.appendChild(renderResult(r));
       }
     } catch (e) {
       const pre = document.createElement('div');
       pre.className = 'err';
       pre.textContent = e.message || String(e);
-      outEl.appendChild(pre);
+      body.appendChild(pre);
     }
+
+    addCell(sql, body);
+    pushHistory(sql);
+    sqlEl.value = '';
   }
 
   runBtn.addEventListener('click', run);
+  clearBtn.addEventListener('click', () => { cellsEl.innerHTML = ''; cellCount = 0; });
+
   sqlEl.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') run();
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      run();
+      return;
+    }
+    // Plain Enter: run once the statement looks complete (ends with ';'),
+    // same convention as sqlite3/psql/mysql's own rustyline-backed REPLs —
+    // otherwise fall through and let the textarea insert a newline as
+    // usual, so a multi-line statement can keep being typed. Shift+Enter
+    // always falls through to a newline (native textarea behavior, no
+    // special-casing needed since we only intercept the plain case here).
+    if (e.key === 'Enter' && !e.shiftKey && sqlEl.value.trim().endsWith(';')) {
+      e.preventDefault();
+      run();
+      return;
+    }
+    const atStart = sqlEl.selectionStart === 0 && sqlEl.selectionEnd === 0;
+    const atEnd = sqlEl.selectionStart === sqlEl.value.length && sqlEl.selectionEnd === sqlEl.value.length;
+
+    if (e.key === 'ArrowUp' && atStart && historyPos > 0) {
+      e.preventDefault();
+      if (historyPos === history.length) draft = sqlEl.value;
+      historyPos -= 1;
+      sqlEl.value = history[historyPos];
+      sqlEl.setSelectionRange(0, 0);
+    } else if (e.key === 'ArrowDown' && atEnd && historyPos < history.length) {
+      e.preventDefault();
+      historyPos += 1;
+      sqlEl.value = historyPos === history.length ? draft : history[historyPos];
+      const p = sqlEl.value.length;
+      sqlEl.setSelectionRange(p, p);
+    }
   });
 
   boot().catch((e) => {
