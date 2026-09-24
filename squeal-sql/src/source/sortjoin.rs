@@ -6,11 +6,11 @@ use std::{
     panic,
     sync::Arc,
     thread,
-    time::Instant,
 };
 
 use postcard::{from_bytes, to_allocvec};
 use store::{
+    clock::Instant,
     cursor::Cursor,
     db::{DBFile, Db},
     run::{Run, RunCursor},
@@ -483,7 +483,7 @@ impl<F: DBFile + 'static> Debug for SortJoinSource<F> {
 
 #[cfg(test)]
 mod tests {
-    use store::{memfile::MemFile, valueitem::ValueItem};
+    use store::{clock::Instant, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
     use crate::source::{

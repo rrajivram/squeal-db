@@ -1,16 +1,15 @@
-use crate::source::{column_names, planinfo::PlanNode};
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, VecDeque},
     fmt::Debug,
     sync::Arc,
-    time::Instant,
     vec::IntoIter,
 };
 
 use postcard::{from_bytes, to_allocvec};
 use sql_parser::{Expr, query::OrderByClause};
 use store::{
+    clock::Instant,
     cursor::Cursor,
     db::{DBFile, Db},
     run::{Run, RunCursor},
@@ -21,7 +20,7 @@ use store::{
 use crate::{
     error::SchemaError,
     plan::memory::{MemReservation, QueryMemory},
-    source::{ProjectableField, QueryStats, Source, merge_stats},
+    source::{ProjectableField, QueryStats, Source, column_names, merge_stats, planinfo::PlanNode},
 };
 
 #[derive(Debug, Clone)]

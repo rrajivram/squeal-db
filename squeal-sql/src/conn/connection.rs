@@ -1,9 +1,6 @@
-use std::{
-    collections::HashMap,
-    collections::HashSet,
-    fs::File,
-    sync::{Arc, LazyLock},
-};
+use std::{collections::HashMap, collections::HashSet, sync::Arc};
+#[cfg(not(target_arch = "wasm32"))]
+use std::{fs::File, sync::LazyLock};
 
 use parking_lot::RwLock;
 use store::{db::DBFile, txn::Transaction};
@@ -30,6 +27,7 @@ mod tests;
 // `Arc<ConnectionManager<File>>` is itself a concrete type, so fixing F
 // here — rather than dropping ConnectionManager's own genericity — is
 // enough to satisfy that.
+#[cfg(not(target_arch = "wasm32"))]
 static CON_MANAGER: LazyLock<ConMgr<File>> = LazyLock::new(|| Arc::new(ConnectionManager::new()));
 
 pub type ConMgr<F> = Arc<ConnectionManager<F>>;
@@ -142,6 +140,7 @@ where
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl ConnectionManager<File> {
     pub fn get_manager() -> ConMgr<File> {
         CON_MANAGER.clone()

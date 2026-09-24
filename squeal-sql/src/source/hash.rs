@@ -2,12 +2,12 @@ use crate::source::{planinfo::PlanNode};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::Instant,
 };
 
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use store::{
+    clock::Instant,
     cursor::Cursor,
     db::{DBFile, Db},
     run::Run,
@@ -926,7 +926,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
 
 #[cfg(test)]
 mod tests {
-    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
+    use store::{clock::Instant, db::Db, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
     use crate::{
@@ -1502,7 +1502,7 @@ mod tests {
         )
         .unwrap();
 
-        let start = std::time::Instant::now();
+        let start = store::clock::Instant::now();
         let rows = drain(&mut source);
         let elapsed = start.elapsed();
         assert_eq!(

@@ -41,7 +41,7 @@ pub struct ArcLockGuard<T: Sized + Clone + Debug> {
 #[derive(Debug, Default)]
 pub struct Holder {
     depth: std::sync::atomic::AtomicU32,
-    since: parking_lot::Mutex<Option<(String, std::time::Instant)>>,
+    since: parking_lot::Mutex<Option<(String, crate::clock::Instant)>>,
 }
 
 impl Holder {
@@ -54,7 +54,7 @@ impl Holder {
             let t = thread::current();
             *self.since.lock() = Some((
                 format!("{:?} {}", t.id(), t.name().unwrap_or("")),
-                std::time::Instant::now(),
+                crate::clock::Instant::now(),
             ));
         }
     }

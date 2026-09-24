@@ -1507,7 +1507,7 @@ where
         // gone" at once (the race STORE_AUDIT.md T14 was about).
         self.tx_mgr.commit(id, commit_lsn.0)?;
         self.versions.mark_committed(id, commit_lsn.0);
-        self.maintenance.wake();
+        self.maintenance_wake();
         // STORE_AUDIT.md T1: don't report success until the record is
         // fsynced. Last, so is_committed flips promptly regardless of how
         // long the fsync takes.
@@ -1542,7 +1542,7 @@ where
         }
         let res = self.finish_abort(id);
         if res.is_err() {
-            self.maintenance.wake();
+            self.maintenance_wake();
         }
         res
     }
@@ -1603,6 +1603,32 @@ where
     /// One maintenance pass (proposal §3.6), run by the maintenance thread:
     /// retry aborts whose revert failed, vacuum by the horizon, purge the
     /// tombstones vacuum released, checkpoint if the log has grown enough.
+    // What every commit/abort used to spell out directly as
+    // `self.maintenance.wake()`: on native, ask the maintenance thread for
+    // a pass soon (fire-and-forget — nothing here waits for it). wasm32 has
+    // no such thread (see maintenance.rs's own doc comment), so it runs the
+    // pass immediately instead; this is the one place that turns "no
+    // background thread" into "do the same work inline" rather than
+    // "skip the work" — see this session's own notes on why the work
+    // itself (bounding dirty pages, WAL bytes, dead MVCC versions) still
+    // matters under wasm, just not the thread. Errors are recorded the
+    // same way the thread would (maintenance.stats), not propagated — a
+    // failed opportunistic pass must never fail the commit/abort that
+    // happened to trigger it.
+    fn maintenance_wake(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.maintenance.wake();
+        #[cfg(target_arch = "wasm32")]
+        if let Err(e) = self.maintenance_pass() {
+            self.maintenance.stats.record_error(&e);
+        } else {
+            self.maintenance
+                .stats
+                .passes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn maintenance_pass(&self) -> Result<(), StoreError> {
         let stats = &self.maintenance.stats;
         for id in self.tx_mgr.aborting_ids() {
@@ -8828,7 +8854,7 @@ mod tests {
 
         // The writer's transaction is active right now: the checkpoint
         // must complete anyway, promptly.
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         db.checkpoint().unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(2),
@@ -9410,7 +9436,7 @@ mod tests {
         held_rx.recv().unwrap();
 
         let t = db.begin().unwrap();
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         let r = db.update(tid, row(1, b"b"), &t);
         assert!(matches!(r, Err(StoreError::LockTimeout(_))), "{r:?}");
         assert!(

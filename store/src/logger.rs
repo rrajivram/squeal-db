@@ -824,10 +824,19 @@ impl Operation {
 // Logger
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+// Manual Debug/Default (not derived): the wasm32 `state` field holds a
+// `Box<dyn WalRunner>`, which has no reason to be Debug, and cfg-gating a
+// derive per-field isn't possible — so both are spelled out by hand below.
 pub(crate) struct Logger {
+    #[cfg(not(target_arch = "wasm32"))]
     log_handle: Option<JoinHandle<Result<(), StoreError>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     log_tx: Option<Sender<LogMsg>>,
+    // wasm32 only: the WAL state itself, called into directly and
+    // synchronously (see WalRunner's own doc comment) instead of being
+    // owned by a background thread and reached via a channel.
+    #[cfg(target_arch = "wasm32")]
+    state: parking_lot::Mutex<Option<Box<dyn WalRunner>>>,
     clock: Arc<LsnClock>,
     // Bytes the runner has appended to the current segment — what the
     // maintenance thread reads to decide when to checkpoint (and roll).
@@ -838,6 +847,30 @@ pub(crate) struct Logger {
     current_segment: Arc<AtomicU64>,
     // Bytes in every segment on disk (retained + current).
     retained_bytes: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for Logger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Logger").finish_non_exhaustive()
+    }
+}
+
+impl Default for Logger {
+    fn default() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            log_handle: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            log_tx: None,
+            #[cfg(target_arch = "wasm32")]
+            state: parking_lot::Mutex::new(None),
+            clock: Arc::default(),
+            segment_bytes: Arc::default(),
+            segment_count: Arc::default(),
+            current_segment: Arc::default(),
+            retained_bytes: Arc::default(),
+        }
+    }
 }
 
 impl Logger {
@@ -883,11 +916,6 @@ impl Logger {
         older: Vec<Segment>,
         log_header_bytes: Vec<u8>,
     ) -> Result<(), StoreError> {
-        // Wide enough that group commit (see log_runner) has something real
-        // to batch under concurrent load.
-        const LOG_CHANNEL_CAPACITY: usize = 256;
-        let (tx, rx) = bounded(LOG_CHANNEL_CAPACITY);
-        self.log_tx = Some(tx);
         self.segment_count
             .store(older.len() + 1, std::sync::atomic::Ordering::Relaxed);
         self.current_segment
@@ -905,8 +933,20 @@ impl Logger {
             current_segment: self.current_segment.clone(),
             retained_bytes: self.retained_bytes.clone(),
         };
-        let clock = self.clock.clone();
-        self.log_handle = Some(thread::spawn(move || log_runner(state, rx, clock)));
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Wide enough that group commit (see log_runner) has something
+            // real to batch under concurrent load.
+            const LOG_CHANNEL_CAPACITY: usize = 256;
+            let (tx, rx) = bounded(LOG_CHANNEL_CAPACITY);
+            self.log_tx = Some(tx);
+            let clock = self.clock.clone();
+            self.log_handle = Some(thread::spawn(move || log_runner(state, rx, clock)));
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            *self.state.lock() = Some(Box::new(state));
+        }
         Ok(())
     }
 
@@ -969,9 +1009,14 @@ impl Logger {
     /// append-only: it keeps no in-memory state (phase 3 — versions live in
     /// `VersionStore`).
     pub(crate) fn log(&self, lsn: LsnId, op: Operation) -> Result<(), StoreError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(tx) = &self.log_tx {
             tx.send(LogMsg::Record(LogRecord { lsn, operation: op }))
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(state) = self.state.lock().as_mut() {
+            state.log_record(lsn, op, &self.clock)?;
         }
         Ok(())
     }
@@ -984,7 +1029,12 @@ impl Logger {
     }
 
     /// Blocks until every record queued before this call is durable.
+    // On wasm32 this is a no-op: every log() call above already wrote and
+    // synced before returning (there is no separate runner it could still
+    // be waiting on), so anything queued before this call is durable by the
+    // time it's reached.
     pub(crate) fn sync(&self) -> Result<(), StoreError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(tx) = &self.log_tx {
             let (reply, done) = bounded(1);
             tx.send(LogMsg::Sync(reply))
@@ -998,6 +1048,7 @@ impl Logger {
     /// Phase 6: starts a new segment and deletes every older one whose
     /// highest LSN is below `floor`. Blocks until done.
     pub(crate) fn roll(&self, floor: u64) -> Result<(), StoreError> {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(tx) = &self.log_tx {
             let (reply, done) = bounded(1);
             tx.send(LogMsg::Roll { floor, reply })
@@ -1005,22 +1056,31 @@ impl Logger {
             done.recv()
                 .map_err(|e| StoreError::UnknownError(e.to_string()))??;
         }
+        #[cfg(target_arch = "wasm32")]
+        if let Some(state) = self.state.lock().as_mut() {
+            state.roll_wal(floor)?;
+        }
         Ok(())
     }
 
+    // On wasm32 there is no runner thread to signal or join — `state` (if
+    // any) just drops along with `self`.
     pub(crate) fn shutdown(self) -> Result<(), StoreError> {
-        if let Some(tx) = self.log_tx {
-            tx.send(LogMsg::ShutDown)
-                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
-        }
-        if let Some(h) = self.log_handle {
-            match h.join() {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Unknown error joining log runner. Thread panic! {}",
-                        e.downcast::<String>().unwrap_or_default()
-                    );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(tx) = self.log_tx {
+                tx.send(LogMsg::ShutDown)
+                    .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            }
+            if let Some(h) = self.log_handle {
+                match h.join() {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(
+                            "Unknown error joining log runner. Thread panic! {}",
+                            e.downcast::<String>().unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
@@ -1134,6 +1194,41 @@ impl<F: DBFile> WalState<F> {
         self.older = keep;
         self.publish_counts();
         Ok(())
+    }
+}
+
+// wasm32 has no threads (see Logger's own doc comment on why this exists at
+// all): this is the direct, synchronous equivalent of one loop iteration of
+// log_runner below, minus the group-commit batching (which exists purely to
+// let concurrent senders share one fsync — on wasm there is never more than
+// one call in flight at a time, so there is nothing to batch). Type-erased
+// (not `WalState<F>` stored directly) so `Logger` itself doesn't need to
+// become generic over F — the one thing every other caller of `Logger`
+// would otherwise have had to start threading through too.
+#[cfg(target_arch = "wasm32")]
+trait WalRunner: Send {
+    fn log_record(&mut self, lsn: LsnId, op: Operation, clock: &LsnClock) -> Result<(), StoreError>;
+    fn roll_wal(&mut self, floor: u64) -> Result<(), StoreError>;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<F: DBFile> WalRunner for WalState<F> {
+    fn log_record(&mut self, lsn: LsnId, op: Operation, clock: &LsnClock) -> Result<(), StoreError> {
+        let rec = LogRecord { lsn, operation: op };
+        let bytes = frame_record(&to_allocvec(&rec)?);
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&bytes)?;
+        self.file.do_sync()?;
+        self.segment_bytes
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.current.max_lsn = self.current.max_lsn.max(lsn.0);
+        clock.mark_written(lsn);
+        self.publish_counts();
+        Ok(())
+    }
+
+    fn roll_wal(&mut self, floor: u64) -> Result<(), StoreError> {
+        self.roll(floor)
     }
 }
 
@@ -1426,7 +1521,7 @@ mod tests {
         // minimum the meaningful statistic.
         let mut elapsed = std::time::Duration::MAX;
         for i in 0..10u64 {
-            let start = std::time::Instant::now();
+            let start = crate::clock::Instant::now();
             let lsn2 = logger
                 .log_new(Operation::new_commit(TransactionId::from(2 + i)))
                 .unwrap();

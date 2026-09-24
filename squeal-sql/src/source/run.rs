@@ -1,7 +1,7 @@
 use crate::source::{planinfo::PlanNode};
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use store::{cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
+use store::{clock::Instant, cursor::Cursor, db::DBFile, run::RunCursor, valueitem::IndexKey};
 
 use crate::{
     error::SchemaError,

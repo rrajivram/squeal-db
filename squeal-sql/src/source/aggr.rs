@@ -1,5 +1,6 @@
+use std::collections::HashMap;
+use store::clock::Instant;
 use crate::source::{planinfo::PlanNode};
-use std::{collections::HashMap, time::Instant};
 
 use store::valueitem::IndexKey;
 

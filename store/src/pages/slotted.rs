@@ -1186,7 +1186,7 @@ mod tests {
         }
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
         const ITERS: u64 = 2_000_000;
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         for _ in 0..ITERS {
             state ^= state << 13;
             state ^= state >> 7;

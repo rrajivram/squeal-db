@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::{Mutex, RwLock};
 use postcard::{from_bytes, to_allocvec};
+use store::clock::Instant;
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},

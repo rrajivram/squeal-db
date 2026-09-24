@@ -1,8 +1,9 @@
 use crate::source::{planinfo::PlanNode};
-use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc, time::Instant};
+use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use sql_parser::expr::BinaryOp;
 use store::{
+    clock::Instant,
     db::{DBFile, Db},
     valueitem::IndexKey,
 };
@@ -470,7 +471,7 @@ mod tests {
 
 #[cfg(test)]
 mod hash_join_tests {
-    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
+    use store::{clock::Instant, db::Db, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
     use crate::source::test_support::{VecSource, drain};

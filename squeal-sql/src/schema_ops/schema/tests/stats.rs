@@ -4,7 +4,8 @@
 // exhaustive, synchronous rebuild. The lifecycle side (create/load/
 // persist/shutdown, the stats table surviving close/reopen) is in
 // `contract` instead.
-use std::time::{Duration, Instant};
+use store::clock::Instant;
+use std::time::{Duration};
 
 use store::table::TableIdType;
 use store::valueitem::ValueItem;

@@ -202,10 +202,20 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // for pages that were evicted but not yet dropped (and gets pruned
     // lazily, on the next failed upgrade() for that page in get_page).
     strong_count: AtomicUsize,
+    #[cfg(not(target_arch = "wasm32"))]
     write_tx: Sender<BufMsg>,
     // None once shutdown() has taken it to join the thread — Drop uses that
     // to tell "shut down properly" apart from "dropped without shutdown".
+    #[cfg(not(target_arch = "wasm32"))]
     write_handle: Option<JoinHandle<Result<(), StoreError>>>,
+    // wasm32 only: the header-writer's own file handle, written to directly
+    // and synchronously instead of through a channel to a background
+    // thread (see write_header_bytes's own doc comment). Page data itself
+    // never goes through here on either target — see this struct's own
+    // note above BufMsg on why the writer (native or not) only ever
+    // handles the header.
+    #[cfg(target_arch = "wasm32")]
+    writer_file: parking_lot::Mutex<F>,
     self_file: RwLock<F>,
     // Phase 6: every tree write holds the read side for its whole
     // duration; a checkpoint holds the write side while it captures the
@@ -263,9 +273,13 @@ where
     ) -> Result<Self, StoreError> {
         let read_file = db_file.do_clone()?;
         let writer_file = db_file.do_clone()?;
+        #[cfg(not(target_arch = "wasm32"))]
         let (write_tx, write_rx) = bounded(64);
-        let w_header = header.clone();
-        let write_handle = thread::spawn(move || writer(writer_file, w_header, write_rx));
+        #[cfg(not(target_arch = "wasm32"))]
+        let write_handle = {
+            let w_header = header.clone();
+            thread::spawn(move || writer(writer_file, w_header, write_rx))
+        };
         let page_overhead = header.page_overhead();
         Ok(Self {
             page_size,
@@ -275,10 +289,14 @@ where
             buffer: (0..BUFFER_SHARD_COUNT)
                 .map(|_| RwLock::new(HashMap::new()))
                 .collect(),
+            #[cfg(not(target_arch = "wasm32"))]
             write_tx,
+            #[cfg(target_arch = "wasm32")]
+            writer_file: parking_lot::Mutex::new(writer_file),
             self_file: RwLock::new(read_file),
             write_gate: RwLock::new(()),
             parked_dirty: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(not(target_arch = "wasm32"))]
             write_handle: Some(write_handle),
             access_map: ShardedPQ::new(max_entries / 10),
             insertion_seq: AtomicU64::new(0),
@@ -319,19 +337,27 @@ where
             self.capture_dirty_pages()?
         };
         self.write_captured(captured)?;
-        self.write_tx.send(BufMsg::Shutdowm)?;
-        if let Some(handle) = self.write_handle.take() {
-            let res = handle.join();
-            match res {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Unknown error joining redo.Thread panic! {}",
-                        e.downcast::<String>().unwrap_or_default()
-                    );
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.write_tx.send(BufMsg::Shutdowm)?;
+            if let Some(handle) = self.write_handle.take() {
+                let res = handle.join();
+                match res {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(
+                            "Unknown error joining redo.Thread panic! {}",
+                            e.downcast::<String>().unwrap_or_default()
+                        );
+                    }
                 }
             }
         }
+        // Everything the checkpoint/shutdown capture wrote is synced by the
+        // writer of those pages; this is the header's turn (see writer()'s
+        // own Shutdowm arm, which this mirrors directly on wasm32).
+        #[cfg(target_arch = "wasm32")]
+        self.writer_file.lock().do_sync()?;
         Ok(())
     }
 
@@ -348,16 +374,31 @@ where
     }
 
     pub(crate) fn write_header(&self, header: Header) -> Result<(), StoreError> {
-        Ok(self.write_tx.send(BufMsg::WriteHeader(header))?)
+        #[cfg(not(target_arch = "wasm32"))]
+        return Ok(self.write_tx.send(BufMsg::WriteHeader(header))?);
+        #[cfg(target_arch = "wasm32")]
+        write_header_bytes(&mut *self.writer_file.lock(), &header)
     }
 
     // STORE_AUDIT.md T5: see WriteHeaderSynced's own comment — blocks until
-    // the header is physically written AND fsynced, not just queued.
+    // the header is physically written AND fsynced, not just queued. On
+    // wasm32 that's just write_header_bytes followed by do_sync, called
+    // directly — there's no separate runner it could still be waiting on.
     pub(crate) fn write_header_synced(&self, header: Header) -> Result<(), StoreError> {
-        let (tx, rx) = bounded(1);
-        self.write_tx.send(BufMsg::WriteHeaderSynced(header, tx))?;
-        rx.recv()
-            .map_err(|e| StoreError::UnknownError(e.to_string()))?
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (tx, rx) = bounded(1);
+            self.write_tx.send(BufMsg::WriteHeaderSynced(header, tx))?;
+            return rx
+                .recv()
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let mut file = self.writer_file.lock();
+            write_header_bytes(&mut *file, &header)?;
+            Ok(file.do_sync()?)
+        }
     }
 
     // Unlike write_locked_page, this one stays synchronous (eager) rather
@@ -1080,7 +1121,7 @@ where
             self.lock_timeout_us
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
-        let started = std::time::Instant::now();
+        let started = crate::clock::Instant::now();
         let lock = match self.locks.lock_for(page_num, timeout) {
             crate::arclock::LockAttempt::Acquired(g) => g,
             crate::arclock::LockAttempt::TimedOut(holder) => {
@@ -1294,6 +1335,9 @@ where
 }
 
 impl<F: DBFile + 'static> Drop for PageBuffer<F> {
+    // wasm32 has no writer thread to abandon (see this struct's own doc
+    // comment) — nothing here to check.
+    #[cfg(not(target_arch = "wasm32"))]
     fn drop(&mut self) {
         // shutdown() always takes write_handle before self is dropped, leaving
         // None. If it's still Some here, this PageBuffer was dropped without
@@ -1310,6 +1354,8 @@ impl<F: DBFile + 'static> Drop for PageBuffer<F> {
             );
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    fn drop(&mut self) {}
 }
 
 impl From<crossbeam::channel::SendError<BufMsg>> for StoreError {
@@ -1370,6 +1416,17 @@ fn write_page_with_bounded_retry<F: DBFile>(
     }
 }
 
+// Encodes `header` to its fixed on-disk size and pwrite's it at offset 0 —
+// shared by the native writer thread's loop and the direct, synchronous
+// wasm32 path (see PageBuffer's own doc comment on why there is one).
+fn write_header_bytes<F: DBFile>(file: &mut F, header: &Header) -> Result<(), StoreError> {
+    let mut bytes = to_allocvec(header)?;
+    if bytes.len() < size_of::<Header>() {
+        bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
+    }
+    pwrite_all(file, &bytes, 0)
+}
+
 fn writer<F: DBFile>(
     file: F,
     _header: Arc<Header>,
@@ -1385,19 +1442,11 @@ fn writer<F: DBFile>(
                 break;
             }
             Ok(BufMsg::WriteHeader(header)) => {
-                let mut bytes = to_allocvec(&header)?;
-                if bytes.len() < size_of::<Header>() {
-                    bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
-                }
-                pwrite_all(&file, &bytes, 0)?;
+                write_header_bytes(&mut file, &header)?;
             }
             Ok(BufMsg::WriteHeaderSynced(header, tx)) => {
                 let res = (|| {
-                    let mut bytes = to_allocvec(&header)?;
-                    if bytes.len() < size_of::<Header>() {
-                        bytes.append(&mut vec![0u8; size_of::<Header>() - bytes.len()]);
-                    }
-                    pwrite_all(&file, &bytes, 0)?;
+                    write_header_bytes(&mut file, &header)?;
                     // STORE_AUDIT.md T5: the whole point of this variant —
                     // the caller (Db::checkpoint) must not delete log
                     // segments until the header is confirmed durable, not
@@ -2594,7 +2643,7 @@ mod tests {
             let _ = buf.get_page(i.into()).unwrap();
         }
         let buf = Arc::new(buf);
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         std::thread::scope(|s| {
             for t in 0..THREADS {
                 let buf = buf.clone();
@@ -2639,7 +2688,7 @@ mod tests {
         page.add_tuple(Tuple::new(1, &big_data)).unwrap();
         buf.write_page(page_id, &page).unwrap();
 
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         for i in 0..ITERS {
             let handle = buf
                 .get_page_mut(page_id, crate::buffer::LockLevel::Data)
@@ -2674,7 +2723,7 @@ mod tests {
         let b = buf.alloc_page(false).unwrap();
 
         let held = buf.get_page_mut(a, Data).unwrap();
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         match buf.get_page_mut(b, Index) {
             Err(StoreError::LockOrderViolation(msg)) => {
                 assert!(msg.contains("Index"), "{msg}");
@@ -2739,7 +2788,7 @@ mod tests {
         };
         held_rx.recv().unwrap();
 
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         let r = buf.get_page_mut(a, Data);
         let waited = start.elapsed();
         match r {

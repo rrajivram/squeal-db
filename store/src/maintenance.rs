@@ -14,10 +14,13 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use crate::db::{DBFile, Db};
+use crate::{
+    clock::Instant,
+    db::{DBFile, Db},
+};
 
 /// Counters published by the maintenance thread.
 #[derive(Debug, Default)]
@@ -77,6 +80,21 @@ impl Maintenance {
 
     /// Start the thread. Holds only a `Weak<Db>` so a `Db` that is dropped
     /// without `close()` still lets the thread exit on its next wake.
+    ///
+    /// A no-op on wasm32: there is no background thread to start at all
+    /// (see this module's own doc comment) — `Db::commit`/`Db::abort` call
+    /// `maintenance_pass()` directly instead of waking one up. `stop()`
+    /// already handles `handle` being `None` (its usual "close() was called
+    /// before start()" case natively), so it needs no wasm-specific
+    /// handling of its own.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn start<F>(&self, _db: &Arc<Db<F>>)
+    where
+        F: DBFile<Item = F> + 'static,
+    {
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn start<F>(&self, db: &Arc<Db<F>>)
     where
         F: DBFile<Item = F> + 'static,

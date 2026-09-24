@@ -1,5 +1,6 @@
+use std::{collections::HashMap, fmt::Debug, sync::Arc};
+use store::clock::Instant;
 use crate::source::{planinfo::PlanNode};
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Instant};
 
 use postcard::from_bytes;
 use store::{

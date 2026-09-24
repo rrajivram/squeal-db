@@ -201,6 +201,7 @@ impl Opener for MemFile {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Opener for std::fs::File {
     type Item = std::fs::File;
     fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<std::fs::File> {

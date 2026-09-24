@@ -3030,7 +3030,7 @@ mod tests {
                     .unwrap();
             }
             let before = crate::alloc::stats();
-            let start = std::time::Instant::now();
+            let start = crate::clock::Instant::now();
             for i in 0..rows {
                 assert!(tree.find(key_for(i)).unwrap().is_some());
             }
@@ -3221,7 +3221,7 @@ mod tests {
         for i in 1..=ROWS {
             tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
         }
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         // Scattered, not sequential, so this doesn't just retrace the same
         // cached root-to-leaf path every time.
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
