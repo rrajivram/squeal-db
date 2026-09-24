@@ -262,10 +262,28 @@ fn print_result(r: &mut ResultType) -> Option<Vec<(String, QueryStats)>> {
     }
 }
 
+// Every command this REPL understands beyond plain SQL — `!`-prefixed
+// ones dispatched by run_custom_command below, plus the bare `exit`
+// keyword handled in the main loop — as (syntax, description) pairs, the
+// single source of truth for `!help`'s listing. Kept as a flat
+// list/match rather than a registry/trait — there's a small, fixed
+// number of these and no shape yet that motivates more indirection.
+const COMMANDS: &[(&str, &str)] = &[
+    ("!help", "show this list of commands"),
+    (
+        "!print stats",
+        "show per-operator timing/row-count stats from the last query",
+    ),
+    ("!reset stats", "zero the allocator stats counters"),
+    (
+        "!show table stats",
+        "show collected table statistics for the current schema",
+    ),
+    ("exit", "quit the REPL (Ctrl-D also works)"),
+];
+
 // Dispatches a line that started with `!` (stripped of that prefix and
-// trimmed) as a REPL-only command rather than SQL. Kept as a flat match
-// rather than a registry/trait — there's a small, fixed number of these
-// and no shape yet that motivates more indirection.
+// trimmed) as a REPL-only command rather than SQL.
 fn run_custom_command<F>(
     command: &str,
     conn: &Arc<Connection<F>>,
@@ -274,13 +292,23 @@ fn run_custom_command<F>(
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    const USAGE: &str = "try '!print stats', '!reset stats', or '!show table stats'";
     match command {
+        "help" => print_help(),
         "print stats" => print_query_stats(last_stats),
         "reset stats" => reset_alloc_stats(),
         "show table stats" => show_table_stats(conn),
-        "" => println!("empty command — {USAGE}"),
-        other => println!("unrecognized command: {other:?} — {USAGE}"),
+        "" => println!("empty command — {USAGE_HINT}"),
+        other => println!("unrecognized command: {other:?} — {USAGE_HINT}"),
+    }
+}
+
+const USAGE_HINT: &str = "try '!help' for a list of commands";
+
+fn print_help() {
+    println!("Available commands:");
+    let width = COMMANDS.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+    for (cmd, desc) in COMMANDS {
+        println!("  {cmd:<width$}  {desc}");
     }
 }
 

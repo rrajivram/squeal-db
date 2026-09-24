@@ -13,12 +13,14 @@
 //! Every database created here is fully in-memory and gone once the
 //! `SquealDb` handle is dropped or the page unloads.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use serde::Serialize;
 use squeal_sql::{
     conn::connection::{Connection, ConnectionManager},
     rslt::resultset::{ResultSet, ResultType, StreamingResultSet},
+    source::QueryStats,
 };
 use store::memfile::MemFile;
 use wasm_bindgen::prelude::*;
@@ -53,6 +55,14 @@ fn init() {
 #[wasm_bindgen]
 pub struct SquealDb {
     conn: Arc<Connection<MemFile>>,
+    // Stats from the most recently executed StreamingResult, so `!print
+    // stats` can be sent as its own, separate `execute()` call rather than
+    // needing to be bolted onto the query itself — mirrors squeal-cli's
+    // own `last_stats` local. A RefCell (not a plain field) because every
+    // `#[wasm_bindgen]` method here takes `&self`, not `&mut self` — JS
+    // only ever sees one handle to a given SquealDb, so there's no real
+    // aliasing risk, just Rust's borrow rules needing satisfying.
+    last_stats: RefCell<Option<Vec<(String, QueryStats)>>>,
 }
 
 #[wasm_bindgen]
@@ -71,19 +81,39 @@ impl SquealDb {
         // this fails for some reason: the connection is still usable, it
         // would just need an explicit USE/CREATE SCHEMA call first.
         let _ = conn.use_schema(DEFAULT_SCHEMA);
-        Ok(SquealDb { conn })
+        Ok(SquealDb {
+            conn,
+            last_stats: RefCell::new(None),
+        })
     }
 
-    /// Runs `sql` (which may itself be several `;`-separated statements)
-    /// and returns every result as one JSON array, one entry per statement
-    /// that produced a result — see `execute_results`' own doc comment for
-    /// the shape of each entry. Throws (a JS exception, via `JsError`) if
-    /// the batch fails to parse/validate at all, or if any statement in it
-    /// fails; whatever ran before the failing statement has already taken
-    /// effect (matches Statement::execute's own all-or-nothing-only-at-
-    /// parse-time contract — see its own doc comment in stmt.rs).
+    /// Runs `sql` and returns every result as one JSON array, one entry per
+    /// statement that produced a result — see `execute_results`' own doc
+    /// comment for the shape of each entry. Throws (a JS exception, via
+    /// `JsError`) if the batch fails to parse/validate at all, or if any
+    /// statement in it fails; whatever ran before the failing statement has
+    /// already taken effect (matches Statement::execute's own
+    /// all-or-nothing-only-at-parse-time contract — see its own doc comment
+    /// in stmt.rs).
+    ///
+    /// If `sql` (after trimming) starts with `!`, it's dispatched as a
+    /// REPL-style command instead of parsed as SQL — same `!help`/`!print
+    /// stats`/`!reset stats`/`!show table stats` set squeal-cli supports
+    /// (see squeal-cli's own `COMMANDS`), for parity between the two
+    /// front-ends. Always exactly one `sql` per call for these — unlike
+    /// plain SQL, a `!` command is never batched with other statements.
     pub fn execute(&self, sql: &str) -> Result<String, JsError> {
-        let results = execute_results(&self.conn, sql).map_err(to_js_error)?;
+        let trimmed = sql.trim();
+        if let Some(command) = trimmed.strip_prefix('!') {
+            let result = run_custom_command(command.trim(), &self.conn, &self.last_stats);
+            return serde_json::to_string(&[result])
+                .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")));
+        }
+
+        let (results, stats) = execute_results(&self.conn, sql).map_err(to_js_error)?;
+        if stats.is_some() {
+            *self.last_stats.borrow_mut() = stats;
+        }
         serde_json::to_string(&results)
             .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
     }
@@ -119,48 +149,168 @@ enum JsonResult {
     },
 }
 
+// Returns every JSON-shaped result alongside whichever StreamingResult's
+// query stats were seen last (a statement can produce several results;
+// same "last one wins" rule squeal-cli's own `run()` uses) — `None` if
+// nothing in this batch was a SELECT at all, in which case the caller
+// leaves SquealDb::last_stats untouched rather than clobbering it.
 fn execute_results(
     conn: &Arc<Connection<MemFile>>,
     sql: &str,
-) -> Result<Vec<JsonResult>, squeal_sql::error::SchemaError> {
+) -> Result<(Vec<JsonResult>, Option<Vec<(String, QueryStats)>>), squeal_sql::error::SchemaError> {
     let mut stmt = conn.clone().create_statement(sql)?;
     stmt.execute()?;
     let mut out = vec![];
+    let mut stats = None;
     let mut next = stmt.get_results();
     loop {
         match next? {
             Some(r) => {
-                out.push(to_json_result(r)?);
+                let (json, s) = to_json_result(r)?;
+                out.push(json);
+                if s.is_some() {
+                    stats = s;
+                }
                 next = stmt.get_nextresult();
             }
             None => break,
         }
     }
-    Ok(out)
+    Ok((out, stats))
 }
 
-fn to_json_result(r: ResultType) -> Result<JsonResult, squeal_sql::error::SchemaError> {
+fn to_json_result(
+    r: ResultType,
+) -> Result<(JsonResult, Option<Vec<(String, QueryStats)>>), squeal_sql::error::SchemaError> {
     Ok(match r {
-        ResultType::Count(n) => JsonResult::Count { rows_affected: n },
-        ResultType::ResultString(text) => JsonResult::Message { text },
+        ResultType::Count(n) => (JsonResult::Count { rows_affected: n }, None),
+        ResultType::ResultString(text) => (JsonResult::Message { text }, None),
         ResultType::Result(rs) => {
             let (columns, rows, message) = drain_materialized(rs);
-            JsonResult::Result {
-                columns,
-                rows,
-                message,
-            }
+            (
+                JsonResult::Result {
+                    columns,
+                    rows,
+                    message,
+                },
+                None,
+            )
         }
         ResultType::StreamingResult(mut stream) => {
             let (columns, rows) = drain_streaming(&mut stream)?;
             let message = stream.get_final_message();
-            JsonResult::Rows {
-                columns,
-                rows,
-                message,
-            }
+            // Only available once the stream is fully drained (see
+            // drain_streaming above) — Source::stats() reports totals
+            // accumulated during next(), so reading it any earlier would
+            // miss whatever work the remaining rows still had to do.
+            let stats = stream.get_query_stats();
+            (
+                JsonResult::Rows {
+                    columns,
+                    rows,
+                    message,
+                },
+                stats,
+            )
         }
     })
+}
+
+// The full set of `!`-commands this shim understands, as (syntax,
+// description) pairs — mirrors squeal-cli's own `COMMANDS` const (kept as
+// a separate, duplicated list rather than a shared one: squeal-cli's own
+// comment on why this stays a flat match, not a registry, applies here
+// too — four short strings isn't worth a cross-crate API for).
+const COMMANDS: &[(&str, &str)] = &[
+    ("!help", "show this list of commands"),
+    (
+        "!print stats",
+        "show per-operator timing/row-count stats from the last query",
+    ),
+    ("!reset stats", "zero the allocator stats counters"),
+    (
+        "!show table stats",
+        "show collected table statistics for the current schema",
+    ),
+];
+
+// Dispatches a `!`-prefixed command (stripped of that prefix and
+// trimmed) — see SquealDb::execute's own doc comment for how it gets
+// here. Always returns a JsonResult, never errors: an unrecognized
+// command is reported as a Message, not a thrown JsError, so `!nonsense`
+// behaves the same as it does in squeal-cli (a printed line, not a
+// crash).
+fn run_custom_command(
+    command: &str,
+    conn: &Arc<Connection<MemFile>>,
+    last_stats: &RefCell<Option<Vec<(String, QueryStats)>>>,
+) -> JsonResult {
+    const USAGE_HINT: &str = "try '!help' for a list of commands";
+    match command {
+        "help" => JsonResult::Message { text: help_text() },
+        "print stats" => JsonResult::Message {
+            text: print_query_stats_text(&last_stats.borrow()),
+        },
+        "reset stats" => {
+            store::alloc::reset();
+            JsonResult::Message {
+                text: "allocator stats reset".to_string(),
+            }
+        }
+        "show table stats" => match conn.table_stats_report() {
+            Ok(rs) => {
+                let (columns, rows, message) = drain_materialized(rs);
+                JsonResult::Result {
+                    columns,
+                    rows,
+                    message,
+                }
+            }
+            Err(e) => JsonResult::Message {
+                text: format!("error: {e}"),
+            },
+        },
+        "" => JsonResult::Message {
+            text: format!("empty command — {USAGE_HINT}"),
+        },
+        other => JsonResult::Message {
+            text: format!("unrecognized command: {other:?} — {USAGE_HINT}"),
+        },
+    }
+}
+
+fn help_text() -> String {
+    let width = COMMANDS.iter().map(|(cmd, _)| cmd.len()).max().unwrap_or(0);
+    let mut out = String::from("Available commands:\n");
+    for (cmd, desc) in COMMANDS {
+        out += &format!("  {cmd:<width$}  {desc}\n");
+    }
+    out.pop(); // drop the trailing newline — JsonResult::Message renders as one block
+    out
+}
+
+// Mirrors squeal-cli's own print_query_stats, building a String instead
+// of printing line-by-line.
+fn print_query_stats_text(stats: &Option<Vec<(String, QueryStats)>>) -> String {
+    let Some(stats) = stats else {
+        return "no query stats available yet — run a query first".to_string();
+    };
+    let mut out = String::new();
+    for (name, query_stats) in stats {
+        let indent = "  ".repeat(query_stats.level());
+        out += &format!("{indent}{name}\n");
+        let mut entries: Vec<_> = query_stats.stats().iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, value) in entries {
+            if let Some(label) = key.strip_suffix("_ns") {
+                out += &format!("{indent}  {label}: {:.3} ms\n", value / 1_000_000.0);
+            } else {
+                out += &format!("{indent}  {key}: {value}\n");
+            }
+        }
+    }
+    out.pop();
+    out
 }
 
 fn drain_materialized(rs: ResultSet) -> (Vec<String>, Vec<Vec<String>>, String) {
@@ -297,5 +447,65 @@ mod tests {
         db.execute("insert into t values (1, null)").unwrap();
         let results = exec(&db, "select id, n from t");
         assert_eq!(results[0]["rows"][0][1], serde_json::json!("(null)"));
+    }
+
+    #[test]
+    fn test_help_lists_every_command_with_its_syntax() {
+        let db = SquealDb::new("t6").unwrap();
+        let results = exec(&db, "!help");
+        assert_eq!(kinds(&results), ["Message"]);
+        let text = results[0]["text"].as_str().unwrap();
+        for (cmd, _) in COMMANDS {
+            assert!(text.contains(cmd), "missing {cmd:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn test_print_stats_before_any_query_says_so_rather_than_erroring() {
+        let db = SquealDb::new("t7").unwrap();
+        let results = exec(&db, "!print stats");
+        assert_eq!(kinds(&results), ["Message"]);
+        assert!(results[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("no query stats available"));
+    }
+
+    #[test]
+    fn test_print_stats_reports_the_most_recent_select() {
+        let db = SquealDb::new("t8").unwrap();
+        db.execute("create table t (id integer not null, primary key(id))")
+            .unwrap();
+        db.execute("insert into t values (1)").unwrap();
+        exec(&db, "select id from t");
+        let results = exec(&db, "!print stats");
+        assert_eq!(kinds(&results), ["Message"]);
+        assert!(results[0]["text"].as_str().unwrap().contains("TableScan"));
+    }
+
+    #[test]
+    fn test_show_table_stats_returns_a_table_not_a_message() {
+        let db = SquealDb::new("t9").unwrap();
+        db.execute("create table t (id integer not null, primary key(id))")
+            .unwrap();
+        let results = exec(&db, "!show table stats");
+        assert_eq!(kinds(&results), ["Result"]);
+    }
+
+    #[test]
+    fn test_reset_stats_confirms_rather_than_erroring() {
+        let db = SquealDb::new("t10").unwrap();
+        let results = exec(&db, "!reset stats");
+        assert_eq!(kinds(&results), ["Message"]);
+        assert!(results[0]["text"].as_str().unwrap().contains("reset"));
+    }
+
+    #[test]
+    fn test_an_unrecognized_bang_command_is_reported_not_thrown() {
+        let db = SquealDb::new("t11").unwrap();
+        let results = exec(&db, "!nonsense");
+        assert_eq!(kinds(&results), ["Message"]);
+        let text = results[0]["text"].as_str().unwrap();
+        assert!(text.contains("unrecognized") && text.contains("nonsense"), "{text}");
     }
 }
