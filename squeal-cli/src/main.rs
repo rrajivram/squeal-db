@@ -310,6 +310,11 @@ fn print_help() {
     for (cmd, desc) in COMMANDS {
         println!("  {cmd:<width$}  {desc}");
     }
+    println!();
+    // squeal_sql::help::SQL_HELP is the single source of truth for the SQL
+    // syntax listing — shared with squeal-wasm's own !help so the two
+    // front-ends can't drift apart on what SQL this engine supports.
+    println!("{}", squeal_sql::help::sql_help_text());
 }
 
 // `!show table stats`: optim::table_stats::SchemaStats' current snapshot

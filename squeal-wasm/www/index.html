@@ -19,7 +19,7 @@
   table { border-collapse: collapse; margin: 0.3rem 0 0.6rem; }
   th, td { border: 1px solid #ccc; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
   th { background: #f0f0f0; }
-  .msg { font-size: 0.85rem; color: #444; padding: 0.2rem 0; }
+  .msg { font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; color: #444; padding: 0.2rem 0; white-space: pre-wrap; }
   .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 4px; }
 
   #prompt { position: sticky; bottom: 0; background: #fff; padding-top: 0.8rem; border-top: 1px solid #ddd; }
@@ -39,7 +39,8 @@
   prompt. In the prompt: <b>Enter</b> runs once the statement ends with <code>;</code> (otherwise it
   just starts a new line, so multi-line statements keep typing), <b>Shift+Enter</b> always inserts a
   newline, <b>⌘/Ctrl+Enter</b> always runs regardless, and <b>↑/↓</b> at the start/end of the text
-  recalls command history (persisted across reloads, though the database itself is not).
+  recalls command history (persisted across reloads, though the database itself is not). Type
+  <b>!help</b> and run it to see every supported command and SQL statement.
 </p>
 
 <div id="cells"></div>

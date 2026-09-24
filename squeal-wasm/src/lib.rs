@@ -285,7 +285,11 @@ fn help_text() -> String {
     for (cmd, desc) in COMMANDS {
         out += &format!("  {cmd:<width$}  {desc}\n");
     }
-    out.pop(); // drop the trailing newline — JsonResult::Message renders as one block
+    out.push('\n');
+    // squeal_sql::help::SQL_HELP is the single source of truth for the SQL
+    // syntax listing — shared with squeal-cli's own !help so the two
+    // front-ends can't drift apart on what SQL this engine supports.
+    out += &squeal_sql::help::sql_help_text();
     out
 }
 
@@ -457,6 +461,12 @@ mod tests {
         let text = results[0]["text"].as_str().unwrap();
         for (cmd, _) in COMMANDS {
             assert!(text.contains(cmd), "missing {cmd:?} in:\n{text}");
+        }
+        // Same SQL cheat sheet squeal-cli's own !help renders — squeal_sql
+        // ::help is the single source of truth, this just checks it's
+        // actually wired in here too, not silently dropped.
+        for section in squeal_sql::help::SQL_HELP {
+            assert!(text.contains(section.title), "missing section {:?}", section.title);
         }
     }
 

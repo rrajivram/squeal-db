@@ -5,6 +5,7 @@ pub(crate) mod datetime;
 pub(crate) mod ds;
 pub(crate) mod envelope;
 pub mod error;
+pub mod help;
 pub mod optim;
 pub mod plan;
 pub mod rslt;
