@@ -1,5 +1,5 @@
 [workspace]
-members=["macros", "sql-parser", "squeal-cli","squeal-sql","store"]
+members=["macros", "sql-parser", "squeal-cli","squeal-sql","squeal-wasm","store"]
 resolver="3"
 
 [profile.release]

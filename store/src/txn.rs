@@ -617,7 +617,7 @@ mod tests {
             }
         }
         let never_registered = TransactionId::for_test(u64::MAX);
-        let start = std::time::Instant::now();
+        let start = crate::clock::Instant::now();
         std::thread::scope(|s| {
             for _ in 0..THREADS {
                 let mgr = mgr.clone();

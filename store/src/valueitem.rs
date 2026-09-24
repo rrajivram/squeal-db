@@ -197,7 +197,17 @@ impl IndexKey {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
-        bytes.extend_from_slice(&self.data.len().to_le_bytes());
+        // Fixed-width u64, not `self.data.len().to_le_bytes()` (a bare
+        // usize) — usize is 4 bytes on wasm32 and 8 bytes natively, so that
+        // wrote a platform-width-dependent count prefix while from_bytes
+        // below always reads a fixed 8 bytes for it. Coincidentally
+        // correct on any 64-bit native target (usize and u64 are the same
+        // width there); on wasm32 it silently wrote 4 bytes too few,
+        // desyncing every byte after it — found by actually running a
+        // SELECT under wasm (a real query returned every column as NULL;
+        // `cargo check --target wasm32-unknown-unknown` cannot catch a
+        // wire-format bug like this, only a real run can).
+        bytes.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
         for d in self.data.iter() {
             bytes.extend_from_slice(&d.to_bytes());
         }
@@ -1497,6 +1507,33 @@ mod indexkey_tests {
             result.is_ok(),
             "IndexKey::from_bytes must not panic on truncated input, only report an error"
         );
+    }
+
+    // Regression: to_bytes() used to write `self.data.len().to_le_bytes()`
+    // — a bare usize, 4 bytes on wasm32 and 8 bytes on every 64-bit native
+    // target this suite runs on — while from_bytes() always reads a fixed
+    // 8 bytes for that same prefix. Round-tripping through to_bytes()/
+    // from_bytes() alone (as every other test here does) could never catch
+    // this: on a 64-bit machine usize IS 8 bytes, so write and read always
+    // agreed. Only running on an actual 32-bit target — wasm32, via a real
+    // SELECT — surfaced it (every field decoded as NULL). Pins the actual
+    // byte layout instead: 8 bytes, always, regardless of the host
+    // platform's own usize width.
+    #[test]
+    fn test_to_bytes_field_count_prefix_is_a_fixed_8_bytes_not_usize_width() {
+        let key = IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap();
+        let bytes = key.to_bytes();
+        assert_eq!(
+            &bytes[0..8],
+            &2u64.to_le_bytes(),
+            "the field count must be a fixed-width u64 (8 bytes), not usize::to_le_bytes() \
+             (4 bytes on a 32-bit target like wasm32) — that's the exact byte range \
+             from_bytes() below always reads as a u64"
+        );
+        // And the inverse: from_bytes() must actually require 8 bytes for
+        // the prefix, not silently accept fewer (which would just move the
+        // bug from "never noticed" to "never noticed differently").
+        assert!(IndexKey::from_bytes(&bytes[..4]).is_err());
     }
 
     #[test]

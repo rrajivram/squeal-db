@@ -25,7 +25,12 @@ pub(crate) struct SchemaStats<F: DBFile + 'static> {
     schema: Arc<Schema<F>>,
     tables: Arc<RwLock<HashMap<TableIdType, TableStatStored>>>,
     sampling_rate: f64,
+    // wasm32 has no collector thread — log_stat below applies
+    // update_table_stats directly instead of sending it a message (see
+    // that function's own doc comment).
+    #[cfg(not(target_arch = "wasm32"))]
     handle: JoinHandle<Result<(), SchemaError>>,
+    #[cfg(not(target_arch = "wasm32"))]
     tx: Sender<StatMsg>,
 }
 
@@ -163,16 +168,21 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         sampling_rate: f64,
     ) -> Result<Self, SchemaError> {
         let sampling_rate = sampling_rate.clamp(0., 0.99);
-        let (tx, rx) = bounded(1);
         let tables = Arc::new(RwLock::new(tables));
-        let t_clone = tables.clone();
-        let handle = thread::spawn(move || stat_collector(rx, t_clone, sampling_rate));
+        #[cfg(not(target_arch = "wasm32"))]
+        let (tx, handle) = {
+            let (tx, rx) = bounded(1);
+            let t_clone = tables.clone();
+            (tx, thread::spawn(move || stat_collector(rx, t_clone, sampling_rate)))
+        };
 
         Ok(Self {
             tables,
             sampling_rate,
             schema,
+            #[cfg(not(target_arch = "wasm32"))]
             tx,
+            #[cfg(not(target_arch = "wasm32"))]
             handle,
         })
     }
@@ -258,11 +268,28 @@ impl<F: DBFile + 'static> SchemaStats<F> {
     // ANALYZE, which needs every row counted exactly once — see
     // `record_row_sync` for that path instead.
     pub(crate) fn log_stat(&self, table: TableIdType, record: IndexKey) {
-        let r = self.tx.try_send(StatMsg::InsertLogStat((table, record)));
-        match r {
-            Err(TrySendError::Full(_)) => {}
-            Err(_) => {}
-            _ => {}
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let r = self.tx.try_send(StatMsg::InsertLogStat((table, record)));
+            match r {
+                Err(TrySendError::Full(_)) => {}
+                Err(_) => {}
+                _ => {}
+            }
+        }
+        // Same sampling coin-flip stat_collector's InsertLogStat arm makes,
+        // applied directly and synchronously — there's no background
+        // thread's queue capacity to drop this on the floor for instead
+        // (see stat_collector's own comment: on native, a full capacity-1
+        // channel is how this stays best-effort/non-blocking under live
+        // traffic; on wasm32 every call already runs synchronously to
+        // completion, so there's nothing to backlog in the first place).
+        #[cfg(target_arch = "wasm32")]
+        {
+            let val = record.hash() as f64 / u64::MAX as f64;
+            if val < self.sampling_rate {
+                update_table_stats(&self.tables, table, record);
+            }
         }
     }
 
@@ -279,8 +306,11 @@ impl<F: DBFile + 'static> SchemaStats<F> {
     }
 
     pub(crate) fn shutdown(self) {
-        let _ = self.tx.send(StatMsg::Shutdown);
-        let _ = self.handle.join();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = self.tx.send(StatMsg::Shutdown);
+            let _ = self.handle.join();
+        }
     }
 
     pub(crate) fn drop_table_stats(&self, table: TableIdType) {

@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>squeal-db — wasm demo</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.3rem; }
+  textarea { width: 100%; height: 8rem; font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; }
+  button { padding: 0.5rem 1.2rem; font-size: 0.95rem; margin-top: 0.5rem; cursor: pointer; }
+  #status { color: #666; font-size: 0.85rem; margin-left: 1rem; }
+  #output { margin-top: 1rem; }
+  table { border-collapse: collapse; margin: 0.5rem 0 1rem; }
+  th, td { border: 1px solid #ccc; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
+  th { background: #f0f0f0; }
+  .msg { font-size: 0.85rem; color: #444; padding: 0.4rem 0; }
+  .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; }
+  .hint { color: #888; font-size: 0.8rem; }
+</style>
+</head>
+<body>
+
+<h1>squeal-db, running entirely in this tab (WebAssembly, in-memory, no server)</h1>
+<p class="hint">Everything below runs in your browser's wasm sandbox. The database is created fresh on page load and disappears when you close/reload the tab — nothing is written to disk.</p>
+
+<textarea id="sql">create table t (id integer not null, name varchar(20), primary key(id));
+insert into t values (1, 'alice'), (2, 'bob'), (3, 'carol');
+select * from t order by id;</textarea>
+<br>
+<button id="run" disabled>Run</button>
+<span id="status">loading wasm…</span>
+
+<div id="output"></div>
+
+<script type="module">
+  import init, { SquealDb } from './pkg/squeal_wasm.js';
+
+  const runBtn = document.getElementById('run');
+  const statusEl = document.getElementById('status');
+  const sqlEl = document.getElementById('sql');
+  const outEl = document.getElementById('output');
+
+  let db;
+
+  async function boot() {
+    await init();
+    db = new SquealDb('browser-demo');
+    statusEl.textContent = 'ready';
+    runBtn.disabled = false;
+  }
+
+  function renderResult(r) {
+    const wrap = document.createElement('div');
+    if (r.kind === 'Message') {
+      wrap.className = 'msg';
+      wrap.textContent = r.text;
+    } else if (r.kind === 'Count') {
+      wrap.className = 'msg';
+      wrap.textContent = `${r.rows_affected} row(s) affected`;
+    } else if (r.kind === 'Result' || r.kind === 'Rows') {
+      const table = document.createElement('table');
+      const thead = table.insertRow();
+      for (const col of r.columns) {
+        const th = document.createElement('th');
+        th.textContent = col;
+        thead.appendChild(th);
+      }
+      for (const row of r.rows) {
+        const tr = table.insertRow();
+        for (const cell of row) {
+          const td = tr.insertCell();
+          td.textContent = cell === null ? 'NULL' : cell;
+        }
+      }
+      wrap.appendChild(table);
+      const msg = document.createElement('div');
+      msg.className = 'msg';
+      msg.textContent = r.message;
+      wrap.appendChild(msg);
+    } else {
+      wrap.textContent = JSON.stringify(r);
+    }
+    return wrap;
+  }
+
+  function run() {
+    outEl.innerHTML = '';
+    const sql = sqlEl.value;
+    try {
+      const json = db.execute(sql);
+      const results = JSON.parse(json);
+      for (const r of results) {
+        outEl.appendChild(renderResult(r));
+      }
+    } catch (e) {
+      const pre = document.createElement('div');
+      pre.className = 'err';
+      pre.textContent = e.message || String(e);
+      outEl.appendChild(pre);
+    }
+  }
+
+  runBtn.addEventListener('click', run);
+  sqlEl.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') run();
+  });
+
+  boot().catch((e) => {
+    statusEl.textContent = 'failed to load: ' + e;
+    console.error(e);
+  });
+</script>
+
+</body>
+</html>

@@ -19,6 +19,7 @@ pub mod alloc;
 // directly for contention benchmarking — see that bench's own comment.
 pub mod arclock;
 mod buffer;
+pub mod clock;
 mod constant;
 pub mod db;
 pub mod error;

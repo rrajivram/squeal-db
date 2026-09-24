@@ -1,5 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::clock::{SystemTime, UNIX_EPOCH};
 use crate::db::DBSizeType;
 
 pub(crate) const MAX_TABLE_NAME_LEN: usize = 128;

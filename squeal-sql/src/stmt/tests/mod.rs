@@ -481,7 +481,7 @@ fn bench_full_pipeline_join_50k_rows() {
         .clone()
         .create_prepared_statement("insert into t2 values (?, ?)")
         .unwrap();
-    let insert_start = std::time::Instant::now();
+    let insert_start = store::clock::Instant::now();
     for i in 0..N {
         ins1.set_field(0, ValueItem::Integer(i)).unwrap();
         ins1.set_field(1, ValueItem::Integer(i % 5)).unwrap();
@@ -498,7 +498,7 @@ fn bench_full_pipeline_join_50k_rows() {
         .unwrap();
     stmt.execute().unwrap();
 
-    let query_start = std::time::Instant::now();
+    let query_start = store::clock::Instant::now();
     let result = stmt
         .results
         .get_mut(0)

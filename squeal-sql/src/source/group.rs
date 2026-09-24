@@ -1,5 +1,6 @@
+use std::{collections::HashMap, sync::Arc};
+use store::clock::Instant;
 use crate::source::{column_names, output_label, planinfo::PlanNode};
-use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use store::valueitem::{IndexKey, ValueItem};
 

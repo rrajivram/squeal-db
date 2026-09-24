@@ -1,5 +1,5 @@
-use std::time::Instant;
 
+use store::clock::Instant;
 use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{

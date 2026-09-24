@@ -1,18 +1,18 @@
-use std::{marker::PhantomData, sync::Arc, time::Instant};
+use std::{marker::PhantomData, sync::Arc};
 
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
     expr::BinaryOp,
     query::{
-        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
+        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, SelectItem,
         SetOperand, TableFactor,
     },
     token::Comma,
     utils::Seq,
     visitor::{Visit, Visitor},
 };
-use store::{db::DBFile, txn::Transaction};
+use store::{clock::Instant, db::DBFile, txn::Transaction};
 
 use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
@@ -342,7 +342,7 @@ where
 {
     type Break = SchemaError;
 
-    fn pre_visit_query(&mut self, query: &Query) -> std::ops::ControlFlow<Self::Break> {
+    fn pre_visit_query(&mut self, _query: &Query) -> std::ops::ControlFlow<Self::Break> {
         self.depth += 1;
         if self.depth == 1 {
             self.steps.push(None);
