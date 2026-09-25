@@ -490,12 +490,9 @@ where
     }
 
     // Takes `rows` by value, not `&[Vec<ValueItem>]`: each row's own
-    // Vec<ValueItem> is moved into its row-storage IndexKey at the end
-    // of the loop body (see IndexKey::new_from_owned's own doc comment
-    // for why that avoids cloning every field) — everything that still
-    // needs to read a row's values (FK checks, the row key, each
-    // index's own key extraction) runs first, while `row` is still just
-    // borrowed.
+    // Vec<ValueItem> is moved into its row-storage IndexKey inside
+    // insert_one_row_in_txn (see IndexKey::new_from_owned's own doc
+    // comment for why that avoids cloning every field).
     fn insert_rows_in_txn(
         self: &Arc<Self>,
         table: &SqlTable,
@@ -504,73 +501,211 @@ where
     ) -> Result<usize, SchemaError> {
         let mut count = 0usize;
         for row in rows {
-            self.check_foreign_keys(table, &row, txn)?;
-            let row_key = self.row_key(table, &row)?;
+            self.insert_one_row_in_txn(table, row, txn)?;
+            count += 1;
+        }
+        Ok(count)
+    }
 
-            // What every index's entry points back to: the row's own
-            // key, itself encoded as an IndexKey — the PRIMARY KEY's own
-            // IndexKey when there is one (so an index lookup can go
-            // straight to DBIdType::Rec of it), or a single-value
-            // IndexKey wrapping the auto-generated id otherwise. Built
-            // (and every index entry inserted) before `row` is moved
-            // into row_data below — extract_field_values below still
-            // needs to borrow it.
-            let identity = match &row_key {
-                DBIdType::Rec(ik) => ik.clone(),
-                DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
-            };
-            for index in &table.indices {
-                let mut values = table.extract_field_values(&index.fields, &row);
-                // A PRIMARY KEY/UNIQUE index's own declared fields are
-                // already unique by definition — that's what makes the
-                // backing BPlusTree's own duplicate-key rejection enforce
-                // the constraint. A plain index has no such guarantee, so
-                // its key has to carry the row's own identity too, or two
-                // rows sharing the same indexed value would collide as
-                // the same physical key (see Schema::create_index's own
-                // doc comment, which this has to stay in lockstep with).
-                if !index.is_primary && !index.is_unique {
-                    values.extend_from_slice(identity.values());
-                }
-                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-                self.db.insert(
-                    index.db_table_id,
-                    Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
-                    txn,
-                )?;
+    // One row's worth of what insert_rows_in_txn used to do inline —
+    // pulled out so UPDATE (see update_rows_in_txn) can reuse the exact
+    // same index-writing/versioning logic for the "write the new
+    // version" half of a delete-then-insert, instead of a second,
+    // parallel implementation that could silently drift from plain
+    // INSERT's.
+    //
+    // Everything that still needs to read `row`'s values (FK checks,
+    // the row key, each index's own key extraction) runs first, while
+    // `row` is still just borrowed — it's moved into row_data only at
+    // the very end.
+    fn insert_one_row_in_txn(
+        self: &Arc<Self>,
+        table: &SqlTable,
+        row: Vec<ValueItem>,
+        txn: &Transaction,
+    ) -> Result<(), SchemaError> {
+        self.check_foreign_keys(table, &row, txn)?;
+        let row_key = self.row_key(table, &row)?;
+
+        // What every index's entry points back to: the row's own
+        // key, itself encoded as an IndexKey — the PRIMARY KEY's own
+        // IndexKey when there is one (so an index lookup can go
+        // straight to DBIdType::Rec of it), or a single-value
+        // IndexKey wrapping the auto-generated id otherwise. Built
+        // (and every index entry inserted) before `row` is moved
+        // into row_data below — extract_field_values below still
+        // needs to borrow it.
+        let identity = match &row_key {
+            DBIdType::Rec(ik) => ik.clone(),
+            DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+        };
+        for index in &table.indices {
+            let mut values = table.extract_field_values(&index.fields, &row);
+            // A PRIMARY KEY/UNIQUE index's own declared fields are
+            // already unique by definition — that's what makes the
+            // backing BPlusTree's own duplicate-key rejection enforce
+            // the constraint. A plain index has no such guarantee, so
+            // its key has to carry the row's own identity too, or two
+            // rows sharing the same indexed value would collide as
+            // the same physical key (see Schema::create_index's own
+            // doc comment, which this has to stay in lockstep with).
+            if !index.is_primary && !index.is_unique {
+                values.extend_from_slice(identity.values());
             }
-
-            // Stamped with the table's CURRENT version — every new
-            // insert is always written in the table's latest shape;
-            // only rows written before an ALTER TABLE carry an older
-            // version (see VersionedRow, SqlTable::reproject). Moves
-            // `row` (see new_from_owned) — must be the last thing that
-            // touches it.
-            let row_data = VersionedRow {
-                version: table.version(),
-                values: IndexKey::new_from_owned(row)?,
-            };
+            let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
             self.db.insert(
-                table.db_table_id,
-                Tuple::new_with(
-                    row_key.clone(),
-                    &to_allocvec(&row_data)?,
-                    Some(txn.id()),
-                    None,
-                ),
+                index.db_table_id,
+                Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
                 txn,
             )?;
-            // Best-effort, matching SchemaStats' own approximate nature
-            // (bloom-filter uniqueness, a skippable send — see log_stat's
-            // own doc comment): logged per row right after its own
-            // insert succeeds, not after the whole batch/transaction
-            // commits, so a row whose transaction later rolls back may
-            // still count once here. Fine for stats used to guide query
-            // planning, not worth threading commit/rollback awareness
-            // into an already-lossy background collector for.
-            if let Some(stats) = self.stats.lock().as_ref() {
-                stats.log_stat(table.db_table_id, row_data.values.clone());
+        }
+
+        // Stamped with the table's CURRENT version — every new
+        // insert is always written in the table's latest shape;
+        // only rows written before an ALTER TABLE carry an older
+        // version (see VersionedRow, SqlTable::reproject). Moves
+        // `row` (see new_from_owned) — must be the last thing that
+        // touches it.
+        let row_data = VersionedRow {
+            version: table.version(),
+            values: IndexKey::new_from_owned(row)?,
+        };
+        self.db.insert(
+            table.db_table_id,
+            Tuple::new_with(
+                row_key.clone(),
+                &to_allocvec(&row_data)?,
+                Some(txn.id()),
+                None,
+            ),
+            txn,
+        )?;
+        // Best-effort, matching SchemaStats' own approximate nature
+        // (bloom-filter uniqueness, a skippable send — see log_stat's
+        // own doc comment): logged right after this row's own insert
+        // succeeds, not after the whole batch/transaction commits, so
+        // a row whose transaction later rolls back may still count
+        // once here. Fine for stats used to guide query planning, not
+        // worth threading commit/rollback awareness into an already-
+        // lossy background collector for.
+        if let Some(stats) = self.stats.lock().as_ref() {
+            stats.log_stat(table.db_table_id, row_data.values.clone());
+        }
+        Ok(())
+    }
+
+    // The mirror of insert_one_row_in_txn: removes `row_key`'s entry
+    // from the main table AND every index's own backing table. `row`
+    // must be the row's CURRENT full field values (table-field order)
+    // — needed to recompute each index's key the same way
+    // insert_one_row_in_txn built it, since an index's key is derived
+    // from the row's data, not stored anywhere that could be looked up
+    // by row_key alone.
+    //
+    // `row_key` must be the row's own already-known identity, never
+    // recomputed here via Schema::row_key — for a table with no
+    // PRIMARY KEY, row_key mints a *fresh* auto-increment id on every
+    // call (see its own doc comment), which would delete nothing and
+    // silently leave the actual row behind. Callers of this function
+    // (update_rows_matching, delete_rows_matching) get the real one from
+    // Statement::execute's own TableSource-backed scan (Source::last_id),
+    // not by recomputing it.
+    fn delete_one_row_in_txn(
+        self: &Arc<Self>,
+        table: &SqlTable,
+        row: &[ValueItem],
+        row_key: &DBIdType,
+        txn: &Transaction,
+    ) -> Result<(), SchemaError> {
+        let identity = match row_key {
+            DBIdType::Rec(ik) => ik.clone(),
+            DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+        };
+        for index in &table.indices {
+            let mut values = table.extract_field_values(&index.fields, row);
+            if !index.is_primary && !index.is_unique {
+                values.extend_from_slice(identity.values());
             }
+            let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+            self.db.remove(index.db_table_id, index_key, txn)?;
+        }
+        self.db.remove(table.db_table_id, row_key.clone(), txn)?;
+        Ok(())
+    }
+
+    // UPDATE's own entry point. `matches` is every row the WHERE clause
+    // selected — Statement::execute finds them by running the exact same
+    // TableSource(+WhereSource) pipeline SELECT itself uses (see
+    // source::Source::last_id's own doc comment for why: so UPDATE/
+    // DELETE automatically inherit whatever pushdown/optimization that
+    // pipeline gains in the future, instead of a second, parallel scan
+    // implementation of their own), pairing each row's real physical key
+    // (Tuple::id, read straight off the scan) with its current field
+    // values. `assignments` is (target field position, its already-
+    // built new-value EvalExpr), one pair per SET item — evaluated here,
+    // per matching row, against that row's own current values (so
+    // `SET age = age + 1` reads the row it's updating, not some other
+    // one). `txn` is always a real, already-active transaction by the
+    // time this is called — Statement::execute guarantees one is open
+    // for exactly as long as both the scan and these writes need to
+    // share one snapshot (see its own with_active_txn).
+    //
+    // Implemented as delete-then-insert per row, not an in-place
+    // store::Db::update — a PRIMARY KEY column can be part of a SET
+    // assignment, which moves the row to a different physical key, and
+    // any changed *indexed* column needs its old index entry removed
+    // and a new one written regardless; delete-then-insert reuses
+    // insert_one_row_in_txn's already-correct index-maintenance for the
+    // "write the new version" half instead of a second, more delicate
+    // in-place-index-update implementation that only pays for itself
+    // when nothing indexed actually changed.
+    pub(crate) fn update_rows_matching(
+        self: &Arc<Self>,
+        table_name: &str,
+        matches: Vec<(DBIdType, IndexKey)>,
+        mut assignments: Vec<(usize, crate::plan::eval::EvalExpr)>,
+        txn: &Transaction,
+    ) -> Result<usize, SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let fields = table.fields();
+        let mut count = 0usize;
+        for (old_key, current) in matches {
+            let mut new_row = current.values().to_vec();
+            for (pos, expr) in &mut assignments {
+                let raw = expr.eval(std::slice::from_ref(&current), 0)?;
+                let field = &fields[*pos];
+                let item = crate::table::coerce_selected_value(raw, field.datatype)?;
+                if item == ValueItem::Null && !field.nullable {
+                    return Err(SchemaError::UserError(format!(
+                        "Column {:?} cannot be null",
+                        field.name
+                    )));
+                }
+                new_row[*pos] = item;
+            }
+            self.delete_one_row_in_txn(&table, current.values(), &old_key, txn)?;
+            self.insert_one_row_in_txn(&table, new_row, txn)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    // DELETE's own entry point — see update_rows_matching's own doc
+    // comment on where `matches`/`txn` come from and why.
+    pub(crate) fn delete_rows_matching(
+        self: &Arc<Self>,
+        table_name: &str,
+        matches: Vec<(DBIdType, IndexKey)>,
+        txn: &Transaction,
+    ) -> Result<usize, SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let mut count = 0usize;
+        for (key, row) in matches {
+            self.delete_one_row_in_txn(&table, row.values(), &key, txn)?;
             count += 1;
         }
         Ok(count)

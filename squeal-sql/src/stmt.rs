@@ -120,38 +120,38 @@ where
         Ok(())
     }
 
-    // Only INSERT is actually executable right now: DELETE/UPDATE
-    // aren't dispatched by Statement::execute at all yet (there's no
-    // row-mutation support in this engine yet, prepared or otherwise),
-    // and Query is permanently limited to "SELECT * FROM <table>" with
-    // no WHERE clause (rejected outright by parse_select_star) — the
-    // only place a "?" could ever legally appear in a Query is a WHERE
-    // clause, so a prepared SELECT can never actually have anything to
-    // bind. Both are accepted at `new()` (matching the parse-time
-    // validation already written) so a caller can construct and bind
-    // one ahead of when those become real, but execute() has to be
-    // honest about not being able to run them yet.
+    // Only INSERT is actually executable through PREPARE/EXECUTE right
+    // now — not because UPDATE/DELETE/SELECT themselves are
+    // unsupported (Statement::execute runs all three directly, WHERE
+    // clause and all), but because placeholder substitution
+    // (substitute_insert_placeholders below) only knows how to walk an
+    // Insert's VALUES rows. Extending it to Update's assignments/WHERE,
+    // Delete's WHERE, and Select's WHERE is a real follow-up, just not
+    // this one. All three are still accepted at `new()` (matching the
+    // parse-time validation already written) so a caller can construct
+    // and bind one ahead of when that follow-up lands, but execute()
+    // has to be honest about not being able to run them yet.
     pub fn execute(&mut self) -> Result<ResultType, SchemaError> {
         let insert = match &self.template {
             sql_parser::Statement::Insert(insert) => insert.clone(),
             sql_parser::Statement::Update(_) => {
                 return Err(SchemaError::UserError(
-                    "prepared UPDATE is not executable yet — UPDATE isn't supported by this \
-                     engine at all yet"
+                    "prepared UPDATE is not executable yet — run it unprepared instead, or bind \
+                     its values into the SQL text directly"
                         .into(),
                 ));
             }
             sql_parser::Statement::Delete(_) => {
                 return Err(SchemaError::UserError(
-                    "prepared DELETE is not executable yet — DELETE isn't supported by this \
-                     engine at all yet"
+                    "prepared DELETE is not executable yet — run it unprepared instead, or bind \
+                     its values into the SQL text directly"
                         .into(),
                 ));
             }
             _ => {
                 return Err(SchemaError::UserError(
-                    "prepared SELECT is not executable yet — SELECT has no WHERE clause support \
-                     yet for a placeholder to bind into"
+                    "prepared SELECT is not executable yet — run it unprepared instead, or bind \
+                     its values into the SQL text directly"
                         .into(),
                 ));
             }
@@ -267,6 +267,119 @@ fn value_item_to_expr(v: &ValueItem) -> Result<sql_parser::Expr, SchemaError> {
         })),
     };
     Ok(Expr::Literal(literal))
+}
+
+// UPDATE/DELETE's own row-selection needs a single-table EvalExpr
+// context to resolve their WHERE/SET column references against — the
+// same shape plan::logical::QueryVisitor::get_table builds for an
+// ordinary unaliased FROM-item, built directly here since UPDATE/DELETE
+// only ever reference the one target table they already resolved (no
+// FROM clause of their own to visit). Fed to table_scan_source below,
+// which does the actual scan+filter.
+fn table_query_for<F>(
+    schema: &Arc<crate::schema_ops::schema::Schema<F>>,
+    table: &Arc<SqlTable>,
+) -> crate::plan::logical::TableQuery<F>
+where
+    F: DBFile + 'static,
+{
+    crate::plan::logical::TableQuery {
+        schema: schema.name.clone(),
+        table: table.name.clone(),
+        alias: table.name.clone(),
+        fields: table.fields_arc(),
+        resolved: TableRef::Real(schema.clone(), table.clone()),
+        joins: vec![],
+        stats: None,
+    }
+}
+
+// Builds the same TableSource(+WhereSource, if `where_expr` is Some)
+// pipeline the general SELECT planner builds for a plain, unjoined
+// `FROM <table>` (see plan::logical::QueryVisitor::get_table/
+// handle_select) — deliberately the real Source objects, not a
+// synthesized SELECT statement run through the full LogicalPlan/
+// QueryVisitor machinery meant for arbitrary joins/projections/
+// aggregates, none of which a single WHERE clause against one table
+// ever needs. UPDATE/DELETE (see their own dispatch arms below) use
+// this specifically so their own row-selection automatically inherits
+// whatever pushdown/optimization this pipeline gains in the future
+// (e.g. an index-backed IndexSource instead of a full TableSource scan,
+// not implemented yet as of this writing) instead of a second, parallel
+// implementation that would need its own, separate improvement.
+fn table_scan_source<F>(
+    schema: &Arc<crate::schema_ops::schema::Schema<F>>,
+    table: &Arc<SqlTable>,
+    where_expr: Option<crate::plan::eval::EvalExpr>,
+    txn: Option<&store::txn::Transaction>,
+) -> Result<Box<dyn crate::source::Source>, SchemaError>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    let mut source: Box<dyn crate::source::Source> = Box::new(
+        crate::source::table::TableSource::new(schema.db.clone(), table.clone(), txn, None)?,
+    );
+    if let Some(expr) = where_expr {
+        source = Box::new(crate::source::where_source::WhereSource::new(source, expr)?);
+    }
+    Ok(source)
+}
+
+// Drains `source` fully before UPDATE/DELETE writes anything (the
+// target table may be its own source; the WHERE scan and the writes it
+// drives must never interleave on the same live cursor), pairing each
+// row with the real physical key Source::last_id reads off of it.
+fn drain_with_ids(
+    mut source: Box<dyn crate::source::Source>,
+) -> Result<Vec<(store::tuple::DBIdType, store::valueitem::IndexKey)>, SchemaError> {
+    let mut out = vec![];
+    while let Some(row) = source.next()? {
+        let id = source.last_id().ok_or_else(|| {
+            SchemaError::InternalSchemaError(
+                "UPDATE/DELETE's own scan yielded a row with no physical id".into(),
+            )
+        })?;
+        out.push((id, row));
+    }
+    Ok(out)
+}
+
+// Runs `f` under a guaranteed-active transaction: the connection's
+// already-open explicit one if there is one (commit/rollback then stays
+// the caller's own later job, via an explicit COMMIT/ROLLBACK
+// statement), or a fresh one begun/committed/rolled-back around `f`
+// itself otherwise. UPDATE/DELETE need this rather than
+// Connection::with_current_txn alone (which only ever hands back
+// whatever's ALREADY active — it never starts one) because their own
+// scan (table_scan_source) and the mutations it drives (Schema::
+// update_rows_matching/delete_rows_matching) must share ONE
+// transaction/snapshot: two separate with_current_txn calls in
+// autocommit mode would let a concurrent writer interleave between the
+// scan and the write it drove.
+fn with_active_txn<F, R>(
+    conn: &Arc<Connection<F>>,
+    f: impl FnOnce(&store::txn::Transaction) -> Result<R, SchemaError>,
+) -> Result<R, SchemaError>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    let was_active = conn.with_current_txn(|t| t.is_some());
+    if !was_active {
+        conn.begin_transaction()?;
+    }
+    let result =
+        conn.with_current_txn(|txn| f(txn.expect("just ensured a transaction is active")));
+    if !was_active {
+        match &result {
+            Ok(_) => conn.commit_transaction()?,
+            Err(_) => {
+                let _ = conn.rollback_transaction();
+            }
+        }
+    }
+    result
 }
 
 impl<F> Statement<F>
@@ -437,13 +550,45 @@ where
                     match table_ref {
                         TableRef::Temp(temp_name, handle) => {
                             let fields = handle.read().fields();
+                            // build_insert_rows rejects InsertSource::Select
+                            // outright (see its own doc comment) — temp
+                            // tables don't get INSERT ... SELECT support in
+                            // this first pass, only real ones (below) do.
                             let rows =
                                 crate::table::build_insert_rows(&temp_name, &fields, insert)?;
                             let count = handle.write().insert_rows(rows)?;
                             self.results.push(Some(ResultType::Count(count)));
                         }
                         TableRef::Real(schema, table) => {
-                            let rows = table.rows_from_insert(insert)?;
+                            let rows = match &insert.source {
+                                sql_parser::dml::InsertSource::Values(_, _) => {
+                                    table.rows_from_insert(insert)?
+                                }
+                                // Runs the inner SELECT through the exact
+                                // same LogicalPlan machinery a literal
+                                // top-level SELECT does, fully materialized
+                                // here (not streamed row-by-row into
+                                // insert_rows) — this table might be its
+                                // own source (INSERT INTO t SELECT * FROM
+                                // t), so every source row has to be read
+                                // before any of them are written.
+                                sql_parser::dml::InsertSource::Select(query) => {
+                                    let mut plan =
+                                        LogicalPlan::build(self.conn.clone(), query)?;
+                                    let mut result = plan.execute()?;
+                                    let mut selected = vec![];
+                                    while let Some(row) = result.next_result()? {
+                                        selected.push(row);
+                                    }
+                                    drop(result);
+                                    crate::table::rows_from_select(
+                                        &table.name,
+                                        table.fields(),
+                                        insert,
+                                        selected,
+                                    )?
+                                }
+                            };
                             let count = self.conn.with_current_txn(|txn| {
                                 schema.insert_rows(&table.name, rows, txn)
                             })?;
@@ -461,6 +606,77 @@ where
                             ));
                         }
                     }
+                }
+                sql_parser::Statement::Update(update) => {
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&update.table)?;
+                    reject_qualified_field("UPDATE", field)?;
+                    let (schema, table) = expect_real(table_ref, "UPDATE")?;
+                    let tq = [table_query_for(&schema, &table)];
+
+                    // Each assignment's target column, resolved once up
+                    // front (fail fast on a bad/duplicate column name),
+                    // paired with its already-built evaluation tree —
+                    // Schema::update_rows_matching evaluates each one per
+                    // matching row against that row's own current values
+                    // (so `SET age = age + 1` reads the row it's
+                    // updating, not some other one).
+                    let mut assignments = Vec::with_capacity(update.assignments.len());
+                    let mut seen = std::collections::HashSet::new();
+                    for a in update.assignments.items() {
+                        let name = a
+                            .column
+                            .idents()
+                            .last()
+                            .expect("ObjectName always has at least one part")
+                            .value
+                            .to_lowercase();
+                        let pos =
+                            table.fields().iter().position(|f| f.name == name).ok_or_else(|| {
+                                SchemaError::UserError(format!(
+                                    "Table {:?} has no column named {name:?}",
+                                    table.name
+                                ))
+                            })?;
+                        if !seen.insert(pos) {
+                            return Err(SchemaError::UserError(format!(
+                                "duplicate assignment to column {name:?} in UPDATE"
+                            )));
+                        }
+                        let expr = *crate::plan::eval::EvalExpr::from_expr(&a.value, &tq)?;
+                        assignments.push((pos, expr));
+                    }
+                    let where_expr = match &update.where_clause {
+                        Some(wc) => {
+                            Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?)
+                        }
+                        None => None,
+                    };
+
+                    let count = with_active_txn(&self.conn, |txn| {
+                        let source = table_scan_source(&schema, &table, where_expr, Some(txn))?;
+                        let matches = drain_with_ids(source)?;
+                        schema.update_rows_matching(&table.name, matches, assignments, txn)
+                    })?;
+                    self.results.push(Some(ResultType::Count(count)));
+                }
+                sql_parser::Statement::Delete(delete) => {
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&delete.table)?;
+                    reject_qualified_field("DELETE", field)?;
+                    let (schema, table) = expect_real(table_ref, "DELETE")?;
+                    let where_expr = match &delete.where_clause {
+                        Some(wc) => {
+                            let tq = [table_query_for(&schema, &table)];
+                            Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?)
+                        }
+                        None => None,
+                    };
+
+                    let count = with_active_txn(&self.conn, |txn| {
+                        let source = table_scan_source(&schema, &table, where_expr, Some(txn))?;
+                        let matches = drain_with_ids(source)?;
+                        schema.delete_rows_matching(&table.name, matches, txn)
+                    })?;
+                    self.results.push(Some(ResultType::Count(count)));
                 }
                 sql_parser::Statement::StartTransaction(_) => {
                     self.conn.begin_transaction()?;

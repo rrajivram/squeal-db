@@ -3144,3 +3144,264 @@ fn test_explain_shows_min_max_sum_and_scalar_functions() {
     let plan = explain(&c, "select concat(name, upper(name)) from t");
     assert!(plan.contains("concat(name, upper(name))"), "{plan}");
 }
+
+// --- INSERT ... SELECT / UPDATE ... WHERE / DELETE ... WHERE ---
+//
+// All three used to be silently unsupported: INSERT ... SELECT was
+// rejected outright by build_insert_rows, and Statement::execute had no
+// match arm for Update/Delete at all — they fell into the `_ => {}`
+// wildcard and silently did nothing (no error, no rows affected, no
+// results). Fixed by extending INSERT's dispatch for a Select source,
+// and by giving UPDATE/DELETE real dispatch arms that synthesize an
+// equivalent `SELECT ... FROM t [WHERE ...]` and run it through the
+// exact same LogicalPlan machinery a literal SELECT uses (see
+// synthetic_select's own doc comment in stmt.rs).
+
+fn dml_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(
+        &c,
+        "create table t (id integer not null, name varchar(20), age integer, primary key(id))",
+    )
+    .unwrap();
+    run(&c, "insert into t values (1, 'alice', 30)").unwrap();
+    run(&c, "insert into t values (2, 'bob', 25)").unwrap();
+    run(&c, "insert into t values (3, 'carol', 40)").unwrap();
+    c
+}
+
+#[test]
+fn test_insert_select_copies_only_the_matching_rows_in_target_column_order() {
+    let c = dml_conn();
+    run(&c, "create table t2 (id integer not null, name varchar(20), primary key(id))").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("insert into t2 select id, name from t where age > 26")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(2)));
+
+    let rows = select_sorted(&c, "select id, name from t2");
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 20))],
+            vec![ValueItem::Integer(3), ValueItem::Str(("carol".into(), 20))],
+        ]
+    );
+}
+
+#[test]
+fn test_insert_select_with_an_explicit_column_list_fills_the_rest_with_default_or_null() {
+    let c = dml_conn();
+    run(&c, "create table t2 (id integer not null, name varchar(20), tag varchar(10), primary key(id))").unwrap();
+    run(&c, "insert into t2 (id, name) select id, name from t where id = 1").unwrap();
+    let rows = select_rows(&c, "select id, name, tag from t2").1;
+    assert_eq!(
+        rows,
+        vec![vec![
+            ValueItem::Integer(1),
+            ValueItem::Str(("alice".into(), 20)),
+            ValueItem::Null,
+        ]]
+    );
+}
+
+#[test]
+fn test_insert_select_rejects_a_type_mismatch_between_selected_value_and_target_column() {
+    let c = dml_conn();
+    run(&c, "create table t2 (id varchar(20) not null, primary key(id))").unwrap();
+    let err = run(&c, "insert into t2 select id from t").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("type") || format!("{err:?}").contains("does not match"));
+}
+
+#[test]
+fn test_insert_select_can_read_and_write_the_same_table() {
+    // Every source row must be read before any of them are written —
+    // this table is its own source, so a row-by-row implementation
+    // (rather than materializing the whole SELECT first) would risk
+    // duplicating rows it just inserted straight back into its own scan.
+    let c = conn();
+    run(&c, "create table t (id integer not null, tag varchar(10), primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 'a')").unwrap();
+    run(&c, "insert into t values (2, 'a')").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("insert into t (id, tag) select id + 100, tag from t")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(2)));
+    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(4)]]);
+}
+
+#[test]
+fn test_update_sets_matching_rows_and_reports_their_count() {
+    let c = dml_conn();
+    let mut stmt = c
+        .clone()
+        .create_statement("update t set age = 99 where name = 'bob'")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(1)));
+
+    let rows = select_sorted(&c, "select id, age from t");
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Integer(30)],
+            vec![ValueItem::Integer(2), ValueItem::Integer(99)],
+            vec![ValueItem::Integer(3), ValueItem::Integer(40)],
+        ]
+    );
+}
+
+#[test]
+fn test_update_set_expression_can_reference_the_rows_own_current_value() {
+    let c = dml_conn();
+    run(&c, "update t set age = age + 1 where name = 'bob'").unwrap();
+    let rows = select_rows(&c, "select age from t where name = 'bob'").1;
+    assert_eq!(rows, vec![vec![ValueItem::Integer(26)]]);
+}
+
+#[test]
+fn test_update_without_a_where_clause_updates_every_row() {
+    let c = dml_conn();
+    let mut stmt = c.clone().create_statement("update t set age = 0").unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(3)));
+    let rows = select_rows(&c, "select age from t").1;
+    assert!(rows.iter().all(|r| r == &vec![ValueItem::Integer(0)]));
+}
+
+#[test]
+fn test_update_moving_the_primary_key_relocates_the_row() {
+    let c = dml_conn();
+    run(&c, "update t set id = 100 where name = 'bob'").unwrap();
+    // The old key is gone...
+    assert_eq!(select_rows(&c, "select * from t where id = 2").1, Vec::<Vec<ValueItem>>::new());
+    // ...and the row is findable at its new one, values otherwise intact.
+    let rows = select_rows(&c, "select id, name, age from t where id = 100").1;
+    assert_eq!(
+        rows,
+        vec![vec![
+            ValueItem::Integer(100),
+            ValueItem::Str(("bob".into(), 20)),
+            ValueItem::Integer(25),
+        ]]
+    );
+    // And the total row count is unchanged — a move, not a duplicate.
+    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(3)]]);
+}
+
+#[test]
+fn test_update_keeps_a_secondary_index_correct() {
+    let c = dml_conn();
+    run(&c, "create index idx_name on t (name)").unwrap();
+    run(&c, "update t set name = 'zzz' where name = 'bob'").unwrap();
+    // A lookup on the OLD indexed value must find nothing now...
+    assert_eq!(select_rows(&c, "select * from t where name = 'bob'").1, Vec::<Vec<ValueItem>>::new());
+    // ...and the NEW value must find exactly the moved row.
+    let rows = select_rows(&c, "select id from t where name = 'zzz'").1;
+    assert_eq!(rows, vec![vec![ValueItem::Integer(2)]]);
+}
+
+#[test]
+fn test_update_enforces_not_null() {
+    let c = dml_conn();
+    run(&c, "alter table t add column req varchar(10) not null default 'x'").unwrap();
+    let err = run(&c, "update t set req = null where id = 1").unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("null"), "{err}");
+}
+
+#[test]
+fn test_update_and_delete_work_on_a_table_with_no_primary_key() {
+    // UPDATE/DELETE identify a matching row by its real physical key
+    // (Tuple::id, read straight off the scan — see Schema::scan_matching's
+    // own doc comment), not by recomputing one from the row's own PRIMARY
+    // KEY columns — so a table with no declared PRIMARY KEY (every table
+    // still has SOME physical key: its auto-generated rowid) works exactly
+    // the same as one that does.
+    let c = conn();
+    run(&c, "create table nopk (id integer not null, tag varchar(10))").unwrap();
+    run(&c, "insert into nopk values (1, 'a')").unwrap();
+    run(&c, "insert into nopk values (2, 'a')").unwrap();
+    run(&c, "insert into nopk values (3, 'b')").unwrap();
+
+    let mut stmt = c
+        .clone()
+        .create_statement("update nopk set tag = 'z' where id = 2")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(1)));
+    assert_eq!(
+        select_sorted(&c, "select id, tag from nopk"),
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("a".into(), 10))],
+            vec![ValueItem::Integer(2), ValueItem::Str(("z".into(), 10))],
+            vec![ValueItem::Integer(3), ValueItem::Str(("b".into(), 10))],
+        ]
+    );
+
+    let mut stmt = c
+        .clone()
+        .create_statement("delete from nopk where tag = 'a'")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(1)));
+    assert_eq!(
+        select_sorted(&c, "select id, tag from nopk"),
+        vec![
+            vec![ValueItem::Integer(2), ValueItem::Str(("z".into(), 10))],
+            vec![ValueItem::Integer(3), ValueItem::Str(("b".into(), 10))],
+        ]
+    );
+}
+
+#[test]
+fn test_delete_removes_matching_rows_and_reports_their_count() {
+    let c = dml_conn();
+    let mut stmt = c
+        .clone()
+        .create_statement("delete from t where age > 26")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(2)));
+    let rows = select_rows(&c, "select id from t").1;
+    assert_eq!(rows, vec![vec![ValueItem::Integer(2)]]);
+}
+
+#[test]
+fn test_delete_without_a_where_clause_deletes_every_row() {
+    let c = dml_conn();
+    let mut stmt = c.clone().create_statement("delete from t").unwrap();
+    stmt.execute().unwrap();
+    assert!(matches!(nth_result(&stmt, 0), ResultType::Count(3)));
+    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(0)]]);
+}
+
+#[test]
+fn test_delete_keeps_a_secondary_index_correct() {
+    let c = dml_conn();
+    run(&c, "create index idx_name on t (name)").unwrap();
+    run(&c, "delete from t where name = 'bob'").unwrap();
+    assert_eq!(select_rows(&c, "select * from t where name = 'bob'").1, Vec::<Vec<ValueItem>>::new());
+    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(2)]]);
+}
+
+#[test]
+fn test_update_then_delete_leave_the_table_in_the_expected_final_state() {
+    // The exact sequence from this feature's own manual smoke test
+    // (squeal-cli, node/wasm, node/wasi) — pinned here so a regression
+    // in any of the three surfaces this same scenario across.
+    let c = dml_conn();
+    run(&c, "update t set age = age + 1 where name = 'bob'").unwrap();
+    run(&c, "delete from t where age > 35").unwrap();
+    let rows = select_sorted(&c, "select id, name, age from t");
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 20)), ValueItem::Integer(30)],
+            vec![ValueItem::Integer(2), ValueItem::Str(("bob".into(), 20)), ValueItem::Integer(26)],
+        ]
+    );
+}

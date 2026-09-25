@@ -1137,9 +1137,16 @@ pub(crate) fn build_insert_rows(
 
     let value_rows = match &insert.source {
         sql_parser::dml::InsertSource::Values(_, rows) => rows,
+        // INSERT ... SELECT goes through rows_from_select instead (see
+        // its own doc comment) — Statement::execute branches on
+        // insert.source before ever calling this function, so reaching
+        // here with a Select source would be this crate's own bug, not
+        // a user-facing case.
         sql_parser::dml::InsertSource::Select(_) => {
-            return Err(SchemaError::UserError(
-                "Only INSERT ... VALUES (...) is supported".into(),
+            return Err(SchemaError::InternalSchemaError(
+                "build_insert_rows called with an INSERT ... SELECT — should have gone \
+                 through rows_from_select instead"
+                    .into(),
             ));
         }
     };
@@ -1165,30 +1172,125 @@ pub(crate) fn build_insert_rows(
             }
             by_name.insert(field.name.as_str(), item);
         }
-        let mut full_row = Vec::with_capacity(fields.len());
-        for f in fields {
-            match by_name.remove(f.name.as_str()) {
-                Some(v) => full_row.push(v),
-                // DEFAULT applies to any omitted column, not just a
-                // backfilled pre-ALTER row (see Field::default) —
-                // checked before the plain-NULL fallback so a NOT
-                // NULL column with a DEFAULT still works via an
-                // explicit column list that leaves it out.
-                None if f.default.is_some() => {
-                    full_row.push(f.default.clone().expect("checked Some above"))
-                }
-                None if f.nullable => full_row.push(ValueItem::Null),
-                None => {
-                    return Err(SchemaError::UserError(format!(
-                        "Column {:?} has no value and is not nullable",
-                        f.name
-                    )));
-                }
-            }
-        }
-        rows.push(full_row);
+        rows.push(fill_full_row(fields, by_name)?);
     }
     Ok(rows)
+}
+
+// Shared tail of both build_insert_rows and rows_from_select: given
+// `by_name` (one entry per column the caller actually supplied a value
+// for), produces one full row in `fields`' own declared order — DEFAULT
+// for any omitted column that has one (checked before the plain-NULL
+// fallback so a NOT NULL column with a DEFAULT still works via an
+// explicit column list that leaves it out), Null for any other omitted
+// nullable column, and an error for an omitted NOT NULL column with no
+// DEFAULT.
+fn fill_full_row(
+    fields: &[Arc<Field>],
+    mut by_name: HashMap<&str, ValueItem>,
+) -> Result<Vec<ValueItem>, SchemaError> {
+    let mut full_row = Vec::with_capacity(fields.len());
+    for f in fields {
+        match by_name.remove(f.name.as_str()) {
+            Some(v) => full_row.push(v),
+            None if f.default.is_some() => {
+                full_row.push(f.default.clone().expect("checked Some above"))
+            }
+            None if f.nullable => full_row.push(ValueItem::Null),
+            None => {
+                return Err(SchemaError::UserError(format!(
+                    "Column {:?} has no value and is not nullable",
+                    f.name
+                )));
+            }
+        }
+    }
+    Ok(full_row)
+}
+
+// INSERT ... SELECT's own row-shaping — the SELECT side has already run
+// by the time this is called (see Statement::execute; this function
+// stays free of Connection/LogicalPlan so table.rs doesn't need to know
+// how a query executes, only how to shape its output into this table's
+// row order). Resolves insert's column list exactly like
+// build_insert_rows does, coerces each selected value to its target
+// column's declared type (coerce_selected_value re-wraps a Str/Blob
+// with THIS column's own reserved capacity — a selected value carries
+// whatever capacity its own source column had, never this one's), and
+// fills every omitted column with DEFAULT/NULL exactly like the VALUES
+// path (fill_full_row).
+pub(crate) fn rows_from_select(
+    table_name: &str,
+    fields: &[Arc<Field>],
+    insert: &sql_parser::dml::Insert,
+    selected_rows: Vec<IndexKey>,
+) -> Result<Vec<Vec<ValueItem>>, SchemaError> {
+    let target_fields: Vec<&Arc<Field>> = match &insert.columns {
+        None => fields.iter().collect(),
+        Some((_, cols, _)) => cols
+            .items()
+            .map(|c| {
+                let name = c.value.to_lowercase();
+                fields.iter().find(|f| f.name == name).ok_or_else(|| {
+                    SchemaError::UserError(format!(
+                        "Table {table_name:?} has no column named {name:?}"
+                    ))
+                })
+            })
+            .collect::<Result<_, _>>()?,
+    };
+
+    let mut rows = Vec::with_capacity(selected_rows.len());
+    for selected in selected_rows {
+        let values = selected.values();
+        if values.len() != target_fields.len() {
+            return Err(SchemaError::UserError(format!(
+                "SELECT returned {} column(s) but INSERT expects {}",
+                values.len(),
+                target_fields.len()
+            )));
+        }
+        let mut by_name: HashMap<&str, ValueItem> = HashMap::with_capacity(values.len());
+        for (field, value) in target_fields.iter().zip(values) {
+            let item = coerce_selected_value(value.clone(), field.datatype)?;
+            if item == ValueItem::Null && !field.nullable {
+                return Err(SchemaError::UserError(format!(
+                    "Column {:?} cannot be null",
+                    field.name
+                )));
+            }
+            by_name.insert(field.name.as_str(), item);
+        }
+        rows.push(fill_full_row(fields, by_name)?);
+    }
+    Ok(rows)
+}
+
+// Re-typing for a specific target column — same spirit as
+// expr_to_value_item (which does this for a VALUES literal), but the
+// input here is already a concrete ValueItem the SELECT side produced,
+// not an AST node to parse. Deliberately as strict as expr_to_value_item
+// (no int-to-double widening, no implicit casts): a value whose variant
+// doesn't already match `datatype` is rejected with a clear message
+// rather than silently coerced.
+pub(crate) fn coerce_selected_value(
+    value: ValueItem,
+    datatype: DataType,
+) -> Result<ValueItem, SchemaError> {
+    Ok(match (value, datatype) {
+        (ValueItem::Null, _) => ValueItem::Null,
+        (ValueItem::Integer(i), DataType::Integer) => ValueItem::Integer(i),
+        (ValueItem::Double(d), DataType::Double) => ValueItem::Double(d),
+        (ValueItem::Datetime(d), DataType::Datetime) => ValueItem::Datetime(d),
+        (ValueItem::Str((s, _)), DataType::Str(cap)) => ValueItem::Str((s, cap)),
+        (ValueItem::Blob((b, _)), DataType::Blob(cap)) => ValueItem::Blob((b, cap)),
+        (ValueItem::Boolean(b), DataType::Boolean) => ValueItem::Boolean(b),
+        (v, dt) => {
+            return Err(SchemaError::UserError(format!(
+                "value {v:?} does not match column type {dt:?}"
+            )));
+        }
+    })
 }
 
 // Converts a single VALUES-clause literal into a ValueItem matching

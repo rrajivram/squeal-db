@@ -85,6 +85,26 @@ pub trait Source: Debug + Send {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
+    // The most recently yielded row's REAL physical key (Tuple::id — the
+    // PRIMARY KEY's own IndexKey if the table declared one, its auto-
+    // generated rowid otherwise), if this source (or, through however
+    // many layers, whatever it wraps) is backed by one at all. None
+    // before the first next() call, after next() returns None, or for a
+    // source with no such underlying identity (an aggregate/projection
+    // that computes new columns, a UNION combining rows from more than
+    // one place, ...).
+    //
+    // Exists specifically so UPDATE/DELETE (see Statement::execute) can
+    // reuse this exact scan/filter pipeline — the same one SELECT itself
+    // runs, automatically inheriting whatever pushdown/optimization it
+    // gains in the future — instead of a second, parallel table-scan
+    // implementation of their own. Default None costs every other
+    // Source nothing to not care about; only TableSource actually knows
+    // a real id, and only WhereSource needs to pass it through (a plain
+    // filter doesn't change which row is "current").
+    fn last_id(&self) -> Option<store::tuple::DBIdType> {
+        None
+    }
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         None
     }

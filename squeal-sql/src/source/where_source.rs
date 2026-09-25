@@ -44,6 +44,12 @@ impl Source for WhereSource {
         self.source.fields()
     }
 
+    // A filter doesn't change which row is "current" — see Source::
+    // last_id's own doc comment for why this exists at all.
+    fn last_id(&self) -> Option<store::tuple::DBIdType> {
+        self.source.last_id()
+    }
+
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
         let start = Instant::now();
         while let Some(res) = self.source.next()? {

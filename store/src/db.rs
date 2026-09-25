@@ -721,14 +721,21 @@ where
         // are found (its namespace: the directory for a real file). Every
         // segment's header is validated BEFORE any lock is taken, so a
         // wrongly-paired log (wrong database, WAL version, page size) is
-        // refused with zero side effects.
-        let mut wal = Self::open_segments(name.as_ref(), &log_file, header.page_size)?;
+        // refused with zero side effects — find_existing_segments is
+        // read-only, so a rejected open (do_lock() failing just below)
+        // really does leave zero side effects, unlike this function's
+        // own former, unsplit version (see find_existing_segments' own
+        // doc comment for the bug that closed).
+        let (older_segs, mut records) =
+            Self::find_existing_segments(name.as_ref(), &log_file, header.page_size)?;
         // One comparison decides what recovery replays: a record below the
         // last checkpoint's floor is already on disk (see Header).
         let floor = header.checkpoint_lsn;
-        let mut records = std::mem::take(&mut wal.records);
         records.retain(|r| r.lsn.0 >= floor);
         file.do_lock()?;
+        // Only now — after confirming exclusive ownership — does opening
+        // actually write anything to disk (a fresh WAL segment).
+        let wal = Self::roll_to_fresh_segment(name.as_ref(), &log_file, header.page_size, older_segs)?;
         let gens = Arc::new(Generator::new());
         // STORE_AUDIT.md T5 follow-up: the audit's own recommendation
         // ("derive page_count from file length instead of trusting the
@@ -847,39 +854,31 @@ where
     /// all means a fresh log: segment 1 is created. Returns the records of
     /// every segment concatenated in order (recovery replays them as one
     /// log) plus what the runner needs to continue appending.
-    fn open_segments(
+    // Read-only: locates every existing WAL segment for `name`,
+    // validates each one's header, and scans it for redo/undo records —
+    // no filesystem writes at all. Split out from what used to be one
+    // `open_segments` specifically so a rejected open (do_lock() failing
+    // right after this returns — see Db::open_using) never leaves a
+    // side effect behind: the old, unsplit version unconditionally
+    // started a fresh WAL segment (a real, permanent file write) as
+    // part of "opening" a database, before the caller had even
+    // confirmed it actually owns the file — so a second, doomed-to-fail
+    // concurrent open attempt still left a stray segment file behind,
+    // which then collided with the legitimate owner's own later segment
+    // rolls (confirmed by hand: two connect() attempts racing the same
+    // path, the losing one still visibly bumping the segment counter).
+    // See roll_to_fresh_segment for the part that actually writes,
+    // deliberately kept separate and only ever called once a caller has
+    // confirmed exclusive ownership.
+    fn find_existing_segments(
         name: &str,
         handle: &F,
         page_size: DBSizeType,
-    ) -> Result<OpenedWal<F>, StoreError> {
+    ) -> Result<(Vec<Segment>, Vec<LogRecord>), StoreError> {
         let segs = list_segments(handle, name)?;
-        if segs.is_empty() {
-            let path = segment_path(name, 1);
-            let opts = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .clone();
-            let mut f = handle.open_sibling(&path, opts)?;
-            let header_bytes = write_log_header(&mut f, page_size)?;
-            f.do_sync()?;
-            return Ok(OpenedWal {
-                current_file: f,
-                current: Segment {
-                    n: 1,
-                    path,
-                    max_lsn: 0,
-                    bytes: header_bytes.len() as u64,
-                },
-                older: Vec::new(),
-                header_bytes,
-                records: Vec::new(),
-            });
-        }
         let opts = OpenOptions::new().read(true).write(true).clone();
         let mut records = Vec::new();
         let mut scanned = Vec::with_capacity(segs.len());
-        let mut last_file = None;
         for (n, path) in segs {
             let mut f = handle.open_sibling(&path, opts.clone())?;
             let validated = read_and_validate_log_header(&mut f, page_size)?;
@@ -902,14 +901,42 @@ where
                 max_lsn,
                 bytes: size,
             });
-            last_file = Some(f);
         }
-        drop(last_file);
-        // Never append to a recovered segment: a crash may have left a torn
-        // tail at its end, and records appended after that point would be
-        // unreadable (the scan stops at the tear). A fresh segment costs one
-        // file, deleted at the first checkpoint that passes it.
-        let next_n = scanned.last().map(|s| s.n + 1).unwrap_or(1);
+        Ok((scanned, records))
+    }
+
+    // The one part of opening/creating a database that actually writes
+    // to disk: starts a fresh segment numbered one past whatever
+    // `older` already has (or 1, for a brand new database with none).
+    // Never appends to a recovered segment: a crash may have left a
+    // torn tail at its end, and records appended past that point would
+    // be unreadable (find_existing_segments' own scan stops at the
+    // tear) — a fresh segment costs one file, deleted at the first
+    // checkpoint that passes it.
+    //
+    // Only call this once the caller actually owns the file
+    // exclusively: do_lock() having already succeeded (Db::open_using),
+    // or — for a brand new database — create_new(true)'s own atomicity
+    // on the main file having already guaranteed it (Db::
+    // create_core_db, which calls this directly with an empty `older`
+    // rather than through find_existing_segments — a brand new file
+    // never has any existing segments to find). A rejected/failed open
+    // must never reach this — find_existing_segments alone is what a
+    // failed do_lock() needs to leave as this database's only footprint
+    // on disk.
+    // `records` isn't a parameter here — a fresh segment never has any
+    // of its own, and neither caller (open_using, create_core_db) ever
+    // reads OpenedWal.records back out of the value this returns
+    // (setup_needed_modules, the one thing that consumes an OpenedWal,
+    // never looks at that field); each keeps whatever records it found
+    // via find_existing_segments in its own local instead.
+    fn roll_to_fresh_segment(
+        name: &str,
+        handle: &F,
+        page_size: DBSizeType,
+        older: Vec<Segment>,
+    ) -> Result<OpenedWal<F>, StoreError> {
+        let next_n = older.last().map(|s| s.n + 1).unwrap_or(1);
         let path = segment_path(name, next_n);
         let opts = OpenOptions::new()
             .create_new(true)
@@ -927,9 +954,9 @@ where
                 max_lsn: 0,
                 bytes: header_bytes.len() as u64,
             },
-            older: scanned,
+            older,
             header_bytes,
-            records,
+            records: Vec::new(),
         })
     }
 
@@ -2605,8 +2632,11 @@ where
             .clone();
         let mut f = F::open(f, &name)?;
         f.do_lock()?;
-        // Phase 6: the first WAL segment, next to the data file.
-        let wal = Self::open_segments(&name, &f, page_size)?;
+        // Phase 6: the first WAL segment, next to the data file. Straight
+        // to roll_to_fresh_segment, not via find_existing_segments first —
+        // `f` was just opened with create_new(true) above, so there is
+        // provably nothing existing to find.
+        let wal = Self::roll_to_fresh_segment(&name, &f, page_size, Vec::new())?;
         let mut header = Header {
             magic: MAGIC,
             format_version: HEADER_FORMAT_VERSION,
@@ -2957,7 +2987,7 @@ mod tests {
         cursor::Cursor,
         db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
-        logger::LogHeader,
+        logger::{LogHeader, list_segments},
         memfile::MemFile,
         table::TableIdType,
         tuple::{DBIdType, Tuple},
@@ -6130,6 +6160,54 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         panic!("timed out waiting for {expected} file-backed log record(s) to land");
+    }
+
+    // The exact bug this session's own WAL open/lock reordering fixed:
+    // Db::open_using used to create a brand new WAL segment (a real disk
+    // write) as part of "opening" a database, before ever checking
+    // whether the caller actually owns the file — so a second,
+    // independent open attempt racing an already-open database still
+    // left a stray segment file behind even though it correctly failed
+    // at the lock check, and that stray file then collided with the
+    // legitimate owner's own later segment rolls (confirmed by hand,
+    // before the fix: the original handle's own close() failed with an
+    // AlreadyExists io error). find_existing_segments (read-only) now
+    // runs before do_lock(); roll_to_fresh_segment (the part that
+    // writes) only after it succeeds.
+    #[test]
+    fn test_a_failed_concurrent_open_leaves_no_stray_wal_segment_behind() {
+        let db_name = temp_db_path("concurrent_open");
+        FileDB::delete(&db_name).unwrap_or_default();
+        let db = FileDB::create(&db_name).unwrap();
+
+        let segments_before = list_segments(&db.file, &db_name).unwrap().len();
+        assert_eq!(
+            segments_before, 1,
+            "a freshly created database starts with exactly one segment"
+        );
+
+        // A second, genuinely independent open of the SAME path (a fresh
+        // file handle, not a clone of `db`'s own — this is what actually
+        // exercises do_lock()'s real OS-level exclusivity, unlike
+        // crash_clone_file's deliberately-shared fd used elsewhere in
+        // this test module) must fail...
+        let second = FileDB::open(&db_name);
+        assert!(second.is_err(), "opening an already-open database should fail");
+        drop(second);
+
+        // ...and must not have created a new WAL segment in the process.
+        let segments_after = list_segments(&db.file, &db_name).unwrap().len();
+        assert_eq!(
+            segments_after, segments_before,
+            "a failed concurrent open must not leave a new WAL segment behind"
+        );
+
+        // The original handle is unaffected by the failed second attempt
+        // — this is exactly what used to break: closing `db` afterward
+        // used to fail, colliding with the stray segment the doomed
+        // second attempt had already created.
+        drop(db);
+        FileDB::delete(&db_name).unwrap_or_default();
     }
 
     // mmap-ing a zero-length file is a classic edge case (some mmap

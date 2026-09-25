@@ -1,0 +1,27 @@
+{
+  "name": "ws-napi",
+  "version": "0.1.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "ws-napi",
+    "targets": [
+      "wasm32-wasip1-threads"
+    ],
+    "wasm": {
+      "browser": {
+        "fs": true
+      }
+    }
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3",
+    "@emnapi/core": "^2.0.0-alpha.4",
+    "@emnapi/runtime": "^2.0.0-alpha.4",
+    "emnapi": "^2.0.0-alpha.4"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform"
+  }
+}

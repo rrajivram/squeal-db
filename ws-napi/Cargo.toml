@@ -1,0 +1,30 @@
+[package]
+name = "ws-napi"
+version = "0.1.0"
+edition = "2024"
+
+# cdylib for napi-rs's own loader to load (native .node on native
+# platforms, wasm32-wasip1-threads for the portable/no-prebuilt-binary
+# path) — see this crate's own doc comment for why WASI here, unlike
+# squeal-wasm's browser target, and why napi-rs rather than
+# wasm-bindgen. Also rlib: a plain cdylib fails to link at all for
+# `cargo test`'s own test binary (unresolved napi_* symbols — those are
+# only ever provided by the real Node/napi host loading the cdylib
+# dynamically, same root cause as squeal-wasm's JsError not working
+# outside a JS host, but total rather than one call failing) — rlib
+# gives cargo test something linkable, matching squeal-wasm's own
+# ["cdylib", "rlib"].
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+squeal-sql = { path = "../squeal-sql" }
+store = { path = "../store" }
+napi = { version = "3", default-features = false, features = ["napi4"] }
+napi-derive = "3"
+parking_lot = "0.12.5"
+serde_json = "1.0"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[build-dependencies]
+napi-build = "2"

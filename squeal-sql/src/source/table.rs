@@ -22,6 +22,11 @@ pub struct TableSource<F: DBFile> {
     fields: Arc<[ProjectableField]>,
     next_time: u128,
     stats: Option<ComputedTableStat>,
+    // The most recently yielded tuple's own key — see Source::last_id's
+    // own doc comment for why this exists at all (UPDATE/DELETE's own
+    // use). None before the first next() call or after next() returns
+    // None.
+    last_id: Option<store::tuple::DBIdType>,
 }
 
 impl<F> TableSource<F>
@@ -59,6 +64,7 @@ where
             fields,
             next_time: 0,
             stats,
+            last_id: None,
         })
     }
 }
@@ -80,12 +86,18 @@ where
         if let Some(tuple) = self.cursor.next()? {
             let row = from_bytes::<VersionedRow>(tuple.data())?;
             let out = self.table.reproject(&row)?;
+            self.last_id = Some(tuple.id().clone());
             self.next_time += start.elapsed().as_nanos();
             Ok(Some(out))
         } else {
+            self.last_id = None;
             self.next_time += start.elapsed().as_nanos();
             Ok(None)
         }
+    }
+
+    fn last_id(&self) -> Option<store::tuple::DBIdType> {
+        self.last_id.clone()
     }
 
     fn fields(&self) -> Arc<[ProjectableField]> {
@@ -93,6 +105,7 @@ where
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
+        self.last_id = None;
         Ok(self.cursor.reset()?)
     }
 

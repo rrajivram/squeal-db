@@ -201,6 +201,13 @@ impl Opener for MemFile {
     }
 }
 
+// Real files work on every native target — see WasiFile just below for
+// wasm32-wasip1 (a real filesystem too, but one that needs a different
+// Opener impl, not this one: see its own doc comment for why). The one
+// wasm target excluded from both is wasm32-unknown-unknown
+// (target_os = "unknown"): that's the browser target, with no
+// filesystem syscalls at all — see this crate's own memfile-only wasm32
+// story.
 #[cfg(not(target_arch = "wasm32"))]
 impl Opener for std::fs::File {
     type Item = std::fs::File;
@@ -261,6 +268,161 @@ impl Opener for std::fs::File {
     #[cfg(windows)]
     fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
         std::os::windows::fs::FileExt::seek_write(self, buf, offset)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+// wasm32-wasip1's real-file backend — NOT `impl Opener for std::fs::File`
+// like native, because two things `DBFile` leans on constantly turned out
+// to be broken at runtime under WASI (both confirmed empirically, by
+// actually running a build under Node — not from documentation, which
+// suggested both should work):
+//
+// - `File::try_lock()` compiles (std provides some implementation for
+//   every public API on every target) but every call returns "lock
+//   acquisition failed due to I/O error": WASI Preview 1 has no
+//   flock-equivalent syscall at all for std to wrap.
+// - `File::try_clone()` compiles but every call returns an `Unsupported`
+//   io::Error: WASI Preview 1 has no fd-duplication syscall either. This
+//   one is load-bearing — `Opener::do_clone` is how every subsystem
+//   (logger, buffer pool, temp pool) gets its own independent handle to
+//   the same underlying file — so it rules out not just do_clone itself
+//   but also the try_clone-based pread/pwrite fallback a first pass at
+//   this used (real positioned I/O is separately unavailable too: see
+//   below).
+//
+// WasiFile's fix for both is the same idea: a `do_clone`/pread/pwrite
+// that needs "another handle to this file" gets one by reopening the
+// same path (a fresh `path_open` syscall) instead of duplicating a file
+// descriptor — genuinely independent, and the WASI-native way to get
+// that. That needs remembering the path a bare `std::fs::File` doesn't
+// keep, hence the wrapper struct rather than a second `impl Opener for
+// std::fs::File` gated on `target_os = "wasi"` (tried first; doesn't
+// work, since File alone has nowhere to keep it).
+#[cfg(target_os = "wasi")]
+#[derive(Debug)]
+pub struct WasiFile {
+    // A Mutex, not a plain File: pread/pwrite take &self (shared) per
+    // Opener's contract — real positioned I/O syscalls exist on WASI
+    // (fd_pread/fd_pwrite) but std's wrapper for them
+    // (std::os::wasi::fs::FileExt) is still behind the unstable
+    // `wasi_ext` feature (rust-lang/rust#71213), not available on
+    // stable. Seeking then reading/writing the shared fd under a lock is
+    // exactly as correct here as true positioned I/O would be, because
+    // this build never spawns real OS threads on any wasm32 target
+    // (wasip1 included — see store's maintenance/logger/buffer wasm32
+    // collapse) — the Mutex exists to satisfy the borrow checker for a
+    // &self method that needs to seek, not as a real concurrency
+    // mechanism. Read/Write/Seek (below) use get_mut() instead of
+    // locking: those take &mut self, so exclusive access is already
+    // guaranteed by the borrow checker, no runtime lock needed.
+    file: Mutex<std::fs::File>,
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_os = "wasi")]
+impl std::io::Read for WasiFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.get_mut().read(buf)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl std::io::Write for WasiFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.get_mut().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.get_mut().flush()
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl std::io::Seek for WasiFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.get_mut().seek(pos)
+    }
+}
+
+#[cfg(target_os = "wasi")]
+impl Opener for WasiFile {
+    type Item = WasiFile;
+
+    fn open<P: AsRef<Path>>(op: OpenOptions, p: P) -> std::io::Result<WasiFile> {
+        let path = p.as_ref().to_path_buf();
+        let file = op.open(&path)?;
+        Ok(WasiFile {
+            file: Mutex::new(file),
+            path,
+        })
+    }
+
+    fn open_sibling(&self, path: &str, op: OpenOptions) -> std::io::Result<WasiFile> {
+        let file = op.open(path)?;
+        Ok(WasiFile {
+            file: Mutex::new(file),
+            path: std::path::PathBuf::from(path),
+        })
+    }
+
+    fn list_siblings(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        list_files_with_prefix(prefix)
+    }
+
+    fn remove_sibling(&self, path: &str) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        }
+    }
+
+    fn do_sync(&mut self) -> std::io::Result<()> {
+        self.file.get_mut().sync_data()
+    }
+
+    // See this struct's own doc comment: try_clone() doesn't work on
+    // WASI, so "another handle to the same file" means reopening its
+    // path instead.
+    fn do_clone(&self) -> std::io::Result<Self::Item> {
+        WasiFile::open(
+            OpenOptions::new().read(true).write(true).clone(),
+            &self.path,
+        )
+    }
+
+    fn get_metadata(&self) -> std::io::Result<Meta> {
+        let m = self.file.lock().metadata()?;
+        Ok(Meta { len: m.len() })
+    }
+
+    // No flock-equivalent syscall on WASI Preview 1 — see this struct's
+    // own doc comment. Same no-op tradeoff MemFile's own do_lock already
+    // makes (for a different reason): this loses the "reject a second
+    // concurrent open of the same path" safety net, with no OS mechanism
+    // left to provide it.
+    fn do_lock(&self) -> Result<(), std::fs::TryLockError> {
+        Ok(())
+    }
+
+    fn truncate(&mut self) -> std::io::Result<()> {
+        self.file.get_mut().set_len(0)
+    }
+
+    fn pread(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = self.file.lock();
+        f.seek(SeekFrom::Start(offset))?;
+        f.read(buf)
+    }
+
+    fn pwrite(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = self.file.lock();
+        f.seek(SeekFrom::Start(offset))?;
+        f.write(buf)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
