@@ -31,6 +31,22 @@ Requires `wasm-bindgen-cli`, matching the `wasm-bindgen` version in
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
 ```
 
+## Loading a CSV
+
+`CREATE TABLE t AS COPY FROM @path` infers column names/types from a CSV's
+first rows, creates the table and loads every row — but `@path` needs a
+filesystem, which a browser tab doesn't have (in this build that statement
+fails with "operation not supported on this platform"). The browser
+equivalent is a method that takes the CSV text itself:
+
+```js
+const text = await file.text();          // e.g. from <input type="file">
+db.createTableFromCsv('orders', text);   // same inference + load, no path
+```
+
+The demo page's **Load CSV…** button does exactly this; the file never
+leaves the browser.
+
 ## Try it in Node instead
 
 Same build, different `wasm-bindgen` target:

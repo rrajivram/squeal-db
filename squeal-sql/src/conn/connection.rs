@@ -190,6 +190,27 @@ where
         ))
     }
 
+    // A non-SQL entry point for "sniff this CSV's columns/types, create
+    // a table for them, load every row" — squeal-wasm's and ws-napi's
+    // own way to offer `CREATE TABLE <name> AS COPY FROM @<path>`'s
+    // capability (see that statement's own grammar/dispatch) where
+    // `@path` can't mean anything at all: a browser tab has no
+    // filesystem to resolve one against (see store::memfile's own
+    // wasm32-unknown-unknown story), so `content` comes from wherever
+    // the JS host itself read it (a File object, a fetch() response,
+    // ...) and is hers straight through to Schema::create_table_from_csv,
+    // no path/file I/O anywhere in this call at all — which is exactly
+    // why it also works unchanged on every other target (native, WASI),
+    // not just the browser.
+    pub fn create_table_from_csv(
+        self: &Arc<Self>,
+        table_name: &str,
+        content: &str,
+    ) -> Result<(usize, usize), SchemaError> {
+        let schema = self.current_schema().ok_or(SchemaError::NoSchemaSelected)?;
+        schema.create_table_from_csv(table_name, content, false)
+    }
+
     // Looks up any named schema in this connection's current database —
     // not necessarily the current one, and doesn't change it (unlike
     // use_schema). For resolving a schema-qualified table reference

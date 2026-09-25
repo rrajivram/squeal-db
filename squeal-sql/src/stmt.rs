@@ -493,6 +493,32 @@ where
                         ))));
                     }
                 }
+                sql_parser::Statement::CreateTableAsCopy(c) => {
+                    let schema = self
+                        .conn
+                        .current_schema()
+                        .ok_or(SchemaError::NoSchemaSelected)?;
+                    let table_name = c.name.to_dotted();
+                    let content = std::fs::read_to_string(&c.path.path).map_err(|e| {
+                        SchemaError::UserError(format!(
+                            "could not open {:?}: {e}",
+                            c.path.path
+                        ))
+                    })?;
+                    let (loaded, failed) = schema.create_table_from_csv(
+                        &table_name,
+                        &content,
+                        c.if_not_exists.is_some(),
+                    )?;
+                    self.results.push(Some(ResultType::ResultString(format!(
+                        "Table {table_name:?} created, {loaded} row(s) loaded{}",
+                        if failed > 0 {
+                            format!(", {failed} row(s) failed")
+                        } else {
+                            String::new()
+                        }
+                    ))));
+                }
                 sql_parser::Statement::CreateDatabase(c) => {
                     let name = c.name.value.to_lowercase();
                     let message = if c.kind.is_left() {

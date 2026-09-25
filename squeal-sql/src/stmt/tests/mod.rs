@@ -1416,6 +1416,99 @@ fn test_execute_copy_into_records_load_counts() {
 }
 
 #[test]
+fn test_execute_create_table_as_copy_infers_and_creates_and_loads() {
+    let path = std::env::temp_dir().join(format!(
+        "squeal_sql_stmt_create_as_copy_test_{}.csv",
+        std::process::id()
+    ));
+    std::fs::write(&path, "id,name,age\n1,alice,30\n2,bob,25\n").unwrap();
+
+    let c = conn();
+    let mut stmt = c
+        .clone()
+        .create_statement(&format!(
+            "create table t as copy from @{}",
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(stmt.results.len(), 1);
+    assert_eq!(
+        result_string(nth_result(&stmt, 0)),
+        "Table \"t\" created, 2 row(s) loaded"
+    );
+
+    let rows = select_sorted(&c, "select id, name, age from t");
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                ValueItem::Integer(1),
+                ValueItem::Str(("alice".into(), 32)),
+                ValueItem::Integer(30)
+            ],
+            vec![
+                ValueItem::Integer(2),
+                ValueItem::Str(("bob".into(), 32)),
+                ValueItem::Integer(25)
+            ],
+        ]
+    );
+
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn test_execute_create_table_as_copy_reports_failed_rows_too() {
+    let path = std::env::temp_dir().join(format!(
+        "squeal_sql_stmt_create_as_copy_failed_test_{}.csv",
+        std::process::id()
+    ));
+    // csv_infer only samples the first 100 data rows (see its own
+    // SAMPLE_ROWS) and never creates a PRIMARY KEY/UNIQUE constraint
+    // (see its own doc comment), so a plain duplicate wouldn't fail
+    // here — a non-integer value past the sample window does, since
+    // it's inferred as Integer from the sample but fails to parse as
+    // one once copy_csv_str_into actually reaches it.
+    let mut csv = String::from("id\n");
+    for i in 1..=101 {
+        csv.push_str(&i.to_string());
+        csv.push('\n');
+    }
+    csv.push_str("not-a-number\n");
+    std::fs::write(&path, csv).unwrap();
+
+    let c = conn();
+    let mut stmt = c
+        .clone()
+        .create_statement(&format!(
+            "create table t as copy from @{}",
+            path.to_str().unwrap()
+        ))
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(
+        result_string(nth_result(&stmt, 0)),
+        "Table \"t\" created, 101 row(s) loaded, 1 row(s) failed"
+    );
+
+    std::fs::remove_file(path).ok();
+}
+
+#[test]
+fn test_execute_create_table_as_copy_fails_for_a_missing_file() {
+    let c = conn();
+    let mut stmt = c
+        .clone()
+        .create_statement("create table t as copy from @/nonexistent/squeal_test.csv")
+        .unwrap();
+    let err = stmt.execute().unwrap_err();
+    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+    // And nothing was left half-created.
+    assert!(!c.current_schema().unwrap().table_exists("t"));
+}
+
+#[test]
 fn test_execute_copy_into_fails_for_an_unknown_table() {
     let c = conn();
     let mut stmt = c
@@ -2866,17 +2959,18 @@ fn test_conditions_that_are_not_a_cross_table_column_equality_stay_a_cross_join(
     );
 }
 
-// Comparing columns of different data types is an error (see plan::eval's
+// Comparing columns of incompatible data types is an error (see plan::eval's
 // same_type), and such an equality is not planned as a join — the
-// comparison itself is what rejects it.
+// comparison itself is what rejects it (a join would just find no matches
+// and hide the mistake).
 #[test]
 fn test_comparing_columns_of_different_types_is_an_error_not_a_join() {
     let c = conn();
     run(&c, "create table i (id integer not null, primary key(id))").unwrap();
-    run(&c, "create table d (v double)").unwrap();
+    run(&c, "create table s (v varchar(10))").unwrap();
     run(&c, "insert into i values (1)").unwrap();
-    run(&c, "insert into d values (1.0)").unwrap();
-    let sql = "select i.id from i, d where i.id = d.v";
+    run(&c, "insert into s values ('1')").unwrap();
+    let sql = "select i.id from i, s where i.id = s.v";
     let plan = explain(&c, sql);
     assert!(has(&plan, "CrossJoin") && !plan.contains("HashJoin"), "{plan}");
     let mut stmt = c.clone().create_statement(sql).unwrap();
@@ -2886,6 +2980,91 @@ fn test_comparing_columns_of_different_types_is_an_error_not_a_join() {
     };
     let err = s.next_result().unwrap_err().to_string();
     assert!(err.contains("different data types"), "{err}");
+}
+
+// Integer and double compare by value everywhere: in a WHERE filter against
+// a literal of the other type, and column-to-column — where the equality is
+// planned as a hash join, which must find exactly what a row-by-row filter
+// would (1 matches 1.0, 2 does not match 2.5).
+fn int_double_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(&c, "create table i (id integer not null, primary key(id))").unwrap();
+    run(&c, "create table d (v double, tag varchar(5))").unwrap();
+    for id in [1, 2, 3] {
+        run(&c, &format!("insert into i values ({id})")).unwrap();
+    }
+    for (v, tag) in [("1.0", "one"), ("2.5", "half"), ("3.0", "three")] {
+        run(&c, &format!("insert into d values ({v}, '{tag}')")).unwrap();
+    }
+    c
+}
+
+#[test]
+fn test_integer_and_double_compare_against_literals_of_the_other_type() {
+    let c = int_double_conn();
+    // double column vs integer literal (this used to be an error)
+    assert_eq!(
+        select_sorted(&c, "select tag from d where v > 2"),
+        vec![
+            vec![ValueItem::Str(("half".into(), 5))],
+            vec![ValueItem::Str(("three".into(), 5))],
+        ]
+    );
+    assert_eq!(
+        select_sorted(&c, "select tag from d where v = 3"),
+        vec![vec![ValueItem::Str(("three".into(), 5))]]
+    );
+    // integer column vs double literal
+    assert_eq!(
+        select_sorted(&c, "select id from i where id < 2.5"),
+        vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(2)]]
+    );
+    assert_eq!(
+        select_sorted(&c, "select id from i where id = 2.0"),
+        vec![vec![ValueItem::Integer(2)]]
+    );
+}
+
+#[test]
+fn test_integer_equals_double_in_where_is_a_hash_join_with_filter_semantics() {
+    let c = int_double_conn();
+    let sql = "select i.id, d.tag from i, d where i.id = d.v";
+    let plan = explain(&c, sql);
+    assert!(plan.contains("HashJoin"), "{plan}");
+    assert_eq!(
+        select_sorted(&c, sql),
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("one".into(), 5))],
+            vec![ValueItem::Integer(3), ValueItem::Str(("three".into(), 5))],
+        ]
+    );
+    // Either operand order.
+    assert_eq!(
+        select_sorted(&c, "select i.id from i, d where d.v = i.id").len(),
+        2
+    );
+}
+
+#[test]
+fn test_explicit_join_on_integer_and_double_columns_matches_by_value() {
+    let c = int_double_conn();
+    assert_eq!(
+        select_sorted(&c, "select i.id, d.tag from i join d on i.id = d.v"),
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("one".into(), 5))],
+            vec![ValueItem::Integer(3), ValueItem::Str(("three".into(), 5))],
+        ]
+    );
+    // Outer join: id 2 has no numerically-equal v, so it's NULL-padded
+    // rather than wrongly matched or dropped.
+    assert_eq!(
+        select_sorted(&c, "select i.id, d.tag from i left join d on i.id = d.v"),
+        vec![
+            vec![ValueItem::Integer(1), ValueItem::Str(("one".into(), 5))],
+            vec![ValueItem::Integer(2), ValueItem::Null],
+            vec![ValueItem::Integer(3), ValueItem::Str(("three".into(), 5))],
+        ]
+    );
 }
 
 #[test]

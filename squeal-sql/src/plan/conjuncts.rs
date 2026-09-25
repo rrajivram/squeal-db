@@ -242,9 +242,10 @@ fn split<'a>(expr: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
     }
 }
 
-// `col = col` across two different tables whose columns have the same type.
-// (Comparing different types is an error in the comparison itself, so such
-// an equality is not a join edge.)
+// `col = col` across two different tables whose columns have the same type
+// (integer and double count as the same — see same_type below).
+// (Comparing any other pair of types is an error in the comparison itself,
+// so such an equality is not a join edge.)
 fn equi_edge(
     expr: &EvalExpr,
     starts: &[usize],
@@ -273,12 +274,17 @@ fn equi_edge(
 }
 
 // The same-type rule comparisons enforce (see plan::eval's same_type); a
-// varchar(5) and a varchar(20) are both strings.
+// varchar(5) and a varchar(20) are both strings, and an integer and a
+// double compare by value (the join matcher and hasher follow the same
+// rule — see source::joinmatch's cmp_keys, source::hash's get_hash), so
+// they make a join edge too.
 fn same_type(a: &DataType, b: &DataType) -> bool {
     matches!(
         (a, b),
         (DataType::Integer, DataType::Integer)
             | (DataType::Double, DataType::Double)
+            | (DataType::Integer, DataType::Double)
+            | (DataType::Double, DataType::Integer)
             | (DataType::Datetime, DataType::Datetime)
             | (DataType::Str(_), DataType::Str(_))
             | (DataType::Boolean, DataType::Boolean)
@@ -413,8 +419,16 @@ mod tests {
                 ConjunctKind::Multi,
                 vec![0, 1],
             ),
-            // different types: not a join edge (the comparison itself errors)
-            (bin(v(0), BinaryOp::Eq, v(4)), ConjunctKind::Multi, vec![0, 1]),
+            // integer = double compares by value, so it IS a join edge
+            (
+                bin(v(0), BinaryOp::Eq, v(4)),
+                ConjunctKind::Equi {
+                    left: ColumnRef { table: 0, pos: 0 },
+                    right: ColumnRef { table: 1, pos: 4 },
+                },
+                vec![0, 1],
+            ),
+            // string = integer: not a join edge (the comparison itself errors)
             (bin(v(2), BinaryOp::Eq, v(3)), ConjunctKind::Multi, vec![0, 1]),
             // three tables in one condition
             (

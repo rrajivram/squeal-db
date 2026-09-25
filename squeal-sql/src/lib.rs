@@ -1,11 +1,13 @@
 pub mod conn;
 pub(crate) mod constant;
+pub(crate) mod csv_infer;
 pub mod datatype;
 pub(crate) mod datetime;
 pub(crate) mod ds;
 pub(crate) mod envelope;
 pub mod error;
 pub mod help;
+pub(crate) mod numeric;
 pub mod optim;
 pub mod plan;
 pub mod rslt;

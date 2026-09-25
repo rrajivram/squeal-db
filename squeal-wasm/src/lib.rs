@@ -117,6 +117,49 @@ impl SquealDb {
         serde_json::to_string(&results)
             .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
     }
+
+    /// Non-SQL: infers a table's columns/types from `csv_text` (a whole
+    /// CSV document, header row included), creates `table_name` with
+    /// them, and loads every row — this crate's own way to offer `CREATE
+    /// TABLE <name> AS COPY FROM @<path>`'s capability (see that
+    /// statement's own grammar/dispatch in squeal-sql) where `@path`
+    /// can't mean anything at all: a browser tab has no filesystem to
+    /// resolve one against. `csv_text` comes from wherever the JS side
+    /// itself read it — a `File` object's own `.text()`, a `fetch()`
+    /// response, a `<textarea>`, anything — no path/file I/O happens on
+    /// this side of the call at all. Returns the same one-element
+    /// JSON-array shape `execute()` does (a single `Message`), so
+    /// existing JS-side result handling doesn't need a second code path.
+    ///
+    /// Exposed to JS as `createTableFromCsv` — the same name ws-napi's
+    /// napi-rs binding gives its own method (napi-rs camelCases by
+    /// default; wasm-bindgen doesn't), so one capability has one
+    /// spelling across both JS APIs.
+    #[wasm_bindgen(js_name = createTableFromCsv)]
+    pub fn create_table_from_csv(
+        &self,
+        table_name: &str,
+        csv_text: &str,
+    ) -> Result<String, JsError> {
+        let (loaded, failed) = self
+            .conn
+            .create_table_from_csv(table_name, csv_text)
+            .map_err(to_js_error)?;
+        // Same wording as CREATE TABLE ... AS COPY's own SQL-dispatched
+        // result message (squeal-sql's stmt.rs) — duplicated, not
+        // shared, matching this crate's own established precedent for
+        // small front-end-specific formatting (see COMMANDS below).
+        let text = format!(
+            "Table {table_name:?} created, {loaded} row(s) loaded{}",
+            if failed > 0 {
+                format!(", {failed} row(s) failed")
+            } else {
+                String::new()
+            }
+        );
+        serde_json::to_string(&[JsonResult::Message { text }])
+            .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
+    }
 }
 
 // One JSON-serializable entry per ResultType a statement produced — the
@@ -451,6 +494,37 @@ mod tests {
         db.execute("insert into t values (1, null)").unwrap();
         let results = exec(&db, "select id, n from t");
         assert_eq!(results[0]["rows"][0][1], serde_json::json!("(null)"));
+    }
+
+    #[test]
+    fn test_create_table_from_csv_infers_creates_and_loads() {
+        let db = SquealDb::new("csv1").unwrap();
+        let json = db
+            .create_table_from_csv("t", "id,name,age\n1,alice,30\n2,bob,25\n")
+            .unwrap();
+        let results: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(kinds(&results), ["Message"]);
+        assert_eq!(
+            results[0]["text"].as_str().unwrap(),
+            "Table \"t\" created, 2 row(s) loaded"
+        );
+
+        let rows = exec(&db, "select id, name, age from t order by id");
+        assert_eq!(
+            rows[0]["rows"],
+            serde_json::json!([["1", "alice", "30"], ["2", "bob", "25"]])
+        );
+    }
+
+    #[test]
+    fn test_create_table_from_csv_reports_a_bad_document_as_an_error() {
+        // Via self.conn directly, not db.create_table_from_csv: the
+        // latter's error path goes through to_js_error, which (like
+        // JsError::new elsewhere in this file) calls a real wasm-bindgen
+        // imported function and panics outside an actual JS host — see
+        // this module's own note on execute_results for the same reason.
+        let db = SquealDb::new("csv2").unwrap();
+        assert!(db.conn.create_table_from_csv("t", "").is_err());
     }
 
     #[test]

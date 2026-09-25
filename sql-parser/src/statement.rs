@@ -14,8 +14,8 @@ use crate::{
     datatype::DataType,
     ddl::{
         AlterTable, AnalyzeTable, AnalyzeTables, CopyInto, CreateDatabase, CreateIndex,
-        CreateTable, DescribeTable, DropDatabase, DropIndex, DropTable, ShowSchemas,
-        ShowTableIndex, ShowTables, Truncate, UseStatement,
+        CreateTable, CreateTableAsCopy, DescribeTable, DropDatabase, DropIndex, DropTable,
+        ShowSchemas, ShowTableIndex, ShowTables, Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -35,6 +35,12 @@ pub enum Statement {
     Update(Update),
     Delete(Delete),
     CreateTable(CreateTable),
+    // Tried after CreateTable in this enum's own derived alternation:
+    // both start with `CREATE TABLE <name>`, and CreateTable's own
+    // parser only succeeds if what follows is `(` — this one only if
+    // it's `AS COPY FROM`, so the two never actually collide on real
+    // input.
+    CreateTableAsCopy(CreateTableAsCopy),
     CreateIndex(CreateIndex),
     CreateDatabase(CreateDatabase),
     DropTable(DropTable),

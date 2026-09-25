@@ -85,6 +85,10 @@ pub const SQL_HELP: &[HelpSection] = &[
                 "  types: INTEGER, BIGINT, SMALLINT, TINYINT, FLOAT/DOUBLE [PRECISION], DECIMAL(p,s), BOOLEAN, VARCHAR(n), CHAR(n), TEXT, BYTEA/BINARY, DATE, TIME, TIMESTAMP",
                 "(plus common aliases: INT, INT64, REAL, STRING, ...)",
             ),
+            (
+                "CREATE TABLE [IF NOT EXISTS] t AS COPY FROM @path",
+                "infer columns/types from a CSV's first rows, create t, load every row",
+            ),
             ("DROP TABLE [IF EXISTS] t, ...", "remove a table"),
             (
                 "ALTER TABLE t ADD|DROP COLUMN ... | RENAME TO name | RENAME COLUMN a TO b | ADD|DROP CONSTRAINT ...",

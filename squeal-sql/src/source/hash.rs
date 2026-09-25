@@ -609,8 +609,24 @@ impl<F: DBFile + 'static> HashedSource<F> {
         Ok(matches)
     }
 
+    // A Double key holding an exact integer hashes as that Integer (see
+    // crate::numeric::hash_normalized), so the Integer/Double pairs
+    // JoinMatcher::cmp_keys calls equal always land in the same bucket.
+    // Keys with no Double in them (the common case) hash as-is, with no
+    // allocation.
     fn get_hash(&self, key: &IndexKey, fields: &[usize]) -> u64 {
-        IndexKey::hash_fields(fields.iter().map(|f| &key.values()[*f]))
+        let values = key.values();
+        if !fields
+            .iter()
+            .any(|f| matches!(values[*f], store::valueitem::ValueItem::Double(_)))
+        {
+            return IndexKey::hash_fields(fields.iter().map(|f| &values[*f]));
+        }
+        let normalized: Vec<store::valueitem::ValueItem> = fields
+            .iter()
+            .map(|f| crate::numeric::hash_normalized(&values[*f]).unwrap_or_else(|| values[*f].clone()))
+            .collect();
+        IndexKey::hash_fields(normalized.iter())
     }
 
     // STORE_AUDIT.md P6: `run_cursor` (a plain sequential walk over every

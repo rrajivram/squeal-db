@@ -142,6 +142,7 @@ impl Visit for Statement {
             Statement::Update(update) => visit_update(update, v)?,
             Statement::Delete(delete) => visit_delete(delete, v)?,
             Statement::CreateTable(c) => visit_create_table(c, v)?,
+            Statement::CreateTableAsCopy(c) => visit_relation(&c.name, v)?,
             Statement::CreateIndex(c) => visit_create_index(c, v)?,
             Statement::DropTable(d) => visit_drop_table(d, v)?,
             Statement::AlterTable(a) => visit_alter_table(a, v)?,

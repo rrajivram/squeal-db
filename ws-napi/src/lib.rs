@@ -132,6 +132,36 @@ impl SquealDb {
             .map_err(|e| Error::from_reason(format!("failed to serialize results: {e}")))
     }
 
+    /// Non-SQL counterpart to `CREATE TABLE <name> AS COPY FROM @<path>`:
+    /// infers columns/types from `csv_text` (a whole CSV document, header
+    /// row included), creates `table_name`, loads every row. Node *can*
+    /// use the `@path` SQL form directly (real filesystem, unlike the
+    /// browser), but this spares a host that already has the CSV in
+    /// memory (an HTTP upload, a fetched body, ...) from writing it to a
+    /// temp file first — and keeps parity with squeal-wasm's own method
+    /// of the same name. Same one-element JSON-array result shape as
+    /// `execute()`.
+    #[napi]
+    pub fn create_table_from_csv(&self, table_name: String, csv_text: String) -> Result<String> {
+        let conn = self.current_conn()?;
+        let (loaded, failed) = conn
+            .create_table_from_csv(&table_name, &csv_text)
+            .map_err(to_napi_error)?;
+        // Same wording as the SQL-dispatched form's own result message
+        // (squeal-sql's stmt.rs) — duplicated rather than shared, same
+        // precedent as COMMANDS below.
+        let text = format!(
+            "Table {table_name:?} created, {loaded} row(s) loaded{}",
+            if failed > 0 {
+                format!(", {failed} row(s) failed")
+            } else {
+                String::new()
+            }
+        );
+        serde_json::to_string(&[JsonResult::Message { text }])
+            .map_err(|e| Error::from_reason(format!("failed to serialize results: {e}")))
+    }
+
     /// Flushes every loaded schema's metadata and truncates the WAL, then
     /// marks this handle unusable — a later `execute()` call returns an
     /// error instead of silently reopening. Safe to call more than once
@@ -546,6 +576,30 @@ mod tests {
         // now covered directly by store's own
         // test_a_failed_concurrent_open_leaves_no_stray_wal_segment_behind.
         a.close().unwrap();
+        cleanup(&path);
+    }
+
+    #[test]
+    fn test_create_table_from_csv_persists_across_close_and_reopen() {
+        let path = temp_db_path("csv1");
+        cleanup(&path);
+        {
+            let conn = open_or_create(&path).unwrap();
+            let (loaded, failed) = conn
+                .create_table_from_csv("t", "id,name\n1,alice\n2,bob\n")
+                .unwrap();
+            assert_eq!((loaded, failed), (2, 0));
+            conn.close().unwrap();
+        }
+        {
+            let conn = open_or_create(&path).unwrap();
+            let results = exec(&conn, "select id, name from t order by id");
+            assert_eq!(
+                results[0]["rows"],
+                serde_json::json!([["1", "alice"], ["2", "bob"]])
+            );
+            conn.close().unwrap();
+        }
         cleanup(&path);
     }
 

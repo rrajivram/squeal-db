@@ -1089,14 +1089,38 @@ where
         table_name: &str,
         path: &str,
     ) -> Result<(usize, usize), SchemaError> {
+        // std::fs, unconditionally — same as every other native-file-
+        // only path in this codebase (see e.g. store::memfile's own
+        // wasm32 story), this simply doesn't work on wasm32-unknown-
+        // unknown (no filesystem there at all) and needs the host to
+        // have preopened the right directory on wasm32-wasip1. Neither
+        // is new: @path-based COPY INTO/CREATE TABLE ... AS COPY were
+        // always native/WASI-only. copy_csv_str_into (below) is the
+        // target-agnostic half both this and the browser's own
+        // Connection::create_table_from_csv actually share.
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| SchemaError::UserError(format!("could not open {path:?}: {e}")))?;
+        self.copy_csv_str_into(table_name, &content)
+    }
+
+    // The target-agnostic core both copy_csv_into (above, native/WASI
+    // only — reads `content` from a real @path file) and
+    // Connection::create_table_from_csv (browser included — `content`
+    // comes straight from JS, which read it however it wanted to: a
+    // File object, a fetch() response, ...) share. Doesn't care where
+    // `content` came from, only that it's a whole CSV document already
+    // in memory.
+    pub(crate) fn copy_csv_str_into(
+        self: &Arc<Self>,
+        table_name: &str,
+        content: &str,
+    ) -> Result<(usize, usize), SchemaError> {
         let table = self.get_table(table_name).ok_or_else(|| {
             SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
         })?;
-        let file = std::fs::File::open(path)
-            .map_err(|e| SchemaError::UserError(format!("could not open {path:?}: {e}")))?;
         let mut reader = csv::ReaderBuilder::new()
             .has_headers(true)
-            .from_reader(file);
+            .from_reader(content.as_bytes());
         let fields = table.fields();
 
         let mut loaded = 0usize;
@@ -1134,6 +1158,30 @@ where
         }
         flush(&mut batch, &mut loaded, &mut failed);
         Ok((loaded, failed))
+    }
+
+    // Backs `CREATE TABLE <name> AS COPY FROM @<path>` (see stmt.rs's own
+    // dispatch, which reads `content` from `path` before calling this)
+    // and, directly, `Connection::create_table_from_csv` (squeal-wasm/
+    // ws-napi's own non-SQL entry point — see its doc comment for why
+    // that exists at all). Sniffs `content` for column names/types
+    // (csv_infer::infer_schema), builds a synthetic CREATE TABLE from
+    // them and creates it through the exact same SqlTable::from_sql path
+    // a hand-typed CREATE TABLE goes through, then loads every row.
+    // `if_not_exists` only matters to the SQL-dispatched caller (there's
+    // no AST for the direct API to have parsed one out of) — passed
+    // straight into the synthetic statement, same field, same semantics
+    // as a plain CREATE TABLE's own.
+    pub(crate) fn create_table_from_csv(
+        self: &Arc<Self>,
+        table_name: &str,
+        content: &str,
+        if_not_exists: bool,
+    ) -> Result<(usize, usize), SchemaError> {
+        let columns = crate::csv_infer::infer_schema(content)?;
+        let ast = crate::csv_infer::synthetic_create_table(table_name, &columns, if_not_exists);
+        self.create_table(SqlTable::from_sql(self, ast)?)?;
+        self.copy_csv_str_into(table_name, content)
     }
 
     // Entry point for `ANALYZE TABLE <name>` / `ANALYZE TABLES` (stmt.rs).

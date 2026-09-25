@@ -51,10 +51,21 @@ impl JoinMatcher {
     }
 
     // Lexicographic over the join-key fields, in ValueItem's total order —
-    // the same order sort-based algorithms sort by (NULL lowest).
+    // the same order sort-based algorithms sort by (NULL lowest) — except
+    // an Integer/Double pair, which compares by numeric value (the same
+    // exact rule a WHERE comparison uses — see crate::numeric), so a join
+    // between an integer column and a double column matches `1` with `1.0`.
+    // A NaN is ordered after every number, and so never matches one.
     pub(crate) fn cmp_keys(&self, left: &IndexKey, right: &IndexKey) -> Ordering {
         for (l, r) in self.left_fields.iter().zip(&self.right_fields) {
-            match left.values()[*l].cmp(&right.values()[*r]) {
+            let (a, b) = (&left.values()[*l], &right.values()[*r]);
+            let ord = match crate::numeric::cmp_mixed(a, b) {
+                Some(Some(ord)) => ord,
+                Some(None) if matches!(a, ValueItem::Double(_)) => Ordering::Greater,
+                Some(None) => Ordering::Less,
+                None => a.cmp(b),
+            };
+            match ord {
                 Ordering::Equal => continue,
                 other => return other,
             }

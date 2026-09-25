@@ -279,10 +279,12 @@ struct QueryVisitor<F: DBFile> {
 // joined in when the items are folded left to right).
 //
 // Only same-type columns qualify (a varchar(5) and a varchar(20) count as
-// the same type). Comparing different types is an error in the comparison
-// itself (see plan::eval's same_type), so such an equality is left as a
-// cross join + filter, which is what reports that error — a join would just
-// find no matches and hide it. The equalities also stay in
+// the same type, and so do an integer and a double — both compare by value,
+// and the join matcher/hasher agree; see plan::conjuncts' same_type).
+// Comparing any other pair of types is an error in the comparison itself
+// (see plan::eval's same_type), so such an equality is left as a cross join
+// + filter, which is what reports that error — a join would just find no
+// matches and hide it. The equalities also stay in
 // the WHERE filter afterwards: WHERE treats a NULL operand as "no match"
 // while the join matches NULL keys to each other, and re-checking keeps the
 // result exactly what cross-join-then-filter gave.

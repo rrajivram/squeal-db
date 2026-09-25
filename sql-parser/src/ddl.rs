@@ -260,6 +260,27 @@ pub struct CopyInto {
     pub path: StagePath,
 }
 
+/// `CREATE TABLE [IF NOT EXISTS] <name> AS COPY FROM @<path>` — not real
+/// Snowflake syntax (Snowflake's `CREATE TABLE ... AS SELECT` has no
+/// COPY-based form), deliberately squeal-db's own shorthand for "sniff
+/// the CSV at `path` for column names/types, create `name` with the
+/// inferred schema, then load every row" in one statement — see
+/// squeal-sql's own csv_infer module for how the inference itself works.
+/// As minimal as CopyInto's own grammar for the same reason: no target
+/// column list, no FILE_FORMAT/COPY options, nothing CopyInto doesn't
+/// already have either.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct CreateTableAsCopy {
+    pub create: kw::Create,
+    pub table: kw::Table,
+    pub if_not_exists: Option<(kw::If, kw::Not, kw::Exists)>,
+    pub name: ObjectName,
+    pub as_token: kw::As,
+    pub copy: kw::Copy,
+    pub from: kw::From,
+    pub path: StagePath,
+}
+
 /// The `@<path>` half of `COPY INTO ... FROM @<path>` — a literal local
 /// filesystem path, `@` already stripped by the lexer (see lexer::stage_path).
 #[derive(Debug, Clone, PartialEq)]

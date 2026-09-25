@@ -68,6 +68,9 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
                 }
             }
         }
+        // A literal @path only — no expression anywhere in this
+        // statement's grammar for a placeholder to appear in.
+        Statement::CreateTableAsCopy(_) => {}
         Statement::CreateIndex(c) => {
             for item in c.columns.items() {
                 expr(&item.expr, out);

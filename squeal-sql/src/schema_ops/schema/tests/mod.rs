@@ -27,6 +27,11 @@
 //   permissive (continue-on-error, not atomic) row handling. COPY INTO
 //   *dispatch* (parsing, result reporting) is tested in stmt.rs, same
 //   split as everything else.
+// - `create_from_csv`: Schema::create_table_from_csv's own mechanics —
+//   csv_infer's own type/nullability inference is tested directly in
+//   csv_infer.rs; this is "does create_table_from_csv actually create
+//   the inferred table and load it." CREATE TABLE ... AS COPY *dispatch*
+//   is tested in stmt.rs, same split as everything else.
 // - `key_width`: DDL-time rejection of a primary key/index wider than the
 //   database's configured max_index_key_size (persistence versioning
 //   Stage 3).
@@ -39,6 +44,7 @@ mod alter;
 mod catalog_versioning;
 mod contract;
 mod copy_into;
+mod create_from_csv;
 mod dml;
 mod foreign_key;
 mod key_width;

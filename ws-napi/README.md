@@ -93,6 +93,18 @@ db.close();
 
 Run it again — the table and row are still there.
 
+## Loading a CSV
+
+Both forms work here (Node has a real filesystem, WASI included):
+
+```js
+db.execute('create table orders as copy from @/path/to/orders.csv');
+db.createTableFromCsv('orders', csvText);   // CSV already in memory
+```
+
+Either one infers column names/types from the first rows (see
+`squeal-sql/src/csv_infer.rs`), creates the table, and loads every row.
+
 ## Native tests
 
 ```bash

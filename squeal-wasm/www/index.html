@@ -41,6 +41,8 @@
   newline, <b>⌘/Ctrl+Enter</b> always runs regardless, and <b>↑/↓</b> at the start/end of the text
   recalls command history (persisted across reloads, though the database itself is not). Type
   <b>!help</b> and run it to see every supported command and SQL statement.
+  <b>Load CSV…</b> picks a CSV file from your machine, infers its column types from the first rows,
+  creates a table for it and loads every row — the file never leaves your browser.
 </p>
 
 <div id="cells"></div>
@@ -52,6 +54,8 @@ select * from t order by id;</textarea>
   <div class="controls">
     <button id="run" disabled>Run</button>
     <button id="clear" class="secondary">Clear notebook</button>
+    <button id="load-csv" class="secondary" disabled>Load CSV…</button>
+    <input id="csv-file" type="file" accept=".csv,text/csv" hidden>
     <span id="status">loading wasm…</span>
   </div>
 </div>
@@ -64,6 +68,8 @@ select * from t order by id;</textarea>
   const statusEl = document.getElementById('status');
   const sqlEl = document.getElementById('sql');
   const cellsEl = document.getElementById('cells');
+  const loadCsvBtn = document.getElementById('load-csv');
+  const csvFileEl = document.getElementById('csv-file');
 
   const HISTORY_KEY = 'squeal-wasm-demo-history';
   let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
@@ -78,6 +84,7 @@ select * from t order by id;</textarea>
     db = new SquealDb('browser-demo');
     statusEl.textContent = 'ready';
     runBtn.disabled = false;
+    loadCsvBtn.disabled = false;
     sqlEl.focus();
   }
 
@@ -174,6 +181,52 @@ select * from t order by id;</textarea>
 
   runBtn.addEventListener('click', run);
   clearBtn.addEventListener('click', () => { cellsEl.innerHTML = ''; cellCount = 0; });
+
+  // "orders-2024 (final).csv" -> "orders_2024_final" — something that
+  // parses as a bare SQL identifier without quoting.
+  function tableNameFor(fileName) {
+    let name = fileName.replace(/\.[^.]*$/, '').toLowerCase()
+      .replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+    if (!name) name = 'csv_table';
+    if (/^[0-9]/.test(name)) name = 't_' + name;
+    return name;
+  }
+
+  // Load CSV: the file is read entirely in the browser (File.text()) and
+  // handed to the wasm module as a string — there's no filesystem here
+  // for `CREATE TABLE ... AS COPY FROM @path` to read from, so this goes
+  // through SquealDb.createTableFromCsv instead (same inference, same
+  // load, no path involved).
+  loadCsvBtn.addEventListener('click', () => csvFileEl.click());
+  csvFileEl.addEventListener('change', async () => {
+    const file = csvFileEl.files[0];
+    csvFileEl.value = ''; // so picking the same file again still fires 'change'
+    if (!file) return;
+    const name = prompt(`Table name for ${file.name}:`, tableNameFor(file.name));
+    if (!name) return;
+
+    const label = `-- load ${file.name} as table ${name}`;
+    const body = document.createElement('div');
+    try {
+      const text = await file.text();
+      for (const r of JSON.parse(db.createTableFromCsv(name, text))) {
+        body.appendChild(renderResult(r));
+      }
+      // Show what was inferred, then a peek at the data.
+      for (const sql of [`describe table ${name}`, `select * from ${name} limit 10`]) {
+        for (const r of JSON.parse(db.execute(sql))) {
+          body.appendChild(renderResult(r));
+        }
+      }
+    } catch (e) {
+      const pre = document.createElement('div');
+      pre.className = 'err';
+      pre.textContent = e.message || String(e);
+      body.appendChild(pre);
+    }
+    addCell(label, body);
+    sqlEl.focus();
+  });
 
   sqlEl.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {

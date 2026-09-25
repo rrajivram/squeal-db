@@ -529,11 +529,15 @@ fn numeric(
 }
 
 // Every comparison (= <> < <= > >=) needs both operands to be the SAME data
-// type: comparing an Integer with a Double, a Str with an Integer, and so on
-// is an error, not a silent false or an implicit conversion. (Deliberately
-// strict for now, and simple: it lets a comparison between two columns be
-// planned as a join on their values — see plan::logical's WhereJoins.
-// Arithmetic still promotes Integer to Double; see `numeric`.)
+// type — comparing a Str with an Integer, a Boolean with an Integer, and so
+// on is an error, not a silent false or an implicit conversion. The one
+// exception is Integer vs Double, which compares by numeric value (exactly —
+// see crate::numeric), matching arithmetic's own Integer-to-Double
+// promotion. values_equal/compare handle that pair before ever calling
+// this, and the join planner/matcher/hasher apply the same rule (see
+// plan::conjuncts' same_type and source::joinmatch/hash), so a
+// column-to-column equality gives the same answer as a join as it does as
+// a filter.
 fn same_type(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<(), SchemaError> {
     if std::mem::discriminant(lhs) == std::mem::discriminant(rhs) {
         return Ok(());
@@ -567,6 +571,11 @@ fn type_name(v: &ValueItem) -> &'static str {
 // a `raj` read out of a `varchar(10)` column (capacity 10) are the same
 // *value*.
 fn values_equal(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<bool, SchemaError> {
+    // Integer vs Double: equal only when numerically equal (a NaN is equal
+    // to nothing).
+    if let Some(ord) = crate::numeric::cmp_mixed(lhs, rhs) {
+        return Ok(ord == Some(std::cmp::Ordering::Equal));
+    }
     same_type(lhs, rhs, op)?;
     Ok(match (lhs, rhs) {
         (ValueItem::Str((a, _)), ValueItem::Str((b, _))) => a == b,
@@ -588,6 +597,12 @@ fn compare(
     rhs: &ValueItem,
     op: &BinaryOp,
 ) -> Result<std::cmp::Ordering, SchemaError> {
+    // Integer vs Double: exact numeric order; a NaN is unorderable, the
+    // same as it already is between two Doubles below.
+    if let Some(ord) = crate::numeric::cmp_mixed(lhs, rhs) {
+        return ord
+            .ok_or_else(|| SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into()));
+    }
     same_type(lhs, rhs, op)?;
     match (lhs, rhs) {
         (ValueItem::Integer(a), ValueItem::Integer(b)) => Ok(a.cmp(b)),
@@ -786,8 +801,9 @@ mod tests {
         );
     }
 
-    // Every comparison needs both operands to be the same data type: no
-    // Integer/Double promotion, and no silent false for unlike types.
+    // Every comparison needs both operands to be the same data type — no
+    // silent false for unlike types. (Integer vs Double is the exception,
+    // comparing by value; see the next test.)
     #[test]
     fn test_binary_comparisons_reject_operands_of_different_types() {
         let ops = [
@@ -799,8 +815,6 @@ mod tests {
             BinaryOp::GtEq,
         ];
         let pairs = [
-            (int(1), dbl(1.0)),
-            (dbl(1.5), int(1)),
             (int(1), str_val("1")),
             (str_val("1"), int(1)),
             (ValueItem::Boolean(true), int(1)),
@@ -811,6 +825,40 @@ mod tests {
                 assert!(err.contains("different data types"), "{op:?} {l:?} {r:?}: {err}");
             }
         }
+    }
+
+    // Integer vs Double compares by value, in either operand order, for
+    // every comparison operator.
+    #[test]
+    fn test_integer_and_double_compare_by_value() {
+        let t = ValueItem::Boolean(true);
+        let f = ValueItem::Boolean(false);
+        assert_eq!(bin(&int(1), BinaryOp::Eq, &dbl(1.0)).unwrap(), t);
+        assert_eq!(bin(&dbl(1.0), BinaryOp::Eq, &int(1)).unwrap(), t);
+        assert_eq!(bin(&int(1), BinaryOp::Eq, &dbl(1.5)).unwrap(), f);
+        assert_eq!(bin(&int(1), BinaryOp::NotEq, &dbl(1.5)).unwrap(), t);
+        assert_eq!(bin(&dbl(10.5), BinaryOp::Gt, &int(10)).unwrap(), t);
+        assert_eq!(bin(&int(10), BinaryOp::Gt, &dbl(10.5)).unwrap(), f);
+        assert_eq!(bin(&int(10), BinaryOp::Lt, &dbl(10.5)).unwrap(), t);
+        assert_eq!(bin(&int(10), BinaryOp::LtEq, &dbl(10.0)).unwrap(), t);
+        assert_eq!(bin(&dbl(10.0), BinaryOp::GtEq, &int(10)).unwrap(), t);
+    }
+
+    // No `as f64` rounding: 2^53 + 1 is not equal to the double 2^53, even
+    // though casting it to f64 would make it so.
+    #[test]
+    fn test_integer_and_double_comparison_is_exact_for_large_integers() {
+        let big = int(9_007_199_254_740_993);
+        let near = dbl(9_007_199_254_740_992.0);
+        assert_eq!(bin(&big, BinaryOp::Eq, &near).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(bin(&big, BinaryOp::Gt, &near).unwrap(), ValueItem::Boolean(true));
+    }
+
+    #[test]
+    fn test_integer_against_nan_is_unequal_and_unorderable() {
+        let nan = dbl(f64::NAN);
+        assert_eq!(bin(&int(1), BinaryOp::Eq, &nan).unwrap(), ValueItem::Boolean(false));
+        assert!(bin(&int(1), BinaryOp::Lt, &nan).is_err());
     }
 
     #[test]
