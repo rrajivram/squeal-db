@@ -101,6 +101,25 @@ where
         Ok(self.new_connection(database))
     }
 
+    // Opens `db_name` from already-open data and log files (see
+    // Database::open_using) and hands back a connection to it — how
+    // squeal-wasm restores an in-memory database from a saved snapshot.
+    pub fn connect_using(
+        self: &Arc<Self>,
+        db_name: &str,
+        file: F,
+        log_file: F,
+    ) -> Result<Arc<Connection<F>>, SchemaError> {
+        if self.open_databases.read().contains_key(db_name) {
+            return Err(SchemaError::DatabaseInUseError(db_name.to_string()));
+        }
+        let database = Database::<F>::open_using(db_name.to_string(), file, log_file)?;
+        self.open_databases
+            .write()
+            .insert(db_name.to_string(), database.clone());
+        Ok(self.new_connection(database))
+    }
+
     fn new_connection(self: &Arc<Self>, database: Arc<Database<F>>) -> Arc<Connection<F>> {
         let conn = Arc::new(Connection::new(self.clone(), database));
         self.active_conns.write().insert(conn.clone());
@@ -144,6 +163,15 @@ where
 impl ConnectionManager<File> {
     pub fn get_manager() -> ConMgr<File> {
         CON_MANAGER.clone()
+    }
+}
+
+impl Connection<store::memfile::MemFile> {
+    /// The current database's committed state as (data file, log file) —
+    /// see `Db::<MemFile>::synced_snapshot`. Feed both to
+    /// `ConnectionManager::connect_using` to reopen it.
+    pub fn synced_snapshot(&self) -> (store::memfile::MemFile, store::memfile::MemFile) {
+        self.database.read().db.synced_snapshot()
     }
 }
 

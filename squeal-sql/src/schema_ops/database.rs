@@ -97,7 +97,17 @@ where
     }
 
     pub fn open(name: String) -> Result<Arc<Self>, SchemaError> {
-        let db = Db::open(&name)?;
+        Self::from_db(name.clone(), Db::open(&name)?)
+    }
+
+    /// Opens a database from already-open data and log files (see
+    /// `Db::open_using`) — e.g. an in-memory database restored from a
+    /// saved snapshot.
+    pub fn open_using(name: String, file: F, log_file: F) -> Result<Arc<Self>, SchemaError> {
+        Self::from_db(name.clone(), Db::open_using(&name, file, log_file)?)
+    }
+
+    fn from_db(name: String, db: Arc<Db<F>>) -> Result<Arc<Self>, SchemaError> {
         let schemas_table = db
             .table_id_by_name(SYSTEM_SCHEMAS_TABLE)?
             .ok_or_else(|| SchemaError::UnknownError("Unable to load system schemas!".into()))?;

@@ -31,15 +31,16 @@
 </head>
 <body>
 
-<h1>squeal-db, running entirely in this tab (WebAssembly, in-memory, no server)</h1>
+<h1>squeal-db, running entirely in this tab (WebAssembly, no server)</h1>
 <p class="hint">
-  Everything runs in your browser's wasm sandbox — the database is created fresh on page load and
-  disappears on reload; nothing is written to disk. Each run below becomes its own block, like a
+  Everything runs in your browser's wasm sandbox. The database is saved in this browser (IndexedDB)
+  shortly after each change and reopened on reload — nothing leaves your machine; <b>Forget saved
+  database</b> starts over. Each run below becomes its own block, like a
   notebook cell, so earlier results stay on screen. Click any past command to load it back into the
   prompt. In the prompt: <b>Enter</b> runs once the statement ends with <code>;</code> (otherwise it
   just starts a new line, so multi-line statements keep typing), <b>Shift+Enter</b> always inserts a
   newline, <b>⌘/Ctrl+Enter</b> always runs regardless, and <b>↑/↓</b> at the start/end of the text
-  recalls command history (persisted across reloads, though the database itself is not). Type
+  recalls command history (also persisted across reloads). Type
   <b>!help</b> and run it to see every supported command and SQL statement.
   <b>Load CSV…</b> picks a CSV file from your machine, infers its column types from the first rows,
   creates a table for it and loads every row — the file never leaves your browser.
@@ -56,12 +57,14 @@ select * from t order by id;</textarea>
     <button id="clear" class="secondary">Clear notebook</button>
     <button id="load-csv" class="secondary" disabled>Load CSV…</button>
     <input id="csv-file" type="file" accept=".csv,text/csv" hidden>
+    <button id="forget" class="secondary" disabled>Forget saved database</button>
     <span id="status">loading wasm…</span>
   </div>
 </div>
 
 <script type="module">
-  import init, { SquealDb } from './pkg/squeal_wasm.js';
+  import init from './pkg/squeal_wasm.js';
+  import { openPersistent } from './persist.js';
 
   const runBtn = document.getElementById('run');
   const clearBtn = document.getElementById('clear');
@@ -70,6 +73,7 @@ select * from t order by id;</textarea>
   const cellsEl = document.getElementById('cells');
   const loadCsvBtn = document.getElementById('load-csv');
   const csvFileEl = document.getElementById('csv-file');
+  const forgetBtn = document.getElementById('forget');
 
   const HISTORY_KEY = 'squeal-wasm-demo-history';
   let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
@@ -77,16 +81,36 @@ select * from t order by id;</textarea>
   let draft = '';
 
   let db;
+  let persist;
   let cellCount = 0;
 
   async function boot() {
     await init();
-    db = new SquealDb('browser-demo');
+    persist = await openPersistent('browser-demo', {
+      onSaved: () => { statusEl.textContent = 'saved'; },
+    });
+    db = persist.db;
     statusEl.textContent = 'ready';
     runBtn.disabled = false;
     loadCsvBtn.disabled = false;
+    forgetBtn.disabled = false;
     sqlEl.focus();
   }
+
+  // Called after anything that may have written: schedules a save.
+  function changed() {
+    persist.changed();
+    if (persist.unsynced()) statusEl.textContent = 'unsaved changes…';
+  }
+
+  // Leaving with changes not yet saved: have the browser ask first.
+  window.addEventListener('squeal:unsynced', (e) => e.detail.event.preventDefault());
+
+  forgetBtn.addEventListener('click', async () => {
+    if (!confirm('Delete the saved database and start over with an empty one?')) return;
+    await persist.clear();
+    location.reload();
+  });
 
   function renderResult(r) {
     const wrap = document.createElement('div');
@@ -174,6 +198,7 @@ select * from t order by id;</textarea>
       body.appendChild(pre);
     }
 
+    changed();
     addCell(sql, body);
     pushHistory(sql);
     sqlEl.value = '';
@@ -224,6 +249,7 @@ select * from t order by id;</textarea>
       pre.textContent = e.message || String(e);
       body.appendChild(pre);
     }
+    changed();
     addCell(label, body);
     sqlEl.focus();
   });

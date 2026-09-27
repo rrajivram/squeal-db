@@ -100,7 +100,13 @@ impl SquealDb {
         let mgr: Arc<ConnectionManager<F>> = Arc::new(ConnectionManager::new());
         let conn = mgr
             .connect(&path)
-            .or_else(|_| mgr.create_and_connect(&path))
+            .or_else(|e| {
+                if e.is_not_found() {
+                    mgr.create_and_connect(&path)
+                } else {
+                    Err(e)
+                }
+            })
             .map_err(to_napi_error)?;
         let _ = conn.use_schema(DEFAULT_SCHEMA);
         Ok(SquealDb {
@@ -439,7 +445,15 @@ mod tests {
     // own doc comment for why that can't be exercised via cargo test).
     fn open_or_create(path: &str) -> SqlResult<Arc<Connection<F>>> {
         let mgr: Arc<ConnectionManager<F>> = Arc::new(ConnectionManager::new());
-        let conn = mgr.connect(path).or_else(|_| mgr.create_and_connect(path))?;
+        let conn = mgr
+            .connect(path)
+            .or_else(|e| {
+                if e.is_not_found() {
+                    mgr.create_and_connect(path)
+                } else {
+                    Err(e)
+                }
+            })?;
         let _ = conn.use_schema(DEFAULT_SCHEMA);
         Ok(conn)
     }

@@ -12,9 +12,9 @@ use crate::{db::DBSizeType, tuple::DBIdType};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("IO Error")]
+    #[error("IO Error :{0}")]
     IoError(#[from] std::io::Error),
-    #[error("Serialization Error")]
+    #[error("Serialization Error : {0}")]
     SerializationError(#[from] postcard::Error),
     #[error("Bad file")]
     FileError,
@@ -85,6 +85,12 @@ pub enum StoreError {
     ReservedTableName(String),
     #[error("Unknown error {0}")]
     UnknownError(String),
+    // do_lock() found the database already open elsewhere — another
+    // process (or another open handle in this one) holds its exclusive
+    // lock. Its own variant, not UnknownError, so the message says what
+    // actually happened and names the file.
+    #[error("database {0} is locked: it is already open in another process")]
+    DatabaseLocked(String),
     #[error("Duplicate table name {0}")]
     DuplicateName(String),
     #[error("Missing key {0}")]

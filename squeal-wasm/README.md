@@ -47,6 +47,35 @@ db.createTableFromCsv('orders', text);   // same inference + load, no path
 The demo page's **Load CSV…** button does exactly this; the file never
 leaves the browser.
 
+## Keeping the database across reloads
+
+The database lives in memory; persistence is whole-database snapshots.
+`db.snapshot()` returns the committed state (data file + WAL, never an open
+transaction's writes) as a `Uint8Array`, and `SquealDb.fromSnapshot(bytes)`
+reopens it. `www/persist.js` stores those in IndexedDB:
+
+```js
+import { openPersistent } from './persist.js';
+const persist = await openPersistent('my-db');   // restores if saved before
+persist.db.execute(sql);
+persist.changed();          // after anything that may have written: saves ~500 ms later
+
+// Leaving the page before that save happened:
+window.addEventListener('squeal:unsynced', (e) => {
+  e.detail.event.preventDefault();   // ask the user before leaving
+});
+```
+
+It also saves when the tab is hidden and tries once more on unload; that last
+try can lose the race with the page closing, which is what the event is for.
+`persist.clear()` deletes the saved copy. The demo page wires all of this up
+(**Forget saved database** calls `clear()`).
+
+Limits, by design — this is a scratchpad, not a server database: every save
+writes the whole database (a 20k-row table is ~3 MB and saves in well under a
+second), the browser can evict IndexedDB data under storage pressure, and two
+tabs on the same key each save their own copy (last save wins).
+
 ## Try it in Node instead
 
 Same build, different `wasm-bindgen` target:

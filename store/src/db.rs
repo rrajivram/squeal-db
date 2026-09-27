@@ -732,10 +732,11 @@ where
         // last checkpoint's floor is already on disk (see Header).
         let floor = header.checkpoint_lsn;
         records.retain(|r| r.lsn.0 >= floor);
-        file.do_lock()?;
+        lock_database(&file, name.as_ref())?;
         // Only now — after confirming exclusive ownership — does opening
         // actually write anything to disk (a fresh WAL segment).
-        let wal = Self::roll_to_fresh_segment(name.as_ref(), &log_file, header.page_size, older_segs)?;
+        let wal =
+            Self::roll_to_fresh_segment(name.as_ref(), &log_file, header.page_size, older_segs)?;
         let gens = Arc::new(Generator::new());
         // STORE_AUDIT.md T5 follow-up: the audit's own recommendation
         // ("derive page_count from file length instead of trusting the
@@ -2631,7 +2632,7 @@ where
             .write(true)
             .clone();
         let mut f = F::open(f, &name)?;
-        f.do_lock()?;
+        lock_database(&f, &name)?;
         // Phase 6: the first WAL segment, next to the data file. Straight
         // to roll_to_fresh_segment, not via find_existing_segments first —
         // `f` was just opened with create_new(true) above, so there is
@@ -2945,6 +2946,17 @@ impl Db<MemFile> {
         }
         (data, disk)
     }
+}
+
+// Takes the database file's exclusive OS lock. WouldBlock (someone else
+// already holds it) becomes DatabaseLocked naming the file, so a second
+// opener sees "already open in another process" rather than an opaque
+// try_lock message; a genuine I/O failure stays an IoError.
+fn lock_database<F: DBFile>(file: &F, name: &str) -> Result<(), StoreError> {
+    file.do_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => StoreError::DatabaseLocked(name.to_string()),
+        std::fs::TryLockError::Error(e) => StoreError::IoError(e),
+    })
 }
 
 pub(crate) fn db_hash(bytes: &[u8]) -> u64 {

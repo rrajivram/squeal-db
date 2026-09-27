@@ -3,9 +3,9 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SchemaError {
-    #[error("IO Error")]
+    #[error("IO Error: {0}")]
     IoError(StoreError),
-    #[error("Internal Store Error")]
+    #[error("Internal Store Error: {0}")]
     InternalError(StoreError),
     #[error("Key not found : {0}")]
     KeyNotFound(DBIdType),
@@ -96,10 +96,26 @@ pub enum SchemaError {
     },
 }
 
+impl SchemaError {
+    /// True when this is an open failing only because the database file
+    /// doesn't exist yet — the one case where an open-or-create caller
+    /// should fall back to create. Any other open failure (the database
+    /// is locked by another process, a corrupt header, ...) must be
+    /// reported as-is: falling back to create on those just replaces the
+    /// real reason with create's own "File exists".
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, SchemaError::IoError(StoreError::IoError(e))
+            if e.kind() == std::io::ErrorKind::NotFound)
+    }
+}
+
 impl From<StoreError> for SchemaError {
     fn from(value: StoreError) -> Self {
         match value {
-            StoreError::IoError(_) | StoreError::SerializationError(_) | StoreError::FileError => {
+            StoreError::IoError(_)
+            | StoreError::SerializationError(_)
+            | StoreError::FileError
+            | StoreError::DatabaseLocked(_) => {
                 Self::IoError(value)
             }
             StoreError::BadRowNumber(_)

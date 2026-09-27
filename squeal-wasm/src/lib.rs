@@ -8,15 +8,16 @@
 //!
 //! Only `MemFile` is wired up: the real-file `DBFile` backend doesn't exist
 //! on wasm32 (see store::memfile's own `#[cfg(not(target_arch = "wasm32"))]`
-//! gate on `impl Opener for std::fs::File`), and there is nothing durable
-//! to persist to yet regardless (IndexedDB is a later option, not this).
-//! Every database created here is fully in-memory and gone once the
-//! `SquealDb` handle is dropped or the page unloads.
+//! gate on `impl Opener for std::fs::File`). Every database is in memory;
+//! persistence is whole-database snapshots — `snapshot()` hands JS the
+//! committed state as bytes to store wherever it likes (www/persist.js
+//! uses IndexedDB), `SquealDb.fromSnapshot(bytes)` reopens it. Meant for
+//! small databases in a demo/scratchpad, not as a server database.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use squeal_sql::{
     conn::connection::{Connection, ConnectionManager},
     rslt::resultset::{ResultSet, ResultType, StreamingResultSet},
@@ -54,6 +55,7 @@ fn init() {
 // page from creating more than one under different names.
 #[wasm_bindgen]
 pub struct SquealDb {
+    name: String,
     conn: Arc<Connection<MemFile>>,
     // Stats from the most recently executed StreamingResult, so `!print
     // stats` can be sent as its own, separate `execute()` call rather than
@@ -82,9 +84,36 @@ impl SquealDb {
         // would just need an explicit USE/CREATE SCHEMA call first.
         let _ = conn.use_schema(DEFAULT_SCHEMA);
         Ok(SquealDb {
+            name: name.to_string(),
             conn,
             last_stats: RefCell::new(None),
         })
+    }
+
+    /// Reopens a database from bytes a previous `snapshot()` returned
+    /// (possibly in an earlier page load), under the name it was saved
+    /// with.
+    #[wasm_bindgen(js_name = fromSnapshot)]
+    pub fn from_snapshot(bytes: &[u8]) -> Result<SquealDb, JsError> {
+        restore(bytes).map_err(|e| JsError::new(&e))
+    }
+
+    /// The database's committed state as one byte array: its data file
+    /// and WAL segments as of the last commit (`Db::synced_snapshot`), so
+    /// an open transaction's uncommitted writes are never included. The
+    /// whole database every time — fine for the small databases this
+    /// crate is for.
+    pub fn snapshot(&self) -> Result<Vec<u8>, JsError> {
+        snapshot_bytes(self).map_err(|e| JsError::new(&e))
+    }
+
+    /// A number that changes whenever committed data changes (see
+    /// store::memfile::sync_generation). Read it before `snapshot()`;
+    /// if it differs later, there are changes that snapshot doesn't have.
+    /// Reads don't move it.
+    #[wasm_bindgen(js_name = syncGeneration)]
+    pub fn sync_generation(&self) -> f64 {
+        store::memfile::sync_generation() as f64
     }
 
     /// Runs `sql` and returns every result as one JSON array, one entry per
@@ -160,6 +189,58 @@ impl SquealDb {
         serde_json::to_string(&[JsonResult::Message { text }])
             .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
     }
+}
+
+// What snapshot() produces and fromSnapshot() reads back. `version` so a
+// future format change refuses an old saved blob instead of misreading it.
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    version: u32,
+    name: String,
+    data: Vec<u8>,
+    wal: Vec<(String, Vec<u8>)>,
+}
+
+const SNAPSHOT_VERSION: u32 = 1;
+
+fn snapshot_bytes(db: &SquealDb) -> Result<Vec<u8>, String> {
+    let (data, disk) = db.conn.synced_snapshot();
+    let snapshot = Snapshot {
+        version: SNAPSHOT_VERSION,
+        name: db.name.clone(),
+        data: data.synced_data(),
+        // `disk` is a fresh namespace holding only the WAL segments.
+        wal: disk.synced_siblings(""),
+    };
+    postcard::to_allocvec(&snapshot).map_err(|e| format!("failed to encode snapshot: {e}"))
+}
+
+fn restore(bytes: &[u8]) -> Result<SquealDb, String> {
+    let snapshot: Snapshot =
+        postcard::from_bytes(bytes).map_err(|e| format!("not a squeal snapshot: {e}"))?;
+    if snapshot.version != SNAPSHOT_VERSION {
+        return Err(format!(
+            "snapshot format version {} is not supported (expected {SNAPSHOT_VERSION})",
+            snapshot.version
+        ));
+    }
+    // Same shape Db::synced_snapshot hands the crash harness: the data
+    // file on its own, the WAL segments as siblings in one namespace.
+    let data = MemFile::from_bytes(snapshot.data);
+    let disk = MemFile::new();
+    for (path, bytes) in snapshot.wal {
+        disk.add_sibling_from_bytes(&path, bytes);
+    }
+    let mgr: Arc<ConnectionManager<MemFile>> = Arc::new(ConnectionManager::new());
+    let conn = mgr
+        .connect_using(&snapshot.name, data, disk)
+        .map_err(|e| e.to_string())?;
+    let _ = conn.use_schema(DEFAULT_SCHEMA);
+    Ok(SquealDb {
+        name: snapshot.name,
+        conn,
+        last_stats: RefCell::new(None),
+    })
 }
 
 // One JSON-serializable entry per ResultType a statement produced — the
@@ -494,6 +575,59 @@ mod tests {
         db.execute("insert into t values (1, null)").unwrap();
         let results = exec(&db, "select id, n from t");
         assert_eq!(results[0]["rows"][0][1], serde_json::json!("(null)"));
+    }
+
+    #[test]
+    fn test_a_snapshot_reopens_with_its_committed_data() {
+        let db = SquealDb::new("snap1").unwrap();
+        db.execute("create table t (id integer not null, name varchar(10), primary key(id))")
+            .unwrap();
+        db.execute("insert into t values (1, 'alice'), (2, 'bob')")
+            .unwrap();
+        let bytes = snapshot_bytes(&db).unwrap();
+        drop(db);
+
+        let db = restore(&bytes).unwrap();
+        let rows = exec(&db, "select id, name from t order by id");
+        assert_eq!(
+            rows[0]["rows"],
+            serde_json::json!([["1", "alice"], ["2", "bob"]])
+        );
+        // Still writable, and a snapshot of the restored database
+        // round-trips too.
+        db.execute("insert into t values (3, 'carol')").unwrap();
+        let db = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        let rows = exec(&db, "select count(*) from t");
+        assert_eq!(rows[0]["rows"], serde_json::json!([["3"]]));
+    }
+
+    #[test]
+    fn test_a_snapshot_leaves_out_an_open_transactions_writes() {
+        let db = SquealDb::new("snap2").unwrap();
+        db.execute("create table t (id integer not null, primary key(id))")
+            .unwrap();
+        db.execute("insert into t values (1)").unwrap();
+        db.execute("begin").unwrap();
+        db.execute("insert into t values (2)").unwrap();
+        let db2 = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        let rows = exec(&db2, "select id from t");
+        assert_eq!(rows[0]["rows"], serde_json::json!([["1"]]));
+    }
+
+    #[test]
+    fn test_a_commit_moves_the_sync_generation() {
+        let db = SquealDb::new("snap3").unwrap();
+        db.execute("create table t (id integer not null, primary key(id))")
+            .unwrap();
+        let before = db.sync_generation();
+        db.execute("insert into t values (1)").unwrap();
+        assert!(db.sync_generation() > before);
+    }
+
+    #[test]
+    fn test_garbage_is_refused_as_a_snapshot() {
+        let err = restore(b"definitely not a snapshot").err().unwrap();
+        assert!(err.contains("snapshot"), "{err}");
     }
 
     #[test]

@@ -10,6 +10,19 @@ use crate::db::{Meta, Opener};
 /// (or two tests) that reuse a name never see each other's segments.
 type Namespace = Arc<Mutex<HashMap<String, MemFile>>>;
 
+/// Bumped by every `do_sync` that actually changed some MemFile's synced
+/// bytes — any file, any database. A caller persisting snapshots of the
+/// synced state (squeal-wasm's IndexedDB save) compares it against the
+/// value it saw at its last save to know whether there is anything new to
+/// save. Process-wide rather than per database for simplicity: another
+/// database's sync can only make a caller think it has unsaved changes
+/// when it doesn't (one redundant save), never the other way round.
+static SYNC_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn sync_generation() -> u64 {
+    SYNC_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MemFile {
     data: Arc<RwLock<Vec<u8>>>,
@@ -143,6 +156,9 @@ impl Opener for MemFile {
         let data = self.data.read();
         let range = self.dirty.write().take();
         let mut synced = self.synced.write();
+        if range.is_some() || synced.len() != data.len() {
+            SYNC_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         // Length first: a truncate shrinks, an append grows.
         synced.resize(data.len(), 0);
         if let Some((lo, hi)) = range {

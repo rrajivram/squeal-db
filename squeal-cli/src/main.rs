@@ -100,7 +100,13 @@ where
     // Open it if it already exists from a previous session, otherwise
     // this is a first run — create it instead.
     mgr.connect(db_path)
-        .or_else(|_| mgr.create_and_connect(db_path))
+        .or_else(|e| {
+            if e.is_not_found() {
+                mgr.create_and_connect(db_path)
+            } else {
+                Err(e)
+            }
+        })
         .unwrap_or_else(|e| {
             eprintln!("failed to open database {db_path:?}: {e}");
             std::process::exit(1);
