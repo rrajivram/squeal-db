@@ -1401,6 +1401,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "sq-json"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "postcard",
+ "serde",
+ "serde_json",
+ "store",
+ "thiserror",
+]
+
+[[package]]
 name = "sql-parser"
 version = "0.1.0"
 dependencies = [
