@@ -18,7 +18,7 @@ pub mod planinfo;
 pub mod proj;
 pub(crate) mod run;
 pub mod sort;
-mod sortjoin;
+pub(crate) mod sortjoin;
 pub mod table;
 #[cfg(test)]
 mod tests;

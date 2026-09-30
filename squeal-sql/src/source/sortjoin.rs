@@ -114,8 +114,11 @@ pub(crate) struct SortJoinSource<F: DBFile + 'static> {
     // Present until the first next(), which hands them to the sorts.
     left_source: Option<Box<dyn Source>>,
     right_source: Option<Box<dyn Source>>,
-    left_sorted: Option<SortSource<F>>,
-    right_sorted: Option<SortSource<F>>,
+    // Each side in key order: a SortSource over the input, or the input
+    // itself when it already comes out in key order (`presorted`).
+    left_sorted: Option<Box<dyn Source>>,
+    right_sorted: Option<Box<dyn Source>>,
+    presorted: bool,
     // primed: both sorts have produced their first row (left_cur/right_cur
     // are valid). Cleared by reset(), which re-sorts lazily.
     primed: bool,
@@ -180,6 +183,7 @@ where
             right_source: Some(right_source),
             left_sorted: None,
             right_sorted: None,
+            presorted: false,
             primed: false,
             db,
             mem,
@@ -197,6 +201,34 @@ where
             next_time: 0,
             spilled_groups: 0,
         })
+    }
+
+    /// As `new`, for inputs that already come out in join-key order —
+    /// ascending on the key fields in order, NULLs first, the way
+    /// JoinMatcher::cmp_keys orders them (see optim::picker's OrderWanted
+    /// for how a table or index read gives that order) — so neither side
+    /// is sorted: one pass over each.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn presorted(
+        left_source: Box<dyn Source>,
+        right_source: Box<dyn Source>,
+        db: Arc<Db<F>>,
+        mem: Arc<QueryMemory>,
+        left_fields: &[usize],
+        right_fields: &[usize],
+        join_type: JoinType,
+    ) -> Result<Self, SchemaError> {
+        let mut join = Self::new(
+            left_source,
+            right_source,
+            db,
+            mem,
+            left_fields,
+            right_fields,
+            join_type,
+        )?;
+        join.presorted = true;
+        Ok(join)
     }
 
     fn make_sort_field(fields: &[usize]) -> Vec<SortField> {
@@ -217,20 +249,25 @@ where
                 "sort join has no inputs to sort".into(),
             ));
         };
-        self.left_sorted = Some(SortSource::new(
+        if self.presorted {
+            self.left_sorted = Some(left);
+            self.right_sorted = Some(right);
+            return Ok(());
+        }
+        self.left_sorted = Some(Box::new(SortSource::new(
             left,
             &Self::make_sort_field(&self.left_fields),
             None,
             self.db.clone(),
             self.mem.clone(),
-        )?);
-        self.right_sorted = Some(SortSource::new(
+        )?));
+        self.right_sorted = Some(Box::new(SortSource::new(
             right,
             &Self::make_sort_field(&self.right_fields),
             None,
             self.db.clone(),
             self.mem.clone(),
-        )?);
+        )?));
         Ok(())
     }
 
@@ -384,13 +421,13 @@ where
 {
     fn plan(&self) -> PlanNode {
         let side =
-            |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| match (raw, sorted) {
+            |raw: &Option<Box<dyn Source>>, sorted: &Option<Box<dyn Source>>| match (raw, sorted) {
                 (Some(s), _) => Some(s.plan()),
                 (None, Some(s)) => Some(s.plan()),
                 _ => None,
             };
         let names =
-            |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| match (raw, sorted) {
+            |raw: &Option<Box<dyn Source>>, sorted: &Option<Box<dyn Source>>| match (raw, sorted) {
                 (Some(s), _) => column_names(&s.fields()),
                 (None, Some(s)) => column_names(&s.fields()),
                 _ => vec![],
@@ -408,8 +445,17 @@ where
             .map(|(l, r)| format!("left({}) = right({})", name(&left, l), name(&right, r)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let mut node = PlanNode::new("SortMergeJoin")
-            .detail(format!("{:?} on {keys}", self.matcher.join_type()));
+        // Presorted: the inputs arrive in key order and are read as they
+        // come; otherwise each side's plan is its input, sorted here.
+        let presorted = if self.presorted {
+            ", inputs in key order"
+        } else {
+            ""
+        };
+        let mut node = PlanNode::new("SortMergeJoin").detail(format!(
+            "{:?} on {keys}{presorted}",
+            self.matcher.join_type()
+        ));
         for child in [
             side(&self.left_source, &self.left_sorted),
             side(&self.right_source, &self.right_sorted),

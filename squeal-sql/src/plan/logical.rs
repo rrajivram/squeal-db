@@ -45,6 +45,7 @@ use crate::{
         proj::Projection,
         run::RunSource,
         sort::SortSource,
+        sortjoin::SortJoinSource,
         table::TableSource,
         where_source::WhereSource,
     },
@@ -341,6 +342,19 @@ impl WhereJoins {
                 rhs: Box::new(r),
             })
     }
+}
+
+// What building and probing a hash table costs, in the same units as
+// reading (see optim::picker): per row of the side it is built from.
+const HASH_BYTES_PER_BUILD_ROW: f64 = 32.0;
+
+// A merge join's plan (see QueryVisitor::merge_plan): the orders to read
+// the two tables in, and the key fields in each one's row.
+struct MergePlan {
+    base_order: OrderWanted,
+    inner_order: OrderWanted,
+    left_fields: Vec<usize>,
+    right_fields: Vec<usize>,
 }
 
 // The AND-ed terms of a condition.
@@ -645,7 +659,18 @@ where
         for table in tables.iter() {
             item_start.push(accesses.len());
             let needs_t = needs.next();
-            let (combined, access) = self.open_item(table, needs_t, order_wanted.as_ref())?;
+            // Read this table in the order a merge join with its first
+            // joined table would want, when that plan wins (see merge_plan).
+            let merge = match table.joins.first() {
+                Some(j) => self.merge_plan(table, needs_t, j, all_needs.get(accesses.len() + 1)),
+                None => None,
+            };
+            let base_order = merge
+                .as_ref()
+                .map(|m| &m.base_order)
+                .or(order_wanted.as_ref());
+            let (combined, access) = self.open_item(table, needs_t, base_order)?;
+            let base_sorted = merge.is_some() && access.as_ref().is_some_and(|a| a.sorted);
             let (mut combined, rows) =
                 self.push_filters(combined, table, needs_t, access.as_ref())?;
             // Rows so far on the join's outer side, when known — what decides
@@ -656,8 +681,9 @@ where
             // The column types of the joined-so-far row, which each join's
             // ON positions index (see get_tables).
             let mut left_types: Vec<DataType> = table.fields.iter().map(|f| f.datatype).collect();
-            for j in &table.joins {
+            for (n, j) in table.joins.iter().enumerate() {
                 let needs_j = needs.next();
+                let merge = merge.as_ref().filter(|_| n == 0 && base_sorted);
                 if let Some(join) = self.nested_loop_join(
                     &mut combined,
                     j.join_type,
@@ -673,20 +699,36 @@ where
                     // Its rows come from the join itself: WHERE checks them.
                     pushed.push(false);
                 } else {
-                    let (relation, access) = self.open_item(&j.relation, needs_j, None)?;
+                    let inner_order = merge.map(|m| &m.inner_order);
+                    let (relation, access) = self.open_item(&j.relation, needs_j, inner_order)?;
+                    let inner_sorted = access.as_ref().is_some_and(|a| a.sorted);
                     let (relation, _) =
                         self.push_filters(relation, &j.relation, needs_j, access.as_ref())?;
                     accesses.push(access);
                     pushed.push(true);
                     let outer = std::mem::replace(&mut combined, Box::new(UnionJoin::new(vec![])?));
-                    combined = Box::new(JoinSource::new(
-                        outer,
-                        relation,
-                        j.on_expr.clone(),
-                        j.join_type,
-                        self.conn.database.read().db.clone(),
-                        self.mem.clone(),
-                    )?);
+                    let db = self.conn.database.read().db.clone();
+                    combined = match merge {
+                        // Both sides arrive in join-key order: merge them in
+                        // one pass, no sort, no hash table.
+                        Some(m) if inner_sorted => Box::new(SortJoinSource::presorted(
+                            outer,
+                            relation,
+                            db,
+                            self.mem.clone(),
+                            &m.left_fields,
+                            &m.right_fields,
+                            j.join_type,
+                        )?),
+                        _ => Box::new(JoinSource::new(
+                            outer,
+                            relation,
+                            j.on_expr.clone(),
+                            j.join_type,
+                            db,
+                            self.mem.clone(),
+                        )?),
+                    };
                     outer_rows = None;
                 }
                 left_types.extend(j.relation.fields.iter().map(|f| f.datatype));
@@ -988,6 +1030,100 @@ where
     // Opens one FROM item. A real table is read the way optim::picker
     // chooses (a scan or seek of the table or one of its indexes); anything
     // else is opened as is.
+    // Whether to join a FROM item's base table to its first joined table
+    // by reading both in join-key order and merging them (a presorted
+    // SortJoinSource): the ON condition is only equalities between the two
+    // tables' columns, of the same non-double type (a double key's two
+    // zeros sort apart but join as equal), both tables can be read in that
+    // order — ascending, NULLs first, as the merge compares keys — and
+    // reading them so costs no more than reading each the cheapest way and
+    // building a hash table. Returns the orders to read them in.
+    fn merge_plan(
+        &self,
+        base: &TableQuery<F>,
+        base_needs: Option<&ItemNeeds>,
+        j: &JoinRelation<F>,
+        j_needs: Option<&ItemNeeds>,
+    ) -> Option<MergePlan> {
+        let (TableRef::Real(_, base_table), TableRef::Real(_, inner_table)) =
+            (&base.resolved, &j.relation.resolved)
+        else {
+            return None;
+        };
+        if matches!(j.join_type, JoinType::Cross) {
+            return None;
+        }
+        let (base_needs, j_needs) = (base_needs?, j_needs?);
+        let width = base.fields.len();
+        let mut terms = vec![];
+        conjunct_terms(&j.on_expr, &mut terms);
+        let mut left_fields = vec![];
+        let mut right_fields = vec![];
+        for t in terms {
+            let EvalExpr::Binary {
+                lhs,
+                op: BinaryOp::Eq,
+                rhs,
+            } = t
+            else {
+                return None;
+            };
+            let (l, r) = match (lhs.as_ref(), rhs.as_ref()) {
+                (EvalExpr::Value(a), EvalExpr::Value(b)) if *a < width && *b >= width => (*a, *b),
+                (EvalExpr::Value(b), EvalExpr::Value(a)) if *a < width && *b >= width => (*a, *b),
+                _ => return None,
+            };
+            let (lt, rt) = (
+                base.fields[l].datatype,
+                j.relation.fields[r - width].datatype,
+            );
+            let mergeable = match (lt, rt) {
+                (DataType::Str(_), DataType::Str(_)) => true,
+                (a, b) => {
+                    a == b
+                        && matches!(
+                            a,
+                            DataType::Integer | DataType::Datetime | DataType::Boolean
+                        )
+                }
+            };
+            if !mergeable {
+                return None;
+            }
+            left_fields.push(l);
+            right_fields.push(r - width);
+        }
+        if left_fields.is_empty() {
+            return None;
+        }
+        let order = |fields: &[usize]| OrderWanted {
+            columns: fields.iter().map(|f| (*f, true)).collect(),
+            limit: None,
+        };
+        let (base_order, inner_order) = (order(&left_fields), order(&right_fields));
+        let page = self.conn.database.read().db.get_page_data_size();
+        let read = |table: &SqlTable, item: &TableQuery<F>, needs, order| {
+            pick_access(table, item.stats.as_ref(), needs, page, order)
+        };
+        let base_plain = read(base_table, base, base_needs, None);
+        let base_ordered = read(base_table, base, base_needs, Some(&base_order));
+        let inner_plain = read(inner_table, &j.relation, j_needs, None);
+        let inner_ordered = read(inner_table, &j.relation, j_needs, Some(&inner_order));
+        if !(base_ordered.sorted && inner_ordered.sorted) {
+            return None;
+        }
+        let merge_cost = base_ordered.cost? + inner_ordered.cost?;
+        let build_rows = base_plain.rows?.min(inner_plain.rows?) as f64;
+        let hash_cost =
+            base_plain.cost? + inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
+        (merge_cost <= hash_cost).then(|| MergePlan {
+            base_order,
+            inner_order,
+            left_fields,
+            right_fields,
+        })
+    }
+
     // Applies a FROM item's own WHERE conditions (ItemNeeds::filters, the
     // stated ones) right at its scan, below any join, leaving out those its
     // seek reads exactly (Access::enforced). Returns the source and how
