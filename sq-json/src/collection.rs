@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use parking_lot::RwLockReadGuard;
 use store::cursor::{Cursor, KeyRange};
-use store::db::DBFile;
+use store::db::{DBFile, Durability};
 use store::error::StoreError;
 use store::tuple::{DBIdType, Tuple};
 use store::txn::Transaction;
@@ -136,6 +136,9 @@ pub struct Collection<F: DBFile<Item = F> + 'static = std::fs::File> {
     inner: Arc<Inner<F>>,
     ns: String,
     session: Option<Session<F>>,
+    /// Writes outside a transaction wait for the log sync (MongoDB's
+    /// `j: true`); see with_journal.
+    journaled: bool,
 }
 
 impl<F: DBFile<Item = F> + 'static> Clone for Collection<F> {
@@ -144,6 +147,7 @@ impl<F: DBFile<Item = F> + 'static> Clone for Collection<F> {
             inner: self.inner.clone(),
             ns: self.ns.clone(),
             session: self.session.clone(),
+            journaled: self.journaled,
         }
     }
 }
@@ -154,6 +158,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
             inner,
             ns: format!("{db}.{name}"),
             session: None,
+            journaled: true,
         }
     }
 
@@ -167,6 +172,17 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
     pub fn with_session(&self, session: &Session<F>) -> Self {
         Collection {
             session: Some(session.clone()),
+            ..self.clone()
+        }
+    }
+
+    /// This collection, with writes outside a transaction returning before
+    /// their commit reaches disk when `journaled` is false (MongoDB's
+    /// `writeConcern: {j: false}`): visible at once, durable at the next
+    /// log sync, lost (with any later ones) if the process dies first.
+    pub fn with_journal(&self, journaled: bool) -> Self {
+        Collection {
+            journaled,
             ..self.clone()
         }
     }
@@ -441,6 +457,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
                 inner: self.inner.clone(),
                 ns: format!("{db}.{from}"),
                 session: self.session.clone(),
+                journaled: self.journaled,
             };
             other.find(filter, FindOptions::new())
         })
@@ -653,7 +670,8 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         let txn = db.begin()?;
         match f(&txn) {
             Ok(v) => {
-                db.commit(txn)?;
+                let durability = if self.journaled { Durability::Sync } else { Durability::Async };
+                db.commit_with(txn, durability)?;
                 Ok(v)
             }
             Err(e) => {

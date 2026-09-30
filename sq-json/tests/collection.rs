@@ -286,6 +286,9 @@ fn test_collections_and_indexes_persist_across_reopen() {
         for i in 0..200 {
             c.insert_one(d(&format!(r#"{{"_id": {i}, "kind": "k{}", "labels": ["x", "y{}"]}}"#, i % 7, i % 3))).unwrap();
         }
+        // Unjournaled writes are visible at once and durable after close.
+        c.with_journal(false).insert_one(d(r#"{"_id": "quick", "kind": "fast"}"#)).unwrap();
+        assert!(c.find_one(d(r#"{"_id": "quick"}"#)).unwrap().is_some());
         client.database("app").collection("gone").insert_one(d("{}")).unwrap();
         client.database("app").collection("gone").drop().unwrap();
         drop(c);
@@ -298,6 +301,7 @@ fn test_collections_and_indexes_persist_across_reopen() {
     assert_eq!(c.list_indexes().len(), 3);
     assert_eq!(stage_file(&c, r#"{"kind": "k3"}"#), "IXSCAN");
     assert_eq!(c.count_documents(d(r#"{"kind": "k3"}"#)).unwrap(), 29);
+    assert_eq!(c.count_documents(d(r#"{"kind": "fast"}"#)).unwrap(), 1);
     assert_eq!(c.explain(d(r#"{"labels": "x"}"#)).unwrap().get("multikey"), Some(&Value::Bool(true)));
     assert_eq!(c.count_documents(d(r#"{"labels": {"$in": ["x", "y1"]}}"#)).unwrap(), 200);
     drop(c);
