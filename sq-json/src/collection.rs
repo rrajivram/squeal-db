@@ -65,6 +65,39 @@ impl FindOptions {
     }
 }
 
+/// Options for the find_one_and_* operations.
+#[derive(Debug, Clone, Default)]
+pub struct FindOneAndOptions {
+    /// Which document, when several match: the first in this order.
+    pub sort: Option<Document>,
+    pub projection: Option<Document>,
+    pub upsert: bool,
+    /// Return the document as the operation left it, not as it was.
+    pub return_new: bool,
+}
+
+impl FindOneAndOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn sort(mut self, sort: Document) -> Self {
+        self.sort = Some(sort);
+        self
+    }
+    pub fn projection(mut self, projection: Document) -> Self {
+        self.projection = Some(projection);
+        self
+    }
+    pub fn upsert(mut self) -> Self {
+        self.upsert = true;
+        self
+    }
+    pub fn return_new(mut self) -> Self {
+        self.return_new = true;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct IndexOptions {
     pub unique: bool,
@@ -249,23 +282,94 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         };
         let (_ddl, state) = self.read_state();
         let Some(state) = state else { return Ok(vec![]) };
-        let planned = plan(&state, &filter, sort.as_ref(), options.limit.is_some());
-        // Read in order, only the first skip + limit are needed.
-        let in_order = sort.is_none() || planned.sorted;
-        let enough = match options.limit {
-            Some(limit) if in_order => Some(options.skip + limit),
-            _ => None,
-        };
-        let mut docs = self.run(|txn| self.matching(&state, &filter, planned.plan, enough, txn))?;
-        if let Some(sort) = &sort
-            && !in_order
-        {
-            docs.sort_by(|a, b| sort.compare(a, b));
-        }
-        let docs = docs.into_iter().skip(options.skip).take(options.limit.unwrap_or(usize::MAX));
+        let docs = self.run(|txn| {
+            self.select(&state, &filter, sort.as_ref(), options.skip, options.limit, txn)
+        })?;
         Ok(match &projection {
-            Some(p) => docs.map(|d| p.apply(&d)).collect(),
-            None => docs.collect(),
+            Some(p) => docs.iter().map(|d| p.apply(d)).collect(),
+            None => docs,
+        })
+    }
+
+    /// Finds the first document matching `filter` (in `options.sort`
+    /// order), updates it and returns it as it was — or, with
+    /// `return_new`, as it became. With `upsert`, inserts when nothing
+    /// matches (returning None unless `return_new`).
+    pub fn find_one_and_update(
+        &self,
+        filter: Document,
+        update: Document,
+        options: FindOneAndOptions,
+    ) -> Result<Option<Document>> {
+        self.find_and_modify(filter, Some(operators(update)?), options)
+    }
+
+    /// As find_one_and_update, replacing the document whole.
+    pub fn find_one_and_replace(
+        &self,
+        filter: Document,
+        replacement: Document,
+        options: FindOneAndOptions,
+    ) -> Result<Option<Document>> {
+        let update = Update::parse(&replacement)?;
+        if !matches!(update, Update::Replace(_)) {
+            return Err(Error::BadValue("a replacement document can't contain update operators".into()));
+        }
+        self.find_and_modify(filter, Some(update), options)
+    }
+
+    /// Deletes the first document matching `filter` (in `options.sort`
+    /// order) and returns it.
+    pub fn find_one_and_delete(&self, filter: Document, options: FindOneAndOptions) -> Result<Option<Document>> {
+        self.find_and_modify(filter, None, options)
+    }
+
+    fn find_and_modify(
+        &self,
+        filter: Document,
+        update: Option<Update>,
+        options: FindOneAndOptions,
+    ) -> Result<Option<Document>> {
+        let filter = Filter::parse(&filter)?;
+        let sort = options.sort.as_ref().map(Sort::parse).transpose()?;
+        let projection = match &options.projection {
+            Some(p) => Projection::parse(p)?,
+            None => None,
+        };
+        let upsert = options.upsert && update.is_some();
+        let (_ddl, state) = if upsert {
+            let (g, s) = self.write_state()?;
+            (g, Some(s))
+        } else {
+            self.read_state()
+        };
+        let Some(state) = state else { return Ok(None) };
+        let doc = self.run(|txn| {
+            let found = self.select(&state, &filter, sort.as_ref(), 0, Some(1), txn)?.pop();
+            match (found, update) {
+                (Some(old), None) => {
+                    self.delete_doc(&state, &old, txn)?;
+                    Ok(Some(old))
+                }
+                (Some(old), Some(update)) => {
+                    let mut new = old.clone();
+                    if update.apply(&mut new, false)? {
+                        self.update_doc(&state, &old, &new, txn)?;
+                    }
+                    Ok(Some(if options.return_new { new } else { old }))
+                }
+                (None, Some(update)) if upsert => {
+                    let mut doc = update.upsert_document(&filter)?;
+                    prepare_insert(&mut doc)?;
+                    self.insert_doc(&state, &doc, txn)?;
+                    Ok(options.return_new.then_some(doc))
+                }
+                (None, _) => Ok(None),
+            }
+        })?;
+        Ok(match (&projection, doc) {
+            (Some(p), Some(d)) => Some(p.apply(&d)),
+            (_, d) => d,
         })
     }
 
@@ -557,6 +661,33 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
                 Err(e)
             }
         }
+    }
+
+    // What a find returns before projection: the documents matching
+    // `filter`, in `sort` order, past `skip`, up to `limit` of them.
+    fn select(
+        &self,
+        state: &CollState,
+        filter: &Filter,
+        sort: Option<&Sort>,
+        skip: usize,
+        limit: Option<usize>,
+        txn: &Transaction,
+    ) -> Result<Vec<Document>> {
+        let planned = plan(state, filter, sort, limit.is_some());
+        // Read in order, only the first skip + limit are needed.
+        let in_order = sort.is_none() || planned.sorted;
+        let enough = match limit {
+            Some(limit) if in_order => Some(skip + limit),
+            _ => None,
+        };
+        let mut docs = self.matching(state, filter, planned.plan, enough, txn)?;
+        if let Some(sort) = sort
+            && !in_order
+        {
+            docs.sort_by(|a, b| sort.compare(a, b));
+        }
+        Ok(docs.into_iter().skip(skip).take(limit.unwrap_or(usize::MAX)).collect())
     }
 
     // The documents matching `filter`, up to `limit` of them.

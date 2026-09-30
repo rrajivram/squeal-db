@@ -28,6 +28,7 @@ session.commit_transaction()?;
   type order.
 - **CRUD**: `insert_one/many`, `find`, `find_one`, `count_documents`,
   `distinct`, `update_one/many`, `replace_one` (all with upsert),
+  `find_one_and_update/replace/delete` (sort, upsert, before or after),
   `delete_one/many`.
 - **Filters**:
   - comparison: `$eq $ne $gt $gte $lt $lte`, type-bracketed as in MongoDB;

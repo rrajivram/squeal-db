@@ -11,6 +11,6 @@ pub(crate) mod update;
 pub mod value;
 
 pub use client::{Client, Database, Session};
-pub use collection::{Collection, FindOptions, IndexInfo, IndexOptions, UpdateResult};
+pub use collection::{Collection, FindOneAndOptions, FindOptions, IndexInfo, IndexOptions, UpdateResult};
 pub use error::{Error, Result};
 pub use value::{Document, ObjectId, Value};

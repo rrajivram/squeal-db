@@ -429,3 +429,49 @@ fn test_aggregate_over_collections_with_lookup() {
     assert_eq!(json(&out), r#"{"_id":4,"who":[]}"#);
     assert!(orders.aggregate(pipeline(r#"[{"$bogus": 1}]"#)).is_err());
 }
+
+#[test]
+fn test_find_one_and_modify() {
+    use sq_json::FindOneAndOptions as O;
+    let client = client("sqjson_find_and_modify");
+    let jobs = client.database("q").collection("jobs");
+    jobs.insert_many(vec![
+        d(r#"{"_id": 1, "pri": 5, "state": "new"}"#),
+        d(r#"{"_id": 2, "pri": 1, "state": "new"}"#),
+        d(r#"{"_id": 3, "pri": 3, "state": "new"}"#),
+    ])
+    .unwrap();
+    // A queue: claim the most urgent new job.
+    let claim = || {
+        jobs.find_one_and_update(
+            d(r#"{"state": "new"}"#),
+            d(r#"{"$set": {"state": "running"}}"#),
+            O::new().sort(d(r#"{"pri": 1}"#)).projection(d(r#"{"pri": 0}"#)),
+        )
+        .unwrap()
+        .map(|doc| doc.to_json())
+    };
+    assert_eq!(claim().unwrap(), r#"{"_id":2,"state":"new"}"#);
+    assert_eq!(claim().unwrap(), r#"{"_id":3,"state":"new"}"#);
+    let after = jobs
+        .find_one_and_update(d(r#"{"_id": 1}"#), d(r#"{"$inc": {"pri": 1}}"#), O::new().return_new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.to_json(), r#"{"_id":1,"pri":6,"state":"new"}"#);
+    let replaced = jobs
+        .find_one_and_replace(d(r#"{"_id": 1}"#), d(r#"{"state": "done"}"#), O::new().return_new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(replaced.to_json(), r#"{"_id":1,"state":"done"}"#);
+    // Upserts return nothing unless asked for the new document.
+    assert!(jobs.find_one_and_update(d(r#"{"_id": 9}"#), d(r#"{"$set": {"x": 1}}"#), O::new().upsert()).unwrap().is_none());
+    let new = jobs
+        .find_one_and_update(d(r#"{"_id": 10}"#), d(r#"{"$set": {"x": 1}}"#), O::new().upsert().return_new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.to_json(), r#"{"_id":10,"x":1}"#);
+    let gone = jobs.find_one_and_delete(d(r#"{"state": "running"}"#), O::new().sort(d(r#"{"_id": -1}"#))).unwrap();
+    assert_eq!(gone.unwrap().get("_id"), Some(&Value::Int(3)));
+    assert_eq!(jobs.count_documents(d("{}")).unwrap(), 4);
+    assert!(jobs.find_one_and_delete(d(r#"{"_id": 77}"#), O::new()).unwrap().is_none());
+}
