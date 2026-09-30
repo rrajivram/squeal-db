@@ -284,6 +284,11 @@ pub(crate) struct OrderWanted {
     /// whether NULLs come first.
     pub columns: Vec<(usize, bool)>,
     pub limit: Option<usize>,
+    /// Only a read that produces the order will do — for a merge join,
+    /// which needs its input read in order, where a later sort doesn't
+    /// count (see QueryVisitor::merge_plan). Otherwise a read that doesn't
+    /// may win, paying for the sort.
+    pub required: bool,
 }
 
 // Whether a key's order is the wanted one (see pick_access's order_of).
@@ -529,7 +534,8 @@ pub(crate) fn pick_access(
         // same table reads, so it is never the worse of the two — whatever
         // the (possibly stale) statistics say.
         let descent = page_size.min(rows * table_row);
-        let cost = (est * table_row + descent * ranges.len()).min(rows * table_row);
+        let cost =
+            (est * (table_row + TREE_ROW_BYTES) + descent * ranges.len()).min(rows * table_row);
         candidates.push(Candidate {
             ordered: gives_order(&pk_columns, Some(&ranges)),
             path: AccessPath::TableSeek(ranges),
@@ -539,13 +545,12 @@ pub(crate) fn pick_access(
             used,
         });
     } else if !pk_columns.is_empty() && gives_order(&pk_columns, None) {
-        // The whole table, in primary key order: through its key, which
-        // visits rows in key order rather than page order — measured about
-        // a tenth slower than a plain scan.
+        // The whole table, in primary key order: through its key, so each
+        // row pays the cursor's per-row cost (see TREE_ROW_BYTES).
         candidates.push(Candidate {
             path: AccessPath::TableSeek(vec![KeyRange::prefix(vec![])]),
             rows,
-            cost: rows * table_row * KEY_ORDER_READ_PERCENT / 100,
+            cost: rows * (table_row + TREE_ROW_BYTES),
             key: pk_columns.clone(),
             ordered: true,
             used: 0,
@@ -579,7 +584,7 @@ pub(crate) fn pick_access(
                     ordered,
                     path: AccessPath::IndexSeek(i, ranges),
                     rows: est,
-                    cost: est * entry + descent * descents,
+                    cost: est * (entry + TREE_ROW_BYTES) + descent * descents,
                     key: key.clone(),
                     used,
                 });
@@ -593,7 +598,7 @@ pub(crate) fn pick_access(
                     ordered,
                     path: AccessPath::IndexLookup(i, ranges),
                     rows: est,
-                    cost: est * (entry + fetch) + descent * descents,
+                    cost: est * (entry + TREE_ROW_BYTES + fetch) + descent * descents,
                     key: key.clone(),
                     used,
                 });
@@ -608,7 +613,7 @@ pub(crate) fn pick_access(
                         None => AccessPath::IndexScan(i),
                     },
                     rows,
-                    cost: rows * entry,
+                    cost: rows * (entry + TREE_ROW_BYTES),
                     key: key.clone(),
                     used: 0,
                 });
@@ -623,7 +628,7 @@ pub(crate) fn pick_access(
                         ranges.unwrap_or_else(|| vec![KeyRange::prefix(vec![])]),
                     ),
                     rows,
-                    cost: rows * (entry + fetch),
+                    cost: rows * (entry + TREE_ROW_BYTES + fetch),
                     key: key.clone(),
                     ordered: true,
                     used: 0,
@@ -642,6 +647,7 @@ pub(crate) fn pick_access(
         let cost = c.cost as f64;
         match order {
             None => cost,
+            Some(o) if !c.ordered && o.required => f64::INFINITY,
             Some(_) if !c.ordered => {
                 let n = c.rows as f64;
                 cost + n * (n + 1.0).log2() * SORT_BYTES_PER_COMPARE
@@ -671,8 +677,14 @@ pub(crate) fn pick_access(
     }
 }
 
-// Reading a whole table in key order, as a percentage of scanning it.
-const KEY_ORDER_READ_PERCENT: usize = 125;
+// What each row read through a tree cursor costs on top of its bytes —
+// any read but a table scan (seeks, index reads, a table read in key
+// order): each entry is resolved to its row on its own, where a scan walks
+// data pages in order. Measured: scans cost ~1.2 ns per unit of row size;
+// cursor reads the same plus 50-150 units per row (key-order reads of
+// narrow tables nearly twice a scan; the orders table's primary key index
+// slower to count than the table itself).
+const TREE_ROW_BYTES: usize = 100;
 
 // What sorting costs, in the same units as reading: per comparison.
 // Measured: sorting 30k rows in memory added 1-2 ms to a 32 ms scan of
@@ -795,7 +807,7 @@ pub(crate) fn pick_join_seek(
             }
             let rows_per_key = per_key(&key, &used, unique);
             let descent = page_size.min(rows * entry);
-            let cost = outer_rows * (descent + rows_per_key * row);
+            let cost = outer_rows * (descent + rows_per_key * (row + TREE_ROW_BYTES));
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {
                 best = Some((
                     cost,

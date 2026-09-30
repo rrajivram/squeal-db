@@ -344,19 +344,106 @@ impl WhereJoins {
     }
 }
 
+// The column positions `j`'s ON equalities join on, both sides, in the
+// joined row (the outer side's, then `j`'s own from `width`).
+fn j_keys<F: DBFile + 'static>(j: &JoinRelation<F>, width: usize) -> Vec<usize> {
+    let mut terms = vec![];
+    conjunct_terms(&j.on_expr, &mut terms);
+    terms
+        .iter()
+        .filter_map(|t| match t {
+            EvalExpr::Binary {
+                lhs,
+                op: BinaryOp::Eq,
+                rhs,
+            } => match (lhs.as_ref(), rhs.as_ref()) {
+                (EvalExpr::Value(a), EvalExpr::Value(b)) => Some([*a, *b]),
+                _ => None,
+            },
+            _ => None,
+        })
+        .flatten()
+        .filter(|p| *p < width + j.relation.fields.len())
+        .collect()
+}
+
+// Whether each of `joins` (in chain order) equates one of the key columns
+// `keys` — which grow with each join's own key columns, the columns it
+// makes equal to them — with its table: a chain all on one key, which
+// merge joins can carry in key order from end to end.
+fn joins_on_key<F: DBFile + 'static>(keys: &[usize], joins: &[JoinRelation<F>]) -> bool {
+    let mut keys = keys.to_vec();
+    for j in joins {
+        let mut terms = vec![];
+        conjunct_terms(&j.on_expr, &mut terms);
+        let mut hit = false;
+        for t in terms {
+            if let EvalExpr::Binary {
+                lhs,
+                op: BinaryOp::Eq,
+                rhs,
+            } = t
+                && let (EvalExpr::Value(a), EvalExpr::Value(b)) = (lhs.as_ref(), rhs.as_ref())
+                && (keys.contains(a) || keys.contains(b))
+            {
+                hit = true;
+                keys.extend([*a, *b]);
+            }
+        }
+        if !hit {
+            return false;
+        }
+    }
+    true
+}
+
+// Tests only: merge wherever the inputs can be read in key order, whatever
+// the costs say, to check the merge path's results for every join shape
+// (see stmt::tests::merge_join). Per thread, so a test sets it for its own
+// queries.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_MERGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn force_merge() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_MERGE.with(|f| f.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+// Key types a merge join can take: the same type on both sides, and not a
+// double (its two zeros sort apart in a key but join as equal).
+fn mergeable(a: DataType, b: DataType) -> bool {
+    match (a, b) {
+        (DataType::Str(_), DataType::Str(_)) => true,
+        (a, b) => {
+            a == b
+                && matches!(
+                    a,
+                    DataType::Integer | DataType::Datetime | DataType::Boolean
+                )
+        }
+    }
+}
+
 // What building and probing a hash table costs, in the same units as
 // reading (see optim::picker): per row of the side it is built from.
 const HASH_BYTES_PER_BUILD_ROW: f64 = 32.0;
 
 // A merge join's plan (see QueryVisitor::merge_plan): the orders to read
-// the two tables in, the key fields in each one's row, and the order its
-// output comes in.
+// the two tables in, and the key fields in each one's row.
+#[derive(Clone)]
 struct MergePlan {
     base_order: OrderWanted,
     inner_order: OrderWanted,
     left_fields: Vec<usize>,
     right_fields: Vec<usize>,
-    order: MergeOrder,
 }
 
 // The orders the query would like its joined rows in: ORDER BY's columns
@@ -365,6 +452,9 @@ struct MergePlan {
 #[derive(Default)]
 struct WantedOrder {
     order: Option<Vec<(usize, bool)>>,
+    // The LIMIT that goes with `order`: rows in that order stop coming
+    // once it is reached.
+    limit: Option<usize>,
     group: Option<Vec<usize>>,
     nullable: Vec<bool>,
 }
@@ -375,11 +465,30 @@ struct WantedOrder {
 // join's by the left key only (the right one is NULL where nothing
 // matched), with any NULL left keys first; a RIGHT join's by the right key
 // likewise; a FULL join's by neither alone.
+#[derive(Clone)]
 struct MergeOrder {
     orders: Vec<(Vec<usize>, bool)>,
 }
 
 impl MergeOrder {
+    // The orders after merging rows that came in `outer`'s orders: INNER
+    // and LEFT merges emit the outer rows in their own order, each with its
+    // matches, so those orders carry on alongside the join key's; RIGHT and
+    // FULL interleave rows the outer side didn't have, so only the key's.
+    fn after(
+        outer: Option<&MergeOrder>,
+        left: &[usize],
+        right: &[usize],
+        width: usize,
+        join_type: JoinType,
+    ) -> Self {
+        let mut order = Self::new(left, right, width, join_type);
+        if let (Some(outer), JoinType::Inner | JoinType::Left) = (outer, join_type) {
+            order.orders.extend(outer.orders.iter().cloned());
+        }
+        order
+    }
+
     fn new(left: &[usize], right: &[usize], width: usize, join_type: JoinType) -> Self {
         let left = left.to_vec();
         let right: Vec<usize> = right.iter().map(|r| r + width).collect();
@@ -716,15 +825,17 @@ where
             (Some(columns), [only]) if only.joins.is_empty() => Some(OrderWanted {
                 columns: columns.clone(),
                 limit,
+                required: false,
             }),
             _ => None,
         };
         // What a merge join's output order could save: the ORDER BY or GROUP
-        // BY sort, when the join is the query's only one (anything after it
-        // would scramble the order).
+        // BY sort, when the query is one FROM item (a comma join's fold would
+        // scramble the order).
         let wants_order = match tables.as_slice() {
-            [only] if only.joins.len() == 1 => WantedOrder {
+            [only] if !only.joins.is_empty() => WantedOrder {
                 order: order_columns.clone(),
+                limit,
                 group: group_positions.clone().filter(|g| !g.is_empty()),
                 nullable: flat_tables
                     .iter()
@@ -761,6 +872,7 @@ where
                     j,
                     all_needs.get(accesses.len() + 1),
                     &wants_order,
+                    &table.joins[1..],
                 ),
                 None => None,
             };
@@ -780,9 +892,44 @@ where
             // The column types of the joined-so-far row, which each join's
             // ON positions index (see get_tables).
             let mut left_types: Vec<DataType> = table.fields.iter().map(|f| f.datatype).collect();
+            // The orders the joined-so-far rows come in (see MergeOrder): the
+            // base table's key order when it was read that way for a merge;
+            // then whatever each join leaves — a merge its key order, a
+            // nested-loop join its outer side's, a hash join none.
+            let mut chain_order: Option<MergeOrder> =
+                merge.as_ref().filter(|_| base_sorted).map(|m| MergeOrder {
+                    orders: vec![(m.left_fields.clone(), true)],
+                });
+            let joins = table.joins.len();
             for (n, j) in table.joins.iter().enumerate() {
                 let needs_j = needs.next();
-                let merge = merge.as_ref().filter(|_| n == 0 && base_sorted);
+                let left_width = left_types.len();
+                let merge = if n == 0 {
+                    merge.clone().filter(|_| base_sorted)
+                } else {
+                    // A join's order reaches GROUP BY / ORDER BY only when
+                    // it is the chain's last, or every join after it is on
+                    // the key too (and so can keep the order by merging).
+                    let keys: Vec<usize> = chain_order
+                        .iter()
+                        .flat_map(|o| o.orders.iter().flat_map(|(c, _)| c.clone()))
+                        .chain(j_keys(j, left_width))
+                        .collect();
+                    let rest = &table.joins[n + 1..];
+                    let wanted = if rest.is_empty() || joins_on_key(&keys, rest) {
+                        &wants_order
+                    } else {
+                        &WantedOrder::default()
+                    };
+                    self.chain_merge_plan(
+                        chain_order.as_ref(),
+                        j,
+                        needs_j,
+                        &left_types,
+                        outer_rows,
+                        wanted,
+                    )
+                };
                 if let Some(join) = self.nested_loop_join(
                     &mut combined,
                     j.join_type,
@@ -797,8 +944,10 @@ where
                     accesses.push(None);
                     // Its rows come from the join itself: WHERE checks them.
                     pushed.push(false);
+                    // Each outer row's matches come out together, in the
+                    // outer rows' order: chain_order stands.
                 } else {
-                    let inner_order = merge.map(|m| &m.inner_order);
+                    let inner_order = merge.as_ref().map(|m| &m.inner_order);
                     let (relation, access) = self.open_item(&j.relation, needs_j, inner_order)?;
                     let inner_sorted = access.as_ref().is_some_and(|a| a.sorted);
                     let (relation, _) =
@@ -807,17 +956,15 @@ where
                     pushed.push(true);
                     let outer = std::mem::replace(&mut combined, Box::new(UnionJoin::new(vec![])?));
                     let db = self.conn.database.read().db.clone();
-                    if let Some(m) = merge.filter(|_| inner_sorted)
-                        && table.joins.len() == 1
-                        && tables.len() == 1
-                    {
-                        merged_order = Some(MergeOrder::new(
+                    chain_order = merge.as_ref().filter(|_| inner_sorted).map(|m| {
+                        MergeOrder::after(
+                            chain_order.as_ref(),
                             &m.left_fields,
                             &m.right_fields,
-                            table.fields.len(),
+                            left_width,
                             j.join_type,
-                        ));
-                    }
+                        )
+                    });
                     combined = match merge {
                         // Both sides arrive in join-key order: merge them in
                         // one pass, no sort, no hash table.
@@ -842,6 +989,9 @@ where
                     outer_rows = None;
                 }
                 left_types.extend(j.relation.fields.iter().map(|f| f.datatype));
+            }
+            if tables.len() == 1 && joins > 0 {
+                merged_order = chain_order;
             }
             sources.push(combined);
             item_rows.push(outer_rows);
@@ -1166,6 +1316,7 @@ where
         j: &JoinRelation<F>,
         j_needs: Option<&ItemNeeds>,
         wanted: &WantedOrder,
+        later: &[JoinRelation<F>],
     ) -> Option<MergePlan> {
         let (TableRef::Real(_, base_table), TableRef::Real(_, inner_table)) =
             (&base.resolved, &j.relation.resolved)
@@ -1195,21 +1346,10 @@ where
                 (EvalExpr::Value(b), EvalExpr::Value(a)) if *a < width && *b >= width => (*a, *b),
                 _ => return None,
             };
-            let (lt, rt) = (
+            if !mergeable(
                 base.fields[l].datatype,
                 j.relation.fields[r - width].datatype,
-            );
-            let mergeable = match (lt, rt) {
-                (DataType::Str(_), DataType::Str(_)) => true,
-                (a, b) => {
-                    a == b
-                        && matches!(
-                            a,
-                            DataType::Integer | DataType::Datetime | DataType::Boolean
-                        )
-                }
-            };
-            if !mergeable {
+            ) {
                 return None;
             }
             left_fields.push(l);
@@ -1221,6 +1361,7 @@ where
         let order = |fields: &[usize]| OrderWanted {
             columns: fields.iter().map(|f| (*f, true)).collect(),
             limit: None,
+            required: true,
         };
         let (base_order, inner_order) = (order(&left_fields), order(&right_fields));
         let page = self.conn.database.read().db.get_page_data_size();
@@ -1234,23 +1375,151 @@ where
         if !(base_ordered.sorted && inner_ordered.sorted) {
             return None;
         }
-        let merge_cost = base_ordered.cost? + inner_ordered.cost?;
+        let mut merge_cost = base_ordered.cost? + inner_ordered.cost?;
         let build_rows = base_plain.rows?.min(inner_plain.rows?) as f64;
         let mut hash_cost =
             base_plain.cost? + inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
         // The merge's output order may also save the query a sort (see
         // MergeOrder::saves), which hashing would still need.
         let order = MergeOrder::new(&left_fields, &right_fields, width, j.join_type);
-        if order.gives_group(wanted) || order.gives_order(wanted) {
+        let keys: Vec<usize> = order
+            .orders
+            .iter()
+            .flat_map(|(cols, _)| cols.clone())
+            .collect();
+        let chain_continues = later.is_empty() || joins_on_key(&keys, later);
+        if chain_continues && (order.gives_group(wanted) || order.gives_order(wanted)) {
             let n = (base_plain.rows? + inner_plain.rows?) as f64;
             hash_cost += n * (n + 1.0).log2() * SORT_BYTES_PER_COMPARE;
+            // ORDER BY ... LIMIT: merging stops after LIMIT rows, having read
+            // about that share of each side; hashing reads them all.
+            if let (true, Some(limit)) = (order.gives_order(wanted), wanted.limit) {
+                let out = base_plain.rows?.max(inner_plain.rows?).max(1) as f64;
+                merge_cost *= (limit as f64 / out).min(1.0);
+            }
         }
-        (merge_cost <= hash_cost).then(|| MergePlan {
+        // A later join on this key can merge too, sparing its hash table —
+        // only if this one merges and leaves the rows in key order.
+        for l in later {
+            let mut terms = vec![];
+            conjunct_terms(&l.on_expr, &mut terms);
+            let on_key = terms.iter().any(|t| match t {
+                EvalExpr::Binary {
+                    lhs,
+                    op: BinaryOp::Eq,
+                    rhs,
+                } => matches!((lhs.as_ref(), rhs.as_ref()),
+                    (EvalExpr::Value(a), EvalExpr::Value(b)) if keys.contains(a) || keys.contains(b)),
+                _ => false,
+            });
+            if on_key && let Some(s) = &l.relation.stats {
+                hash_cost += s.table_stat.row_count as f64 * HASH_BYTES_PER_BUILD_ROW;
+            }
+        }
+        (merge_cost <= hash_cost || force_merge()).then(|| MergePlan {
             base_order,
             inner_order,
             left_fields,
             right_fields,
-            order,
+        })
+    }
+
+    // Whether to merge the joined-so-far rows with the next table `j`, the
+    // way merge_plan does for a chain's first join: the rows already come
+    // in an order (`chain`) whose leading columns are exactly the ON
+    // equalities' outer columns — in any arrangement, since equalities can
+    // be taken in whichever order matches — and reading `j` in the
+    // matching key order costs no more than reading it the cheapest way
+    // and hashing it (less any sort the result spares GROUP BY / ORDER BY,
+    // per `wanted`). Positions are in the joined-so-far row, `left_types`
+    // wide.
+    fn chain_merge_plan(
+        &self,
+        chain: Option<&MergeOrder>,
+        j: &JoinRelation<F>,
+        j_needs: Option<&ItemNeeds>,
+        left_types: &[DataType],
+        outer_rows: Option<usize>,
+        wanted: &WantedOrder,
+    ) -> Option<MergePlan> {
+        let chain = chain?;
+        let TableRef::Real(_, inner_table) = &j.relation.resolved else {
+            return None;
+        };
+        if matches!(j.join_type, JoinType::Cross) {
+            return None;
+        }
+        let j_needs = j_needs?;
+        let width = left_types.len();
+        let mut terms = vec![];
+        conjunct_terms(&j.on_expr, &mut terms);
+        let mut pairs = vec![];
+        for t in terms {
+            let EvalExpr::Binary {
+                lhs,
+                op: BinaryOp::Eq,
+                rhs,
+            } = t
+            else {
+                return None;
+            };
+            let (l, r) = match (lhs.as_ref(), rhs.as_ref()) {
+                (EvalExpr::Value(a), EvalExpr::Value(b)) if *a < width && *b >= width => (*a, *b),
+                (EvalExpr::Value(b), EvalExpr::Value(a)) if *a < width && *b >= width => (*a, *b),
+                _ => return None,
+            };
+            if !mergeable(left_types[l], j.relation.fields[r - width].datatype) {
+                return None;
+            }
+            pairs.push((l, r - width));
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        // An order whose leading columns are the outer keys, and the pairs
+        // arranged to match it.
+        let (left_fields, right_fields): (Vec<usize>, Vec<usize>) =
+            chain.orders.iter().find_map(|(cols, _)| {
+                let lead = cols.get(..pairs.len())?;
+                lead.iter()
+                    .map(|c| pairs.iter().find(|(l, _)| l == c).copied())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|p| p.into_iter().unzip())
+            })?;
+        let inner_order = OrderWanted {
+            columns: right_fields.iter().map(|f| (*f, true)).collect(),
+            limit: None,
+            required: true,
+        };
+        let page = self.conn.database.read().db.get_page_data_size();
+        let stats = j.relation.stats.as_ref();
+        let inner_plain = pick_access(inner_table, stats, j_needs, page, None);
+        let inner_ordered = pick_access(inner_table, stats, j_needs, page, Some(&inner_order));
+        if !inner_ordered.sorted {
+            return None;
+        }
+        let build_rows = outer_rows.unwrap_or(usize::MAX).min(inner_plain.rows?) as f64;
+        let mut hash_cost = inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
+        let mut merge_cost = inner_ordered.cost?;
+        let order = MergeOrder::after(Some(chain), &left_fields, &right_fields, width, j.join_type);
+        if order.gives_group(wanted) || order.gives_order(wanted) {
+            let n = (outer_rows.unwrap_or(0) + inner_plain.rows?) as f64;
+            hash_cost += n * (n + 1.0).log2() * SORT_BYTES_PER_COMPARE;
+            // ORDER BY ... LIMIT: merging stops after LIMIT rows.
+            if let (true, Some(limit)) = (order.gives_order(wanted), wanted.limit) {
+                let out = outer_rows.unwrap_or(0).max(inner_plain.rows?).max(1) as f64;
+                merge_cost *= (limit as f64 / out).min(1.0);
+            }
+        }
+        (merge_cost <= hash_cost || force_merge()).then(|| MergePlan {
+            base_order: OrderWanted {
+                columns: vec![],
+                limit: None,
+                required: true,
+            },
+            inner_order,
+            left_fields,
+            right_fields,
         })
     }
 
