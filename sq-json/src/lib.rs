@@ -3,6 +3,7 @@ pub(crate) mod aggregate;
 pub mod client;
 pub mod collection;
 pub mod error;
+pub mod shell;
 pub(crate) mod filter;
 pub(crate) mod keys;
 pub(crate) mod plan;

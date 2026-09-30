@@ -1,6 +1,21 @@
 # sq-json
 
-A MongoDB-style document database on `store`, with a Rust API.
+A MongoDB-style document database on `store`, with a Rust API and a
+mongosh-style shell:
+
+```
+$ cargo run -p sq-json -- shop.db
+test> use shop
+shop> db.orders.insertOne({sku: 'pen', qty: 5, at: ISODate('2024-01-02T00:00:00Z')})
+shop> db.orders.createIndex({qty: 1})
+shop> db.orders.find({qty: {$gte: 3}}, {_id: 0}).sort({qty: 1}).limit(10)
+shop> db.orders.aggregate([{$group: {_id: '$sku', n: {$sum: 1}}}])
+shop> begin
+shop (txn)> db.orders.deleteMany({})
+shop (txn)> abort
+```
+
+Type `help` in the shell for every statement. From Rust:
 
 ```rust
 use sq_json::{Client, Document, FindOptions, IndexOptions};
