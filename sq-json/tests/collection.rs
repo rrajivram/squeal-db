@@ -475,3 +475,38 @@ fn test_find_one_and_modify() {
     assert_eq!(jobs.count_documents(d("{}")).unwrap(), 4);
     assert!(jobs.find_one_and_delete(d(r#"{"_id": 77}"#), O::new()).unwrap().is_none());
 }
+
+#[test]
+fn test_regex_prefixes_seek_indexes() {
+    let client = client("sqjson_regex");
+    let c = client.database("t").collection("words");
+    let words = ["apple", "apply", "apt", "banana", "Apple", "ap", "b", "appl\u{10FFFF}x"];
+    c.insert_many(words.iter().enumerate().map(|(i, w)| {
+        let mut doc = Document::new();
+        doc.insert("_id", Value::Int(i as i64));
+        doc.insert("w", Value::String(w.to_string()));
+        doc
+    }).collect()).unwrap();
+    c.insert_one(d(r#"{"_id": 100, "w": 7}"#)).unwrap();
+    let ids = |f: &str| {
+        let docs = c.find(d(f), FindOptions::new().sort(d(r#"{"_id": 1}"#))).unwrap();
+        docs.iter().map(|x| x.get("_id").unwrap().to_json()).collect::<Vec<_>>().join(",")
+    };
+    let filters = [
+        r#"{"w": {"$regex": "^app"}}"#,
+        r#"{"w": {"$regex": "^appl."}}"#,
+        r#"{"w": {"$regex": "^ap"}}"#,
+        r#"{"w": {"$regex": "^"}}"#,
+        r#"{"w": {"$regex": "^app", "$options": "i"}}"#,
+        r#"{"w": {"$regex": "an"}}"#,
+    ];
+    let before: Vec<String> = filters.iter().map(|f| ids(f)).collect();
+    assert_eq!(before[0], "0,1,7");
+    c.create_index(d(r#"{"w": 1}"#), IndexOptions::default()).unwrap();
+    for (f, want) in filters.iter().zip(&before) {
+        assert_eq!(&ids(f), want, "{f}");
+    }
+    assert_eq!(stage(&c, filters[0]), "IXSCAN w_1");
+    assert_eq!(stage(&c, filters[4]), "COLLSCAN");
+    assert_eq!(stage(&c, filters[5]), "COLLSCAN");
+}

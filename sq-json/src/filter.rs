@@ -46,6 +46,71 @@ pub(crate) enum Cond {
     /// fields, or conditions on the element values themselves.
     ElemMatch(Box<ElemMatch>),
     Not(Vec<Cond>),
+    /// A string field matches the pattern.
+    Regex(Pattern),
+}
+
+/// A compiled `$regex` with its `$options`.
+#[derive(Debug, Clone)]
+pub(crate) struct Pattern {
+    regex: regex::Regex,
+    source: String,
+    options: String,
+}
+
+impl PartialEq for Pattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source && self.options == other.options
+    }
+}
+
+impl Pattern {
+    fn new(source: &str, options: &str) -> Result<Pattern> {
+        let mut b = regex::RegexBuilder::new(source);
+        for o in options.chars() {
+            match o {
+                'i' => b.case_insensitive(true),
+                'm' => b.multi_line(true),
+                's' => b.dot_matches_new_line(true),
+                'x' => b.ignore_whitespace(true),
+                other => return Err(Error::BadValue(format!("unknown $regex option '{other}'"))),
+            };
+        }
+        let regex = b.build().map_err(|e| Error::BadValue(format!("bad $regex: {e}")))?;
+        Ok(Pattern { regex, source: source.to_string(), options: options.to_string() })
+    }
+
+    fn is_match(&self, v: &Value) -> bool {
+        matches!(v, Value::String(s) if self.regex.is_match(s))
+    }
+
+    /// The literal text every match starts with, when the pattern is
+    /// anchored at the start of the string (`^abc...`): matches then lie in
+    /// one range of strings.
+    pub(crate) fn prefix(&self) -> Option<String> {
+        if self.options.contains(['i', 'm', 'x']) {
+            return None;
+        }
+        let body = self.source.strip_prefix('^').or_else(|| self.source.strip_prefix("\\A"))?;
+        let mut prefix = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if ".^$*+?()[]{}|\\".contains(c) {
+                // A quantifier makes the character before it optional.
+                if "*?{".contains(c) {
+                    prefix.pop();
+                }
+                break;
+            }
+            prefix.push(c);
+            chars.next();
+        }
+        // An alternation anywhere can escape the anchor's prefix.
+        if body.contains('|') {
+            return None;
+        }
+        Some(prefix)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,9 +200,22 @@ fn parse_operators(path: &str, d: &Document) -> Result<Vec<Cond>> {
         Value::Array(items) => Ok(items.clone()),
         _ => Err(Error::BadValue(format!("{op} needs an array"))),
     };
+    let options = match d.get("$options") {
+        None => "",
+        Some(_) if d.get("$regex").is_none() => {
+            return Err(Error::BadValue("$options needs a $regex".into()));
+        }
+        Some(Value::String(o)) => o.as_str(),
+        Some(_) => return Err(Error::BadValue("$options needs a string".into())),
+    };
     d.iter()
+        .filter(|(op, _)| op.as_str() != "$options")
         .map(|(op, v)| {
             Ok(match op.as_str() {
+                "$regex" => match v {
+                    Value::String(source) => Cond::Regex(Pattern::new(source, options)?),
+                    _ => return Err(Error::BadValue("$regex needs a string".into())),
+                },
                 "$eq" => Cond::Eq(v.clone()),
                 "$ne" => Cond::Ne(v.clone()),
                 "$gt" => Cond::Cmp(CmpOp::Gt, v.clone()),
@@ -202,6 +280,9 @@ impl Cond {
                 _ => false,
             }),
             Cond::Not(conds) => !conds.iter().all(|c| c.holds(values)),
+            Cond::Regex(p) => values.iter().any(|v| {
+                p.is_match(v) || matches!(v, Value::Array(items) if items.iter().any(|e| p.is_match(e)))
+            }),
         }
     }
 }
@@ -343,6 +424,18 @@ mod tests {
         let doc = r#"{"items": [{"sku": "x", "qty": 1}, {"sku": "y", "qty": 5}]}"#;
         assert!(matches(r#"{"items": {"$elemMatch": {"sku": "y", "qty": {"$gt": 2}}}}"#, doc));
         assert!(!matches(r#"{"items": {"$elemMatch": {"sku": "x", "qty": {"$gt": 2}}}}"#, doc));
+    }
+
+    #[test]
+    fn test_regex() {
+        assert!(matches(r#"{"a": {"$regex": "^pe"}}"#, r#"{"a": "pen"}"#));
+        assert!(!matches(r#"{"a": {"$regex": "^pe"}}"#, r#"{"a": "ape"}"#));
+        assert!(matches(r#"{"a": {"$regex": "PEN", "$options": "i"}}"#, r#"{"a": ["x", "pen"]}"#));
+        assert!(!matches(r#"{"a": {"$regex": "1"}}"#, r#"{"a": 1}"#));
+        assert!(matches(r#"{"a": {"$not": {"$regex": "^p"}}}"#, r#"{"b": 1}"#));
+        assert!(Filter::parse(&Document::parse(r#"{"a": {"$regex": "("}}"#).unwrap()).is_err());
+        assert!(Filter::parse(&Document::parse(r#"{"a": {"$options": "i"}}"#).unwrap()).is_err());
+        assert!(Filter::parse(&Document::parse(r#"{"a": {"$regex": "a", "$options": "q"}}"#).unwrap()).is_err());
     }
 
     #[test]

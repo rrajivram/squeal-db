@@ -188,6 +188,16 @@ fn cond_set(cond: &Cond) -> Option<FieldSet> {
             Some(FieldSet::Points(vec![Value::Null]))
         }
         Cond::Cmp(_, Value::Null) => Some(FieldSet::Points(vec![])),
+        // An anchored pattern's matches are the strings starting with its
+        // prefix: from the prefix to just past it.
+        Cond::Regex(p) => p.prefix().map(|prefix| FieldSet::Range {
+            bracket: Value::String(String::new()),
+            upper: match successor(&prefix) {
+                Some(s) => Bound::Excluded(Value::String(s)),
+                None => Bound::Unbounded,
+            },
+            lower: Bound::Included(Value::String(prefix)),
+        }),
         Cond::Cmp(op, v) if orders_like_mongo(v) => {
             let (lower, upper) = match op {
                 CmpOp::Gt => (Bound::Excluded(v.clone()), Bound::Unbounded),
@@ -203,6 +213,21 @@ fn cond_set(cond: &Cond) -> Option<FieldSet> {
         }
         _ => None,
     }
+}
+
+// The least string above every string starting with `prefix`: its last
+// character that can be, incremented, the rest dropped (UTF-8 bytes order
+// as code points do). None when there is none (no upper bound).
+fn successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let next = (last as u32 + 1..=char::MAX as u32).find_map(char::from_u32);
+        if let Some(next) = next {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
 }
 
 fn intersect(a: FieldSet, b: FieldSet) -> FieldSet {
@@ -314,6 +339,27 @@ mod tests {
         assert!(!key_order_sorts(&["a"], &sort(&[("a", true), ("z", true)]), &[]));
         let f = Filter::parse(&Document::parse(r#"{"a": 1, "b": {"$in": [2]}, "c": {"$in": [1, 2]}, "d": {"$gt": 1}}"#).unwrap()).unwrap();
         assert_eq!(fixed_paths(&f), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_anchored_regexes_seek_a_string_range() {
+        let s = seek(r#"{"a": {"$regex": "^ab+c"}}"#, &["a"], false).unwrap();
+        assert!(s.ranged);
+        let bound = |b: &Bound<ValueItem>| match b {
+            Bound::Included(ValueItem::Str((s, _))) => format!("[{s}"),
+            Bound::Excluded(ValueItem::Str((s, _))) => format!("{s})"),
+            other => format!("{other:?}"),
+        };
+        // `b+` needs a b, so the prefix is "ab".
+        assert_eq!((bound(&s.ranges[0].lower), bound(&s.ranges[0].upper)), ("[ab".into(), "ac)".into()));
+        let s = seek(r#"{"a": {"$regex": "^abc?"}}"#, &["a"], false).unwrap();
+        assert_eq!(bound(&s.ranges[0].lower), "[ab");
+        // Unanchored, case-insensitive or alternated patterns can't seek.
+        assert!(seek(r#"{"a": {"$regex": "abc"}}"#, &["a"], false).is_none());
+        assert!(seek(r#"{"a": {"$regex": "^abc", "$options": "i"}}"#, &["a"], false).is_none());
+        assert!(seek(r#"{"a": {"$regex": "^a|b"}}"#, &["a"], false).is_none());
+        assert_eq!(successor("a\u{10FFFF}"), Some("b".into()));
+        assert_eq!(successor("\u{10FFFF}"), None);
     }
 
     #[test]

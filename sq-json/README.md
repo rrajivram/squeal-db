@@ -8,6 +8,7 @@ $ cargo run -p sq-json -- shop.db
 test> use shop
 shop> db.orders.insertOne({sku: 'pen', qty: 5, at: ISODate('2024-01-02T00:00:00Z')})
 shop> db.orders.createIndex({qty: 1})
+shop> db.orders.find({sku: /^p/})
 shop> db.orders.find({qty: {$gte: 3}}, {_id: 0}).sort({qty: 1}).limit(10)
 shop> db.orders.aggregate([{$group: {_id: '$sku', n: {$sum: 1}}}])
 shop> begin
@@ -49,6 +50,8 @@ session.commit_transaction()?;
   - comparison: `$eq $ne $gt $gte $lt $lte`, type-bracketed as in MongoDB;
   - sets: `$in $nin`;
   - element and array: `$exists $size $all $elemMatch`;
+  - `$regex` with `$options` (`i m s x`); an anchored prefix (`^abc`)
+    seeks an index as a string range;
   - logic: `$not $and $or $nor`;
   - paths: dotted paths, which reach through arrays; null matches a missing field.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push $addToSet $pull
@@ -81,7 +84,7 @@ session.commit_transaction()?;
 - **Atomicity outside a transaction**: each operation runs in one store
   transaction. A failing `insert_many` or `update_many` therefore changes
   nothing; MongoDB would keep the writes made before the failure.
-- **Missing features**: no regex, `$facet`/`$bucket` and other stages, text, geo, TTL, sparse or
+- **Missing features**: no `$facet`/`$bucket` and other stages, text, geo, TTL, sparse or
   partial indexes, collation, or `$slice` and positional projections.
 - **Descending sorts**: done in memory, since an index is only read forwards.
   Descending index fields are stored ascending.

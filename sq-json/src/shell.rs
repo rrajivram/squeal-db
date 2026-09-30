@@ -369,6 +369,28 @@ impl Parser<'_> {
         match self.peek() {
             Some('{') => self.list('{', '}', out, true),
             Some('[') => self.list('[', ']', out, false),
+            // `/pattern/flags`: a $regex.
+            Some('/') => {
+                self.i += 1;
+                let start = self.i;
+                let mut escaped = false;
+                loop {
+                    match self.peek() {
+                        None => return Err(self.error("unterminated /regex/")),
+                        Some('/') if !escaped => break,
+                        Some(c) => {
+                            escaped = c == '\\' && !escaped;
+                            self.i += c.len_utf8();
+                        }
+                    }
+                }
+                let pattern = &self.s[start..self.i];
+                self.i += 1;
+                let flags = self.ident();
+                let quote = |s: &str| serde_json::to_string(s).expect("strings serialize");
+                out.push_str(&format!("{{\"$regex\":{},\"$options\":{}}}", quote(pattern), quote(&flags)));
+                Ok(())
+            }
             Some('"' | '\'') => {
                 let s = self.string()?;
                 out.push_str(&serde_json::to_string(&s).expect("strings serialize"));
@@ -554,6 +576,8 @@ mod tests {
         );
         assert_eq!(run(&mut sh, "db.items.aggregate([{$group: {_id: null, total: {$sum: '$qty'}}}])"), r#"{"_id":null,"total":22}"#);
         assert_eq!(run(&mut sh, "db.items.distinct('tags')"), r#"["a"]"#);
+        assert_eq!(run(&mut sh, "db.items.find({name: /^P/i}, {name: 1, _id: 0})"), "{\"name\":\"pen\"}\n{\"name\":\"pad\"}");
+        assert_eq!(run(&mut sh, r"db.items.countDocuments({name: {$regex: 'n\\b'}})"), "1");
         assert_eq!(run(&mut sh, "show collections"), "items");
         assert_eq!(run(&mut sh, "show dbs"), "shop");
 
