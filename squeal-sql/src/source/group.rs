@@ -1,6 +1,6 @@
+use crate::source::{column_names, output_label, planinfo::PlanNode};
 use std::{collections::HashMap, sync::Arc};
 use store::clock::Instant;
-use crate::source::{column_names, output_label, planinfo::PlanNode};
 
 use store::valueitem::{IndexKey, ValueItem};
 
@@ -133,7 +133,9 @@ impl Source for GroupSource {
             .collect::<Vec<_>>()
             .join(", ");
         if self.key_positions.is_empty() {
-            PlanNode::new("Aggregate").detail(outputs).child(self.source.plan())
+            PlanNode::new("Aggregate")
+                .detail(outputs)
+                .child(self.source.plan())
         } else {
             let keys = self
                 .key_positions
@@ -146,7 +148,6 @@ impl Source for GroupSource {
                 .child(self.source.plan())
         }
     }
-
 
     fn fields(&self) -> Arc<[ProjectableField]> {
         Arc::from(self.fields.clone())
@@ -230,7 +231,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        plan::funcs::{Avg, Count, FuncArgs, FuncObj, Upper},
+        plan::{
+            eval::dummy_arc_field,
+            funcs::{Avg, Count, FuncArgs, FuncObj, Upper},
+        },
         source::test_support::{VecSource, drain},
         table::Field,
     };
@@ -258,7 +262,15 @@ mod tests {
             0,
             0,
             EvalExpr::Function(FuncObj::Avg(
-                Avg::new(vec![FuncArgs::Field(Box::new(EvalExpr::Value(pos)))], None).unwrap(),
+                Avg::new(
+                    vec![FuncArgs::Field(Box::new(EvalExpr::Value(
+                        pos,
+                        dummy_arc_field(),
+                        None,
+                    )))],
+                    None,
+                )
+                .unwrap(),
             )),
         )
     }
@@ -369,7 +381,11 @@ mod tests {
         let db = store::db::Db::<store::memfile::MemFile>::create("group_reset_test.db").unwrap();
         let sorted = SortSource::new(
             raw,
-            &[SortField { asc: true, null_first: true, index: 0 }],
+            &[SortField {
+                asc: true,
+                null_first: true,
+                index: 0,
+            }],
             None,
             db,
             QueryMemory::new(1024 * 1024),
@@ -389,7 +405,10 @@ mod tests {
 
         group.reset().unwrap();
         let second = drain(&mut group);
-        assert_eq!(second, first, "a reset GROUP BY over a real sort must reproduce the same groups");
+        assert_eq!(
+            second, first,
+            "a reset GROUP BY over a real sort must reproduce the same groups"
+        );
     }
 
     #[test]

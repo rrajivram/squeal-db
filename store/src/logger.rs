@@ -513,7 +513,11 @@ pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
                 h.magic,
                 h.version,
                 h.page_size,
-                if h.magic == LOG_MAGIC { "ok" } else { "MISMATCH" },
+                if h.magic == LOG_MAGIC {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                },
             )),
             Err(e) => out.push(format!("LogHeader undecodable: {e}")),
         },
@@ -532,7 +536,11 @@ pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
         let line = match &r.operation {
             Operation::Add { txn, post } => format!(
                 "lsn={} ADD    txn={} table={} key={} page={:?}",
-                r.lsn.0, txn.id_num(), post.table_id, post.tuple.id, post.data_page
+                r.lsn.0,
+                txn.id_num(),
+                post.table_id,
+                post.tuple.id,
+                post.data_page
             ),
             Operation::Mod { txn, pre, post } => format!(
                 "lsn={} MOD    txn={} table={} key={} pre_txn={}{}",
@@ -541,11 +549,18 @@ pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
                 post.table_id,
                 post.tuple.id,
                 pre.tuple.txn_id.map(|t| t.id_num()).unwrap_or(0),
-                if pre.tuple.is_tombstoned() { "(tombstone)" } else { "" }
+                if pre.tuple.is_tombstoned() {
+                    "(tombstone)"
+                } else {
+                    ""
+                }
             ),
             Operation::Del { txn, pre } => format!(
                 "lsn={} DEL    txn={} table={} key={}",
-                r.lsn.0, txn.id_num(), pre.table_id, pre.tuple.id
+                r.lsn.0,
+                txn.id_num(),
+                pre.table_id,
+                pre.tuple.id
             ),
             Operation::Commit(t) => format!("lsn={} COMMIT txn={}", r.lsn.0, t.id_num()),
             Operation::Rollback(t) => format!("lsn={} ABORT  txn={}", r.lsn.0, t.id_num()),
@@ -556,10 +571,18 @@ pub fn describe_wal(bytes: &[u8]) -> Vec<String> {
                 table_id,
                 key
             ),
-            Operation::Sequence { name, high_water, dropped } => format!(
+            Operation::Sequence {
+                name,
+                high_water,
+                dropped,
+            } => format!(
                 "lsn={} SEQ    {name} {}",
                 r.lsn.0,
-                if *dropped { "dropped".to_string() } else { format!("high_water={high_water}") }
+                if *dropped {
+                    "dropped".to_string()
+                } else {
+                    format!("high_water={high_water}")
+                }
             ),
         };
         out.push(line);
@@ -650,7 +673,10 @@ pub(crate) fn segment_number(prefix: &str, path: &str) -> Option<u64> {
 }
 
 /// The database's segments as `handle`'s namespace lists them, oldest first.
-pub(crate) fn list_segments<F: DBFile>(handle: &F, name: &str) -> Result<Vec<(u64, String)>, StoreError> {
+pub(crate) fn list_segments<F: DBFile>(
+    handle: &F,
+    name: &str,
+) -> Result<Vec<(u64, String)>, StoreError> {
     let prefix = segment_prefix(name);
     let mut segs: Vec<(u64, String)> = handle
         .list_siblings(&prefix)?
@@ -855,6 +881,7 @@ impl std::fmt::Debug for Logger {
     }
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Logger {
     fn default() -> Self {
         Self {
@@ -952,7 +979,10 @@ impl Logger {
 
     /// Test fixture: a runner over one in-memory segment.
     #[cfg(test)]
-    pub(crate) fn set_db_for_test(&mut self, file: impl DBFile + 'static) -> Result<(), StoreError> {
+    pub(crate) fn set_db_for_test(
+        &mut self,
+        file: impl DBFile + 'static,
+    ) -> Result<(), StoreError> {
         self.set_db(
             file,
             "test".into(),
@@ -974,12 +1004,14 @@ impl Logger {
 
     /// Bytes appended to the current segment.
     pub(crate) fn segment_bytes(&self) -> u64 {
-        self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed)
+        self.segment_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Segments on disk: the retained ones plus the current one.
     pub(crate) fn segments(&self) -> usize {
-        self.segment_count.load(std::sync::atomic::Ordering::Relaxed)
+        self.segment_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn current_segment(&self) -> u64 {
@@ -1150,7 +1182,10 @@ impl<F: DBFile> WalState<F> {
             .store(self.current.n, std::sync::atomic::Ordering::Relaxed);
         let older: u64 = self.older.iter().map(|s| s.bytes).sum();
         self.retained_bytes.store(
-            older + self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            older
+                + self
+                    .segment_bytes
+                    .load(std::sync::atomic::Ordering::Relaxed),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
@@ -1176,7 +1211,9 @@ impl<F: DBFile> WalState<F> {
         f.write_all(&self.header_bytes)?;
         f.do_sync()?;
         let mut previous = std::mem::replace(&mut self.current, next);
-        previous.bytes = self.segment_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        previous.bytes = self
+            .segment_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.file = f;
         self.older.push(previous);
         self.segment_bytes
@@ -1207,13 +1244,19 @@ impl<F: DBFile> WalState<F> {
 // would otherwise have had to start threading through too.
 #[cfg(target_arch = "wasm32")]
 trait WalRunner: Send {
-    fn log_record(&mut self, lsn: LsnId, op: Operation, clock: &LsnClock) -> Result<(), StoreError>;
+    fn log_record(&mut self, lsn: LsnId, op: Operation, clock: &LsnClock)
+    -> Result<(), StoreError>;
     fn roll_wal(&mut self, floor: u64) -> Result<(), StoreError>;
 }
 
 #[cfg(target_arch = "wasm32")]
 impl<F: DBFile> WalRunner for WalState<F> {
-    fn log_record(&mut self, lsn: LsnId, op: Operation, clock: &LsnClock) -> Result<(), StoreError> {
+    fn log_record(
+        &mut self,
+        lsn: LsnId,
+        op: Operation,
+        clock: &LsnClock,
+    ) -> Result<(), StoreError> {
         let rec = LogRecord { lsn, operation: op };
         let bytes = frame_record(&to_allocvec(&rec)?);
         self.file.seek(SeekFrom::End(0))?;
@@ -1337,9 +1380,10 @@ fn log_runner<F: DBFile>(
 #[cfg(test)]
 mod tests {
 
-    use super::{CURRENT_LOG_VERSION, LOG_MAGIC, LogHeader, LsnId, read_and_validate_log_header, scan_log,
-                write_log_header};
-    use postcard::{from_bytes, to_allocvec};
+    use super::{
+        CURRENT_LOG_VERSION, LOG_MAGIC, LogHeader, LsnId, read_and_validate_log_header, scan_log,
+        write_log_header,
+    };
     use crate::{
         error::StoreError,
         logger::{Logger, Operation, Record, frame_record},
@@ -1348,12 +1392,17 @@ mod tests {
         tuple::{DBIdType, Tuple},
         txn::TransactionId,
     };
+    use postcard::{from_bytes, to_allocvec};
 
     #[test]
     fn test_operation_round_trip() {
         let txn = TransactionId::from(1);
         let tuple = Tuple::new(5, b"hello");
-        let record = Record::new(TableIdType::from(2), tuple, Some(crate::page::PageId::from(9u64)));
+        let record = Record::new(
+            TableIdType::from(2),
+            tuple,
+            Some(crate::page::PageId::from(9u64)),
+        );
         // Tuple's cached serialized_size (#[serde(skip)]) is 0 after any
         // real deserialize; round-trip the freshly-built record once so
         // the "expected" side matches that, instead of comparing a
@@ -1361,13 +1410,31 @@ mod tests {
         // one's cleared cache.
         let record: Record = from_bytes(&to_allocvec(&record).unwrap()).unwrap();
         let ops = [
-            Operation::Add { txn, post: record.clone() },
-            Operation::Mod { txn, pre: record.clone(), post: record.clone() },
-            Operation::Del { txn, pre: record.clone() },
+            Operation::Add {
+                txn,
+                post: record.clone(),
+            },
+            Operation::Mod {
+                txn,
+                pre: record.clone(),
+                post: record.clone(),
+            },
+            Operation::Del {
+                txn,
+                pre: record.clone(),
+            },
             Operation::Commit(txn),
             Operation::Rollback(txn),
-            Operation::Sequence { name: "s".to_string(), high_water: 7, dropped: false },
-            Operation::Purge { txn, table_id: TableIdType::from(2), key: DBIdType::Int(5) },
+            Operation::Sequence {
+                name: "s".to_string(),
+                high_water: 7,
+                dropped: false,
+            },
+            Operation::Purge {
+                txn,
+                table_id: TableIdType::from(2),
+                key: DBIdType::Int(5),
+            },
         ];
         for op in ops {
             let bytes = to_allocvec(&op).unwrap();
@@ -1400,23 +1467,63 @@ mod tests {
 
         let txn = TransactionId::from(1);
         let tuple = Tuple::new(5, b"hello");
-        let record = Record::new(TableIdType::from(2), tuple, Some(crate::page::PageId::from(9u64)));
+        let record = Record::new(
+            TableIdType::from(2),
+            tuple,
+            Some(crate::page::PageId::from(9u64)),
+        );
         // See test_operation_round_trip: normalize the cached, non-persisted
         // Tuple::serialized_size the same way a real decode does.
         let record: Record = from_bytes(&to_allocvec(&record).unwrap()).unwrap();
 
         macro_rules! assert_decodes {
             ($bytes:expr, $expected:expr) => {
-                assert_eq!(format!("{:?}", from_bytes::<Operation>($bytes).unwrap()), format!("{:?}", $expected));
+                assert_eq!(
+                    format!("{:?}", from_bytes::<Operation>($bytes).unwrap()),
+                    format!("{:?}", $expected)
+                );
             };
         }
-        assert_decodes!(ADD_BYTES, Operation::Add { txn, post: record.clone() });
-        assert_decodes!(MOD_BYTES, Operation::Mod { txn, pre: record.clone(), post: record.clone() });
-        assert_decodes!(DEL_BYTES, Operation::Del { txn, pre: record.clone() });
+        assert_decodes!(
+            ADD_BYTES,
+            Operation::Add {
+                txn,
+                post: record.clone()
+            }
+        );
+        assert_decodes!(
+            MOD_BYTES,
+            Operation::Mod {
+                txn,
+                pre: record.clone(),
+                post: record.clone()
+            }
+        );
+        assert_decodes!(
+            DEL_BYTES,
+            Operation::Del {
+                txn,
+                pre: record.clone()
+            }
+        );
         assert_decodes!(COMMIT_BYTES, Operation::Commit(txn));
         assert_decodes!(ROLLBACK_BYTES, Operation::Rollback(txn));
-        assert_decodes!(SEQ_BYTES, Operation::Sequence { name: "s".to_string(), high_water: 7, dropped: false });
-        assert_decodes!(PURGE_BYTES, Operation::Purge { txn, table_id: TableIdType::from(2), key: DBIdType::Int(5) });
+        assert_decodes!(
+            SEQ_BYTES,
+            Operation::Sequence {
+                name: "s".to_string(),
+                high_water: 7,
+                dropped: false
+            }
+        );
+        assert_decodes!(
+            PURGE_BYTES,
+            Operation::Purge {
+                txn,
+                table_id: TableIdType::from(2),
+                key: DBIdType::Int(5)
+            }
+        );
     }
 
     #[test]
@@ -1627,8 +1734,8 @@ mod tests {
         let bytes = to_allocvec(&bad).unwrap();
         let mut file = MemFile::new();
         std::io::Write::write_all(&mut file, &bytes).unwrap();
-        let StoreError::LogHeaderMismatch(msg) = read_and_validate_log_header(&mut file, 4096)
-            .unwrap_err()
+        let StoreError::LogHeaderMismatch(msg) =
+            read_and_validate_log_header(&mut file, 4096).unwrap_err()
         else {
             panic!("expected LogHeaderMismatch");
         };
@@ -1646,8 +1753,8 @@ mod tests {
         let bytes = to_allocvec(&bad).unwrap();
         let mut file = MemFile::new();
         std::io::Write::write_all(&mut file, &bytes).unwrap();
-        let StoreError::LogHeaderMismatch(msg) = read_and_validate_log_header(&mut file, 4096)
-            .unwrap_err()
+        let StoreError::LogHeaderMismatch(msg) =
+            read_and_validate_log_header(&mut file, 4096).unwrap_err()
         else {
             panic!("expected LogHeaderMismatch");
         };
@@ -1668,7 +1775,10 @@ mod tests {
     fn test_header_len_of_honors_the_segments_own_version() {
         let mut file = MemFile::new();
         write_log_header(&mut file, 4096).unwrap();
-        assert_eq!(super::header_len_of(&file.data()).unwrap(), LogHeader::encoded_len());
+        assert_eq!(
+            super::header_len_of(&file.data()).unwrap(),
+            LogHeader::encoded_len()
+        );
         assert!(super::header_len_of(&[0u8; 3]).is_err(), "truncated prefix");
     }
 
@@ -1687,7 +1797,10 @@ mod tests {
             matches!(&err, StoreError::LogHeaderMismatch(m) if m.contains("recreate the database")),
             "got {err}"
         );
-        assert!(scan_log(1, &[]).is_ok(), "an empty body has nothing to decode");
+        assert!(
+            scan_log(1, &[]).is_ok(),
+            "an empty body has nothing to decode"
+        );
         let framed = super::frame_record(&sample_record_bytes(1));
         assert!(scan_log(1, &framed).is_err());
     }
@@ -1788,8 +1901,7 @@ mod tests {
 
     // Captured from `print_v2_wal_fixture` (above) at the commit that
     // introduced version dispatch; DO NOT edit.
-    const V2_WAL_SEGMENT_HEX: &str =
-        "5371574c0200001000000000000012000000c2cb8f8c01000a030001010a0005616c7068610001051f000000b1bcff5202010b030001010a0005616c7068610000030001010b010104626574610000180000001f61d77003020c04010204016b08010e010b01020567616d6d610000030000000ecb0ee704030a03000000055939a305040b0b000000fe80469d0605057365715f618020000c00000044a2e08407060c04010204016b08010e";
+    const V2_WAL_SEGMENT_HEX: &str = "5371574c0200001000000000000012000000c2cb8f8c01000a030001010a0005616c7068610001051f000000b1bcff5202010b030001010a0005616c7068610000030001010b010104626574610000180000001f61d77003020c04010204016b08010e010b01020567616d6d610000030000000ecb0ee704030a03000000055939a305040b0b000000fe80469d0605057365715f618020000c00000044a2e08407060c04010204016b08010e";
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len())
@@ -1896,7 +2008,11 @@ mod tests {
         buf.extend(frame_record(&sample_record_bytes(1)));
         buf.extend_from_slice(&[1, 2, 3]); // fewer than 8 bytes — a torn frame header
         let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
-        assert_eq!(scanned.records.len(), 1, "the one complete record must still be recovered");
+        assert_eq!(
+            scanned.records.len(),
+            1,
+            "the one complete record must still be recovered"
+        );
     }
 
     #[test]
@@ -1908,7 +2024,11 @@ mod tests {
         // actually follows — exactly what a crash mid-write_all leaves.
         buf.extend_from_slice(&full_second[..full_second.len() - 2]);
         let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
-        assert_eq!(scanned.records.len(), 1, "the torn second record must be dropped, not errored");
+        assert_eq!(
+            scanned.records.len(),
+            1,
+            "the torn second record must be dropped, not errored"
+        );
     }
 
     #[test]
@@ -1920,7 +2040,10 @@ mod tests {
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
         let scanned = scan_log(CURRENT_LOG_VERSION, &buf).unwrap();
-        assert!(scanned.records.is_empty(), "must be treated as a torn tail, not an error");
+        assert!(
+            scanned.records.is_empty(),
+            "must be treated as a torn tail, not an error"
+        );
     }
 
     #[test]

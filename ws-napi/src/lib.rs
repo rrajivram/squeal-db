@@ -22,7 +22,7 @@
 //! `WasiFile`'s own doc comment for the full story, and this crate's own
 //! README for how it was found (by actually running a build under Node,
 //! not by reading documentation — both were documented as supported).
-
+#![allow(clippy::type_complexity)]
 use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
@@ -197,8 +197,12 @@ impl SquealDb {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind")]
 enum JsonResult {
-    Count { rows_affected: usize },
-    Message { text: String },
+    Count {
+        rows_affected: usize,
+    },
+    Message {
+        text: String,
+    },
     Result {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
@@ -211,6 +215,7 @@ enum JsonResult {
     },
 }
 
+#[allow(clippy::type_complexity)]
 fn execute_results(
     conn: &Arc<Connection<F>>,
     sql: &str,
@@ -236,9 +241,7 @@ fn execute_results(
     Ok((out, stats))
 }
 
-fn to_json_result(
-    r: ResultType,
-) -> SqlResult<(JsonResult, Option<Vec<(String, QueryStats)>>)> {
+fn to_json_result(r: ResultType) -> SqlResult<(JsonResult, Option<Vec<(String, QueryStats)>>)> {
     Ok(match r {
         ResultType::Count(n) => (JsonResult::Count { rows_affected: n }, None),
         ResultType::ResultString(text) => (JsonResult::Message { text }, None),
@@ -276,9 +279,7 @@ fn drain_materialized(rs: ResultSet) -> (Vec<String>, Vec<Vec<String>>, String) 
     (columns, rows, message)
 }
 
-fn drain_streaming(
-    stream: &mut StreamingResultSet,
-) -> SqlResult<(Vec<String>, Vec<Vec<String>>)> {
+fn drain_streaming(stream: &mut StreamingResultSet) -> SqlResult<(Vec<String>, Vec<Vec<String>>)> {
     let columns = stream.columns();
     let mut rows = vec![];
     while let Some(row) = stream.next_result_as_strings()? {
@@ -476,7 +477,10 @@ mod tests {
         let path = temp_db_path("t1");
         cleanup(&path);
         let conn = open_or_create(&path).unwrap();
-        let results = exec(&conn, "create table t (id integer not null, primary key(id))");
+        let results = exec(
+            &conn,
+            "create table t (id integer not null, primary key(id))",
+        );
         assert_eq!(kinds(&results), ["Message"]);
         conn.close().unwrap();
         cleanup(&path);
@@ -630,7 +634,11 @@ mod tests {
             assert!(text.contains(cmd), "missing {cmd:?} in:\n{text}");
         }
         for section in squeal_sql::help::SQL_HELP {
-            assert!(text.contains(section.title), "missing section {:?}", section.title);
+            assert!(
+                text.contains(section.title),
+                "missing section {:?}",
+                section.title
+            );
         }
         conn.close().unwrap();
         cleanup(&path);
@@ -641,7 +649,11 @@ mod tests {
         let path = temp_db_path("t9");
         cleanup(&path);
         let conn = open_or_create(&path).unwrap();
-        execute_results(&conn, "create table t (id integer not null, primary key(id))").unwrap();
+        execute_results(
+            &conn,
+            "create table t (id integer not null, primary key(id))",
+        )
+        .unwrap();
         execute_results(&conn, "insert into t values (1)").unwrap();
         let (_, stats) = execute_results(&conn, "select id from t").unwrap();
         let result = run_custom_command("print stats", &conn, &Mutex::new(stats));
@@ -657,7 +669,11 @@ mod tests {
         let path = temp_db_path("t10");
         cleanup(&path);
         let conn = open_or_create(&path).unwrap();
-        execute_results(&conn, "create table t (id integer not null, primary key(id))").unwrap();
+        execute_results(
+            &conn,
+            "create table t (id integer not null, primary key(id))",
+        )
+        .unwrap();
         let result = run_custom_command("show table stats", &conn, &Mutex::new(None));
         let json = serde_json::to_string(&result).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();

@@ -1,6 +1,6 @@
+use crate::{conn::connection::Connection, source::planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use store::clock::Instant;
-use crate::source::{planinfo::PlanNode};
 
 use postcard::from_bytes;
 use store::{
@@ -28,33 +28,34 @@ pub struct IndexSource<F: DBFile + 'static> {
 #[allow(unused)]
 impl<F: DBFile + 'static> IndexSource<F> {
     pub fn new(
-        db: Arc<Db<F>>,
-        table: Arc<SqlTable>,
-        index: &SqlIndex,
+        db: &Arc<Connection<F>>,
+        table: &Arc<SqlTable>,
+        index: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
     ) -> Result<Self, SchemaError> {
+        let db = &db.database.read().db;
         let cursor = match txn {
             Some(tx) => db.range_scan_bounds_in_txn(
-                index.db_table_id,
+                table.indices[index].db_table_id,
                 tx,
                 std::ops::Bound::Unbounded,
                 std::ops::Bound::Unbounded,
             )?,
             None => db.range_scan_bounds(
-                index.db_table_id,
+                table.indices[index].db_table_id,
                 std::ops::Bound::Unbounded,
                 std::ops::Bound::Unbounded,
             )?,
         };
-        let name = if let Some(name) = index.name.as_ref() {
+        let name = if let Some(name) = table.indices[index].name.as_ref() {
             name.clone()
         } else {
             "noname".into()
         };
         let name = format!("IndexScan {}({})", table.name.clone(), name);
         let fields = Arc::from(
-            index
+            table.indices[index]
                 .fields
                 .iter()
                 .enumerate()
@@ -75,7 +76,6 @@ impl<F: DBFile + 'static> Source for IndexSource<F> {
     fn plan(&self) -> PlanNode {
         PlanNode::new(self.name.clone()).rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
     }
-
 
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()

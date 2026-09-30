@@ -1,23 +1,19 @@
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
-use store::{db::DBFile, valueitem::IndexKey};
+use store::valueitem::IndexKey;
 
 use crate::{
-    conn::connection::Connection,
-    error::SchemaError,
-    optim::table_stats::TableStat,
-    plan::eval::EvalExpr,
-    table::{Field, SqlTable},
+    error::SchemaError, optim::table_stats::ComputedTableStat, plan::eval::EvalExpr, table::Field,
 };
 
 pub mod aggr;
 pub(crate) mod group;
 pub mod hash;
-mod index;
+pub mod index;
 pub(crate) mod join;
 mod joinmatch;
-pub mod planinfo;
 pub mod limit;
+pub mod planinfo;
 pub mod proj;
 pub(crate) mod run;
 pub mod sort;
@@ -35,21 +31,6 @@ pub struct ProjectableField {
     pub(crate) source_id: usize,
     pub(crate) field_id: usize,
     pub(crate) expr: EvalExpr,
-}
-
-#[allow(unused)]
-#[derive(Debug, Clone)]
-pub struct ComputedTableStat {
-    pub table_stat: TableStat,
-    pub indices: Option<Vec<IndexStat>>,
-    pub self_index: Option<IndexStat>,
-}
-
-#[derive(Debug, Clone)]
-pub struct IndexStat {
-    pub levels: usize,
-    pub nodes_per_page: usize,
-    pub unique: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -136,45 +117,6 @@ pub(crate) fn output_label(f: &ProjectableField, names: &[String]) -> String {
     } else {
         format!("{expr} AS {}", f.display_name)
     }
-}
-
-pub(crate) fn compute_table_stats<F: DBFile + 'static>(
-    conn: &Arc<Connection<F>>,
-    schema: &str,
-    table: &Arc<SqlTable>,
-) -> Result<Option<ComputedTableStat>, SchemaError> {
-    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.db_table_id)? {
-        let (levels, nodes_per_page) = conn
-            .database
-            .read()
-            .db
-            .btree_range_params(table.db_table_id)?;
-        let mut indices = vec![];
-        for index in &table.indices {
-            let unique = index.is_primary || index.is_unique;
-            let (levels, nodes_per_page) = conn
-                .database
-                .read()
-                .db
-                .btree_range_params(index.db_table_id)?;
-            indices.push(IndexStat {
-                levels,
-                nodes_per_page,
-                unique,
-            })
-        }
-        return Ok(Some(ComputedTableStat {
-            table_stat,
-            indices: Some(indices),
-            self_index: Some(IndexStat {
-                levels,
-                nodes_per_page,
-                unique: true,
-            }),
-        }));
-    }
-
-    Ok(None)
 }
 
 // Folds a child Source's own stats() result into `this_stats` (the

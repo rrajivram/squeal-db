@@ -24,6 +24,7 @@ pub(crate) struct JoinMatcher {
     right_null: IndexKey,
 }
 
+#[allow(dead_code)]
 impl JoinMatcher {
     pub(crate) fn new(
         join_type: JoinType,
@@ -94,7 +95,11 @@ impl JoinMatcher {
         &self.right_null
     }
 
-    pub(crate) fn combine(&self, left: &IndexKey, right: &IndexKey) -> Result<IndexKey, SchemaError> {
+    pub(crate) fn combine(
+        &self,
+        left: &IndexKey,
+        right: &IndexKey,
+    ) -> Result<IndexKey, SchemaError> {
         let mut values = left.values().to_vec();
         values.extend_from_slice(right.values());
         Ok(IndexKey::new_from_owned(values)?)
@@ -167,7 +172,10 @@ mod tests {
     fn test_rows_assemble_left_then_right_and_pad_the_missing_side_with_nulls() {
         let m = matcher(JoinType::Full);
         let (l, r) = (row(&[1, 2]), row(&[2, 3, 4]));
-        assert_eq!(m.combine(&l, &r).unwrap().values(), row(&[1, 2, 2, 3, 4]).values());
+        assert_eq!(
+            m.combine(&l, &r).unwrap().values(),
+            row(&[1, 2, 2, 3, 4]).values()
+        );
         let lo = m.left_only(&l).unwrap();
         assert_eq!(lo.values().len(), 5);
         assert_eq!(&lo.values()[..2], l.values());

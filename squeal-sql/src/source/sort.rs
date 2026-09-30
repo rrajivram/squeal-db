@@ -164,7 +164,7 @@ where
     // projected field's display_name — the position found is directly
     // the row position, since `fields` IS the projected row's own field
     // list, one for one.
-    fn resolve_order_by_index(
+    pub(crate) fn resolve_order_by_index(
         expr: &Expr,
         fields: &[ProjectableField],
     ) -> Result<usize, SchemaError> {
@@ -455,7 +455,10 @@ where
             if current_run.is_empty() {
                 return Ok(InitialBuild::Empty);
             }
-            return Ok(InitialBuild::InMemory(Self::sort_rows(&self.sort_fields, current_run)));
+            return Ok(InitialBuild::InMemory(Self::sort_rows(
+                &self.sort_fields,
+                current_run,
+            )));
         }
         if !current_run.is_empty() {
             Self::close_run(
@@ -482,7 +485,7 @@ where
     // `rows` so the caller's accumulator is ready to start the next
     // run.
     fn close_run(
-        sort_fields: &Vec<SortField>,
+        sort_fields: &[SortField],
         run: &mut Run<F>,
         rows: &mut Vec<IndexKey>,
         records_per_page: usize,
@@ -544,7 +547,10 @@ where
             .map(|f| {
                 format!(
                     "{} {}{}",
-                    names.get(f.index).cloned().unwrap_or_else(|| format!("#{}", f.index)),
+                    names
+                        .get(f.index)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{}", f.index)),
                     if f.asc { "ASC" } else { "DESC" },
                     if f.null_first { " NULLS FIRST" } else { "" },
                 )
@@ -557,7 +563,6 @@ where
         }
         .child(self.source.plan())
     }
-
 
     fn fields(&self) -> Arc<[super::ProjectableField]> {
         self.source.fields()
@@ -1139,7 +1144,10 @@ mod tests {
             panic!("a generous budget must never spill to a Run");
         };
         assert_eq!(
-            sorted.iter().map(|k| k.values()[0].clone()).collect::<Vec<_>>(),
+            sorted
+                .iter()
+                .map(|k| k.values()[0].clone())
+                .collect::<Vec<_>>(),
             (0..5).map(ValueItem::Integer).collect::<Vec<_>>(),
             "the in-memory result must already be sorted ascending"
         );
@@ -1395,9 +1403,12 @@ mod tests {
 
     #[test]
     fn test_reset_makes_a_drained_sort_yield_its_rows_again() {
-        let rows: Vec<Vec<ValueItem>> = [3, 1, 2].iter().map(|n| vec![ValueItem::Integer(*n)]).collect();
+        let rows: Vec<Vec<ValueItem>> = [3, 1, 2]
+            .iter()
+            .map(|n| vec![ValueItem::Integer(*n)])
+            .collect();
         let mut sort = unlimited_sort_source(rows, 1 << 20);
-        let mut drain = |s: &mut SortSource<store::memfile::MemFile>| {
+        let drain = |s: &mut SortSource<store::memfile::MemFile>| {
             let mut out = vec![];
             while let Some(r) = s.next().unwrap() {
                 out.push(r.values().to_vec());
@@ -1410,4 +1421,3 @@ mod tests {
         assert_eq!(drain(&mut sort), first);
     }
 }
-

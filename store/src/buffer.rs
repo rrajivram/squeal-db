@@ -389,9 +389,8 @@ where
         {
             let (tx, rx) = bounded(1);
             self.write_tx.send(BufMsg::WriteHeaderSynced(header, tx))?;
-            return rx
-                .recv()
-                .map_err(|e| StoreError::UnknownError(e.to_string()))?;
+            rx.recv()
+                .map_err(|e| StoreError::UnknownError(e.to_string()))?
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -1679,7 +1678,8 @@ fn read_page(
                     page_id
                 )));
             }
-            cur_header = read_page_header(cur_page_id, file, page_size, first_offset, page_overhead)?;
+            cur_header =
+                read_page_header(cur_page_id, file, page_size, first_offset, page_overhead)?;
             if cur_header.page_data_size > page_size {
                 return Err(StoreError::UnknownError(format!(
                     "read_page: corrupt overflow page_data_size {} > page_size {}",
@@ -1707,7 +1707,11 @@ fn read_page(
         let mut full_bytes = primary_header.to_bytes()?;
         full_bytes.resize(page_overhead, 0);
         full_bytes.extend_from_slice(&all_data);
-        Ok(Page::from_bytes(&full_bytes, content_registry, page_overhead)?)
+        Ok(Page::from_bytes(
+            &full_bytes,
+            content_registry,
+            page_overhead,
+        )?)
     } else {
         // Read the full page slot so Page::from_bytes gets the complete
         // serialized data. Single pread, not pread_exact: if the async writer
@@ -2023,8 +2027,15 @@ mod tests {
         // Re-open with the clone — it shares backing storage so sees all flushed writes
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
-        let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header2 = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                page_count,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,
@@ -2096,7 +2107,9 @@ mod tests {
     fn test_write_header_sends_without_error() {
         let (buf, _) = make_buffer(0, 10);
         // Create an updated header via the same deserialization path
-        let header = from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap();
+        let header =
+            from_bytes::<Header>(&make_header_bytes(0, 5, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE))
+                .unwrap();
         assert!(buf.write_header(header).is_ok());
         assert!(buf.shutdown().is_ok());
     }
@@ -2404,7 +2417,15 @@ mod tests {
         let file_clone = mem.clone();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                0,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
 
         let buf = PageBuffer::new(
             page_size,
@@ -2438,8 +2459,15 @@ mod tests {
         // the first buffer already had in memory.
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
-        let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header2 = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                page_count,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,
@@ -2467,7 +2495,15 @@ mod tests {
         let mut mem = MemFile::new();
         mem.seek(SeekFrom::Start(0)).unwrap();
         let page_counter = Arc::new(AtomicU64::new(0));
-        let header = Arc::new(from_bytes::<Header>(&make_header_bytes(0, 0, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                0,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf = PageBuffer::new(
             page_size,
             page_counter.clone(),
@@ -2522,8 +2558,15 @@ mod tests {
         // ever touching disk.
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
-        let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header2 = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                page_count,
+                PAGE_SIZE,
+                TEST_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf2 = PageBuffer::new(
             PAGE_SIZE,
             page_counter2,
@@ -2555,8 +2598,15 @@ mod tests {
 
         let page_count = page_counter.load(Ordering::Relaxed);
         let page_counter2 = Arc::new(AtomicU64::new(page_count));
-        let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, page_count, PAGE_SIZE, TEST_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header2 = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                page_count,
+                PAGE_SIZE,
+                TEST_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf2 = PageBuffer::new(
             PAGE_SIZE,
             page_counter2,
@@ -2607,8 +2657,15 @@ mod tests {
         file_clone.pwrite(&byte, corrupt_offset).unwrap();
 
         let page_counter2 = Arc::new(AtomicU64::new(count_after));
-        let header2 =
-            Arc::new(from_bytes::<Header>(&make_header_bytes(0, count_after, page_size, TEST_MIN_MAX_INDEX_KEY_SIZE)).unwrap());
+        let header2 = Arc::new(
+            from_bytes::<Header>(&make_header_bytes(
+                0,
+                count_after,
+                page_size,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap(),
+        );
         let buf2 = PageBuffer::new(
             page_size,
             page_counter2,

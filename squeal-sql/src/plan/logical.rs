@@ -5,30 +5,34 @@ use sql_parser::{
     Expr, Query,
     expr::BinaryOp,
     query::{
-        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, SelectItem,
+        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
         SetOperand, TableFactor,
     },
     token::Comma,
     utils::Seq,
     visitor::{Visit, Visitor},
 };
-use store::{clock::Instant, db::DBFile, txn::Transaction};
+use store::{clock::Instant, db::DBFile, table::TableIdType, txn::Transaction};
 
 use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     error::SchemaError,
+    optim::{
+        picker::{analyze_query, pick_source_for_proj},
+        table_stats::{ComputedTableStat, compute_table_stats},
+    },
     plan::{
         conjuncts::{Conjuncts, TableShape, null_supplied_tables},
-        eval::EvalExpr,
+        eval::{EvalExpr, dummy_arc_field},
         memory::QueryMemory,
     },
     rslt::resultset::StreamingResultSet,
     source::{
-        ComputedTableStat, ProjectableField, Source,
+        ProjectableField, Source,
         aggr::AggregatingSource,
-        compute_table_stats,
         group::GroupSource,
+        index::IndexSource,
         join::{JoinSource, JoinType, UnionJoin},
         limit::Limit,
         planinfo::PlanNode,
@@ -200,6 +204,7 @@ where
                     .map(|f| f.field.clone())
                     .collect::<Vec<_>>(),
             ),
+            TableRef::IndexScan(t, i) => t.indices[*i].fields.clone(),
         }
     }
 
@@ -213,6 +218,7 @@ where
             TableRef::Real(_, t) => t.open_source(conn, stat, txn),
             TableRef::Temp(_, t) => t.open_source(conn, stat, txn),
             TableRef::Derived(name, d) => d.take(name),
+            TableRef::IndexScan(t, i) => Ok(Box::new(IndexSource::new(conn, t, *i, txn, None)?)),
         }
     }
 }
@@ -236,6 +242,7 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     // anything, nor treat "we already validated this" and "so of course
     // this lookup will succeed" as two separate, unwrap-worthy facts.
     pub(crate) resolved: TableRef<F>,
+    pub(crate) table_id: Option<TableIdType>,
     pub(crate) joins: Vec<JoinRelation<F>>,
     pub(crate) stats: Option<ComputedTableStat>,
 }
@@ -321,9 +328,9 @@ impl WhereJoins {
             .iter()
             .filter(|(item, _, _)| *item == k)
             .map(|(_, a, b)| EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(*a)),
+                lhs: Box::new(EvalExpr::Value(*a, dummy_arc_field(), None)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(*b)),
+                rhs: Box::new(EvalExpr::Value(*b, dummy_arc_field(), None)),
             })
             .reduce(|l, r| EvalExpr::Binary {
                 lhs: Box::new(l),
@@ -335,6 +342,10 @@ impl WhereJoins {
 
 struct SourceHolder {
     source: Box<dyn Source>,
+    // How many columns at the END of `source`'s rows are not part of the
+    // SELECT list: ORDER BY columns handle_select had to add so the sort
+    // can see them. plan_query drops them again after sorting.
+    hidden: usize,
 }
 
 impl<F> Visitor for QueryVisitor<F>
@@ -412,7 +423,9 @@ where
                 "a query body other than a plain SELECT".into(),
             ));
         };
-        let mut step = self.handle_select(select)?.source;
+        let SourceHolder { source, hidden } =
+            self.handle_select(select, query.order_by.as_ref())?;
+        let mut step = source;
 
         // Resolved once, up front, and used by BOTH the ORDER BY and
         // no-ORDER-BY paths below — previously this was only ever
@@ -444,6 +457,20 @@ where
         } else if let Some(limit_count) = limit_count {
             step = Box::new(Limit::new(step, limit_count));
         }
+        if hidden > 0 {
+            // Keep only the SELECT-list columns: each passes through by
+            // position, under its own display name.
+            let fields = step.fields();
+            let visible = fields[..fields.len() - hidden]
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ProjectableField {
+                    expr: EvalExpr::Value(i, f.field.clone(), None),
+                    ..f.clone()
+                })
+                .collect();
+            step = Box::new(Projection::new(step, visible));
+        }
         Ok(step)
     }
 
@@ -462,6 +489,7 @@ where
     fn handle_select(
         &mut self,
         select: &sql_parser::query::SelectCore,
+        order_by: Option<&OrderByClause>,
     ) -> Result<SourceHolder, SchemaError> {
         let distinct = select.distinct.is_some();
         let tables = self.get_tables(&select.from)?;
@@ -484,7 +512,32 @@ where
         // at all — see SortSource::create_from's own doc comment.)
         let flat_tables = Self::flatten_tables(&tables);
         let proj = self.get_projections(&select.projection, &flat_tables)?;
-        let projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
+        let mut projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
+        // ORDER BY may name a column the SELECT list leaves out (`SELECT
+        // id FROM t ORDER BY created`). The sort only sees the projected
+        // row, so each such column is projected too, as a hidden column
+        // after the SELECT list, and dropped again after the sort (see
+        // plan_query). Only plain column references: anything the sort
+        // can't resolve anyway is left for it to report.
+        let mut hidden = 0;
+        for item in order_by.iter().flat_map(|o| o.items.items()) {
+            if !matches!(item.expr, Expr::Column(_)) {
+                continue;
+            }
+            if let Err(SchemaError::FieldNotFound(name)) =
+                SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
+            {
+                if distinct {
+                    // Which of several source rows would a DISTINCT row
+                    // take its sort value from? Same rule as Postgres.
+                    return Err(SchemaError::UnsupportedFeature(format!(
+                        "ORDER BY {name} with SELECT DISTINCT: an ORDER BY column must appear in the SELECT list"
+                    )));
+                }
+                projected_fields.push(self.handle_expr(&item.expr, &None, &flat_tables)?);
+                hidden += 1;
+            }
+        }
         let has_aggregation = projected_fields.iter().any(|f| f.expr.has_aggregate());
         let projected_field_count = projected_fields.len();
 
@@ -506,11 +559,28 @@ where
         // layout made a plain SELECT read the wrong physical column
         // outright (confirmed via direct repro: an integer column came
         // back holding a string value from an unrelated table).
+        analyze_query(&tables, &projected_fields, &wh_expr);
         let mut sources = vec![];
+        let page_size = self.conn.database.read().db.get_page_data_size();
         for table in tables.iter() {
-            let mut combined = self.open(&table.resolved, table.stats.clone())?;
+            let mut combined = if let Some((table, index)) =
+                pick_source_for_proj(page_size, &table.resolved, &projected_fields, &table.stats)
+            {
+                self.open(&TableRef::IndexScan(table.clone(), index), None)?
+            } else {
+                self.open(&table.resolved, table.stats.clone())?
+            };
             for j in &table.joins {
-                let relation = self.open(&j.relation.resolved, j.relation.stats.clone())?;
+                let relation = if let Some((table, index)) = pick_source_for_proj(
+                    page_size,
+                    &j.relation.resolved,
+                    &projected_fields,
+                    &j.relation.stats,
+                ) {
+                    self.open(&TableRef::IndexScan(table.clone(), index), None)?
+                } else {
+                    self.open(&j.relation.resolved, j.relation.stats.clone())?
+                };
 
                 combined = Box::new(JoinSource::new(
                     combined,
@@ -645,7 +715,7 @@ where
             projected
         };
 
-        Ok(SourceHolder { source })
+        Ok(SourceHolder { source, hidden })
     }
 
     fn get_projections(
@@ -676,7 +746,11 @@ where
                             f.clone(),
                             sid,
                             fid,
-                            EvalExpr::Value(EvalExpr::flat_position(tables, sid, fid)),
+                            EvalExpr::Value(
+                                EvalExpr::flat_position(tables, sid, fid),
+                                f.clone(),
+                                t.table_id,
+                            ),
                         ));
                     }
                 }
@@ -696,7 +770,11 @@ where
                             f.clone(),
                             pos,
                             fid,
-                            EvalExpr::Value(EvalExpr::flat_position(tables, pos, fid)),
+                            EvalExpr::Value(
+                                EvalExpr::flat_position(tables, pos, fid),
+                                f.clone(),
+                                tables[pos].table_id,
+                            ),
                         ));
                     }
                     return Ok(v);
@@ -857,6 +935,7 @@ where
                     table: sqltable.name.clone(),
                     joins: vec![],
                     stats: compute_table_stats(&self.conn, &schema.name, sqltable)?,
+                    table_id: Some(sqltable.db_table_id),
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
                 TableQuery {
@@ -870,6 +949,7 @@ where
                     resolved: table.clone(),
                     joins: vec![],
                     stats: None,
+                    table_id: None,
                 }
             } else {
                 todo!()
@@ -896,6 +976,7 @@ where
                 resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
                 joins: vec![],
                 stats,
+                table_id: None,
             }
         } else {
             unreachable!("TableFactor is Table or Derived")
@@ -939,7 +1020,7 @@ where
         let group_by_positions = group_by
             .iter()
             .filter_map(|g| match &g.expr {
-                EvalExpr::Value(u) => Some(*u),
+                EvalExpr::Value(u, _, _) => Some(*u),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1047,6 +1128,7 @@ impl<F: DBFile + 'static> Clone for TableQuery<F> {
             schema: self.schema.clone(),
             table: self.table.clone(),
             stats: self.stats.clone(),
+            table_id: self.table_id,
         }
     }
 }

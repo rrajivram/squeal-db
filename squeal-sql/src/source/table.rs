@@ -1,6 +1,6 @@
+use crate::{optim::table_stats::ComputedTableStat, source::planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use store::clock::Instant;
-use crate::source::{planinfo::PlanNode};
 
 use postcard::from_bytes;
 use store::{
@@ -12,7 +12,7 @@ use store::{
 
 use crate::{
     error::SchemaError,
-    source::{ComputedTableStat, ProjectableField, QueryStats, Source},
+    source::{ProjectableField, QueryStats, Source},
     table::{SqlTable, VersionedRow},
 };
 
@@ -79,7 +79,6 @@ where
             .detail(self.table.name.clone())
             .rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
     }
-
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();

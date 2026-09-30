@@ -542,6 +542,7 @@ pub(crate) enum TableRef<F: DBFile + 'static> {
     // A FROM-clause subquery: the already-built output of an inner query.
     // See DerivedSource for why this is a shared one-shot handle.
     Derived(String, DerivedSource),
+    IndexScan(Arc<SqlTable>, usize),
 }
 
 // The output of a previous query used as a FROM item. A Source is a live,
@@ -560,6 +561,7 @@ pub(crate) struct DerivedSource {
     backing: Arc<parking_lot::Mutex<DerivedBacking>>,
 }
 
+#[allow(dead_code)]
 enum DerivedBacking {
     // The live stream, until the first take().
     Stream(Option<Box<dyn Source>>),
@@ -571,7 +573,9 @@ impl DerivedSource {
     pub(crate) fn new(source: Box<dyn Source>) -> Self {
         Self {
             fields: source.fields(),
-            backing: Arc::new(parking_lot::Mutex::new(DerivedBacking::Stream(Some(source)))),
+            backing: Arc::new(parking_lot::Mutex::new(DerivedBacking::Stream(Some(
+                source,
+            )))),
         }
     }
 
@@ -638,6 +642,11 @@ impl<F: DBFile + 'static> std::fmt::Debug for TableRef<F> {
                 .finish(),
             TableRef::Temp(name, _) => f.debug_tuple("Temp").field(name).finish(),
             TableRef::Derived(n, _s) => f.debug_tuple("Derived").field(n).finish(),
+            TableRef::IndexScan(t, i) => f
+                .debug_tuple("Index")
+                .field(&t.name)
+                .field(&t.indices[*i].name)
+                .finish(),
         }
     }
 }
@@ -649,6 +658,7 @@ impl<F: DBFile + 'static> Clone for TableRef<F> {
             Self::Temp(s, t) => Self::Temp(s.clone(), t.clone()),
             // Shares the one-shot stream — see DerivedSource.
             Self::Derived(n, d) => Self::Derived(n.clone(), d.clone()),
+            Self::IndexScan(t, i) => Self::IndexScan(t.clone(), *i),
         }
     }
 }
@@ -673,7 +683,7 @@ mod derived_tests {
         let mut s = d.take("x").unwrap();
         assert_eq!(s.next().unwrap().unwrap().values().len(), 2);
         assert!(s.next().unwrap().is_none());
-        let err = d.take("x").err().expect("second take must fail");
+        let err = d.take("x").expect_err("second take must fail");
         assert!(err.to_string().contains("already opened"), "{err}");
     }
 
@@ -682,7 +692,10 @@ mod derived_tests {
         let d = derived();
         let copy = d.clone();
         assert!(copy.take("x").is_ok());
-        assert!(d.take("x").is_err(), "the original sees the same, already-taken slot");
+        assert!(
+            d.take("x").is_err(),
+            "the original sees the same, already-taken slot"
+        );
     }
 
     #[test]
@@ -707,7 +720,9 @@ mod derived_tests {
     fn many_rows(n: i64) -> DerivedSource {
         DerivedSource::new(Box::new(VecSource::new(
             &["a", "b"],
-            (0..n).map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)]).collect(),
+            (0..n)
+                .map(|i| vec![ValueItem::Integer(i), ValueItem::Integer(i * 10)])
+                .collect(),
         )))
     }
 
@@ -728,14 +743,30 @@ mod derived_tests {
         let copy = d.clone();
         d.materialize(&db).unwrap();
         assert_eq!(count(d.take("x").unwrap()), 1000);
-        assert_eq!(count(d.take("x").unwrap()), 1000, "a second open of the same handle");
+        assert_eq!(
+            count(d.take("x").unwrap()),
+            1000,
+            "a second open of the same handle"
+        );
         assert_eq!(count(copy.take("x").unwrap()), 1000, "and through a clone");
         // Two scans open at once do not interfere.
         let (mut a, mut b) = (d.take("x").unwrap(), d.take("x").unwrap());
-        assert_eq!(a.next().unwrap().unwrap().values()[0], ValueItem::Integer(0));
-        assert_eq!(b.next().unwrap().unwrap().values()[0], ValueItem::Integer(0));
-        assert_eq!(a.next().unwrap().unwrap().values()[0], ValueItem::Integer(1));
-        assert_eq!(b.next().unwrap().unwrap().values()[0], ValueItem::Integer(1));
+        assert_eq!(
+            a.next().unwrap().unwrap().values()[0],
+            ValueItem::Integer(0)
+        );
+        assert_eq!(
+            b.next().unwrap().unwrap().values()[0],
+            ValueItem::Integer(0)
+        );
+        assert_eq!(
+            a.next().unwrap().unwrap().values()[0],
+            ValueItem::Integer(1)
+        );
+        assert_eq!(
+            b.next().unwrap().unwrap().values()[0],
+            ValueItem::Integer(1)
+        );
     }
 
     #[test]

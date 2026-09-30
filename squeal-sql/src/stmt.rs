@@ -291,6 +291,7 @@ where
         resolved: TableRef::Real(schema.clone(), table.clone()),
         joins: vec![],
         stats: None,
+        table_id: None,
     }
 }
 
@@ -369,8 +370,7 @@ where
     if !was_active {
         conn.begin_transaction()?;
     }
-    let result =
-        conn.with_current_txn(|txn| f(txn.expect("just ensured a transaction is active")));
+    let result = conn.with_current_txn(|txn| f(txn.expect("just ensured a transaction is active")));
     if !was_active {
         match &result {
             Ok(_) => conn.commit_transaction()?,
@@ -500,10 +500,7 @@ where
                         .ok_or(SchemaError::NoSchemaSelected)?;
                     let table_name = c.name.to_dotted();
                     let content = std::fs::read_to_string(&c.path.path).map_err(|e| {
-                        SchemaError::UserError(format!(
-                            "could not open {:?}: {e}",
-                            c.path.path
-                        ))
+                        SchemaError::UserError(format!("could not open {:?}: {e}", c.path.path))
                     })?;
                     let (loaded, failed) = schema.create_table_from_csv(
                         &table_name,
@@ -599,8 +596,7 @@ where
                                 // t), so every source row has to be read
                                 // before any of them are written.
                                 sql_parser::dml::InsertSource::Select(query) => {
-                                    let mut plan =
-                                        LogicalPlan::build(self.conn.clone(), query)?;
+                                    let mut plan = LogicalPlan::build(self.conn.clone(), query)?;
                                     let mut result = plan.execute()?;
                                     let mut selected = vec![];
                                     while let Some(row) = result.next_result()? {
@@ -631,6 +627,11 @@ where
                                 "resolve_table_ref unexpectedly returned Derived".into(),
                             ));
                         }
+                        TableRef::IndexScan(..) => {
+                            return Err(SchemaError::InternalSchemaError(
+                                "resolve_table_ref unexpectedly returned IndexScan".into(),
+                            ));
+                        }
                     }
                 }
                 sql_parser::Statement::Update(update) => {
@@ -656,8 +657,11 @@ where
                             .expect("ObjectName always has at least one part")
                             .value
                             .to_lowercase();
-                        let pos =
-                            table.fields().iter().position(|f| f.name == name).ok_or_else(|| {
+                        let pos = table
+                            .fields()
+                            .iter()
+                            .position(|f| f.name == name)
+                            .ok_or_else(|| {
                                 SchemaError::UserError(format!(
                                     "Table {:?} has no column named {name:?}",
                                     table.name
@@ -672,9 +676,7 @@ where
                         assignments.push((pos, expr));
                     }
                     let where_expr = match &update.where_clause {
-                        Some(wc) => {
-                            Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?)
-                        }
+                        Some(wc) => Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?),
                         None => None,
                     };
 
@@ -853,6 +855,11 @@ where
                         TableRef::Derived(..) => {
                             return Err(SchemaError::UnknownError(
                                 "Can't show indices for a derived table".into(),
+                            ));
+                        }
+                        TableRef::IndexScan(..) => {
+                            return Err(SchemaError::UnknownError(
+                                "Can't show indices for index".into(),
                             ));
                         }
                     };
@@ -1136,6 +1143,9 @@ where
             "{what} is not supported on temp tables (temp.{name})"
         ))),
         TableRef::Derived(..) => Err(SchemaError::InternalSchemaError(format!(
+            "resolve_table_ref unexpectedly returned Derived for {what}"
+        ))),
+        TableRef::IndexScan(..) => Err(SchemaError::InternalSchemaError(format!(
             "resolve_table_ref unexpectedly returned Derived for {what}"
         ))),
     }

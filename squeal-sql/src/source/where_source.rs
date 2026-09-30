@@ -1,6 +1,6 @@
+use crate::source::{column_names, planinfo::PlanNode};
 use std::collections::HashMap;
 use store::clock::Instant;
-use crate::source::{column_names, planinfo::PlanNode};
 
 use store::valueitem::ValueItem;
 
@@ -34,7 +34,6 @@ impl Source for WhereSource {
             .detail(self.expr.describe(&names))
             .child(self.source.plan())
     }
-
 
     fn fields(&self) -> std::sync::Arc<[ProjectableField]> {
         // A filter passes its input's rows through unchanged, so its row
@@ -101,7 +100,10 @@ mod tests {
     use store::valueitem::ValueItem;
 
     use super::*;
-    use crate::source::test_support::{VecSource, drain};
+    use crate::{
+        plan::eval::dummy_arc_field,
+        source::test_support::{VecSource, drain},
+    };
 
     fn src() -> Box<dyn Source> {
         Box::new(VecSource::new(
@@ -116,7 +118,7 @@ mod tests {
 
     fn gt_one() -> EvalExpr {
         EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0)),
+            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
             op: BinaryOp::Gt,
             rhs: Box::new(EvalExpr::Literal(ValueItem::Integer(1))),
         }

@@ -2203,7 +2203,7 @@ where
     pub fn btree_range_params(
         self: &Arc<Self>,
         tid: TableIdType,
-    ) -> Result<(usize, usize), StoreError> {
+    ) -> Result<(usize, usize, usize), StoreError> {
         self.table_by_id(tid)?.table_btree_params()
     }
     // Like range_scan_bounds, but reads under `txn` (seeing its own
@@ -6204,7 +6204,10 @@ mod tests {
         // crash_clone_file's deliberately-shared fd used elsewhere in
         // this test module) must fail...
         let second = FileDB::open(&db_name);
-        assert!(second.is_err(), "opening an already-open database should fail");
+        assert!(
+            second.is_err(),
+            "opening an already-open database should fail"
+        );
         drop(second);
 
         // ...and must not have created a new WAL segment in the process.

@@ -19,7 +19,9 @@ use store::{
     valueitem::{IndexKey, ValueItem},
 };
 
-use crate::{error::SchemaError, schema_ops::schema::Schema, table::SqlTable};
+use crate::{
+    conn::connection::Connection, error::SchemaError, schema_ops::schema::Schema, table::SqlTable,
+};
 
 pub(crate) struct SchemaStats<F: DBFile + 'static> {
     schema: Arc<Schema<F>>,
@@ -51,6 +53,22 @@ pub(crate) struct ColumnStatStored {
     nulls: usize,
     min: Option<ValueItem>,
     max: Option<ValueItem>,
+}
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub struct ComputedTableStat {
+    pub table_stat: TableStat,
+    pub indices: Option<Vec<IndexStat>>,
+    pub self_index: Option<IndexStat>,
+    pub row_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexStat {
+    pub levels: usize,
+    pub nodes_per_page: usize,
+    pub unique: bool,
+    pub row_size: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -173,7 +191,10 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         let (tx, handle) = {
             let (tx, rx) = bounded(1);
             let t_clone = tables.clone();
-            (tx, thread::spawn(move || stat_collector(rx, t_clone, sampling_rate)))
+            (
+                tx,
+                thread::spawn(move || stat_collector(rx, t_clone, sampling_rate)),
+            )
         };
 
         Ok(Self {
@@ -528,6 +549,49 @@ impl TableStatStored {
             col_stats: RwLock::new(col_stats),
         })
     }
+}
+
+pub(crate) fn compute_table_stats<F: DBFile + 'static>(
+    conn: &Arc<Connection<F>>,
+    schema: &str,
+    table: &Arc<SqlTable>,
+) -> Result<Option<ComputedTableStat>, SchemaError> {
+    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.db_table_id)? {
+        let (levels, nodes_per_page, record_size) = conn
+            .database
+            .read()
+            .db
+            .btree_range_params(table.db_table_id)?;
+        let mut indices = vec![];
+        for index in &table.indices {
+            let unique = index.is_primary || index.is_unique;
+            let (levels, nodes_per_page, record_size) = conn
+                .database
+                .read()
+                .db
+                .btree_range_params(index.db_table_id)?;
+            indices.push(IndexStat {
+                levels,
+                nodes_per_page,
+                unique,
+                row_size: record_size,
+            })
+        }
+        let row_size = table.fields().iter().map(|f| f.datatype.size()).sum();
+        return Ok(Some(ComputedTableStat {
+            table_stat,
+            indices: Some(indices),
+            self_index: Some(IndexStat {
+                levels,
+                nodes_per_page,
+                unique: true,
+                row_size: record_size,
+            }),
+            row_size,
+        }));
+    }
+
+    Ok(None)
 }
 
 #[cfg(test)]

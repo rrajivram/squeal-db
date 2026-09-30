@@ -122,7 +122,7 @@ struct IndexHolder {
     fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Field {
     // A permanent identity, distinct from `name` and from this field's
     // position in any particular SchemaVersion — assigned once (see
@@ -145,6 +145,8 @@ pub struct Field {
     // SqlTable::reproject) — the "backfill" ALTER TABLE ADD COLUMN
     // needs without rewriting existing rows.
     pub(crate) default: Option<ValueItem>,
+    #[serde(skip)]
+    pub(crate) is_ephemeral: bool,
 }
 
 pub struct TableBuilder {
@@ -242,6 +244,7 @@ impl Field {
             nullable,
             datatype,
             default,
+            is_ephemeral: false,
         })
     }
 
@@ -259,6 +262,7 @@ impl From<String> for Field {
             default: None,
             name: value,
             nullable: true,
+            is_ephemeral: true,
         }
     }
 }
@@ -975,6 +979,7 @@ impl SqlTable {
                         datatype: f.datatype,
                         nullable: f.nullable,
                         default: f.default.clone(),
+                        is_ephemeral: f.is_ephemeral,
                     })
                 } else {
                     f.clone()

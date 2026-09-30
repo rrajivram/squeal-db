@@ -21,7 +21,7 @@ use crate::constant::DEFAULT_VAR_SIZE;
 /// end. The tags below are fixed forever at their historical declaration-
 /// index values (Integer=0 .. Boolean=7); a future variant picks an unused
 /// tag (10+ is free) rather than reordering these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {
     Integer,
     Double,

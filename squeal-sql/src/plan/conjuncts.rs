@@ -197,18 +197,24 @@ impl Conjuncts {
         })
     }
 
-    pub(crate) fn of_kind(&self, pred: impl Fn(&ConjunctKind) -> bool) -> impl Iterator<Item = &Conjunct> {
+    pub(crate) fn of_kind(
+        &self,
+        pred: impl Fn(&ConjunctKind) -> bool,
+    ) -> impl Iterator<Item = &Conjunct> {
         self.items.iter().filter(move |c| pred(&c.kind))
     }
 
     // AND the given conjuncts back into one expression (None if there are
     // none) — e.g. the residual filter left after some were taken out.
     pub(crate) fn and_all<'a>(items: impl IntoIterator<Item = &'a Conjunct>) -> Option<EvalExpr> {
-        items.into_iter().map(|c| c.expr.clone()).reduce(|l, r| EvalExpr::Binary {
-            lhs: Box::new(l),
-            op: BinaryOp::And,
-            rhs: Box::new(r),
-        })
+        items
+            .into_iter()
+            .map(|c| c.expr.clone())
+            .reduce(|l, r| EvalExpr::Binary {
+                lhs: Box::new(l),
+                op: BinaryOp::And,
+                rhs: Box::new(r),
+            })
     }
 }
 
@@ -259,18 +265,23 @@ fn equi_edge(
     else {
         return None;
     };
-    let (EvalExpr::Value(a), EvalExpr::Value(b)) = (lhs.as_ref(), rhs.as_ref()) else {
+    let (EvalExpr::Value(a, _, _), EvalExpr::Value(b, _, _)) = (lhs.as_ref(), rhs.as_ref()) else {
         return None;
     };
     let locate = |pos: usize| -> Option<(ColumnRef, DataType)> {
-        let t = (0..tables.len()).find(|t| pos >= starts[*t] && pos < starts[*t] + tables[*t].len())?;
+        let t =
+            (0..tables.len()).find(|t| pos >= starts[*t] && pos < starts[*t] + tables[*t].len())?;
         Some((ColumnRef { table: t, pos }, tables[t][pos - starts[t]]))
     };
     let ((ca, ta), (cb, tb)) = (locate(*a)?, locate(*b)?);
     if ca.table == cb.table || !same_type(&ta, &tb) {
         return None;
     }
-    Some(if ca.table < cb.table { (ca, cb) } else { (cb, ca) })
+    Some(if ca.table < cb.table {
+        (ca, cb)
+    } else {
+        (cb, ca)
+    })
 }
 
 // The same-type rule comparisons enforce (see plan::eval's same_type); a
@@ -295,10 +306,12 @@ fn same_type(a: &DataType, b: &DataType) -> bool {
 mod tests {
     use store::valueitem::ValueItem;
 
+    use crate::plan::eval::dummy_arc_field;
+
     use super::*;
 
     fn v(p: usize) -> EvalExpr {
-        EvalExpr::Value(p)
+        EvalExpr::Value(p, dummy_arc_field(), None)
     }
     fn lit(i: i64) -> EvalExpr {
         EvalExpr::Literal(ValueItem::Integer(i))
@@ -323,7 +336,10 @@ mod tests {
         ]
         .into_iter()
         .zip(null_supplied)
-        .map(|(columns, null_supplied)| TableShape { columns, null_supplied })
+        .map(|(columns, null_supplied)| TableShape {
+            columns,
+            null_supplied,
+        })
         .collect()
     }
 
@@ -375,10 +391,22 @@ mod tests {
     fn test_classification_of_each_shape() {
         let cases: Vec<(EvalExpr, ConjunctKind, Vec<usize>)> = vec![
             // constant
-            (bin(lit(1), BinaryOp::Eq, lit(1)), ConjunctKind::Constant, vec![]),
+            (
+                bin(lit(1), BinaryOp::Eq, lit(1)),
+                ConjunctKind::Constant,
+                vec![],
+            ),
             // local: a column against a literal, and two columns of one table
-            (bin(v(0), BinaryOp::Gt, lit(5)), ConjunctKind::Local(0), vec![0]),
-            (bin(v(0), BinaryOp::Eq, v(1)), ConjunctKind::Local(0), vec![0]),
+            (
+                bin(v(0), BinaryOp::Gt, lit(5)),
+                ConjunctKind::Local(0),
+                vec![0],
+            ),
+            (
+                bin(v(0), BinaryOp::Eq, v(1)),
+                ConjunctKind::Local(0),
+                vec![0],
+            ),
             // a computed expression over one table is still local
             (
                 bin(bin(v(3), BinaryOp::Plus, lit(1)), BinaryOp::Lt, lit(9)),
@@ -412,10 +440,22 @@ mod tests {
                 vec![0, 2],
             ),
             // multi-table but not an equi-join
-            (bin(v(0), BinaryOp::Lt, v(3)), ConjunctKind::Multi, vec![0, 1]),
-            (bin(bin(v(0), BinaryOp::Plus, lit(0)), BinaryOp::Eq, v(3)), ConjunctKind::Multi, vec![0, 1]),
             (
-                bin(bin(v(0), BinaryOp::Eq, v(3)), BinaryOp::Or, bin(v(0), BinaryOp::Eq, lit(1))),
+                bin(v(0), BinaryOp::Lt, v(3)),
+                ConjunctKind::Multi,
+                vec![0, 1],
+            ),
+            (
+                bin(bin(v(0), BinaryOp::Plus, lit(0)), BinaryOp::Eq, v(3)),
+                ConjunctKind::Multi,
+                vec![0, 1],
+            ),
+            (
+                bin(
+                    bin(v(0), BinaryOp::Eq, v(3)),
+                    BinaryOp::Or,
+                    bin(v(0), BinaryOp::Eq, lit(1)),
+                ),
                 ConjunctKind::Multi,
                 vec![0, 1],
             ),
@@ -429,7 +469,11 @@ mod tests {
                 vec![0, 1],
             ),
             // string = integer: not a join edge (the comparison itself errors)
-            (bin(v(2), BinaryOp::Eq, v(3)), ConjunctKind::Multi, vec![0, 1]),
+            (
+                bin(v(2), BinaryOp::Eq, v(3)),
+                ConjunctKind::Multi,
+                vec![0, 1],
+            ),
             // three tables in one condition
             (
                 bin(bin(v(0), BinaryOp::Plus, v(3)), BinaryOp::Eq, v(5)),
@@ -448,7 +492,11 @@ mod tests {
 
     #[test]
     fn test_an_or_or_not_over_one_table_is_one_local_conjunct_not_split() {
-        let e = bin(bin(v(0), BinaryOp::Eq, lit(1)), BinaryOp::Or, bin(v(1), BinaryOp::Eq, lit(2)));
+        let e = bin(
+            bin(v(0), BinaryOp::Eq, lit(1)),
+            BinaryOp::Or,
+            bin(v(1), BinaryOp::Eq, lit(2)),
+        );
         let cs = analyze(&e);
         assert_eq!(kinds(&cs), [ConjunctKind::Local(0)]);
     }
@@ -462,8 +510,18 @@ mod tests {
     #[test]
     fn test_accessors_group_conjuncts_by_kind() {
         let e = and(
-            and(bin(v(0), BinaryOp::Gt, lit(1)), bin(v(0), BinaryOp::Eq, v(3))),
-            and(bin(v(4), BinaryOp::Gt, EvalExpr::Literal(ValueItem::Double(1.0))), bin(v(0), BinaryOp::Lt, v(5))),
+            and(
+                bin(v(0), BinaryOp::Gt, lit(1)),
+                bin(v(0), BinaryOp::Eq, v(3)),
+            ),
+            and(
+                bin(
+                    v(4),
+                    BinaryOp::Gt,
+                    EvalExpr::Literal(ValueItem::Double(1.0)),
+                ),
+                bin(v(0), BinaryOp::Lt, v(5)),
+            ),
         );
         let cs = analyze(&e);
         assert_eq!(cs.local_to(0).count(), 1);
@@ -477,7 +535,10 @@ mod tests {
     #[test]
     fn test_and_all_recombines_the_conjuncts_it_is_given() {
         let e = and(
-            and(bin(v(0), BinaryOp::Gt, lit(1)), bin(v(0), BinaryOp::Eq, v(3))),
+            and(
+                bin(v(0), BinaryOp::Gt, lit(1)),
+                bin(v(0), BinaryOp::Eq, v(3)),
+            ),
             bin(v(5), BinaryOp::Lt, lit(9)),
         );
         let cs = analyze(&e);
@@ -485,10 +546,15 @@ mod tests {
         let all = Conjuncts::and_all(cs.iter()).unwrap();
         assert_eq!(all.describe(&[]), e.describe(&[]));
         // Taking the join edge out leaves the other two.
-        let residual = Conjuncts::and_all(cs.of_kind(|k| !matches!(k, ConjunctKind::Equi { .. }))).unwrap();
+        let residual =
+            Conjuncts::and_all(cs.of_kind(|k| !matches!(k, ConjunctKind::Equi { .. }))).unwrap();
         assert_eq!(
             residual.describe(&[]),
-            and(bin(v(0), BinaryOp::Gt, lit(1)), bin(v(5), BinaryOp::Lt, lit(9))).describe(&[])
+            and(
+                bin(v(0), BinaryOp::Gt, lit(1)),
+                bin(v(5), BinaryOp::Lt, lit(9))
+            )
+            .describe(&[])
         );
         assert!(Conjuncts::and_all(std::iter::empty()).is_none());
     }
@@ -498,7 +564,11 @@ mod tests {
         // t1 starts at flat position 3: `#3 > 5 AND #4 < 2.0` becomes `#0 > 5 AND #1 < 2.0`.
         let e = and(
             bin(v(3), BinaryOp::Gt, lit(5)),
-            bin(v(4), BinaryOp::Lt, EvalExpr::Literal(ValueItem::Double(2.0))),
+            bin(
+                v(4),
+                BinaryOp::Lt,
+                EvalExpr::Literal(ValueItem::Double(2.0)),
+            ),
         );
         let cs = analyze(&e);
         let rebased: Vec<String> = cs
@@ -544,13 +614,20 @@ mod tests {
     fn test_a_local_conjunct_is_pushable_unless_its_table_is_null_supplied() {
         // one predicate on each of t0, t1, t2
         let e = and(
-            and(bin(v(0), BinaryOp::Gt, lit(1)), bin(v(3), BinaryOp::Gt, lit(2))),
+            and(
+                bin(v(0), BinaryOp::Gt, lit(1)),
+                bin(v(3), BinaryOp::Gt, lit(2)),
+            ),
             bin(v(5), BinaryOp::Gt, lit(3)),
         );
         // t1 is NULL-extended (as by `t0 LEFT JOIN t1`)
         let cs = Conjuncts::analyze(Some(&e), &shape_with([false, true, false]));
         assert_eq!(cs.pushable_to(0).count(), 1);
-        assert_eq!(cs.pushable_to(1).count(), 0, "local to t1, but t1 is null-supplied");
+        assert_eq!(
+            cs.pushable_to(1).count(),
+            0,
+            "local to t1, but t1 is null-supplied"
+        );
         assert_eq!(cs.local_to(1).count(), 1, "still classified Local");
         assert_eq!(cs.pushable_to(2).count(), 1);
         let stay: Vec<_> = cs.not_pushable().map(|c| c.kind.clone()).collect();

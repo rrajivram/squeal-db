@@ -1,4 +1,4 @@
-use crate::source::{planinfo::PlanNode};
+use crate::source::planinfo::PlanNode;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -160,7 +160,10 @@ impl MemTable {
         match budget.try_reserve(bytes) {
             Ok(reservation) => {
                 self.mem.push(reservation);
-                self.index.entry(value.hash).or_default().push(self.entries.len());
+                self.index
+                    .entry(value.hash)
+                    .or_default()
+                    .push(self.entries.len());
                 self.entries.push(value);
                 self.matched.push(false);
                 Ok(())
@@ -514,7 +517,13 @@ impl<F: DBFile + 'static> HashedSource<F> {
         let start = Instant::now();
         let hash = self.get_hash(&item, &self.left_fields);
         match &mut self.table {
-            BuildTable::Mem(mt) => match mt.try_insert(&self.mem, HashValue { hash, left_value: item }) {
+            BuildTable::Mem(mt) => match mt.try_insert(
+                &self.mem,
+                HashValue {
+                    hash,
+                    left_value: item,
+                },
+            ) {
                 Ok(()) => self.count += 1,
                 // Doesn't fit the budget: migrate every already-accumulated
                 // entry to a Run-backed table (see migrate_to_run), then
@@ -565,7 +574,8 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // Run, always Run for the rest of this HashedSource's life (until
     // reset() — see its own comment).
     fn migrate_to_run(&mut self) -> Result<(), SchemaError> {
-        let BuildTable::Mem(mt) = std::mem::replace(&mut self.table, BuildTable::Mem(MemTable::new()))
+        let BuildTable::Mem(mt) =
+            std::mem::replace(&mut self.table, BuildTable::Mem(MemTable::new()))
         else {
             unreachable!("migrate_to_run requires a Mem table")
         };
@@ -624,7 +634,9 @@ impl<F: DBFile + 'static> HashedSource<F> {
         }
         let normalized: Vec<store::valueitem::ValueItem> = fields
             .iter()
-            .map(|f| crate::numeric::hash_normalized(&values[*f]).unwrap_or_else(|| values[*f].clone()))
+            .map(|f| {
+                crate::numeric::hash_normalized(&values[*f]).unwrap_or_else(|| values[*f].clone())
+            })
             .collect();
         IndexKey::hash_fields(normalized.iter())
     }
@@ -840,7 +852,6 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
             .child(self.sources[1].plan().with_role("probe"))
     }
 
-
     fn fields(&self) -> Arc<[super::ProjectableField]> {
         self.fields.clone()
     }
@@ -936,13 +947,14 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
             },
             indices: None,
             self_index: None,
+            row_size: 1,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use store::{clock::Instant, db::Db, memfile::MemFile, valueitem::ValueItem};
+    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
     use crate::{
@@ -1111,7 +1123,10 @@ mod tests {
         // fails immediately against a 0 budget); capacity is only known
         // once that has happened.
         source
-            .insert_left(IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)]).unwrap())
+            .insert_left(
+                IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)])
+                    .unwrap(),
+            )
             .unwrap();
         let initial_capacity = source.run_table().capacity;
         // The count==capacity check runs at the START of insert_left, so
@@ -1161,7 +1176,10 @@ mod tests {
         // up where it left off, so the final present-ids set is still
         // exactly 0..n.
         source
-            .insert_left(IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)]).unwrap())
+            .insert_left(
+                IndexKey::new_from_owned(vec![ValueItem::Integer(0), ValueItem::Integer(0)])
+                    .unwrap(),
+            )
             .unwrap();
         let initial_capacity = source.run_table().capacity;
         // Enough distinct rows to force at least one rehash, landing the
@@ -1652,6 +1670,7 @@ mod tests {
                 },
                 indices: None,
                 self_index: None,
+                row_size: 1,
             })
         }
     }
@@ -1684,17 +1703,23 @@ mod tests {
     // 0) and built — for tests checking that table's own sizing, which
     // (unlike swapped/join-result tests) only exists once something has
     // actually been inserted into it.
-    fn spilled_join_with_counts(join_type: JoinType, left: usize, right: usize) -> HashedSource<MemFile> {
-        spill(HashedSource::new(
-            Box::new(WithRowCount(left_source(), left)),
-            Box::new(WithRowCount(right_source(), right)),
-            make_db(),
-            QueryMemory::new(0),
-            &[0],
-            &[0],
-            join_type,
+    fn spilled_join_with_counts(
+        join_type: JoinType,
+        left: usize,
+        right: usize,
+    ) -> HashedSource<MemFile> {
+        spill(
+            HashedSource::new(
+                Box::new(WithRowCount(left_source(), left)),
+                Box::new(WithRowCount(right_source(), right)),
+                make_db(),
+                QueryMemory::new(0),
+                &[0],
+                &[0],
+                join_type,
+            )
+            .unwrap(),
         )
-        .unwrap())
     }
 
     #[test]
@@ -1786,7 +1811,11 @@ mod tests {
         let s = spilled_join_with_counts(JoinType::Inner, 30271, 10000);
         assert!(!s.swapped);
         let rt = s.run_table();
-        assert!(rt.capacity >= wanted_slots(30271), "capacity {}", rt.capacity);
+        assert!(
+            rt.capacity >= wanted_slots(30271),
+            "capacity {}",
+            rt.capacity
+        );
         assert_eq!(rt.capacity % rt.records_per_page, 0, "whole pages of slots");
         // ...and not wildly more than asked for: at most one extra page.
         assert!(rt.capacity < wanted_slots(30271) + rt.records_per_page);
@@ -1806,30 +1835,34 @@ mod tests {
         // A generous budget never spills a table this small (confirmed by
         // test_construction_allocates_only_the_pages_the_run_needs) — force
         // it via 0 to see what the Run-backed table would have started at.
-        let s = spill(HashedSource::new(
-            left_source(),
-            right_source(),
-            make_db(),
-            QueryMemory::new(0),
-            &[0],
-            &[0],
-            JoinType::Inner,
-        )
-        .unwrap());
+        let s = spill(
+            HashedSource::new(
+                left_source(),
+                right_source(),
+                make_db(),
+                QueryMemory::new(0),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap(),
+        );
         let rt = s.run_table();
         assert_eq!(rt.capacity, rt.records_per_page);
         // Only the (post-swap) build side's stats matter; a probe side that
         // reports none must not stop it being sized.
-        let build_only = spill(HashedSource::new(
-            Box::new(WithRowCount(left_source(), 5000)),
-            right_source(),
-            make_db(),
-            QueryMemory::new(0),
-            &[0],
-            &[0],
-            JoinType::Inner,
-        )
-        .unwrap());
+        let build_only = spill(
+            HashedSource::new(
+                Box::new(WithRowCount(left_source(), 5000)),
+                right_source(),
+                make_db(),
+                QueryMemory::new(0),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap(),
+        );
         assert!(build_only.run_table().capacity >= wanted_slots(5000));
     }
 
@@ -1852,7 +1885,10 @@ mod tests {
         )
         .unwrap();
         s.build_left().unwrap();
-        assert!(s.is_mem(), "a small build under a generous budget must never spill");
+        assert!(
+            s.is_mem(),
+            "a small build under a generous budget must never spill"
+        );
         assert_eq!(
             db.stats().temp.live_pages,
             before,
@@ -1865,16 +1901,18 @@ mod tests {
         // unless) a build actually needs it, so this checks the page count
         // right where that now happens.
         let before = db.stats().temp.live_pages;
-        let small = spill(HashedSource::new(
-            left_source(),
-            right_source(),
-            db.clone(),
-            QueryMemory::new(0),
-            &[0],
-            &[0],
-            JoinType::Inner,
-        )
-        .unwrap());
+        let small = spill(
+            HashedSource::new(
+                left_source(),
+                right_source(),
+                db.clone(),
+                QueryMemory::new(0),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap(),
+        );
         let rt = small.run_table();
         assert_eq!(
             db.stats().temp.live_pages - before,
@@ -1882,16 +1920,18 @@ mod tests {
         );
 
         let before = db.stats().temp.live_pages;
-        let big = spill(HashedSource::new(
-            Box::new(WithRowCount(left_source(), 5000)),
-            Box::new(WithRowCount(right_source(), 10)),
-            db.clone(),
-            QueryMemory::new(0),
-            &[0],
-            &[0],
-            JoinType::Inner,
-        )
-        .unwrap());
+        let big = spill(
+            HashedSource::new(
+                Box::new(WithRowCount(left_source(), 5000)),
+                Box::new(WithRowCount(right_source(), 10)),
+                db.clone(),
+                QueryMemory::new(0),
+                &[0],
+                &[0],
+                JoinType::Inner,
+            )
+            .unwrap(),
+        );
         let rt = big.run_table();
         let pages = rt.capacity / rt.records_per_page;
         assert!(pages > 1);
@@ -2001,4 +2041,3 @@ mod tests {
         );
     }
 }
-

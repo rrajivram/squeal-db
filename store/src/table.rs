@@ -42,7 +42,9 @@ impl<'de> Deserialize<'de> for TableType {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord)]
+#[derive(
+    Debug, Serialize, Deserialize, Clone, Copy, Eq, Hash, PartialEq, PartialOrd, Ord, Default,
+)]
 pub struct TableIdType(DBSizeType);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -90,7 +92,11 @@ mod tests {
         for v in [TableType::BtreeTable, TableType::Index] {
             let bytes = postcard::to_allocvec(&v).unwrap();
             let back: TableType = postcard::from_bytes(&bytes).unwrap();
-            assert!(matches!((v, back), (TableType::BtreeTable, TableType::BtreeTable) | (TableType::Index, TableType::Index)));
+            assert!(matches!(
+                (v, back),
+                (TableType::BtreeTable, TableType::BtreeTable)
+                    | (TableType::Index, TableType::Index)
+            ));
         }
     }
 

@@ -278,6 +278,7 @@ enum JsonResult {
 // same "last one wins" rule squeal-cli's own `run()` uses) — `None` if
 // nothing in this batch was a SELECT at all, in which case the caller
 // leaves SquealDb::last_stats untouched rather than clobbering it.
+#[allow(clippy::type_complexity)]
 fn execute_results(
     conn: &Arc<Connection<MemFile>>,
     sql: &str,
@@ -303,6 +304,7 @@ fn execute_results(
     Ok((out, stats))
 }
 
+#[allow(clippy::type_complexity)]
 fn to_json_result(
     r: ResultType,
 ) -> Result<(JsonResult, Option<Vec<(String, QueryStats)>>), squeal_sql::error::SchemaError> {
@@ -674,7 +676,11 @@ mod tests {
         // ::help is the single source of truth, this just checks it's
         // actually wired in here too, not silently dropped.
         for section in squeal_sql::help::SQL_HELP {
-            assert!(text.contains(section.title), "missing section {:?}", section.title);
+            assert!(
+                text.contains(section.title),
+                "missing section {:?}",
+                section.title
+            );
         }
     }
 
@@ -683,10 +689,12 @@ mod tests {
         let db = SquealDb::new("t7").unwrap();
         let results = exec(&db, "!print stats");
         assert_eq!(kinds(&results), ["Message"]);
-        assert!(results[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("no query stats available"));
+        assert!(
+            results[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("no query stats available")
+        );
     }
 
     #[test]
@@ -724,6 +732,9 @@ mod tests {
         let results = exec(&db, "!nonsense");
         assert_eq!(kinds(&results), ["Message"]);
         let text = results[0]["text"].as_str().unwrap();
-        assert!(text.contains("unrecognized") && text.contains("nonsense"), "{text}");
+        assert!(
+            text.contains("unrecognized") && text.contains("nonsense"),
+            "{text}"
+        );
     }
 }

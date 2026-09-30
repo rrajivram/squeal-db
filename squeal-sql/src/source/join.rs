@@ -1,4 +1,4 @@
-use crate::source::{planinfo::PlanNode};
+use crate::source::planinfo::PlanNode;
 use std::{collections::HashMap, fmt::Debug, marker::PhantomData, sync::Arc};
 
 use sql_parser::expr::BinaryOp;
@@ -144,7 +144,7 @@ fn collect_equi_join_fields(
             op: BinaryOp::Eq,
             rhs,
         } => match (lhs.as_ref(), rhs.as_ref()) {
-            (EvalExpr::Value(l), EvalExpr::Value(r)) => {
+            (EvalExpr::Value(l, _, _), EvalExpr::Value(r, _, _)) => {
                 let (left_pos, right_pos) = match (*l < left_field_count, *r < left_field_count) {
                     (true, false) => (*l, *r - left_field_count),
                     (false, true) => (*r, *l - left_field_count),
@@ -179,7 +179,6 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
     fn plan(&self) -> PlanNode {
         self.source.plan()
     }
-
 
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
@@ -232,7 +231,6 @@ impl Source for UnionJoin {
     fn plan(&self) -> PlanNode {
         PlanNode::new("CrossJoin").children(self.sources.iter().map(|s| s.plan()).collect())
     }
-
 
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
@@ -471,10 +469,13 @@ mod tests {
 
 #[cfg(test)]
 mod hash_join_tests {
-    use store::{clock::Instant, db::Db, memfile::MemFile, valueitem::ValueItem};
+    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
-    use crate::source::test_support::{VecSource, drain};
+    use crate::{
+        plan::eval::dummy_arc_field,
+        source::test_support::{VecSource, drain},
+    };
 
     fn make_db() -> Arc<Db<MemFile>> {
         Db::<MemFile>::create("join_source_test.db").unwrap()
@@ -506,9 +507,9 @@ mod hash_join_tests {
     // has 2 columns).
     fn on_id_eq_user_id() -> EvalExpr {
         EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0)),
+            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
             op: BinaryOp::Eq,
-            rhs: Box::new(EvalExpr::Value(2)),
+            rhs: Box::new(EvalExpr::Value(2, dummy_arc_field(), None)),
         }
     }
 
@@ -612,9 +613,9 @@ mod hash_join_tests {
     fn test_on_expr_comparing_two_columns_from_the_same_side_is_rejected() {
         // left.id (0) = left.val (1) — both positions are < left_field_count.
         let bad_on = EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0)),
+            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
             op: BinaryOp::Eq,
-            rhs: Box::new(EvalExpr::Value(1)),
+            rhs: Box::new(EvalExpr::Value(1, dummy_arc_field(), None)),
         };
         let result = JoinSource::new(
             left_source(),
@@ -647,15 +648,15 @@ mod hash_join_tests {
         ));
         let on_expr = EvalExpr::Binary {
             lhs: Box::new(EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(0)),
+                lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(2)),
+                rhs: Box::new(EvalExpr::Value(2, dummy_arc_field(), None)),
             }),
             op: BinaryOp::And,
             rhs: Box::new(EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(1)),
+                lhs: Box::new(EvalExpr::Value(1, dummy_arc_field(), None)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(3)),
+                rhs: Box::new(EvalExpr::Value(3, dummy_arc_field(), None)),
             }),
         };
         let mut join = JoinSource::new(

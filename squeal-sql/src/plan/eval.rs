@@ -1,9 +1,12 @@
+use std::sync::Arc;
+
 use sql_parser::{
     Expr,
     expr::{BinaryOp, UnaryOp},
 };
 use store::{
     db::DBFile,
+    table::TableIdType,
     valueitem::{IndexKey, ValueItem},
 };
 
@@ -13,6 +16,7 @@ use crate::{
         funcs::{FuncObj, FuncTrait},
         logical::TableQuery,
     },
+    table::Field,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,7 +39,7 @@ pub enum EvalExpr {
     // reference to its absolute position has to happen once, at build
     // time in from_expr/validate_field (where each table's own field
     // count is still known), not here.
-    Value(usize),
+    Value(usize, Arc<Field>, Option<TableIdType>),
     Unary {
         op: UnaryOp,
         field: Box<EvalExpr>,
@@ -48,6 +52,10 @@ pub enum EvalExpr {
     Function(FuncObj),
 }
 
+pub(crate) fn dummy_arc_field() -> Arc<Field> {
+    Arc::new(Field::from(""))
+}
+
 impl EvalExpr {
     // A readable rendering for EXPLAIN. `Value(i)` is a flat position into
     // the row this expression reads, so `names` (that row's column names,
@@ -58,7 +66,7 @@ impl EvalExpr {
     pub(crate) fn column_positions(&self) -> Vec<usize> {
         match self {
             Self::None | Self::Literal(_) => vec![],
-            Self::Value(i) => vec![*i],
+            Self::Value(i, _, _) => vec![*i],
             Self::Unary { field, .. } => field.column_positions(),
             Self::Binary { lhs, rhs, .. } => {
                 let mut v = lhs.column_positions();
@@ -81,7 +89,7 @@ impl EvalExpr {
         Some(match self {
             Self::None => Self::None,
             Self::Literal(v) => Self::Literal(v.clone()),
-            Self::Value(i) => Self::Value(i.checked_sub(offset)?),
+            Self::Value(i, _, _) => Self::Value(i.checked_sub(offset)?, dummy_arc_field(), None),
             Self::Unary { op, field } => Self::Unary {
                 op: *op,
                 field: Box::new(field.shifted(offset)?),
@@ -114,7 +122,7 @@ impl EvalExpr {
                 ValueItem::Str((s, _)) => format!("'{s}'"),
                 other => other.to_string(),
             },
-            Self::Value(i) => Self::column_label(names, *i),
+            Self::Value(i, _, _) => Self::column_label(names, *i),
             Self::Unary { op, field } => {
                 let f = field.describe(names);
                 match op {
@@ -183,7 +191,7 @@ impl EvalExpr {
             Self::Literal(_) | Self::None => {
                 vec![]
             }
-            Self::Value(u) => {
+            Self::Value(u, _, _) => {
                 vec![*u]
             }
             Self::Function(f) => {
@@ -222,7 +230,7 @@ impl EvalExpr {
     ) -> Result<ValueItem, SchemaError> {
         let v = match self {
             Self::Literal(v) => v,
-            Self::Value(pos) => &data[0][*pos],
+            Self::Value(pos, _, _) => &data[0][*pos],
             Self::Unary { op, field } => {
                 let v = field.eval(data, _index)?;
                 &CrateValueItem::unary(&v, op)?
@@ -316,7 +324,11 @@ impl EvalExpr {
                     let Some(field_id) = field_id else {
                         return Err(SchemaError::FieldNotFound(field));
                     };
-                    Self::Value(Self::flat_position(tables, table_id, field_id))
+                    Self::Value(
+                        Self::flat_position(tables, table_id, field_id),
+                        table.fields[field_id].clone(),
+                        table.table_id,
+                    )
                 } else {
                     let field = idents[0].value.clone();
                     Self::validate_field(&field, tables)?
@@ -339,6 +351,7 @@ impl EvalExpr {
         let mut found = false;
         let mut fid = 0;
         let mut tid = 0;
+        let mut arc_field = None;
         for (sid, t) in tables.iter().enumerate() {
             let f = t
                 .fields
@@ -351,12 +364,17 @@ impl EvalExpr {
             if let Some(fd) = f {
                 fid = fd;
                 tid = sid;
+                arc_field = Some(t.fields[fid].clone());
             }
         }
         if !found {
             return Err(SchemaError::FieldNotFound(field.into()));
         }
-        Ok(EvalExpr::Value(Self::flat_position(tables, tid, fid)))
+        Ok(EvalExpr::Value(
+            Self::flat_position(tables, tid, fid),
+            arc_field.unwrap(),
+            tables[tid].table_id,
+        ))
     }
 
     // Where (table_id, field_id) actually lands in UnionJoin's combined
@@ -600,8 +618,9 @@ fn compare(
     // Integer vs Double: exact numeric order; a NaN is unorderable, the
     // same as it already is between two Doubles below.
     if let Some(ord) = crate::numeric::cmp_mixed(lhs, rhs) {
-        return ord
-            .ok_or_else(|| SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into()));
+        return ord.ok_or_else(|| {
+            SchemaError::InvalidOperationOnOperand(format!("{op:?}"), "NaN".into())
+        });
     }
     same_type(lhs, rhs, op)?;
     match (lhs, rhs) {
@@ -822,7 +841,10 @@ mod tests {
         for op in ops {
             for (l, r) in &pairs {
                 let err = bin(l, op, r).unwrap_err().to_string();
-                assert!(err.contains("different data types"), "{op:?} {l:?} {r:?}: {err}");
+                assert!(
+                    err.contains("different data types"),
+                    "{op:?} {l:?} {r:?}: {err}"
+                );
             }
         }
     }
@@ -850,28 +872,52 @@ mod tests {
     fn test_integer_and_double_comparison_is_exact_for_large_integers() {
         let big = int(9_007_199_254_740_993);
         let near = dbl(9_007_199_254_740_992.0);
-        assert_eq!(bin(&big, BinaryOp::Eq, &near).unwrap(), ValueItem::Boolean(false));
-        assert_eq!(bin(&big, BinaryOp::Gt, &near).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&big, BinaryOp::Eq, &near).unwrap(),
+            ValueItem::Boolean(false)
+        );
+        assert_eq!(
+            bin(&big, BinaryOp::Gt, &near).unwrap(),
+            ValueItem::Boolean(true)
+        );
     }
 
     #[test]
     fn test_integer_against_nan_is_unequal_and_unorderable() {
         let nan = dbl(f64::NAN);
-        assert_eq!(bin(&int(1), BinaryOp::Eq, &nan).unwrap(), ValueItem::Boolean(false));
+        assert_eq!(
+            bin(&int(1), BinaryOp::Eq, &nan).unwrap(),
+            ValueItem::Boolean(false)
+        );
         assert!(bin(&int(1), BinaryOp::Lt, &nan).is_err());
     }
 
     #[test]
     fn test_binary_comparisons_of_the_same_type_still_work() {
-        assert_eq!(bin(&int(1), BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&dbl(1.5), BinaryOp::Gt, &dbl(1.0)).unwrap(), ValueItem::Boolean(true));
-        assert_eq!(bin(&str_val("a"), BinaryOp::NotEq, &str_val("b")).unwrap(), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&int(1), BinaryOp::Eq, &int(1)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&dbl(1.5), BinaryOp::Gt, &dbl(1.0)).unwrap(),
+            ValueItem::Boolean(true)
+        );
+        assert_eq!(
+            bin(&str_val("a"), BinaryOp::NotEq, &str_val("b")).unwrap(),
+            ValueItem::Boolean(true)
+        );
     }
 
     #[test]
     fn test_a_null_operand_is_still_null_whatever_the_other_type() {
-        assert_eq!(bin(&ValueItem::Null, BinaryOp::Eq, &int(1)).unwrap(), ValueItem::Null);
-        assert_eq!(bin(&str_val("x"), BinaryOp::Lt, &ValueItem::Null).unwrap(), ValueItem::Null);
+        assert_eq!(
+            bin(&ValueItem::Null, BinaryOp::Eq, &int(1)).unwrap(),
+            ValueItem::Null
+        );
+        assert_eq!(
+            bin(&str_val("x"), BinaryOp::Lt, &ValueItem::Null).unwrap(),
+            ValueItem::Null
+        );
     }
 
     #[test]
@@ -990,7 +1036,7 @@ mod tests {
     #[test]
     fn test_has_aggregate_false_for_plain_values_and_literals() {
         assert!(!EvalExpr::Literal(int(1)).has_aggregate());
-        assert!(!EvalExpr::Value(0).has_aggregate());
+        assert!(!EvalExpr::Value(0, dummy_arc_field(), None).has_aggregate());
     }
 
     #[test]

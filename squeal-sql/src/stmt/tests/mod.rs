@@ -2095,6 +2095,72 @@ fn test_order_by_without_limit_is_applied() {
     );
 }
 
+// ORDER BY a column the SELECT list leaves out: it's projected as a
+// hidden column for the sort, then dropped. `d` runs opposite to `id`
+// so a no-op sort can't pass.
+fn order_by_hidden_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(
+        &c,
+        "create table t (id integer not null, d integer, g integer, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "insert into t values (1, 40, 1), (2, 30, 2), (3, 20, 1), (4, 10, 2)",
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn test_order_by_a_column_not_in_the_select_list() {
+    let c = order_by_hidden_conn();
+    let (columns, rows) = select_rows(&c, "select id from t order by d");
+    assert_eq!(columns, ["id"], "the sort column is not returned");
+    let ids: Vec<_> = rows.iter().map(|r| r[0].clone()).collect();
+    assert_eq!(ids, [4, 3, 2, 1].map(ValueItem::Integer));
+}
+
+#[test]
+fn test_order_by_a_hidden_column_with_limit_and_an_alias() {
+    let c = order_by_hidden_conn();
+    let (columns, rows) = select_rows(&c, "select id as x from t order by d desc limit 2");
+    assert_eq!(columns, ["x"]);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(1)], vec![ValueItem::Integer(2)]]
+    );
+}
+
+#[test]
+fn test_order_by_a_group_key_not_in_the_select_list() {
+    let c = order_by_hidden_conn();
+    let (columns, rows) = select_rows(&c, "select sum(d) from t group by g order by g");
+    assert_eq!(columns.len(), 1);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Integer(60)], vec![ValueItem::Integer(40)]]
+    );
+}
+
+#[test]
+fn test_order_by_a_hidden_column_is_refused_with_distinct() {
+    let c = order_by_hidden_conn();
+    let err = run(&c, "select distinct g from t order by d").unwrap_err();
+    assert!(err.to_string().contains("SELECT list"), "{err}");
+}
+
+#[test]
+fn test_explain_shows_a_hidden_sort_column_dropped_after_the_sort() {
+    let c = order_by_hidden_conn();
+    let plan = explain(&c, "select id from t order by d");
+    assert!(
+        plan.starts_with("Projection id\n  Sort d ASC\n    Projection id, d\n      TableScan t"),
+        "{plan}"
+    );
+}
+
 #[test]
 fn test_order_by_desc_without_limit_is_applied() {
     let c = conn();
@@ -2503,7 +2569,6 @@ fn test_a_select_over_several_tables_holds_one_statement_transaction() {
     assert_eq!(db.stats().active_transactions, 0);
 }
 
-
 // ---- subqueries in FROM, end to end ----
 
 fn ints(rows: &[&[i64]]) -> Vec<Vec<ValueItem>> {
@@ -2527,8 +2592,16 @@ fn select_sorted(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<Vec<ValueItem>>
 // t1(id, cat): (1,0) (2,1) (3,0) (4,1) (5,0);  t2(id, val): (1,10) (2,20) (3,30) (4,40)
 fn subquery_conn() -> Arc<Connection<MemFile>> {
     let c = conn();
-    run(&c, "create table t1 (id integer not null, cat integer, primary key(id))").unwrap();
-    run(&c, "create table t2 (id integer not null, val integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t1 (id integer not null, cat integer, primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "create table t2 (id integer not null, val integer, primary key(id))",
+    )
+    .unwrap();
     for (id, cat) in [(1, 0), (2, 1), (3, 0), (4, 1), (5, 0)] {
         run(&c, &format!("insert into t1 values ({id}, {cat})")).unwrap();
     }
@@ -2552,7 +2625,10 @@ fn test_select_star_from_a_subquery() {
 fn test_the_outer_query_filters_and_projects_the_subquery() {
     let c = subquery_conn();
     assert_eq!(
-        select_sorted(&c, "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"),
+        select_sorted(
+            &c,
+            "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"
+        ),
         ints(&[&[3], &[5]])
     );
 }
@@ -2560,7 +2636,10 @@ fn test_the_outer_query_filters_and_projects_the_subquery() {
 #[test]
 fn test_a_subquery_column_alias_is_what_the_outer_query_sees() {
     let c = subquery_conn();
-    let (cols, rows) = select_rows(&c, "select renamed from (select id as renamed from t1 where id = 4) x");
+    let (cols, rows) = select_rows(
+        &c,
+        "select renamed from (select id as renamed from t1 where id = 4) x",
+    );
     assert_eq!(cols, ["renamed"]);
     assert_eq!(rows, ints(&[&[4]]));
 }
@@ -2585,7 +2664,10 @@ fn test_aggregating_inside_a_subquery_and_using_it_outside() {
 fn test_order_by_and_limit_inside_a_subquery() {
     let c = subquery_conn();
     assert_eq!(
-        select_sorted(&c, "select id from (select id from t1 order by id desc limit 2) x"),
+        select_sorted(
+            &c,
+            "select id from (select id from t1 order by id desc limit 2) x"
+        ),
         ints(&[&[4], &[5]])
     );
 }
@@ -2593,7 +2675,10 @@ fn test_order_by_and_limit_inside_a_subquery() {
 #[test]
 fn test_order_by_on_the_outer_query_of_a_subquery() {
     let c = subquery_conn();
-    let (_, rows) = select_rows(&c, "select id from (select id from t1 where cat = 1) x order by id desc");
+    let (_, rows) = select_rows(
+        &c,
+        "select id from (select id from t1 where cat = 1) x order by id desc",
+    );
     assert_eq!(rows, ints(&[&[4], &[2]]));
 }
 
@@ -2671,8 +2756,16 @@ fn test_a_subquery_in_from_needs_an_alias() {
 #[test]
 fn test_a_subquery_over_an_empty_table_yields_no_rows() {
     let c = subquery_conn();
-    run(&c, "create table empty (id integer not null, primary key(id))").unwrap();
-    assert!(select_rows(&c, "select id from (select id from empty) e").1.is_empty());
+    run(
+        &c,
+        "create table empty (id integer not null, primary key(id))",
+    )
+    .unwrap();
+    assert!(
+        select_rows(&c, "select id from (select id from empty) e")
+            .1
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2691,9 +2784,16 @@ fn test_a_subquery_sees_the_same_snapshot_as_the_outer_query_inside_a_transactio
 // ---- EXPLAIN ----
 
 fn explain(c: &Arc<Connection<MemFile>>, sql: &str) -> String {
-    let mut stmt = c.clone().create_statement(&format!("explain {sql}")).unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement(&format!("explain {sql}"))
+        .unwrap();
     stmt.execute().unwrap();
-    match stmt.get_results().unwrap().expect("EXPLAIN must produce a result") {
+    match stmt
+        .get_results()
+        .unwrap()
+        .expect("EXPLAIN must produce a result")
+    {
         ResultType::ResultString(s) => s,
         other => panic!("expected the rendered plan, got {other:?}"),
     }
@@ -2774,7 +2874,10 @@ fn test_explain_shows_aggregation_grouping_and_distinct() {
 fn test_explain_shows_a_subquery_as_a_nested_plan() {
     let c = subquery_conn();
     assert_eq!(
-        explain(&c, "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"),
+        explain(
+            &c,
+            "select x.id from (select id, cat from t1 where cat = 0) x where x.id > 1"
+        ),
         "Projection id\n  Filter (id > 1)\n    Projection id, cat\n      Filter (cat = 0)\n        TableScan t1 (~5 rows)"
     );
 }
@@ -2787,8 +2890,14 @@ fn test_explain_a_join_of_subqueries_keeps_each_side_a_full_plan() {
         "select a.id, b.val from (select id from t1 where cat = 0) a \
          join (select id, val from t2 where val > 10) b on a.id = b.id",
     );
-    assert!(plan.starts_with("Projection id#0, val\n  HashJoin Inner on"), "{plan}");
-    assert!(plan.contains("Filter (cat = 0)") && plan.contains("Filter (val > 10)"), "{plan}");
+    assert!(
+        plan.starts_with("Projection id#0, val\n  HashJoin Inner on"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("Filter (cat = 0)") && plan.contains("Filter (val > 10)"),
+        "{plan}"
+    );
 }
 
 #[test]
@@ -2799,7 +2908,10 @@ fn test_explain_row_estimates_follow_analyze() {
         run(&c, &format!("insert into w values ({i})")).unwrap();
     }
     run(&c, "analyze table w").unwrap();
-    assert_eq!(explain(&c, "select * from w"), "Projection id\n  TableScan w (~7 rows)");
+    assert_eq!(
+        explain(&c, "select * from w"),
+        "Projection id\n  TableScan w (~7 rows)"
+    );
 }
 
 #[test]
@@ -2820,15 +2932,24 @@ fn test_explain_of_something_other_than_a_select_is_rejected() {
         .unwrap_err();
     assert!(err.to_string().contains("EXPLAIN"), "{err}");
     // ...and it did not execute the insert.
-    assert_eq!(select_sorted(&c, "select id from t1 where id = 100").len(), 0);
+    assert_eq!(
+        select_sorted(&c, "select id from t1 where id = 100").len(),
+        0
+    );
 }
 
 #[test]
 fn test_explain_reports_a_bad_query_like_the_query_would() {
     let c = subquery_conn();
-    let mut stmt = c.clone().create_statement("explain select nope from t1").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("explain select nope from t1")
+        .unwrap();
     assert!(stmt.execute().is_err());
-    let mut stmt = c.clone().create_statement("explain select * from missing").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("explain select * from missing")
+        .unwrap();
     assert!(stmt.execute().is_err());
 }
 
@@ -2839,7 +2960,10 @@ fn test_explain_reports_a_bad_query_like_the_query_would() {
 fn has(plan: &str, what: &str) -> bool {
     plan.lines().any(|l| {
         let l = l.trim_start();
-        let l = l.strip_prefix('[').and_then(|r| r.split_once("] ")).map_or(l, |(_, r)| r);
+        let l = l
+            .strip_prefix('[')
+            .and_then(|r| r.split_once("] "))
+            .map_or(l, |(_, r)| r);
         l.starts_with(what)
     })
 }
@@ -2847,10 +2971,20 @@ fn has(plan: &str, what: &str) -> bool {
 // a(id, x): (1,10) (2,20) (3,30) (4,NULL) (5,20); b(id, y): (1,100) (2,200) (2,201) (6,600); c(id, z): (2,7) (5,8)
 fn where_join_conn() -> Arc<Connection<MemFile>> {
     let c = conn();
-    run(&c, "create table a (id integer not null, x integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table a (id integer not null, x integer, primary key(id))",
+    )
+    .unwrap();
     run(&c, "create table b (id integer not null, y integer)").unwrap();
     run(&c, "create table c (id integer not null, z integer)").unwrap();
-    for (id, x) in [("1", "10"), ("2", "20"), ("3", "30"), ("4", "null"), ("5", "20")] {
+    for (id, x) in [
+        ("1", "10"),
+        ("2", "20"),
+        ("3", "30"),
+        ("4", "null"),
+        ("5", "20"),
+    ] {
         run(&c, &format!("insert into a values ({id}, {x})")).unwrap();
     }
     for (id, y) in [(1, 100), (2, 200), (2, 201), (6, 600)] {
@@ -2894,7 +3028,11 @@ fn test_the_join_gives_exactly_the_rows_cross_join_then_filter_gives() {
             "select a.id, a.x, b.y from a, b where a.x + 0 = b.y",
         ),
     ] {
-        assert_eq!(select_sorted(&c, joined), select_sorted(&c, crossed), "{joined}");
+        assert_eq!(
+            select_sorted(&c, joined),
+            select_sorted(&c, crossed),
+            "{joined}"
+        );
     }
 }
 
@@ -2907,7 +3045,13 @@ fn test_a_null_join_key_matches_nothing() {
     // NULL on both sides must not match each other in the join.
     run(&c, "insert into b values (7, null)").unwrap();
     run(&c, "insert into c values (8, null)").unwrap();
-    assert!(select_sorted(&c, "select b.id, c.id from b, c where b.y = c.z and b.y > 1000").is_empty());
+    assert!(
+        select_sorted(
+            &c,
+            "select b.id, c.id from b, c where b.y = c.z and b.y > 1000"
+        )
+        .is_empty()
+    );
     assert_eq!(
         select_sorted(&c, "select b.id from b, c where b.id = c.id"),
         ints(&[&[2], &[2]])
@@ -2954,7 +3098,10 @@ fn test_conditions_that_are_not_a_cross_table_column_equality_stay_a_cross_join(
     // ...and still compute the right answer: a.id = 1 pairs with all four b
     // rows, and a.id = 2 with the two b rows of id 2.
     assert_eq!(
-        select_sorted(&c, "select a.id, b.id from a, b where a.id = b.id or a.id = 1"),
+        select_sorted(
+            &c,
+            "select a.id, b.id from a, b where a.id = b.id or a.id = 1"
+        ),
         ints(&[&[1, 1], &[1, 2], &[1, 2], &[1, 6], &[2, 2], &[2, 2]])
     );
 }
@@ -2972,7 +3119,10 @@ fn test_comparing_columns_of_different_types_is_an_error_not_a_join() {
     run(&c, "insert into s values ('1')").unwrap();
     let sql = "select i.id from i, s where i.id = s.v";
     let plan = explain(&c, sql);
-    assert!(has(&plan, "CrossJoin") && !plan.contains("HashJoin"), "{plan}");
+    assert!(
+        has(&plan, "CrossJoin") && !plan.contains("HashJoin"),
+        "{plan}"
+    );
     let mut stmt = c.clone().create_statement(sql).unwrap();
     stmt.execute().unwrap();
     let ResultType::StreamingResult(mut s) = stmt.results[0].take().unwrap() else {
@@ -3087,10 +3237,17 @@ fn test_a_join_between_a_table_and_an_outer_join_chain_uses_the_equality() {
     let sql = "select a.id, b.y, c.z from a left join b on a.id = b.id, c where a.id = c.id";
     let plan = explain(&c, sql);
     eprintln!("{plan}");
-    assert!(plan.contains("HashJoin Left") && plan.contains("HashJoin Inner"), "{plan}");
+    assert!(
+        plan.contains("HashJoin Left") && plan.contains("HashJoin Inner"),
+        "{plan}"
+    );
     // a=2 matches b twice; a=5 has no b row (NULL y) but does match c.
     let mut want = ints(&[&[2, 200, 7], &[2, 201, 7]]);
-    want.push(vec![ValueItem::Integer(5), ValueItem::Null, ValueItem::Integer(8)]);
+    want.push(vec![
+        ValueItem::Integer(5),
+        ValueItem::Null,
+        ValueItem::Integer(8),
+    ]);
     want.sort();
     assert_eq!(select_sorted(&c, sql), want);
 }
@@ -3098,8 +3255,14 @@ fn test_a_join_between_a_table_and_an_outer_join_chain_uses_the_equality() {
 #[test]
 fn test_where_null_predicates_filter_the_row_instead_of_erroring() {
     let c = where_join_conn();
-    assert_eq!(select_sorted(&c, "select id from a where x = 20"), ints(&[&[2], &[5]]));
-    assert_eq!(select_sorted(&c, "select id from a where x > 15 and x < 100"), ints(&[&[2], &[3], &[5]]));
+    assert_eq!(
+        select_sorted(&c, "select id from a where x = 20"),
+        ints(&[&[2], &[5]])
+    );
+    assert_eq!(
+        select_sorted(&c, "select id from a where x > 15 and x < 100"),
+        ints(&[&[2], &[3], &[5]])
+    );
 }
 
 // ---- pushdown safety, checked against the engine ----
@@ -3137,16 +3300,33 @@ const PUSHDOWN_TABLES: [(&str, &str, &str, &str); 3] = [
 ];
 
 #[test]
-fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is_not_null_supplied() {
+fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is_not_null_supplied()
+{
     use crate::plan::conjuncts::null_supplied_tables;
     use crate::source::join::JoinType;
     let c = pushdown_conn();
     // (FROM-clause text, the chain's join types, tables in chain order)
     let chains: [(&str, Vec<JoinType>, Vec<usize>); 8] = [
-        ("{a} join {b} on a.id = b.id", vec![JoinType::Inner], vec![0, 1]),
-        ("{a} left join {b} on a.id = b.id", vec![JoinType::Left], vec![0, 1]),
-        ("{a} right join {b} on a.id = b.id", vec![JoinType::Right], vec![0, 1]),
-        ("{a} full join {b} on a.id = b.id", vec![JoinType::Full], vec![0, 1]),
+        (
+            "{a} join {b} on a.id = b.id",
+            vec![JoinType::Inner],
+            vec![0, 1],
+        ),
+        (
+            "{a} left join {b} on a.id = b.id",
+            vec![JoinType::Left],
+            vec![0, 1],
+        ),
+        (
+            "{a} right join {b} on a.id = b.id",
+            vec![JoinType::Right],
+            vec![0, 1],
+        ),
+        (
+            "{a} full join {b} on a.id = b.id",
+            vec![JoinType::Full],
+            vec![0, 1],
+        ),
         (
             "{a} left join {b} on a.id = b.id join {c} on a.id = c.id",
             vec![JoinType::Left, JoinType::Inner],
@@ -3172,7 +3352,7 @@ fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is
     for (from, joins, in_chain) in chains {
         let supplied = null_supplied_tables(&joins);
         for (pos, &t) in in_chain.iter().enumerate() {
-            let (_, _, qualified, unqualified) = PUSHDOWN_TABLES[t];
+            let (_, _, qualified, _unqualified) = PUSHDOWN_TABLES[t];
             let render = |wrapped: Option<usize>| {
                 let mut f = from.to_string();
                 for (i, (name, cols, _, plain)) in PUSHDOWN_TABLES.iter().enumerate() {
@@ -3187,22 +3367,41 @@ fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is
             };
             let select = "select a.id, b.id, c.id";
             let cols_available: Vec<&str> = ["a", "b", "c"][..in_chain.len()].to_vec();
-            let list = cols_available.iter().map(|n| format!("{n}.id")).collect::<Vec<_>>().join(", ");
+            let list = cols_available
+                .iter()
+                .map(|n| format!("{n}.id"))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = select;
-            let above = select_sorted(&c, &format!("select {list} from {} where {qualified}", render(None)));
+            let above = select_sorted(
+                &c,
+                &format!("select {list} from {} where {qualified}", render(None)),
+            );
             let pushed = select_sorted(&c, &format!("select {list} from {}", render(Some(t))));
-            let ctx = format!("{from}  [{} on {}, {joins:?}]", qualified, ["a", "b", "c"][t]);
+            let ctx = format!(
+                "{from}  [{} on {}, {joins:?}]",
+                qualified,
+                ["a", "b", "c"][t]
+            );
             if supplied[pos] {
-                assert_ne!(above, pushed, "NULL-extended table: pushing must change the result — {ctx}");
+                assert_ne!(
+                    above, pushed,
+                    "NULL-extended table: pushing must change the result — {ctx}"
+                );
                 differing += 1;
             } else {
-                assert_eq!(above, pushed, "pushable table: pushing must not change the result — {ctx}");
+                assert_eq!(
+                    above, pushed,
+                    "pushable table: pushing must not change the result — {ctx}"
+                );
             }
         }
     }
-    assert!(differing >= 6, "the unsafe cases were actually exercised ({differing})");
+    assert!(
+        differing >= 6,
+        "the unsafe cases were actually exercised ({differing})"
+    );
 }
-
 
 // DISTINCT and GROUP BY both sort via SortSource::with_fields, the same
 // unlimited path ORDER BY/the merge join use (see plan::logical's two call
@@ -3212,7 +3411,11 @@ fn test_pushing_a_predicate_below_a_join_matches_where_exactly_when_the_table_is
 #[test]
 fn test_distinct_and_group_by_use_the_in_memory_sort_fast_path_when_they_fit() {
     let c = conn();
-    run(&c, "create table t (id integer not null, cat integer, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, cat integer, primary key(id))",
+    )
+    .unwrap();
     for i in 0..200 {
         run(&c, &format!("insert into t values ({i}, {})", i % 5)).unwrap();
     }
@@ -3220,17 +3423,29 @@ fn test_distinct_and_group_by_use_the_in_memory_sort_fast_path_when_they_fit() {
 
     let before = db.stats().temp;
     run(&c, "select distinct cat from t").unwrap();
-    assert_eq!(db.stats().temp, before, "DISTINCT must not touch a Run page here");
+    assert_eq!(
+        db.stats().temp,
+        before,
+        "DISTINCT must not touch a Run page here"
+    );
 
     run(&c, "select cat, count(*) from t group by cat").unwrap();
-    assert_eq!(db.stats().temp, before, "GROUP BY must not touch a Run page here");
+    assert_eq!(
+        db.stats().temp,
+        before,
+        "GROUP BY must not touch a Run page here"
+    );
 }
 
 // ---- new SQL functions: min, max, sum, lower, concat ----
 
 fn new_funcs_conn() -> Arc<Connection<MemFile>> {
     let c = conn();
-    run(&c, "create table t (id integer not null, cat integer, name varchar(20), primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, cat integer, name varchar(20), primary key(id))",
+    )
+    .unwrap();
     for (id, cat, name) in [(1, 0, "Bob"), (2, 1, "alice"), (3, 0, "Cy"), (4, 1, "Dee")] {
         run(&c, &format!("insert into t values ({id}, {cat}, '{name}')")).unwrap();
     }
@@ -3249,7 +3464,10 @@ fn test_min_max_sum_as_bare_aggregates() {
 fn test_min_max_sum_grouped_by_category() {
     let c = new_funcs_conn();
     assert_eq!(
-        select_sorted(&c, "select cat, min(id), max(id), sum(id) from t group by cat"),
+        select_sorted(
+            &c,
+            "select cat, min(id), max(id), sum(id) from t group by cat"
+        ),
         ints(&[&[0, 1, 3, 4], &[1, 2, 4, 6]])
     );
 }
@@ -3259,7 +3477,10 @@ fn test_min_max_sum_over_an_empty_table_report_null() {
     let c = conn();
     run(&c, "create table e (id integer not null, primary key(id))").unwrap();
     let (_, rows) = select_rows(&c, "select min(id), max(id), sum(id) from e");
-    assert_eq!(rows, vec![vec![ValueItem::Null, ValueItem::Null, ValueItem::Null]]);
+    assert_eq!(
+        rows,
+        vec![vec![ValueItem::Null, ValueItem::Null, ValueItem::Null]]
+    );
 }
 
 #[test]
@@ -3270,10 +3491,22 @@ fn test_lower_and_upper_as_scalar_functions() {
     assert_eq!(
         rows,
         vec![
-            vec![ValueItem::Str(("alice".into(), 20)), ValueItem::Str(("ALICE".into(), 20))],
-            vec![ValueItem::Str(("bob".into(), 20)), ValueItem::Str(("BOB".into(), 20))],
-            vec![ValueItem::Str(("cy".into(), 20)), ValueItem::Str(("CY".into(), 20))],
-            vec![ValueItem::Str(("dee".into(), 20)), ValueItem::Str(("DEE".into(), 20))],
+            vec![
+                ValueItem::Str(("alice".into(), 20)),
+                ValueItem::Str(("ALICE".into(), 20))
+            ],
+            vec![
+                ValueItem::Str(("bob".into(), 20)),
+                ValueItem::Str(("BOB".into(), 20))
+            ],
+            vec![
+                ValueItem::Str(("cy".into(), 20)),
+                ValueItem::Str(("CY".into(), 20))
+            ],
+            vec![
+                ValueItem::Str(("dee".into(), 20)),
+                ValueItem::Str(("DEE".into(), 20))
+            ],
         ]
     );
 }
@@ -3300,7 +3533,10 @@ fn test_min_max_work_on_strings_through_sql() {
     let (_, rows) = select_rows(&c, "select min(name), max(name) from t");
     assert_eq!(
         rows,
-        vec![vec![ValueItem::Str(("Bob".into(), 20)), ValueItem::Str(("alice".into(), 20))]]
+        vec![vec![
+            ValueItem::Str(("Bob".into(), 20)),
+            ValueItem::Str(("alice".into(), 20))
+        ]]
     );
 }
 
@@ -3308,14 +3544,20 @@ fn test_min_max_work_on_strings_through_sql() {
 fn test_explain_shows_min_max_sum_and_scalar_functions() {
     let c = new_funcs_conn();
     let plan = explain(&c, "select cat, min(id), sum(id) from t group by cat");
-    assert!(plan.contains("min(id)") && plan.contains("sum(id)"), "{plan}");
+    assert!(
+        plan.contains("min(id)") && plan.contains("sum(id)"),
+        "{plan}"
+    );
     // A variadic argument list, literal included (describe() renders each
     // argument via its own describe(), not just the columns it reads —
     // see EvalExpr::describe's own comment).
     let plan = explain(&c, "select concat(name, '-', id) from t");
     assert!(plan.contains("concat(name, '-', id)"), "{plan}");
     let plan = explain(&c, "select upper(name), lower(name) from t");
-    assert!(plan.contains("upper(name)") && plan.contains("lower(name)"), "{plan}");
+    assert!(
+        plan.contains("upper(name)") && plan.contains("lower(name)"),
+        "{plan}"
+    );
     // A call nested inside another function's argument list renders as
     // itself, not the column it ultimately reads (this used to collapse
     // to `concat(name, name)` — see FuncTrait::args' own doc comment on
@@ -3352,7 +3594,11 @@ fn dml_conn() -> Arc<Connection<MemFile>> {
 #[test]
 fn test_insert_select_copies_only_the_matching_rows_in_target_column_order() {
     let c = dml_conn();
-    run(&c, "create table t2 (id integer not null, name varchar(20), primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t2 (id integer not null, name varchar(20), primary key(id))",
+    )
+    .unwrap();
     let mut stmt = c
         .clone()
         .create_statement("insert into t2 select id, name from t where age > 26")
@@ -3373,8 +3619,16 @@ fn test_insert_select_copies_only_the_matching_rows_in_target_column_order() {
 #[test]
 fn test_insert_select_with_an_explicit_column_list_fills_the_rest_with_default_or_null() {
     let c = dml_conn();
-    run(&c, "create table t2 (id integer not null, name varchar(20), tag varchar(10), primary key(id))").unwrap();
-    run(&c, "insert into t2 (id, name) select id, name from t where id = 1").unwrap();
+    run(
+        &c,
+        "create table t2 (id integer not null, name varchar(20), tag varchar(10), primary key(id))",
+    )
+    .unwrap();
+    run(
+        &c,
+        "insert into t2 (id, name) select id, name from t where id = 1",
+    )
+    .unwrap();
     let rows = select_rows(&c, "select id, name, tag from t2").1;
     assert_eq!(
         rows,
@@ -3389,9 +3643,16 @@ fn test_insert_select_with_an_explicit_column_list_fills_the_rest_with_default_o
 #[test]
 fn test_insert_select_rejects_a_type_mismatch_between_selected_value_and_target_column() {
     let c = dml_conn();
-    run(&c, "create table t2 (id varchar(20) not null, primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t2 (id varchar(20) not null, primary key(id))",
+    )
+    .unwrap();
     let err = run(&c, "insert into t2 select id from t").unwrap_err();
-    assert!(err.to_string().to_lowercase().contains("type") || format!("{err:?}").contains("does not match"));
+    assert!(
+        err.to_string().to_lowercase().contains("type")
+            || format!("{err:?}").contains("does not match")
+    );
 }
 
 #[test]
@@ -3401,7 +3662,11 @@ fn test_insert_select_can_read_and_write_the_same_table() {
     // (rather than materializing the whole SELECT first) would risk
     // duplicating rows it just inserted straight back into its own scan.
     let c = conn();
-    run(&c, "create table t (id integer not null, tag varchar(10), primary key(id))").unwrap();
+    run(
+        &c,
+        "create table t (id integer not null, tag varchar(10), primary key(id))",
+    )
+    .unwrap();
     run(&c, "insert into t values (1, 'a')").unwrap();
     run(&c, "insert into t values (2, 'a')").unwrap();
     let mut stmt = c
@@ -3410,7 +3675,10 @@ fn test_insert_select_can_read_and_write_the_same_table() {
         .unwrap();
     stmt.execute().unwrap();
     assert!(matches!(nth_result(&stmt, 0), ResultType::Count(2)));
-    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(4)]]);
+    assert_eq!(
+        select_rows(&c, "select count(*) as n from t").1,
+        vec![vec![ValueItem::Integer(4)]]
+    );
 }
 
 #[test]
@@ -3457,7 +3725,10 @@ fn test_update_moving_the_primary_key_relocates_the_row() {
     let c = dml_conn();
     run(&c, "update t set id = 100 where name = 'bob'").unwrap();
     // The old key is gone...
-    assert_eq!(select_rows(&c, "select * from t where id = 2").1, Vec::<Vec<ValueItem>>::new());
+    assert_eq!(
+        select_rows(&c, "select * from t where id = 2").1,
+        Vec::<Vec<ValueItem>>::new()
+    );
     // ...and the row is findable at its new one, values otherwise intact.
     let rows = select_rows(&c, "select id, name, age from t where id = 100").1;
     assert_eq!(
@@ -3469,7 +3740,10 @@ fn test_update_moving_the_primary_key_relocates_the_row() {
         ]]
     );
     // And the total row count is unchanged — a move, not a duplicate.
-    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(3)]]);
+    assert_eq!(
+        select_rows(&c, "select count(*) as n from t").1,
+        vec![vec![ValueItem::Integer(3)]]
+    );
 }
 
 #[test]
@@ -3478,7 +3752,10 @@ fn test_update_keeps_a_secondary_index_correct() {
     run(&c, "create index idx_name on t (name)").unwrap();
     run(&c, "update t set name = 'zzz' where name = 'bob'").unwrap();
     // A lookup on the OLD indexed value must find nothing now...
-    assert_eq!(select_rows(&c, "select * from t where name = 'bob'").1, Vec::<Vec<ValueItem>>::new());
+    assert_eq!(
+        select_rows(&c, "select * from t where name = 'bob'").1,
+        Vec::<Vec<ValueItem>>::new()
+    );
     // ...and the NEW value must find exactly the moved row.
     let rows = select_rows(&c, "select id from t where name = 'zzz'").1;
     assert_eq!(rows, vec![vec![ValueItem::Integer(2)]]);
@@ -3487,7 +3764,11 @@ fn test_update_keeps_a_secondary_index_correct() {
 #[test]
 fn test_update_enforces_not_null() {
     let c = dml_conn();
-    run(&c, "alter table t add column req varchar(10) not null default 'x'").unwrap();
+    run(
+        &c,
+        "alter table t add column req varchar(10) not null default 'x'",
+    )
+    .unwrap();
     let err = run(&c, "update t set req = null where id = 1").unwrap_err();
     assert!(err.to_string().to_lowercase().contains("null"), "{err}");
 }
@@ -3501,7 +3782,11 @@ fn test_update_and_delete_work_on_a_table_with_no_primary_key() {
     // still has SOME physical key: its auto-generated rowid) works exactly
     // the same as one that does.
     let c = conn();
-    run(&c, "create table nopk (id integer not null, tag varchar(10))").unwrap();
+    run(
+        &c,
+        "create table nopk (id integer not null, tag varchar(10))",
+    )
+    .unwrap();
     run(&c, "insert into nopk values (1, 'a')").unwrap();
     run(&c, "insert into nopk values (2, 'a')").unwrap();
     run(&c, "insert into nopk values (3, 'b')").unwrap();
@@ -3555,7 +3840,10 @@ fn test_delete_without_a_where_clause_deletes_every_row() {
     let mut stmt = c.clone().create_statement("delete from t").unwrap();
     stmt.execute().unwrap();
     assert!(matches!(nth_result(&stmt, 0), ResultType::Count(3)));
-    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(0)]]);
+    assert_eq!(
+        select_rows(&c, "select count(*) as n from t").1,
+        vec![vec![ValueItem::Integer(0)]]
+    );
 }
 
 #[test]
@@ -3563,8 +3851,14 @@ fn test_delete_keeps_a_secondary_index_correct() {
     let c = dml_conn();
     run(&c, "create index idx_name on t (name)").unwrap();
     run(&c, "delete from t where name = 'bob'").unwrap();
-    assert_eq!(select_rows(&c, "select * from t where name = 'bob'").1, Vec::<Vec<ValueItem>>::new());
-    assert_eq!(select_rows(&c, "select count(*) as n from t").1, vec![vec![ValueItem::Integer(2)]]);
+    assert_eq!(
+        select_rows(&c, "select * from t where name = 'bob'").1,
+        Vec::<Vec<ValueItem>>::new()
+    );
+    assert_eq!(
+        select_rows(&c, "select count(*) as n from t").1,
+        vec![vec![ValueItem::Integer(2)]]
+    );
 }
 
 #[test]
@@ -3579,8 +3873,16 @@ fn test_update_then_delete_leave_the_table_in_the_expected_final_state() {
     assert_eq!(
         rows,
         vec![
-            vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 20)), ValueItem::Integer(30)],
-            vec![ValueItem::Integer(2), ValueItem::Str(("bob".into(), 20)), ValueItem::Integer(26)],
+            vec![
+                ValueItem::Integer(1),
+                ValueItem::Str(("alice".into(), 20)),
+                ValueItem::Integer(30)
+            ],
+            vec![
+                ValueItem::Integer(2),
+                ValueItem::Str(("bob".into(), 20)),
+                ValueItem::Integer(26)
+            ],
         ]
     );
 }

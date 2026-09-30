@@ -271,19 +271,29 @@ where
         })
     }
 
-    pub fn table_btree_params(&self) -> Result<(usize, usize), StoreError> {
-        let mut level = 0usize;
+    pub fn table_btree_params(&self) -> Result<(usize, usize, usize), StoreError> {
+        let mut level = 1usize;
         let mut start = self.buffer.get_page(self.table.first_index_page)?;
         loop {
             if start.is_flag_set(LEAF_NODE) {
-                return Ok((level, self.table.nodes_per_page));
+                return Ok((
+                    level,
+                    self.table.nodes_per_page,
+                    start.record_size().unwrap(),
+                ));
             } else {
                 if let Some(tuple) = start.iter().next() {
                     level += 1;
                     let page = from_bytes::<Node>(&tuple.data)?;
                     match page {
                         Node::Inner(p) => start = self.buffer.get_page(p)?,
-                        Node::Leaf(_) => return Ok((level, self.table.nodes_per_page)),
+                        Node::Leaf(_) => {
+                            return Ok((
+                                level,
+                                self.table.nodes_per_page,
+                                start.record_size().unwrap(),
+                            ));
+                        }
                     }
                 } else {
                     panic!("Should not come here!");

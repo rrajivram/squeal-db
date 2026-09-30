@@ -1,12 +1,8 @@
-use crate::source::{column_names, planinfo::PlanNode};
-use std::{
-    cmp::Ordering,
-    collections::HashMap,
-    fmt::Debug,
-    panic,
-    sync::Arc,
-    thread,
+use crate::{
+    optim::table_stats::ComputedTableStat,
+    source::{column_names, planinfo::PlanNode},
 };
+use std::{cmp::Ordering, collections::HashMap, fmt::Debug, panic, sync::Arc, thread};
 
 use postcard::{from_bytes, to_allocvec};
 use store::{
@@ -21,7 +17,7 @@ use crate::{
     error::SchemaError,
     plan::memory::{MemReservation, QueryMemory},
     source::{
-        ComputedTableStat, ProjectableField, QueryStats, Source,
+        ProjectableField, QueryStats, Source,
         join::JoinType,
         joinmatch::JoinMatcher,
         merge_stats,
@@ -77,7 +73,12 @@ where
         self.spill.is_some()
     }
 
-    fn push(&mut self, row: IndexKey, db: &Arc<Db<F>>, budget: &Arc<QueryMemory>) -> Result<(), SchemaError> {
+    fn push(
+        &mut self,
+        row: IndexKey,
+        db: &Arc<Db<F>>,
+        budget: &Arc<QueryMemory>,
+    ) -> Result<(), SchemaError> {
         if self.first.is_none() {
             self.first = Some(row.clone());
         }
@@ -376,25 +377,24 @@ where
     F: DBFile<Item = F>,
 {
     fn plan(&self) -> PlanNode {
-        let side = |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| {
-            match (raw, sorted) {
+        let side =
+            |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| match (raw, sorted) {
                 (Some(s), _) => Some(s.plan()),
                 (None, Some(s)) => Some(s.plan()),
                 _ => None,
-            }
-        };
-        let names = |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| {
-            match (raw, sorted) {
+            };
+        let names =
+            |raw: &Option<Box<dyn Source>>, sorted: &Option<SortSource<F>>| match (raw, sorted) {
                 (Some(s), _) => column_names(&s.fields()),
                 (None, Some(s)) => column_names(&s.fields()),
                 _ => vec![],
-            }
-        };
+            };
         let (left, right) = (
             names(&self.left_source, &self.left_sorted),
             names(&self.right_source, &self.right_sorted),
         );
-        let name = |cols: &[String], i: &usize| cols.get(*i).cloned().unwrap_or_else(|| format!("#{i}"));
+        let name =
+            |cols: &[String], i: &usize| cols.get(*i).cloned().unwrap_or_else(|| format!("#{i}"));
         let keys = self
             .left_fields
             .iter()
@@ -402,7 +402,8 @@ where
             .map(|(l, r)| format!("left({}) = right({})", name(&left, l), name(&right, r)))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let mut node = PlanNode::new("SortMergeJoin").detail(format!("{:?} on {keys}", self.matcher.join_type()));
+        let mut node = PlanNode::new("SortMergeJoin")
+            .detail(format!("{:?} on {keys}", self.matcher.join_type()));
         for child in [
             side(&self.left_source, &self.left_sorted),
             side(&self.right_source, &self.right_sorted),
@@ -414,7 +415,6 @@ where
         }
         node
     }
-
 
     fn fields(&self) -> Arc<[ProjectableField]> {
         self.fields.clone()
@@ -461,7 +461,10 @@ where
                 level: 0,
             },
         )];
-        for s in [&self.left_sorted, &self.right_sorted].into_iter().flatten() {
+        for s in [&self.left_sorted, &self.right_sorted]
+            .into_iter()
+            .flatten()
+        {
             res = merge_stats(res, s.query_stats());
         }
         Some(res)
@@ -486,10 +489,7 @@ mod tests {
     use store::{clock::Instant, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
-    use crate::source::{
-        hash::HashedSource,
-        test_support::VecSource,
-    };
+    use crate::source::{hash::HashedSource, test_support::VecSource};
 
     type Row = Vec<ValueItem>;
 
@@ -568,7 +568,9 @@ mod tests {
         let mut x = seed;
         (0..n)
             .map(|i| {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let k = ((x >> 33) as i64) % (keys + 2);
                 let key = if k >= keys { ValueItem::Null } else { int(k) };
                 vec![key, int(base + i as i64)]
@@ -576,7 +578,12 @@ mod tests {
             .collect()
     }
 
-    const TYPES: [JoinType; 4] = [JoinType::Inner, JoinType::Left, JoinType::Right, JoinType::Full];
+    const TYPES: [JoinType; 4] = [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+    ];
 
     #[test]
     fn test_every_join_type_matches_an_independent_nested_loop_oracle() {
@@ -620,9 +627,21 @@ mod tests {
     fn test_empty_sides() {
         let some = rows(1, 5, 3, 0);
         for t in TYPES {
-            assert_eq!(run(sort_join(&[], &[], t, 1 << 20)), vec![] as Vec<Row>, "{t:?}");
-            assert_eq!(run(sort_join(&some, &[], t, 1 << 20)), oracle(&some, &[], t), "{t:?}");
-            assert_eq!(run(sort_join(&[], &some, t, 1 << 20)), oracle(&[], &some, t), "{t:?}");
+            assert_eq!(
+                run(sort_join(&[], &[], t, 1 << 20)),
+                vec![] as Vec<Row>,
+                "{t:?}"
+            );
+            assert_eq!(
+                run(sort_join(&some, &[], t, 1 << 20)),
+                oracle(&some, &[], t),
+                "{t:?}"
+            );
+            assert_eq!(
+                run(sort_join(&[], &some, t, 1 << 20)),
+                oracle(&[], &some, t),
+                "{t:?}"
+            );
         }
     }
 
@@ -640,7 +659,9 @@ mod tests {
         let mk = |a: i64, b: i64, v: i64| vec![int(a), int(b), int(v)];
         let left = vec![mk(1, 1, 0), mk(1, 2, 1), mk(2, 1, 2)];
         let right = vec![mk(1, 2, 10), mk(2, 1, 11), mk(2, 2, 12)];
-        let s = |r: &[Row]| -> Box<dyn Source> { Box::new(VecSource::new(&["a", "b", "v"], r.to_vec())) };
+        let s = |r: &[Row]| -> Box<dyn Source> {
+            Box::new(VecSource::new(&["a", "b", "v"], r.to_vec()))
+        };
         let join = SortJoinSource::new(
             s(&left),
             s(&right),
@@ -733,7 +754,10 @@ mod tests {
             assert!(spilled > 0, "{t:?}: the big groups must have spilled");
             // ...and they really left memory: pages were written to the
             // temp file, not just held in the pool's cache.
-            assert!(db.stats().temp.spills > 0, "{t:?}: nothing reached the temp file");
+            assert!(
+                db.stats().temp.spills > 0,
+                "{t:?}: nothing reached the temp file"
+            );
         }
     }
 
