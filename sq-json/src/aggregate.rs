@@ -62,7 +62,7 @@ pub(crate) enum Acc {
     Count,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Literal(Value),
     /// `$$ROOT` / `$$CURRENT` (then optionally a path within it).
@@ -451,7 +451,7 @@ fn path_value(v: &Value, parts: &[String]) -> Option<Value> {
     }
 }
 
-fn truthy(v: &Option<Value>) -> bool {
+pub(crate) fn truthy(v: &Option<Value>) -> bool {
     match v {
         None | Some(Value::Null) | Some(Value::Bool(false)) | Some(Value::Int(0)) => false,
         Some(Value::Double(d)) => *d != 0.0,

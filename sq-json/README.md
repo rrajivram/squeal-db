@@ -53,6 +53,7 @@ session.commit_transaction()?;
   - `$regex` with `$options` (`i m s x`); an anchored prefix (`^abc`)
     seeks an index as a string range;
   - logic: `$not $and $or $nor`;
+  - `$expr` with aggregation expressions, to compare fields of one document;
   - paths: dotted paths, which reach through arrays; null matches a missing field.
 - **Updates**: `$set $unset $inc $mul $min $max $rename $push $addToSet $pull
   $pop $setOnInsert $currentDate`. `_id` is immutable.

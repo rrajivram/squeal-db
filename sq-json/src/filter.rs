@@ -12,6 +12,7 @@
 
 use std::cmp::Ordering;
 
+use crate::aggregate::{self, Expr, eval, parse_expr};
 use crate::error::{Error, Result};
 use crate::value::{Document, Value, compare, lookup, type_order, values_equal};
 
@@ -22,6 +23,9 @@ pub(crate) enum Filter {
     Nor(Vec<Filter>),
     /// Every condition holds for the field at this path.
     Field(String, Vec<Cond>),
+    /// `$expr`: an aggregation expression over the document is true. One
+    /// that fails to evaluate (dividing by zero, say) doesn't match.
+    Expr(Expr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,6 +131,7 @@ impl Filter {
                 "$and" => Filter::And(parse_list(key, value)?),
                 "$or" => Filter::Or(parse_list(key, value)?),
                 "$nor" => Filter::Nor(parse_list(key, value)?),
+                "$expr" => Filter::Expr(parse_expr(value)?),
                 "$comment" => continue,
                 k if k.starts_with('$') => {
                     return Err(Error::BadValue(format!("unknown top level operator: {k}")));
@@ -146,6 +151,7 @@ impl Filter {
                 let values = lookup(doc, path);
                 conds.iter().all(|c| c.holds(&values))
             }
+            Filter::Expr(e) => eval(e, doc).is_ok_and(|v| aggregate::truthy(&v)),
         }
     }
 
@@ -161,7 +167,7 @@ impl Filter {
         match self {
             Filter::And(fs) => fs.iter().for_each(|f| f.collect_required(out)),
             Filter::Field(path, conds) => out.extend(conds.iter().map(|c| (path.as_str(), c))),
-            Filter::Or(_) | Filter::Nor(_) => {}
+            Filter::Or(_) | Filter::Nor(_) | Filter::Expr(_) => {}
         }
     }
 }
@@ -424,6 +430,16 @@ mod tests {
         let doc = r#"{"items": [{"sku": "x", "qty": 1}, {"sku": "y", "qty": 5}]}"#;
         assert!(matches(r#"{"items": {"$elemMatch": {"sku": "y", "qty": {"$gt": 2}}}}"#, doc));
         assert!(!matches(r#"{"items": {"$elemMatch": {"sku": "x", "qty": {"$gt": 2}}}}"#, doc));
+    }
+
+    #[test]
+    fn test_expr_compares_fields_of_one_document() {
+        assert!(matches(r#"{"$expr": {"$gt": ["$spent", "$budget"]}}"#, r#"{"spent": 5, "budget": 3}"#));
+        assert!(!matches(r#"{"$expr": {"$gt": ["$spent", "$budget"]}}"#, r#"{"spent": 1, "budget": 3}"#));
+        assert!(matches(r#"{"a": 1, "$expr": {"$eq": [{"$size": "$l"}, 2]}}"#, r#"{"a": 1, "l": [7, 8]}"#));
+        // An expression that fails to evaluate doesn't match.
+        assert!(!matches(r#"{"$expr": {"$divide": [1, "$z"]}}"#, r#"{"z": 0}"#));
+        assert!(Filter::parse(&Document::parse(r#"{"$expr": {"$nope": 1}}"#).unwrap()).is_err());
     }
 
     #[test]
