@@ -733,7 +733,8 @@ fn range_fraction(stat: Option<&ColumnStat>, range: &KeyRange) -> f64 {
 ///
 /// Worth it when `outer_rows` seeks — each a descent plus the rows one key
 /// matches (and, through an index, a fetch per row) — cost less than
-/// `hash_rows` rows of the inner table read for a hash join. Needs
+/// `hash_rows` rows of the inner table read for a hash join, plus building
+/// the hash table (`hash_extra`, spilling included). Needs
 /// statistics for the inner table and an outer row estimate.
 pub(crate) fn pick_join_seek(
     table: &SqlTable,
@@ -741,6 +742,7 @@ pub(crate) fn pick_join_seek(
     pairs: &[(usize, usize, DataType)],
     outer_rows: Option<usize>,
     hash_rows: usize,
+    hash_extra: f64,
     page_size: usize,
 ) -> Option<JoinSeek> {
     let outer_rows = outer_rows?;
@@ -842,7 +844,7 @@ pub(crate) fn pick_join_seek(
         );
     }
     let (cost, seek) = best?;
-    (cost < hash_rows * table_row).then_some(seek)
+    ((cost as f64) < (hash_rows * table_row) as f64 + hash_extra).then_some(seek)
 }
 
 /// Rows left of `rows` once `filters` (conditions on `table`'s own row)

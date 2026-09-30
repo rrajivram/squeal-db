@@ -340,10 +340,16 @@ impl<F: DBFile + 'static> HashedSource<F> {
         // every LEFT row" must keep meaning the ORIGINAL left table, which
         // after a swap is the physical right (probe) side, so the type is
         // mirrored along with the sources.
+        //
+        // Except when the larger side's table wouldn't fit the query's
+        // memory budget: then it spills, and building the smaller side
+        // instead wins by far — re-measured on the 16 GB retail database,
+        // orders (3.3M) x customers (327K) took 96 s building orders
+        // (spilled) and 5 s building customers (fit). See build_right.
         let (left_source, left_fields, right_source, right_fields, join_type, swapped) = {
             if let Some(left_stat) = left_source.table_stats()
                 && let Some(right_stat) = right_source.table_stats()
-                && right_stat.table_stat.row_count > left_stat.table_stat.row_count
+                && Self::build_right(&left_stat, &right_stat, mem.limit())
             {
                 let mirrored = match join_type {
                     JoinType::Left => JoinType::Right,
@@ -437,6 +443,26 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // factor >= 1.0 does that — but about keeping linear-probe chains short:
     // 1.9 ends a full build at ~0.53 load.
     const INITIAL_CAPACITY_FACTOR: f64 = 1.9;
+
+    /// Whether to build the hash table from the right side (swapping it to
+    /// the left) rather than the left, given each side's statistics: the
+    /// side with more rows, if its table fits in `mem_limit`; otherwise the
+    /// one with fewer. Shared with the planner's estimate of what a hash
+    /// join costs (see plan::logical's hash_build_cost).
+    pub(crate) fn build_right(
+        left: &ComputedTableStat,
+        right: &ComputedTableStat,
+        mem_limit: usize,
+    ) -> bool {
+        let (l, r) = (left.table_stat.row_count, right.table_stat.row_count);
+        let bytes = |s: &ComputedTableStat| {
+            s.table_stat
+                .row_count
+                .saturating_mul(s.row_size + MEM_ENTRY_OVERHEAD_BYTES)
+        };
+        let larger_fits = bytes(if r > l { right } else { left }) <= mem_limit;
+        if larger_fits { r > l } else { r < l }
+    }
 
     // Creates a Run (backed by SlottedPage — STORE_AUDIT.md P6) with
     // enough pages to hold at least `min_capacity` slots. Unlike the
@@ -1722,6 +1748,47 @@ mod tests {
         )
     }
 
+    // The larger side is built while its table fits the budget; past that,
+    // the smaller (building the larger would spill — see build_right).
+    #[test]
+    fn test_the_larger_side_is_built_unless_it_would_not_fit() {
+        let stat = |rows: usize| ComputedTableStat {
+            table_stat: crate::optim::table_stats::TableStat {
+                id: store::table::TableIdType::default(),
+                name: "t".into(),
+                row_count: rows,
+                col_stats: Default::default(),
+            },
+            indices: None,
+            self_index: None,
+            row_size: 52,
+        };
+        let entry = 52 + MEM_ENTRY_OVERHEAD_BYTES;
+        let (small, big) = (stat(100), stat(1000));
+        // Both fit: the larger (right) is built.
+        assert!(HashedSource::<MemFile>::build_right(
+            &small,
+            &big,
+            1000 * entry
+        ));
+        assert!(!HashedSource::<MemFile>::build_right(
+            &big,
+            &small,
+            1000 * entry
+        ));
+        // The larger doesn't fit: the smaller is built, wherever it is.
+        assert!(!HashedSource::<MemFile>::build_right(
+            &small,
+            &big,
+            999 * entry
+        ));
+        assert!(HashedSource::<MemFile>::build_right(
+            &big,
+            &small,
+            999 * entry
+        ));
+    }
+
     #[test]
     fn test_a_larger_right_side_is_swapped_and_a_larger_left_is_not() {
         assert!(join_with_counts(JoinType::Inner, 1, 1000).swapped);
@@ -1803,12 +1870,13 @@ mod tests {
 
     #[test]
     fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_not_swapped() {
-        // Left (build) is the big table: 30,271 rows vs 10,000 — the ordinary
-        // order-details-joins-orders shape. This used to stay at one page.
-        // Forced onto the Run-backed table (QueryMemory::new(0)) — this is
-        // specifically testing THAT table's own sizing, which today's
-        // in-memory-first build only reaches once it has spilled.
-        let s = spilled_join_with_counts(JoinType::Inner, 30271, 10000);
+        // Left (build) is a big table: 30,271 rows. This used to stay at one
+        // page. Forced onto the Run-backed table (QueryMemory::new(0)) —
+        // this is specifically testing THAT table's own sizing, which
+        // today's in-memory-first build only reaches once it has spilled.
+        // With nothing fitting a zero budget the smaller side is built (see
+        // build_right), so the right side is the bigger one here.
+        let s = spilled_join_with_counts(JoinType::Inner, 30271, 40000);
         assert!(!s.swapped);
         let rt = s.run_table();
         assert!(
@@ -1823,10 +1891,11 @@ mod tests {
 
     #[test]
     fn test_the_table_is_sized_from_the_build_side_when_the_sources_are_swapped() {
-        // Right is bigger, so it becomes the build side: same table, same size.
-        let swapped = spilled_join_with_counts(JoinType::Inner, 10000, 30271);
+        // Nothing fits a zero budget, so the smaller side is built: the right
+        // one here, so it becomes the build side — same table, same size.
+        let swapped = spilled_join_with_counts(JoinType::Inner, 40000, 30271);
         assert!(swapped.swapped);
-        let plain = spilled_join_with_counts(JoinType::Inner, 30271, 10000);
+        let plain = spilled_join_with_counts(JoinType::Inner, 30271, 40000);
         assert_eq!(swapped.run_table().capacity, plain.run_table().capacity);
     }
 
@@ -1922,8 +1991,10 @@ mod tests {
         let before = db.stats().temp.live_pages;
         let big = spill(
             HashedSource::new(
+                // The build side (the smaller, with nothing fitting a zero
+                // budget) is the 5000-row one.
                 Box::new(WithRowCount(left_source(), 5000)),
-                Box::new(WithRowCount(right_source(), 10)),
+                Box::new(WithRowCount(right_source(), 6000)),
                 db.clone(),
                 QueryMemory::new(0),
                 &[0],

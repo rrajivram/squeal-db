@@ -436,6 +436,18 @@ fn mergeable(a: DataType, b: DataType) -> bool {
 // reading (see optim::picker): per row of the side it is built from.
 const HASH_BYTES_PER_BUILD_ROW: f64 = 32.0;
 
+// What a build row costs when the hash table outgrows the query's memory
+// budget and spills to the temp file, probed back at random. Measured on
+// the 16 GB retail database (orders 3.3M x order_details 9.9M, 64 MB
+// budget): hashing spilled a 4.4 GB table and took 139-146 s where a merge
+// of the same rows took 19-25 s — ~12.8 us more per build row, ~10,000 of
+// these units (scans read ~1.2 ns per unit).
+const SPILL_BYTES_PER_BUILD_ROW: f64 = 10_000.0;
+
+// What each build row takes in the hash table's memory beyond its values
+// (HashedSource's per-entry accounting).
+const HASH_ENTRY_OVERHEAD_BYTES: usize = 48;
+
 // A merge join's plan (see QueryVisitor::merge_plan): the orders to read
 // the two tables in, and the key fields in each one's row.
 #[derive(Clone)]
@@ -444,6 +456,9 @@ struct MergePlan {
     inner_order: OrderWanted,
     left_fields: Vec<usize>,
     right_fields: Vec<usize>,
+    // What merging costs beyond reading the outer side the plain way: the
+    // other plans' (a nested-loop join's) comparison point.
+    cost: f64,
 }
 
 // The orders the query would like its joined rows in: ORDER BY's columns
@@ -938,6 +953,7 @@ where
                     needs_j,
                     outer_rows,
                     &left_types,
+                    merge.as_ref().map(|m| m.cost),
                 )? {
                     outer_rows = outer_rows.map(|r| r * join.1);
                     combined = join.0;
@@ -1050,6 +1066,7 @@ where
                                 all_needs.get(flat),
                                 rows,
                                 &types,
+                                None,
                             )?
                         } else {
                             None
@@ -1301,6 +1318,36 @@ where
     // Opens one FROM item. A real table is read the way optim::picker
     // chooses (a scan or seek of the table or one of its indexes); anything
     // else is opened as is.
+    // What a hash join costs beyond reading its inputs: building and
+    // probing a table of `build_rows` rows of `row_bytes` each, plus
+    // spilling it (SPILL_BYTES_PER_BUILD_ROW) when it won't fit in this
+    // query's memory budget. Of two tables with statistics, HashedSource
+    // picks the build side (see hash_join_cost); a joined input has none,
+    // so it is built from as is.
+    // A hash join of two inputs with statistics — (rows, row bytes) each —
+    // builds from the larger if its table fits the memory budget, else
+    // from the smaller (HashedSource::build_right): the cost of whichever.
+    fn hash_join_cost(&self, a: (usize, usize), b: (usize, usize)) -> f64 {
+        let (larger, smaller) = if b.0 > a.0 { (b, a) } else { (a, b) };
+        let fits = larger
+            .0
+            .saturating_mul(larger.1 + HASH_ENTRY_OVERHEAD_BYTES)
+            <= self.mem.limit();
+        let (rows, bytes) = if fits { larger } else { smaller };
+        self.hash_build_cost(rows, bytes)
+    }
+
+    fn hash_build_cost(&self, build_rows: usize, row_bytes: usize) -> f64 {
+        let rows = build_rows as f64;
+        let bytes = build_rows.saturating_mul(row_bytes + HASH_ENTRY_OVERHEAD_BYTES);
+        let spill = if bytes > self.mem.limit() {
+            rows * SPILL_BYTES_PER_BUILD_ROW
+        } else {
+            0.0
+        };
+        rows * HASH_BYTES_PER_BUILD_ROW + spill
+    }
+
     // Whether to join a FROM item's base table to its first joined table
     // by reading both in join-key order and merging them (a presorted
     // SortJoinSource): the ON condition is only equalities between the two
@@ -1376,9 +1423,14 @@ where
             return None;
         }
         let mut merge_cost = base_ordered.cost? + inner_ordered.cost?;
-        let build_rows = base_plain.rows?.min(inner_plain.rows?) as f64;
-        let mut hash_cost =
-            base_plain.cost? + inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
+        // Both inputs are tables with statistics (see hash_join_cost).
+        let (base_rows, inner_rows) = (base_plain.rows?, inner_plain.rows?);
+        let mut hash_cost = base_plain.cost?
+            + inner_plain.cost?
+            + self.hash_join_cost(
+                (base_rows, base.stats.as_ref()?.row_size),
+                (inner_rows, j.relation.stats.as_ref()?.row_size),
+            );
         // The merge's output order may also save the query a sort (see
         // MergeOrder::saves), which hashing would still need.
         let order = MergeOrder::new(&left_fields, &right_fields, width, j.join_type);
@@ -1413,14 +1465,16 @@ where
                 _ => false,
             });
             if on_key && let Some(s) = &l.relation.stats {
-                hash_cost += s.table_stat.row_count as f64 * HASH_BYTES_PER_BUILD_ROW;
+                hash_cost += self.hash_build_cost(s.table_stat.row_count, s.row_size);
             }
         }
+        let cost = merge_cost - base_plain.cost?;
         (merge_cost <= hash_cost || force_merge()).then(|| MergePlan {
             base_order,
             inner_order,
             left_fields,
             right_fields,
+            cost,
         })
     }
 
@@ -1498,8 +1552,12 @@ where
         if !inner_ordered.sorted {
             return None;
         }
-        let build_rows = outer_rows.unwrap_or(usize::MAX).min(inner_plain.rows?) as f64;
-        let mut hash_cost = inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
+        // The outer side is joined rows, with no table statistics:
+        // HashedSource builds from it. Its size unknown, take the inner
+        // side's as a stand-in.
+        let build_rows = outer_rows.unwrap_or(inner_plain.rows?);
+        let build_bytes = left_types.iter().map(|t| t.size()).sum();
+        let mut hash_cost = inner_plain.cost? + self.hash_build_cost(build_rows, build_bytes);
         let mut merge_cost = inner_ordered.cost?;
         let order = MergeOrder::after(Some(chain), &left_fields, &right_fields, width, j.join_type);
         if order.gives_group(wanted) || order.gives_order(wanted) {
@@ -1520,6 +1578,7 @@ where
             inner_order,
             left_fields,
             right_fields,
+            cost: merge_cost,
         })
     }
 
@@ -1583,6 +1642,7 @@ where
         needs: Option<&ItemNeeds>,
         outer_rows: Option<usize>,
         left_types: &[DataType],
+        merge_cost: Option<f64>,
     ) -> Result<Option<(Box<dyn Source>, usize)>, SchemaError> {
         let (JoinType::Inner | JoinType::Left, TableRef::Real(_, table), Some(needs)) =
             (join_type, &relation.resolved, needs)
@@ -1629,12 +1689,31 @@ where
         let hash_rows = pick_access(table, relation.stats.as_ref(), needs, page_size, None)
             .rows
             .unwrap_or(usize::MAX / 2);
+        // Building from whichever side HashedSource would (see
+        // hash_join_cost).
+        let mut hash_extra = self.hash_join_cost(
+            (
+                outer_rows.unwrap_or(0),
+                left_types.iter().map(|t| t.size()).sum(),
+            ),
+            (hash_rows, relation.stats.as_ref().map_or(0, |s| s.row_size)),
+        );
+        // A merge join, when one is on offer and cheaper still, is what the
+        // seeks must beat. pick_join_seek compares against reading the
+        // table plus `hash_extra`; express the merge on that scale.
+        if let (Some(merge), Some(stats)) = (merge_cost, relation.stats.as_ref())
+            && let Some(self_index) = stats.self_index.as_ref()
+        {
+            let read = (hash_rows * (self_index.row_size + stats.row_size)) as f64;
+            hash_extra = hash_extra.min(merge - read);
+        }
         let Some(seek) = pick_join_seek(
             table,
             relation.stats.as_ref(),
             &pairs,
             outer_rows,
             hash_rows,
+            hash_extra,
             page_size,
         ) else {
             return Ok(None);
