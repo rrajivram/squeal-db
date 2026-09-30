@@ -42,8 +42,18 @@ session.commit_transaction()?;
   - single-field, compound, unique and multikey (arrays);
   - built from existing documents when created;
   - used for equality, `$in` and range seeks on their leading fields;
-  - `_id` seeks use the collection's own key order;
-  - `explain` reports COLLSCAN, IDHACK or IXSCAN.
+  - read in key order to satisfy ascending sorts, stopping early under a limit;
+  - `_id` seeks and `_id` order use the collection's own key order;
+  - `explain` reports COLLSCAN, IDHACK or IXSCAN; `explain_find` also says
+    whether a sort is by index or in memory.
+- **Aggregation**: `aggregate` runs pipelines:
+  - stages: `$match $project $addFields/$set $unset $group $sort $skip $limit
+    $unwind $count $lookup $replaceRoot/$replaceWith`;
+  - expressions: field paths, `$$ROOT`, arithmetic, comparison, logic, `$cond
+    $ifNull $concat $toUpper $toLower $size $arrayElemAt $in $literal`;
+  - accumulators: `$sum $avg $min $max $first $last $push $addToSet $count`;
+  - leading `$match`, `$sort`, `$skip` and `$limit` stages become one find,
+    so they use indexes; `$lookup` is an `$in` find on the other collection.
 - **Transactions**: sessions give snapshot isolation through store's MVCC. A
   write-write conflict fails with `WriteConflict`. A failed operation aborts
   the transaction, as in MongoDB.
@@ -55,10 +65,10 @@ session.commit_transaction()?;
 - **Atomicity outside a transaction**: each operation runs in one store
   transaction. A failing `insert_many` or `update_many` therefore changes
   nothing; MongoDB would keep the writes made before the failure.
-- **Missing features**: no aggregation, regex, text, geo, TTL, sparse or
+- **Missing features**: no regex, `$facet`/`$bucket` and other stages, text, geo, TTL, sparse or
   partial indexes, collation, or `$slice` and positional projections.
-- **Index key order**: descending index fields are stored ascending, which only
-  matters for sort order. Sorts are done in memory.
+- **Descending sorts**: done in memory, since an index is only read forwards.
+  Descending index fields are stored ascending.
 - **Size limits**: keys (`_id` and indexed values) are limited to 256
   serialized bytes (`KeyTooLarge`).
 - **Multikey null keys**: a multikey index stores a null key wherever a path is

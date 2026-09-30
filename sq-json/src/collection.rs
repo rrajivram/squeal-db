@@ -24,6 +24,7 @@ use store::tuple::{DBIdType, Tuple};
 use store::txn::Transaction;
 use store::valueitem::IndexKey;
 
+use crate::aggregate::{self, Stage};
 use crate::client::{CollState, IndexState, Inner, Session};
 use crate::error::{Error, Result};
 use crate::filter::Filter;
@@ -291,6 +292,54 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         values.sort_by(compare);
         values.dedup_by(|a, b| values_equal(a, b));
         Ok(values)
+    }
+
+    /// Runs an aggregation pipeline (see aggregate.rs for its stages). Its
+    /// leading `$match`es, then a `$sort`, `$skip` and `$limit`, are one
+    /// find, so they use indexes.
+    pub fn aggregate(&self, pipeline: Vec<Document>) -> Result<Vec<Document>> {
+        let stages = aggregate::parse_pipeline(&pipeline)?;
+        let mut filters = vec![];
+        let mut options = FindOptions::new();
+        let mut rest = &stages[..];
+        while let [Stage::Match(_, f), tail @ ..] = rest {
+            filters.push(Value::Document(f.clone()));
+            rest = tail;
+        }
+        if let [Stage::Sort(_, sort), tail @ ..] = rest {
+            options.sort = Some(sort.clone());
+            rest = tail;
+        }
+        if let [Stage::Skip(n), tail @ ..] = rest {
+            options.skip = *n;
+            rest = tail;
+        }
+        if let [Stage::Limit(n), tail @ ..] = rest {
+            options.limit = Some(*n);
+            rest = tail;
+        }
+        let filter = match filters.len() {
+            0 => Document::new(),
+            1 => match filters.pop() {
+                Some(Value::Document(f)) => f,
+                _ => unreachable!("filters are documents"),
+            },
+            _ => {
+                let mut and = Document::new();
+                and.insert("$and", Value::Array(filters));
+                and
+            }
+        };
+        let docs = self.find(filter, options)?;
+        let db = self.ns.split_once('.').map(|(db, _)| db).unwrap_or_default().to_string();
+        aggregate::run(rest, docs, &mut |from, filter| {
+            let other = Collection {
+                inner: self.inner.clone(),
+                ns: format!("{db}.{from}"),
+                session: self.session.clone(),
+            };
+            other.find(filter, FindOptions::new())
+        })
     }
 
     /// How a find with `filter` would run: `{stage: "COLLSCAN"}`, or

@@ -378,3 +378,54 @@ fn test_indexes_supply_sort_order_with_the_same_results() {
         }
     }
 }
+
+#[test]
+fn test_aggregate_over_collections_with_lookup() {
+    let client = client("sqjson_aggregate");
+    let db = client.database("shop");
+    let orders = db.collection("orders");
+    let customers = db.collection("customers");
+    customers
+        .insert_many(vec![d(r#"{"_id": "c1", "name": "Ann"}"#), d(r#"{"_id": "c2", "name": "Bo"}"#)])
+        .unwrap();
+    orders
+        .insert_many(vec![
+            d(r#"{"_id": 1, "cust": "c1", "total": 10, "status": "paid"}"#),
+            d(r#"{"_id": 2, "cust": "c2", "total": 5, "status": "paid"}"#),
+            d(r#"{"_id": 3, "cust": "c1", "total": 7.5, "status": "paid"}"#),
+            d(r#"{"_id": 4, "cust": "c3", "total": 1, "status": "open"}"#),
+        ])
+        .unwrap();
+    orders.create_index(d(r#"{"status": 1}"#), IndexOptions::default()).unwrap();
+    let pipeline = |p: &str| match sq_json::value::from_json(p).unwrap() {
+        Value::Array(stages) => stages
+            .into_iter()
+            .map(|s| match s {
+                Value::Document(d) => d,
+                _ => panic!("stages are documents"),
+            })
+            .collect::<Vec<_>>(),
+        _ => panic!("a list"),
+    };
+    let out = orders
+        .aggregate(pipeline(
+            r#"[{"$match": {"status": "paid"}},
+                {"$group": {"_id": "$cust", "spent": {"$sum": "$total"}, "n": {"$sum": 1}}},
+                {"$lookup": {"from": "customers", "localField": "_id", "foreignField": "_id", "as": "who"}},
+                {"$unwind": "$who"},
+                {"$project": {"_id": 0, "name": "$who.name", "spent": 1, "n": 1}},
+                {"$sort": {"spent": -1}}]"#,
+        ))
+        .unwrap();
+    assert_eq!(json(&out), r#"{"spent":17.5,"n":2,"name":"Ann"},{"spent":5,"n":1,"name":"Bo"}"#);
+    // Leading $sort/$limit go to find; an unmatched lookup gives [].
+    let out = orders
+        .aggregate(pipeline(
+            r#"[{"$sort": {"_id": 1}}, {"$skip": 3}, {"$limit": 5},
+                {"$lookup": {"from": "customers", "localField": "cust", "foreignField": "_id", "as": "who"}},
+                {"$project": {"who": 1}}]"#,
+        ))
+        .unwrap();
+    assert_eq!(json(&out), r#"{"_id":4,"who":[]}"#);
+    assert!(orders.aggregate(pipeline(r#"[{"$bogus": 1}]"#)).is_err());
+}

@@ -1,4 +1,5 @@
 //! A MongoDB-style document database on `store`.
+pub(crate) mod aggregate;
 pub mod client;
 pub mod collection;
 pub mod error;
