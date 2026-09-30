@@ -123,6 +123,37 @@ pub(crate) fn seek_for(filter: &Filter, paths: &[&str], multikey: bool) -> Optio
     })
 }
 
+/// The paths `filter` pins to a single value (an equality, or `$in` with
+/// one value): an order over them is no order at all.
+pub(crate) fn fixed_paths(filter: &Filter) -> Vec<&str> {
+    let required = filter.required();
+    let mut paths: Vec<&str> = required.iter().map(|(p, _)| *p).collect();
+    paths.dedup();
+    paths.retain(|path| {
+        let conds: Vec<&Cond> = required.iter().filter(|(p, _)| p == path).map(|(_, c)| *c).collect();
+        matches!(field_set(&conds, false), Some(FieldSet::Points(v)) if v.len() == 1)
+    });
+    paths
+}
+
+/// Whether reading in the order of a key over `key_paths` (ascending)
+/// sorts by `sort` — skipping, on either side, fields fixed to one value.
+pub(crate) fn key_order_sorts(key_paths: &[&str], sort: &[(String, bool)], fixed: &[&str]) -> bool {
+    let mut key = key_paths.iter().peekable();
+    for (path, ascending) in sort {
+        if fixed.contains(&path.as_str()) {
+            continue;
+        }
+        while key.peek().is_some_and(|k| *k != path && fixed.contains(k)) {
+            key.next();
+        }
+        if !ascending || key.next() != Some(&path.as_str()) {
+            return false;
+        }
+    }
+    true
+}
+
 // What the conditions on one field allow, when an index can seek it.
 fn field_set(conds: &[&Cond], multikey: bool) -> Option<FieldSet> {
     let mut set: Option<FieldSet> = None;
@@ -269,6 +300,20 @@ mod tests {
         // Conditions a key order can't answer are left to the filter.
         assert!(seek(r#"{"a": {"$ne": 1}}"#, &["a"], false).is_none());
         assert!(seek(r#"{"a": [1, 2]}"#, &["a"], false).is_none());
+    }
+
+    #[test]
+    fn test_key_order_sorts_skipping_fixed_fields() {
+        let sort = |s: &[(&str, bool)]| s.iter().map(|(p, a)| (p.to_string(), *a)).collect::<Vec<_>>();
+        assert!(key_order_sorts(&["a", "b"], &sort(&[("a", true)]), &[]));
+        assert!(key_order_sorts(&["a", "b"], &sort(&[("a", true), ("b", true)]), &[]));
+        assert!(!key_order_sorts(&["a", "b"], &sort(&[("b", true)]), &[]));
+        assert!(key_order_sorts(&["a", "b"], &sort(&[("b", true)]), &["a"]));
+        assert!(key_order_sorts(&["a", "b"], &sort(&[("c", true), ("a", true)]), &["c"]));
+        assert!(!key_order_sorts(&["a"], &sort(&[("a", false)]), &[]));
+        assert!(!key_order_sorts(&["a"], &sort(&[("a", true), ("z", true)]), &[]));
+        let f = Filter::parse(&Document::parse(r#"{"a": 1, "b": {"$in": [2]}, "c": {"$in": [1, 2]}, "d": {"$gt": 1}}"#).unwrap()).unwrap();
+        assert_eq!(fixed_paths(&f), vec!["a", "b"]);
     }
 
     #[test]

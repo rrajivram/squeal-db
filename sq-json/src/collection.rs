@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use parking_lot::RwLockReadGuard;
-use store::cursor::Cursor;
+use store::cursor::{Cursor, KeyRange};
 use store::db::DBFile;
 use store::error::StoreError;
 use store::tuple::{DBIdType, Tuple};
@@ -28,7 +28,7 @@ use crate::client::{CollState, IndexState, Inner, Session};
 use crate::error::{Error, Result};
 use crate::filter::Filter;
 use crate::keys::{check_size, encode};
-use crate::plan::{Seek, seek_for};
+use crate::plan::{Seek, fixed_paths, key_order_sorts, seek_for};
 use crate::query::{Projection, Sort};
 use crate::update::{Update, check_field_names};
 use crate::value::{Document, ObjectId, Value, compare, lookup, values_equal};
@@ -90,6 +90,12 @@ enum Plan {
     CollScan,
     Id(Seek),
     Index(Arc<IndexState>, Seek),
+}
+
+/// A plan, and whether it reads documents already in the wanted order.
+struct Planned {
+    plan: Plan,
+    sorted: bool,
 }
 
 pub struct Collection<F: DBFile<Item = F> + 'static = std::fs::File> {
@@ -182,7 +188,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         self.run(|txn| {
             // Found first, then changed, so no document is seen twice.
             let limit = if many { None } else { Some(1) };
-            let found = self.matching(&state, &filter, limit, txn)?;
+            let found = self.matching(&state, &filter, plan(&state, &filter, None, false).plan, limit, txn)?;
             if found.is_empty() && upsert {
                 let mut doc = update.upsert_document(&filter)?;
                 prepare_insert(&mut doc)?;
@@ -223,7 +229,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         let (_ddl, state) = self.read_state();
         let Some(state) = state else { return Ok(0) };
         self.run(|txn| {
-            let found = self.matching(&state, &filter, limit, txn)?;
+            let found = self.matching(&state, &filter, plan(&state, &filter, None, false).plan, limit, txn)?;
             for doc in &found {
                 self.delete_doc(&state, doc, txn)?;
             }
@@ -242,15 +248,17 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         };
         let (_ddl, state) = self.read_state();
         let Some(state) = state else { return Ok(vec![]) };
-        let mut docs = self.run(|txn| {
-            // Unsorted, only the first skip + limit are needed.
-            let enough = match (&sort, options.limit) {
-                (None, Some(limit)) => Some(options.skip + limit),
-                _ => None,
-            };
-            self.matching(&state, &filter, enough, txn)
-        })?;
-        if let Some(sort) = &sort {
+        let planned = plan(&state, &filter, sort.as_ref(), options.limit.is_some());
+        // Read in order, only the first skip + limit are needed.
+        let in_order = sort.is_none() || planned.sorted;
+        let enough = match options.limit {
+            Some(limit) if in_order => Some(options.skip + limit),
+            _ => None,
+        };
+        let mut docs = self.run(|txn| self.matching(&state, &filter, planned.plan, enough, txn))?;
+        if let Some(sort) = &sort
+            && !in_order
+        {
             docs.sort_by(|a, b| sort.compare(a, b));
         }
         let docs = docs.into_iter().skip(options.skip).take(options.limit.unwrap_or(usize::MAX));
@@ -289,14 +297,21 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
     /// `{stage: "IXSCAN", indexName, keyRanges, multikey}` (`_id_` for the
     /// collection's own `_id` order), or `{stage: "IDHACK"}` for one `_id`.
     pub fn explain(&self, filter: Document) -> Result<Document> {
+        self.explain_find(filter, &FindOptions::new())
+    }
+
+    /// As explain, for a find with `options`; with a sort, `sort` says
+    /// whether the plan reads in order ("index") or sorts ("memory").
+    pub fn explain_find(&self, filter: Document, options: &FindOptions) -> Result<Document> {
         let filter = Filter::parse(&filter)?;
+        let sort = options.sort.as_ref().map(Sort::parse).transpose()?;
         let (_ddl, state) = self.read_state();
         let mut out = Document::new();
-        let plan = match &state {
-            Some(state) => plan(state, &filter),
-            None => Plan::CollScan,
+        let planned = match &state {
+            Some(state) => plan(state, &filter, sort.as_ref(), options.limit.is_some()),
+            None => Planned { plan: Plan::CollScan, sorted: true },
         };
-        match plan {
+        match planned.plan {
             Plan::CollScan => out.insert("stage", Value::String("COLLSCAN".into())),
             Plan::Id(seek) if !seek.ranged && seek.ranges.len() == 1 => {
                 out.insert("stage", Value::String("IDHACK".into()))
@@ -313,6 +328,10 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
                 out.insert("keyRanges", Value::Int(seek.ranges.len() as i64));
                 out.insert("multikey", Value::Bool(ix.multikey.load(Ordering::SeqCst)));
             }
+        }
+        if sort.is_some() {
+            let how = if planned.sorted { "index" } else { "memory" };
+            out.insert("sort", Value::String(how.into()));
         }
         Ok(out)
     }
@@ -385,7 +404,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
     fn fill(&self, state: &CollState, ix: &IndexState) -> Result<()> {
         let db = &self.inner.db;
         let txn = db.begin()?;
-        let docs = self.matching(state, &Filter::And(vec![]), None, &txn)?;
+        let docs = self.matching(state, &Filter::And(vec![]), Plan::CollScan, None, &txn)?;
         for doc in &docs {
             self.insert_entries(ix, doc, &txn)?;
         }
@@ -492,7 +511,14 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
     }
 
     // The documents matching `filter`, up to `limit` of them.
-    fn matching(&self, state: &CollState, filter: &Filter, limit: Option<usize>, txn: &Transaction) -> Result<Vec<Document>> {
+    fn matching(
+        &self,
+        state: &CollState,
+        filter: &Filter,
+        plan: Plan,
+        limit: Option<usize>,
+        txn: &Transaction,
+    ) -> Result<Vec<Document>> {
         let db = &self.inner.db;
         let limit = limit.unwrap_or(usize::MAX);
         let mut out = vec![];
@@ -505,7 +531,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
             }
             out.len() < limit
         };
-        match plan(state, filter) {
+        match plan {
             Plan::CollScan => {
                 let mut cursor = db.table_scan_in_txn(state.tid, txn)?;
                 while let Some(tuple) = cursor.next()? {
@@ -633,25 +659,49 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
 }
 
 // The best way into `state` for `filter`: the seek fixing the most leading
-// key fields, then one that also bounds a range; `_id` wins ties.
-fn plan(state: &CollState, filter: &Filter) -> Plan {
+// key fields, then one that also bounds a range, then one that reads in
+// `sort` order; `_id` wins ties. With nothing to seek, a sort and a limit,
+// an index in sort order is read whole so the find can stop early.
+fn plan(state: &CollState, filter: &Filter, sort: Option<&Sort>, limited: bool) -> Planned {
+    let fixed = fixed_paths(filter);
+    let sorts = |paths: &[&str]| sort.is_some_and(|s| key_order_sorts(paths, &s.0, &fixed));
     let score = |s: &Seek| (s.points, s.ranged);
-    let mut best = match seek_for(filter, &["_id"], false) {
-        Some(seek) => Plan::Id(seek),
-        None => Plan::CollScan,
+    let mut best = Planned {
+        plan: match seek_for(filter, &["_id"], false) {
+            Some(seek) => Plan::Id(seek),
+            None => Plan::CollScan,
+        },
+        sorted: sorts(&["_id"]),
     };
+    let mut in_order = None;
     for ix in &state.indexes {
-        let paths: Vec<&str> = ix.keys.iter().map(|(p, _)| p.as_str()).collect();
-        let Some(seek) = seek_for(filter, &paths, ix.multikey.load(Ordering::SeqCst)) else {
+        let multikey = ix.multikey.load(Ordering::SeqCst);
+        // Keys end with the _id (unique ones have no ties to break).
+        let mut paths: Vec<&str> = ix.keys.iter().map(|(p, _)| p.as_str()).collect();
+        paths.push("_id");
+        // A multikey index holds a document once per element: not a sort.
+        let sorted = !multikey && sorts(&paths);
+        let Some(seek) = seek_for(filter, &paths[..ix.keys.len()], multikey) else {
+            if sorted && in_order.is_none() {
+                in_order = Some(ix.clone());
+            }
             continue;
         };
-        let better = match &best {
+        let better = match &best.plan {
             Plan::CollScan => true,
-            Plan::Id(b) | Plan::Index(_, b) => score(&seek) > score(b),
+            Plan::Id(b) | Plan::Index(_, b) => (score(&seek), sorted) > (score(b), best.sorted),
         };
         if better {
-            best = Plan::Index(ix.clone(), seek);
+            best = Planned { plan: Plan::Index(ix.clone(), seek), sorted };
         }
+    }
+    if !best.sorted
+        && limited
+        && matches!(best.plan, Plan::CollScan)
+        && let Some(ix) = in_order
+    {
+        let whole = Seek { ranges: vec![KeyRange::prefix(vec![])], points: 0, ranged: false };
+        best = Planned { plan: Plan::Index(ix, whole), sorted: true };
     }
     best
 }

@@ -309,3 +309,72 @@ fn test_collections_and_indexes_persist_across_reopen() {
 fn stage_file(c: &Collection<std::fs::File>, filter: &str) -> String {
     c.explain(d(filter)).unwrap().get("stage").unwrap().to_json().replace('"', "")
 }
+
+#[test]
+fn test_indexes_supply_sort_order_with_the_same_results() {
+    let client = client("sqjson_index_sort");
+    let plain = client.database("t").collection("plain");
+    let indexed = client.database("t").collection("indexed");
+    // A mix of types, ties and missing fields.
+    let docs: Vec<Document> = (0..300)
+        .map(|i| {
+            let a = match i % 11 {
+                0 => String::new(),
+                1 => r#""a": null,"#.into(),
+                2 => format!(r#""a": "s{}","#, i % 4),
+                3 => format!(r#""a": {}.5,"#, i % 6),
+                _ => format!(r#""a": {},"#, i % 6),
+            };
+            d(&format!(r#"{{"_id": {}, {a} "b": {}, "c": {}}}"#, (i * 7919) % 300, i % 5, i % 3))
+        })
+        .collect();
+    plain.insert_many(docs.clone()).unwrap();
+    indexed.insert_many(docs).unwrap();
+    indexed.create_index(d(r#"{"a": 1}"#), IndexOptions::default()).unwrap();
+    indexed.create_index(d(r#"{"b": 1, "a": 1}"#), IndexOptions::default()).unwrap();
+    let cases = [
+        (r#"{}"#, r#"{"a": 1}"#, Some(7), "IXSCAN a_1 index"),
+        (r#"{}"#, r#"{"a": 1, "_id": 1}"#, Some(20), "IXSCAN a_1 index"),
+        (r#"{"a": {"$gte": 2}}"#, r#"{"a": 1}"#, None, "IXSCAN a_1 index"),
+        (r#"{"b": 3}"#, r#"{"a": 1}"#, Some(5), "IXSCAN b_1_a_1 index"),
+        (r#"{"b": 3}"#, r#"{"b": 1, "a": 1}"#, None, "IXSCAN b_1_a_1 index"),
+        (r#"{"b": {"$in": [1, 3]}}"#, r#"{"b": 1, "a": 1}"#, Some(12), "IXSCAN b_1_a_1 index"),
+        (r#"{"b": {"$in": [1, 3]}}"#, r#"{"a": 1}"#, Some(12), "IXSCAN b_1_a_1 memory"),
+        (r#"{"c": 1}"#, r#"{"_id": 1}"#, Some(9), "COLLSCAN index"),
+        (r#"{"_id": {"$gt": 100}}"#, r#"{"_id": 1}"#, Some(9), "IXSCAN _id_ index"),
+        (r#"{}"#, r#"{"a": -1}"#, Some(7), "COLLSCAN memory"),
+        (r#"{"c": 2}"#, r#"{"a": 1}"#, None, "COLLSCAN memory"),
+        (r#"{"c": 2}"#, r#"{"a": 1}"#, Some(4), "IXSCAN a_1 index"),
+    ];
+    for (filter, sort, limit, expected) in cases {
+        let mut options = FindOptions::new().sort(d(sort)).skip(2);
+        if let Some(l) = limit {
+            options = options.limit(l);
+        }
+        let e = indexed.explain_find(d(filter), &options).unwrap();
+        let mut how = e.get("stage").unwrap().to_json();
+        if let Some(n) = e.get("indexName") {
+            how = format!("{how} {}", n.to_json());
+        }
+        let how = format!("{how} {}", e.get("sort").unwrap().to_json()).replace('"', "");
+        assert_eq!(how, expected, "{filter} {sort}");
+        // Ties may come out in any order: compare the sort fields, then the
+        // documents as sets.
+        let got = indexed.find(d(filter), options.clone()).unwrap();
+        let want = plain.find(d(filter), options.clone()).unwrap();
+        let keys = |docs: &[Document]| {
+            let fields: Vec<String> = Document::parse(sort).unwrap().iter().map(|(k, _)| k.clone()).collect();
+            docs.iter()
+                .map(|doc| fields.iter().map(|f| doc.get(f).map(Value::to_json).unwrap_or("null".into())).collect::<Vec<_>>().join("/"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&got), keys(&want), "{filter} {sort}");
+        if limit.is_none() {
+            let mut g: Vec<String> = got.iter().map(Document::to_json).collect();
+            let mut w: Vec<String> = want.iter().map(Document::to_json).collect();
+            g.sort();
+            w.sort();
+            assert_eq!(g, w, "{filter} {sort}");
+        }
+    }
+}
