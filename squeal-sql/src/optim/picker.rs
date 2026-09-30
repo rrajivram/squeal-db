@@ -675,7 +675,9 @@ pub(crate) fn pick_access(
 const KEY_ORDER_READ_PERCENT: usize = 125;
 
 // What sorting costs, in the same units as reading: per comparison.
-const SORT_BYTES_PER_COMPARE: f64 = 8.0;
+// Measured: sorting 30k rows in memory added 1-2 ms to a 32 ms scan of
+// them (~4 MB of reading in these units), about 0.4 per comparison.
+pub(crate) const SORT_BYTES_PER_COMPARE: f64 = 0.5;
 
 // The share of a column's non-NULL values a range keeps: by its bounds'
 // position between the column's min and max, for numbers and datetimes;

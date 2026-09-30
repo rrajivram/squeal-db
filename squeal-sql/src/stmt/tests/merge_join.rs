@@ -84,18 +84,23 @@ fn joined(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<Row> {
 #[test]
 fn test_every_join_type_merges_inputs_in_key_order() {
     let c = setup();
-    for col in ["k", "s"] {
+    // The integer key's index entries are smaller than the rows, so reading
+    // it in order is the cheap way in: merged. The string key's entries
+    // aren't, so either plan may win there; the rows must be right anyway.
+    for (col, merged) in [("k", true), ("s", false)] {
         for kind in ["inner", "left", "right", "full"] {
             let sql = format!("select a.id, b.id from a {kind} join b on a.{col} = b.{col}");
             let plan = explain(&c, &sql);
-            assert!(
-                plan.contains("SortMergeJoin") && plan.contains("inputs in key order"),
-                "{sql}\n{plan}"
-            );
-            assert!(
-                !plan.contains("Sort ") && !plan.contains("TopN"),
-                "{sql}\n{plan}"
-            );
+            if merged {
+                assert!(
+                    plan.contains("SortMergeJoin") && plan.contains("inputs in key order"),
+                    "{sql}\n{plan}"
+                );
+                assert!(
+                    !plan.contains("Sort ") && !plan.contains("TopN"),
+                    "{sql}\n{plan}"
+                );
+            }
             let got = joined(&c, &sql);
             assert_eq!(got, reference(&c, kind, col), "{sql}");
             assert!(!got.is_empty());
@@ -138,4 +143,65 @@ fn test_a_merge_join_with_where_conditions_on_either_side() {
         .collect();
     assert_eq!(joined(&c, sql), expected);
     assert!(!expected.is_empty());
+}
+
+// The merge's output comes in key order: a GROUP BY or ORDER BY on the
+// join key needs no sort of its own.
+#[test]
+fn test_grouping_or_ordering_by_the_join_key_needs_no_sort() {
+    let c = setup();
+    let sql = "select a.k, count(*) from a join b on a.k = b.k group by a.k";
+    let plan = explain(&c, sql);
+    assert!(plan.contains("SortMergeJoin"), "{plan}");
+    assert!(!plan.contains("Sort "), "{plan}");
+    // By hand: per key, (a rows with it) x (b rows with it).
+    let count = |t: &str| {
+        let mut m = std::collections::BTreeMap::new();
+        for r in select_rows(&c, &format!("select k from {t}")).1 {
+            if let ValueItem::Integer(k) = r[0] {
+                *m.entry(k).or_insert(0i64) += 1;
+            }
+        }
+        m
+    };
+    let (a, b) = (count("a"), count("b"));
+    let expected: Vec<Row> = a
+        .iter()
+        .filter_map(|(k, n)| {
+            b.get(k)
+                .map(|m| vec![ValueItem::Integer(*k), ValueItem::Integer(n * m)])
+        })
+        .collect();
+    // Grouped in key order already, so compare as returned.
+    assert_eq!(select_rows(&c, sql).1, expected);
+
+    // The right side's key works too, and ORDER BY with a LIMIT stops early.
+    let plan = explain(
+        &c,
+        "select b.k, count(*) from a join b on a.k = b.k group by b.k",
+    );
+    assert!(!plan.contains("Sort "), "{plan}");
+    let sql = "select a.k, a.id, b.id from a join b on a.k = b.k order by a.k limit 5";
+    let plan = explain(&c, sql);
+    assert!(
+        plan.contains("SortMergeJoin") && !plan.contains("TopN"),
+        "{plan}"
+    );
+    let got = select_rows(&c, sql).1;
+    assert_eq!(got.len(), 5);
+    assert_eq!(
+        got[0][0],
+        ValueItem::Integer(*a.keys().find(|k| b.contains_key(k)).unwrap())
+    );
+    assert!(got.windows(2).all(|w| w[0][0] <= w[1][0]), "{got:?}");
+
+    // Not the join key: sorted as usual.
+    let plan = explain(
+        &c,
+        "select a.id, count(*) from a join b on a.k = b.k group by a.id",
+    );
+    assert!(
+        plan.contains("Sort ") || !plan.contains("SortMergeJoin"),
+        "{plan}"
+    );
 }

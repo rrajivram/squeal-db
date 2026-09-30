@@ -21,8 +21,8 @@ use crate::{
     error::SchemaError,
     optim::{
         picker::{
-            Access, AccessPath, ItemNeeds, OrderWanted, analyze_query, filtered_rows, pick_access,
-            pick_join_seek,
+            Access, AccessPath, ItemNeeds, OrderWanted, SORT_BYTES_PER_COMPARE, analyze_query,
+            filtered_rows, pick_access, pick_join_seek,
         },
         table_stats::{ComputedTableStat, compute_table_stats},
     },
@@ -349,12 +349,73 @@ impl WhereJoins {
 const HASH_BYTES_PER_BUILD_ROW: f64 = 32.0;
 
 // A merge join's plan (see QueryVisitor::merge_plan): the orders to read
-// the two tables in, and the key fields in each one's row.
+// the two tables in, the key fields in each one's row, and the order its
+// output comes in.
 struct MergePlan {
     base_order: OrderWanted,
     inner_order: OrderWanted,
     left_fields: Vec<usize>,
     right_fields: Vec<usize>,
+    order: MergeOrder,
+}
+
+// The orders the query would like its joined rows in: ORDER BY's columns
+// (with NULLs-first), GROUP BY's, and which combined-row columns may hold
+// NULL. Empty unless one merge join is the query's only join.
+#[derive(Default)]
+struct WantedOrder {
+    order: Option<Vec<(usize, bool)>>,
+    group: Option<Vec<usize>>,
+    nullable: Vec<bool>,
+}
+
+// The order a merge join's output rows come in, as combined-row positions:
+// each list is a column sequence the rows ascend by. An inner join's rows
+// ascend by both sides' keys (they are equal) and hold no NULL keys; a LEFT
+// join's by the left key only (the right one is NULL where nothing
+// matched), with any NULL left keys first; a RIGHT join's by the right key
+// likewise; a FULL join's by neither alone.
+struct MergeOrder {
+    orders: Vec<(Vec<usize>, bool)>,
+}
+
+impl MergeOrder {
+    fn new(left: &[usize], right: &[usize], width: usize, join_type: JoinType) -> Self {
+        let left = left.to_vec();
+        let right: Vec<usize> = right.iter().map(|r| r + width).collect();
+        let orders = match join_type {
+            JoinType::Inner => vec![(left, false), (right, false)],
+            JoinType::Left => vec![(left, true)],
+            JoinType::Right => vec![(right, true)],
+            JoinType::Full | JoinType::Cross => vec![],
+        };
+        Self { orders }
+    }
+
+    // GROUP BY only needs equal keys next to each other: its columns must be
+    // the leading columns of an order, in any arrangement.
+    fn gives_group(&self, wanted: &WantedOrder) -> bool {
+        let Some(group) = &wanted.group else {
+            return false;
+        };
+        self.orders.iter().any(|(cols, _)| {
+            group.len() <= cols.len() && group.iter().all(|g| cols[..group.len()].contains(g))
+        })
+    }
+
+    // ORDER BY needs exactly an order's leading columns, and NULLs where the
+    // join puts them: first, unless there can't be any.
+    fn gives_order(&self, wanted: &WantedOrder) -> bool {
+        let Some(order) = &wanted.order else {
+            return false;
+        };
+        self.orders.iter().any(|(cols, null_keys)| {
+            order.len() <= cols.len()
+                && order.iter().zip(cols).all(|((c, nulls_first), k)| {
+                    c == k && (*nulls_first || !null_keys || !wanted.nullable[*c])
+                })
+        })
+    }
 }
 
 // The AND-ed terms of a condition.
@@ -622,26 +683,55 @@ where
         // The order ORDER BY wants, when one table's key could provide it:
         // a single table, nothing grouping or deduplicating rows, and every
         // ORDER BY item an ascending plain column of it.
-        let order_wanted = match (order_by, tables.as_slice()) {
-            (Some(order), [only]) if only.joins.is_empty() && !has_aggregation && !distinct => {
-                order
-                    .items
-                    .items()
-                    .map(|item| {
-                        let ascending = item.direction.map(|d| d.is_left()).unwrap_or(true);
-                        let nulls_first = item.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
-                        let i =
-                            SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
-                                .ok()?;
-                        match projected_fields[i].expr {
-                            EvalExpr::Value(column) if ascending => Some((column, nulls_first)),
-                            _ => None,
-                        }
-                    })
-                    .collect::<Option<Vec<_>>>()
-                    .map(|columns| OrderWanted { columns, limit })
-            }
+        // ORDER BY as ascending plain columns of the combined row (with
+        // whether NULLs come first), when it is that simple and applies to
+        // the rows as read (no grouping or deduplicating first).
+        let order_columns: Option<Vec<(usize, bool)>> = match order_by {
+            Some(order) if !has_aggregation && !distinct => order
+                .items
+                .items()
+                .map(|item| {
+                    let ascending = item.direction.map(|d| d.is_left()).unwrap_or(true);
+                    let nulls_first = item.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
+                    let i = SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
+                        .ok()?;
+                    match projected_fields[i].expr {
+                        EvalExpr::Value(column) if ascending => Some((column, nulls_first)),
+                        _ => None,
+                    }
+                })
+                .collect(),
             _ => None,
+        };
+        // GROUP BY's columns, when they are all plain columns.
+        let group_positions: Option<Vec<usize>> = group_by
+            .iter()
+            .map(|e| match e {
+                EvalExpr::Value(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        // The order a single table's key could give (see picker).
+        let order_wanted = match (&order_columns, tables.as_slice()) {
+            (Some(columns), [only]) if only.joins.is_empty() => Some(OrderWanted {
+                columns: columns.clone(),
+                limit,
+            }),
+            _ => None,
+        };
+        // What a merge join's output order could save: the ORDER BY or GROUP
+        // BY sort, when the join is the query's only one (anything after it
+        // would scramble the order).
+        let wants_order = match tables.as_slice() {
+            [only] if only.joins.len() == 1 => WantedOrder {
+                order: order_columns.clone(),
+                group: group_positions.clone().filter(|g| !g.is_empty()),
+                nullable: flat_tables
+                    .iter()
+                    .flat_map(|t| t.fields.iter().map(|f| f.nullable))
+                    .collect(),
+            },
+            _ => WantedOrder::default(),
         };
         // needs is in flat order: each FROM item, then its joined relations.
         let mut accesses = vec![];
@@ -649,6 +739,9 @@ where
         // read exactly by its seek), so the top-level WHERE can leave them.
         let mut pushed = vec![];
         let all_needs = &needs;
+        // A merge join's output order, when it is the query's only join (see
+        // WantedOrder): what may spare GROUP BY or ORDER BY their sorts.
+        let mut merged_order: Option<MergeOrder> = None;
         let mut needs = needs.iter();
         let mut sources = vec![];
         // Per top-level item: its estimated rows (when known), its row's
@@ -662,7 +755,13 @@ where
             // Read this table in the order a merge join with its first
             // joined table would want, when that plan wins (see merge_plan).
             let merge = match table.joins.first() {
-                Some(j) => self.merge_plan(table, needs_t, j, all_needs.get(accesses.len() + 1)),
+                Some(j) => self.merge_plan(
+                    table,
+                    needs_t,
+                    j,
+                    all_needs.get(accesses.len() + 1),
+                    &wants_order,
+                ),
                 None => None,
             };
             let base_order = merge
@@ -708,6 +807,17 @@ where
                     pushed.push(true);
                     let outer = std::mem::replace(&mut combined, Box::new(UnionJoin::new(vec![])?));
                     let db = self.conn.database.read().db.clone();
+                    if let Some(m) = merge.filter(|_| inner_sorted)
+                        && table.joins.len() == 1
+                        && tables.len() == 1
+                    {
+                        merged_order = Some(MergeOrder::new(
+                            &m.left_fields,
+                            &m.right_fields,
+                            table.fields.len(),
+                            j.join_type,
+                        ));
+                    }
                     combined = match merge {
                         // Both sides arrive in join-key order: merge them in
                         // one pass, no sort, no hash table.
@@ -860,7 +970,14 @@ where
         let projected: Box<dyn Source> = if has_aggregation {
             let key_positions =
                 self.validate_aggreations(&projected_fields, &flat_tables, &select.group_by)?;
-            let grouped_source: Box<dyn Source> = if key_positions.is_empty() {
+            // Rows already grouped: a merge join's output, in key order.
+            let already_grouped = merged_order.as_ref().is_some_and(|m| {
+                m.gives_group(&WantedOrder {
+                    group: Some(key_positions.clone()),
+                    ..WantedOrder::default()
+                })
+            });
+            let grouped_source: Box<dyn Source> = if key_positions.is_empty() || already_grouped {
                 for_proj
             } else {
                 Box::new(SortSource::with_fields(
@@ -899,7 +1016,11 @@ where
             projected
         };
 
-        let sorted = order_wanted.is_some() && matches!(accesses.as_slice(), [Some(a)] if a.sorted);
+        let sorted = (order_wanted.is_some()
+            && matches!(accesses.as_slice(), [Some(a)] if a.sorted))
+            || merged_order
+                .as_ref()
+                .is_some_and(|m| m.gives_order(&wants_order));
         Ok(SourceHolder {
             source,
             hidden,
@@ -1044,6 +1165,7 @@ where
         base_needs: Option<&ItemNeeds>,
         j: &JoinRelation<F>,
         j_needs: Option<&ItemNeeds>,
+        wanted: &WantedOrder,
     ) -> Option<MergePlan> {
         let (TableRef::Real(_, base_table), TableRef::Real(_, inner_table)) =
             (&base.resolved, &j.relation.resolved)
@@ -1114,13 +1236,21 @@ where
         }
         let merge_cost = base_ordered.cost? + inner_ordered.cost?;
         let build_rows = base_plain.rows?.min(inner_plain.rows?) as f64;
-        let hash_cost =
+        let mut hash_cost =
             base_plain.cost? + inner_plain.cost? + build_rows * HASH_BYTES_PER_BUILD_ROW;
+        // The merge's output order may also save the query a sort (see
+        // MergeOrder::saves), which hashing would still need.
+        let order = MergeOrder::new(&left_fields, &right_fields, width, j.join_type);
+        if order.gives_group(wanted) || order.gives_order(wanted) {
+            let n = (base_plain.rows? + inner_plain.rows?) as f64;
+            hash_cost += n * (n + 1.0).log2() * SORT_BYTES_PER_COMPARE;
+        }
         (merge_cost <= hash_cost).then(|| MergePlan {
             base_order,
             inner_order,
             left_fields,
             right_fields,
+            order,
         })
     }
 
