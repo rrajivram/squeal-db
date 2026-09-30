@@ -345,7 +345,13 @@ where
                 (None, None) => return Ok(None),
                 (Some(_), None) => Ordering::Less,
                 (None, Some(_)) => Ordering::Greater,
-                (Some(l), Some(r)) => self.matcher.cmp_keys(l, r),
+                // Equal NULL keys order together but never match (see
+                // JoinMatcher::keys_match): the left row goes by unmatched,
+                // and the right rows after it, as they come up behind.
+                (Some(l), Some(r)) => match self.matcher.cmp_keys(l, r) {
+                    Ordering::Equal if !self.matcher.keys_match(l, r) => Ordering::Less,
+                    order => order,
+                },
             };
             match order {
                 Ordering::Less => {
@@ -527,7 +533,8 @@ mod tests {
         out
     }
 
-    // Independent of JoinMatcher: plain nested loops over ValueItem ==.
+    // Independent of JoinMatcher: plain nested loops over ValueItem ==, with
+    // SQL's rule that a NULL key matches nothing.
     fn oracle(left: &[Row], right: &[Row], t: JoinType) -> Vec<Row> {
         let (keep_l, keep_r) = match t {
             JoinType::Inner => (false, false),
@@ -541,7 +548,7 @@ mod tests {
         for l in left {
             let mut hit = false;
             for (i, r) in right.iter().enumerate() {
-                if l[0] == r[0] {
+                if l[0] != ValueItem::Null && l[0] == r[0] {
                     hit = true;
                     right_hit[i] = true;
                     out.push([l.clone(), r.clone()].concat());

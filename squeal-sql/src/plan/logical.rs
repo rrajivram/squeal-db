@@ -17,15 +17,20 @@ use store::{clock::Instant, db::DBFile, txn::Transaction};
 use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
+    datatype::DataType,
     error::SchemaError,
     optim::{
-        picker::{AccessPath, ItemNeeds, analyze_query, pick_access},
+        picker::{
+            Access, AccessPath, ItemNeeds, OrderWanted, analyze_query, filtered_rows, pick_access,
+            pick_join_seek,
+        },
         table_stats::{ComputedTableStat, compute_table_stats},
     },
     plan::{
-        conjuncts::{Conjuncts, TableShape, null_supplied_tables},
+        conjuncts::{ConjunctKind, Conjuncts, TableShape, null_supplied_tables},
         eval::EvalExpr,
         memory::QueryMemory,
+        sarg::condition_set,
     },
     rslt::resultset::StreamingResultSet,
     source::{
@@ -35,6 +40,7 @@ use crate::{
         index::IndexSource,
         join::{JoinSource, JoinType, UnionJoin},
         limit::Limit,
+        nestloop::NestedLoopJoin,
         planinfo::PlanNode,
         proj::Projection,
         run::RunSource,
@@ -337,12 +343,29 @@ impl WhereJoins {
     }
 }
 
+// The AND-ed terms of a condition.
+fn conjunct_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
+    match e {
+        EvalExpr::Binary {
+            lhs,
+            op: BinaryOp::And,
+            rhs,
+        } => {
+            conjunct_terms(lhs, out);
+            conjunct_terms(rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
 struct SourceHolder {
     source: Box<dyn Source>,
     // How many columns at the END of `source`'s rows are not part of the
     // SELECT list: ORDER BY columns handle_select had to add so the sort
     // can see them. plan_query drops them again after sorting.
     hidden: usize,
+    // The rows already come out in ORDER BY's order.
+    sorted: bool,
 }
 
 impl<F> Visitor for QueryVisitor<F>
@@ -420,10 +443,6 @@ where
                 "a query body other than a plain SELECT".into(),
             ));
         };
-        let SourceHolder { source, hidden } =
-            self.handle_select(select, query.order_by.as_ref())?;
-        let mut step = source;
-
         // Resolved once, up front, and used by BOTH the ORDER BY and
         // no-ORDER-BY paths below — previously this was only ever
         // computed (and therefore ORDER BY only ever applied) inside
@@ -442,8 +461,20 @@ where
             },
             None => None,
         };
+        let SourceHolder {
+            source,
+            hidden,
+            sorted,
+        } = self.handle_select(select, query.order_by.as_ref(), limit_count)?;
+        let mut step = source;
 
-        if let Some(order) = &query.order_by {
+        // Already in ORDER BY's order (read through a key that gives it —
+        // see optim::picker::OrderWanted): no sort, just the LIMIT.
+        if sorted {
+            if let Some(limit_count) = limit_count {
+                step = Box::new(Limit::new(step, limit_count));
+            }
+        } else if let Some(order) = &query.order_by {
             step = Box::new(SortSource::create_from(
                 step,
                 order,
@@ -487,6 +518,7 @@ where
         &mut self,
         select: &sql_parser::query::SelectCore,
         order_by: Option<&OrderByClause>,
+        limit: Option<usize>,
     ) -> Result<SourceHolder, SchemaError> {
         let distinct = select.distinct.is_some();
         let tables = self.get_tables(&select.from)?;
@@ -573,24 +605,95 @@ where
             .chain(&group_by)
             .collect();
         let needs = analyze_query(&tables, &flat_tables, &shapes, &reads, wh_expr.as_ref());
+        // The order ORDER BY wants, when one table's key could provide it:
+        // a single table, nothing grouping or deduplicating rows, and every
+        // ORDER BY item an ascending plain column of it.
+        let order_wanted = match (order_by, tables.as_slice()) {
+            (Some(order), [only]) if only.joins.is_empty() && !has_aggregation && !distinct => {
+                order
+                    .items
+                    .items()
+                    .map(|item| {
+                        let ascending = item.direction.map(|d| d.is_left()).unwrap_or(true);
+                        let nulls_first = item.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
+                        let i =
+                            SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
+                                .ok()?;
+                        match projected_fields[i].expr {
+                            EvalExpr::Value(column) if ascending => Some((column, nulls_first)),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .map(|columns| OrderWanted { columns, limit })
+            }
+            _ => None,
+        };
         // needs is in flat order: each FROM item, then its joined relations.
+        let mut accesses = vec![];
+        // Per flat item: its WHERE conditions were applied at its scan (or
+        // read exactly by its seek), so the top-level WHERE can leave them.
+        let mut pushed = vec![];
+        let all_needs = &needs;
         let mut needs = needs.iter();
         let mut sources = vec![];
+        // Per top-level item: its estimated rows (when known), its row's
+        // column types, and its first flat index.
+        let mut item_rows = vec![];
+        let mut item_types = vec![];
+        let mut item_start = vec![];
         for table in tables.iter() {
-            let mut combined = self.open_item(table, needs.next())?;
+            item_start.push(accesses.len());
+            let needs_t = needs.next();
+            let (combined, access) = self.open_item(table, needs_t, order_wanted.as_ref())?;
+            let (mut combined, rows) =
+                self.push_filters(combined, table, needs_t, access.as_ref())?;
+            // Rows so far on the join's outer side, when known — what decides
+            // whether seeking the next table per row beats a hash join.
+            let mut outer_rows = rows;
+            accesses.push(access);
+            pushed.push(true);
+            // The column types of the joined-so-far row, which each join's
+            // ON positions index (see get_tables).
+            let mut left_types: Vec<DataType> = table.fields.iter().map(|f| f.datatype).collect();
             for j in &table.joins {
-                let relation = self.open_item(&j.relation, needs.next())?;
-
-                combined = Box::new(JoinSource::new(
-                    combined,
-                    relation,
-                    j.on_expr.clone(),
+                let needs_j = needs.next();
+                if let Some(join) = self.nested_loop_join(
+                    &mut combined,
                     j.join_type,
-                    self.conn.database.read().db.clone(),
-                    self.mem.clone(),
-                )?);
+                    &j.relation,
+                    &j.on_expr,
+                    needs_j,
+                    outer_rows,
+                    &left_types,
+                )? {
+                    outer_rows = outer_rows.map(|r| r * join.1);
+                    combined = join.0;
+                    accesses.push(None);
+                    // Its rows come from the join itself: WHERE checks them.
+                    pushed.push(false);
+                } else {
+                    let (relation, access) = self.open_item(&j.relation, needs_j, None)?;
+                    let (relation, _) =
+                        self.push_filters(relation, &j.relation, needs_j, access.as_ref())?;
+                    accesses.push(access);
+                    pushed.push(true);
+                    let outer = std::mem::replace(&mut combined, Box::new(UnionJoin::new(vec![])?));
+                    combined = Box::new(JoinSource::new(
+                        outer,
+                        relation,
+                        j.on_expr.clone(),
+                        j.join_type,
+                        self.conn.database.read().db.clone(),
+                        self.mem.clone(),
+                    )?);
+                    outer_rows = None;
+                }
+                left_types.extend(j.relation.fields.iter().map(|f| f.datatype));
             }
             sources.push(combined);
+            item_rows.push(outer_rows);
+            item_types.push(left_types);
         }
         // Top-level FROM items (`FROM a, b, c`) are implicitly cross joined,
         // but a WHERE equality between two of them (`a.id = b.id`) is
@@ -626,22 +729,76 @@ where
         } else {
             let mut items = sources.into_iter();
             let mut combined = items.next().expect("more than one source");
+            let mut rows = item_rows[0];
+            let mut types = item_types[0].clone();
             for (k, next) in items.enumerate() {
                 let k = k + 1;
-                combined = match links.on_expr_for(k) {
-                    Some(on_expr) => Box::new(JoinSource::new(
-                        combined,
-                        next,
-                        on_expr,
-                        JoinType::Inner,
-                        self.conn.database.read().db.clone(),
-                        self.mem.clone(),
-                    )?),
-                    None => Box::new(UnionJoin::new(vec![combined, next])?),
-                };
+                match links.on_expr_for(k) {
+                    Some(on_expr) => {
+                        // An item that is one table can be joined by seeking
+                        // it per row, like an ON join (its own scan, opened
+                        // above, then goes unused).
+                        let flat = item_start[k];
+                        let seek = if tables[k].joins.is_empty() {
+                            self.nested_loop_join(
+                                &mut combined,
+                                JoinType::Inner,
+                                &tables[k],
+                                &on_expr,
+                                all_needs.get(flat),
+                                rows,
+                                &types,
+                            )?
+                        } else {
+                            None
+                        };
+                        if let Some((join, per_row)) = seek {
+                            combined = join;
+                            rows = rows.map(|r| r * per_row);
+                            accesses[flat] = None;
+                            pushed[flat] = false;
+                        } else {
+                            combined = Box::new(JoinSource::new(
+                                combined,
+                                next,
+                                on_expr,
+                                JoinType::Inner,
+                                self.conn.database.read().db.clone(),
+                                self.mem.clone(),
+                            )?);
+                            rows = None;
+                        }
+                    }
+                    None => {
+                        combined = Box::new(UnionJoin::new(vec![combined, next])?);
+                        rows = None;
+                    }
+                }
+                types.extend(item_types[k].iter().copied());
             }
             combined
         };
+        // WHERE, less the conditions already applied to one table: those
+        // local to it and applicable before any join, which push_filters
+        // checked at its scan (or its seek read exactly). Every row that
+        // table contributes satisfies them, and joins never change a row's
+        // values.
+        let wh_expr = wh_expr.and_then(|wh| {
+            let conjuncts = Conjuncts::analyze(Some(&wh), &shapes);
+            let checked: Vec<_> = conjuncts
+                .iter()
+                .filter(|c| {
+                    let ConjunctKind::Local(t) = c.kind else {
+                        return true;
+                    };
+                    let applied = c.pushable
+                        && pushed.get(t) == Some(&true)
+                        && c.local_expr(&conjuncts).is_some();
+                    !applied
+                })
+                .collect();
+            Conjuncts::and_all(checked)
+        });
         let for_proj: Box<dyn Source> = if let Some(wh_expr) = wh_expr {
             Box::new(WhereSource::new(union, wh_expr)?)
         } else {
@@ -700,7 +857,12 @@ where
             projected
         };
 
-        Ok(SourceHolder { source, hidden })
+        let sorted = order_wanted.is_some() && matches!(accesses.as_slice(), [Some(a)] if a.sorted);
+        Ok(SourceHolder {
+            source,
+            hidden,
+            sorted,
+        })
     }
 
     fn get_projections(
@@ -826,18 +988,158 @@ where
     // Opens one FROM item. A real table is read the way optim::picker
     // chooses (a scan or seek of the table or one of its indexes); anything
     // else is opened as is.
+    // Applies a FROM item's own WHERE conditions (ItemNeeds::filters, the
+    // stated ones) right at its scan, below any join, leaving out those its
+    // seek reads exactly (Access::enforced). Returns the source and how
+    // many rows it is expected to produce, when known.
+    fn push_filters(
+        &self,
+        source: Box<dyn Source>,
+        item: &TableQuery<F>,
+        needs: Option<&ItemNeeds>,
+        access: Option<&Access>,
+    ) -> Result<(Box<dyn Source>, Option<usize>), SchemaError> {
+        let rows = access.and_then(|a| a.rows);
+        let Some(needs) = needs else {
+            return Ok((source, rows));
+        };
+        let types: Vec<DataType> = item.fields.iter().map(|f| f.datatype).collect();
+        let remaining: Vec<&EvalExpr> = needs.filters[..needs.stated]
+            .iter()
+            .filter(|f| {
+                let enforced = access.is_some_and(|a| {
+                    condition_set(f, &types).is_some_and(|(column, _)| a.enforced.contains(&column))
+                });
+                !enforced
+            })
+            .collect();
+        let rows = match (&item.resolved, rows) {
+            (TableRef::Real(_, table), Some(rows)) => {
+                Some(filtered_rows(table, item.stats.as_ref(), rows, &remaining))
+            }
+            _ => rows,
+        };
+        let filter = remaining
+            .into_iter()
+            .cloned()
+            .reduce(|l, r| EvalExpr::Binary {
+                lhs: Box::new(l),
+                op: BinaryOp::And,
+                rhs: Box::new(r),
+            });
+        Ok(match filter {
+            Some(filter) => (Box::new(WhereSource::new(source, filter)?), rows),
+            None => (source, rows),
+        })
+    }
+
+    // Joins `j`'s table onto `outer` by seeking it once per outer row (see
+    // source::nestloop), when optim::picker::pick_join_seek finds that
+    // cheaper than a hash join; returns the join and its rows per outer row.
+    // `outer` is taken only when it does. `left_types` are the outer row's
+    // column types.
+    #[allow(clippy::too_many_arguments)]
+    fn nested_loop_join(
+        &self,
+        outer: &mut Box<dyn Source>,
+        join_type: JoinType,
+        relation: &TableQuery<F>,
+        on_expr: &EvalExpr,
+        needs: Option<&ItemNeeds>,
+        outer_rows: Option<usize>,
+        left_types: &[DataType],
+    ) -> Result<Option<(Box<dyn Source>, usize)>, SchemaError> {
+        let (JoinType::Inner | JoinType::Left, TableRef::Real(_, table), Some(needs)) =
+            (join_type, &relation.resolved, needs)
+        else {
+            return Ok(None);
+        };
+        let Some(reader) = self
+            .conn
+            .with_current_txn(|explicit| explicit.or(self.stmt_txn.as_ref()).map(|t| t.id()))
+        else {
+            return Ok(None);
+        };
+        // The ON equalities between the outer row and this table.
+        let left_width = left_types.len();
+        let mut terms = vec![];
+        conjunct_terms(on_expr, &mut terms);
+        let pairs: Vec<(usize, usize, DataType)> = terms
+            .iter()
+            .filter_map(|t| match t {
+                EvalExpr::Binary {
+                    lhs,
+                    op: BinaryOp::Eq,
+                    rhs,
+                } => match (lhs.as_ref(), rhs.as_ref()) {
+                    (EvalExpr::Value(a), EvalExpr::Value(b))
+                        if *a < left_width && *b >= left_width =>
+                    {
+                        Some((*a, *b - left_width, left_types[*a]))
+                    }
+                    (EvalExpr::Value(b), EvalExpr::Value(a))
+                        if *a < left_width && *b >= left_width =>
+                    {
+                        Some((*a, *b - left_width, left_types[*a]))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let db = self.conn.database.read().db.clone();
+        let page_size = db.get_page_data_size();
+        // What a hash join would read of this table: however it would be
+        // read on its own.
+        let hash_rows = pick_access(table, relation.stats.as_ref(), needs, page_size, None)
+            .rows
+            .unwrap_or(usize::MAX / 2);
+        let Some(seek) = pick_join_seek(
+            table,
+            relation.stats.as_ref(),
+            &pairs,
+            outer_rows,
+            hash_rows,
+            page_size,
+        ) else {
+            return Ok(None);
+        };
+        let rows_per_key = seek.rows_per_key;
+        let outer = std::mem::replace(outer, Box::new(UnionJoin::new(vec![])?));
+        let join = NestedLoopJoin::new(
+            outer,
+            db,
+            reader,
+            table.clone(),
+            seek,
+            on_expr.clone(),
+            join_type,
+        )?;
+        Ok(Some((Box::new(join), rows_per_key)))
+    }
+
+    // Also returns the chosen access (None for anything but a real table),
+    // for what the rest of the plan can rely on (see picker::Access).
     fn open_item(
         &self,
         item: &TableQuery<F>,
         needs: Option<&ItemNeeds>,
-    ) -> Result<Box<dyn Source>, SchemaError> {
+        order: Option<&OrderWanted>,
+    ) -> Result<(Box<dyn Source>, Option<Access>), SchemaError> {
         let (TableRef::Real(_, table), Some(needs)) = (&item.resolved, needs) else {
-            return self.open(&item.resolved, item.stats.clone());
+            return Ok((self.open(&item.resolved, item.stats.clone())?, None));
         };
         let db = self.conn.database.read().db.clone();
-        let access = pick_access(table, item.stats.as_ref(), needs, db.get_page_data_size());
+        let access = pick_access(
+            table,
+            item.stats.as_ref(),
+            needs,
+            db.get_page_data_size(),
+            order,
+        );
         let stats = item.stats.clone();
-        self.conn.with_current_txn(|explicit| {
+        let chosen = access.clone();
+        let source = self.conn.with_current_txn(|explicit| {
             let txn = explicit.or(self.stmt_txn.as_ref());
             let source: Box<dyn Source> = match access.path {
                 AccessPath::TableScan => return item.resolved.open_source(&self.conn, stats, txn),
@@ -874,7 +1176,8 @@ where
                 )?),
             };
             Ok(source)
-        })
+        })?;
+        Ok((source, Some(chosen)))
     }
 
     fn flatten_tables(tables: &[TableQuery<F>]) -> Vec<TableQuery<F>> {

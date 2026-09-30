@@ -2251,10 +2251,23 @@ where
         txn: Option<&Transaction>,
         range: KeyRange,
     ) -> Result<RangeCursor<F>, StoreError> {
-        if let Some(txn) = txn {
-            self.require_active(&txn.id())?;
+        self.key_ranges_scan(tid, txn.map(|t| t.id()), vec![range])
+    }
+
+    // Every key within any of `ranges` — non-overlapping, read in the order
+    // given — as the transaction `reader` (which the caller keeps
+    // open for as long as the cursor is used), else a transaction of the
+    // cursor's own. No ranges reads nothing.
+    pub fn key_ranges_scan(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        reader: Option<TransactionId>,
+        ranges: Vec<KeyRange>,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        if let Some(reader) = reader {
+            self.require_active(&reader)?;
         }
-        RangeCursor::new_key_range(Arc::clone(self), tid, txn.map(|t| t.id()), range)
+        RangeCursor::new_key_ranges(Arc::clone(self), tid, reader, ranges)
     }
 
     // prefix_scan under `txn`; same contract as range_scan_bounds_in_txn.

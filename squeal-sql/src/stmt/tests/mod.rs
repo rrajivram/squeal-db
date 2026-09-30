@@ -2190,6 +2190,8 @@ fn test_order_by_desc_without_limit_is_applied() {
 
 mod index_scan;
 mod index_seek;
+mod nested_loop;
+mod ordering;
 
 #[cfg(test)]
 mod join_tests {
@@ -2818,7 +2820,8 @@ fn test_explain_shows_the_filter_predicate_with_column_names() {
     let c = subquery_conn();
     assert_eq!(
         explain(&c, "select id from t1 where cat = 1 and id > 2"),
-        "Projection id\n  Filter ((cat = 1) AND (id > 2))\n    TableSeek t1 (id > 2) (~4 rows)"
+        // id > 2 is read exactly by the seek, so only cat = 1 is checked.
+        "Projection id\n  Filter (cat = 1)\n    TableSeek t1 (id > 2) (~4 rows)"
     );
 }
 
@@ -2846,9 +2849,14 @@ fn test_explain_shows_sort_topn_limit() {
         explain(&c, "select id from t1 order by id desc"),
         "Sort id DESC\n  Projection id\n    TableScan t1 (~5 rows)"
     );
+    // The primary key gives this order: no sort, reading stops at 2.
     assert_eq!(
         explain(&c, "select id from t1 order by id limit 2"),
-        "TopN 2 by id ASC\n  Projection id\n    TableScan t1 (~5 rows)"
+        "Limit 2\n  Projection id\n    TableScan t1 (in id order) (~5 rows)"
+    );
+    assert_eq!(
+        explain(&c, "select cat from t1 order by cat limit 2"),
+        "TopN 2 by cat ASC\n  Projection cat\n    TableScan t1 (~5 rows)"
     );
     assert_eq!(
         explain(&c, "select id from t1 limit 3"),

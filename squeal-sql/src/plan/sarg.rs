@@ -75,60 +75,266 @@ fn tighter(a: Bound<ValueItem>, b: Bound<ValueItem>, wins: Ordering) -> Bound<Va
     }
 }
 
+/// The values one column may take: a set of points (`x = 1`, `x IN (1, 3)`
+/// — sorted, distinct, never NULL; empty when nothing can match) or a range.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ColumnSet {
+    Points(Vec<ValueItem>),
+    Range(ColumnRange),
+}
+
+impl ColumnSet {
+    fn from_range(r: ColumnRange) -> ColumnSet {
+        if let Some(v) = r.equal_value() {
+            return ColumnSet::Points(vec![v.clone()]);
+        }
+        // `x = 0` on a double column: both zeros (see double_column_range).
+        if let (Bound::Included(ValueItem::Double(a)), Bound::Included(ValueItem::Double(b))) =
+            (&r.lower, &r.upper)
+            && *a == 0.0
+            && *b == 0.0
+        {
+            return ColumnSet::points(vec![ValueItem::Double(-0.0), ValueItem::Double(0.0)]);
+        }
+        let as_key = KeyRange {
+            prefix: vec![],
+            lower: r.lower.clone(),
+            upper: r.upper.clone(),
+        };
+        if is_empty(&as_key) {
+            return ColumnSet::Points(vec![]);
+        }
+        ColumnSet::Range(r)
+    }
+
+    fn points(mut v: Vec<ValueItem>) -> ColumnSet {
+        v.sort();
+        v.dedup_by(|a, b| Ord::cmp(&*a, &*b) == Ordering::Equal);
+        ColumnSet::Points(v)
+    }
+
+    fn intersect(self, other: ColumnSet) -> ColumnSet {
+        use ColumnSet::*;
+        match (self, other) {
+            (Points(a), Points(b)) => Points(
+                a.into_iter()
+                    .filter(|x| b.iter().any(|y| x.cmp(y) == Ordering::Equal))
+                    .collect(),
+            ),
+            (Points(p), Range(r)) | (Range(r), Points(p)) => {
+                Points(p.into_iter().filter(|v| r.contains(v)).collect())
+            }
+            (Range(a), Range(b)) => ColumnSet::from_range(a.intersect(b)),
+        }
+    }
+}
+
+impl ColumnRange {
+    fn contains(&self, v: &ValueItem) -> bool {
+        let above = match &self.lower {
+            Bound::Included(lo) => v >= lo,
+            Bound::Excluded(lo) => v > lo,
+            Bound::Unbounded => true,
+        };
+        let below = match &self.upper {
+            Bound::Included(hi) => v <= hi,
+            Bound::Excluded(hi) => v < hi,
+            Bound::Unbounded => true,
+        };
+        above && below
+    }
+}
+
 /// Every column (position within `types`, the row the filters read) that
 /// the conditions limit, and to what. `filters` are the WHERE conjuncts
 /// local to one table (see optim::picker::ItemNeeds::filters).
-pub(crate) fn column_ranges(
-    filters: &[EvalExpr],
-    types: &[DataType],
-) -> HashMap<usize, ColumnRange> {
-    let mut ranges: HashMap<usize, ColumnRange> = HashMap::new();
+pub(crate) fn column_sets(filters: &[EvalExpr], types: &[DataType]) -> HashMap<usize, ColumnSet> {
+    let mut sets: HashMap<usize, ColumnSet> = HashMap::new();
     for f in filters {
-        let Some((column, op, value)) = column_comparison(f) else {
+        let Some((column, set)) = condition_set(f, types) else {
             continue;
         };
-        let Some(datatype) = types.get(column) else {
-            continue;
+        let merged = match sets.remove(&column) {
+            Some(existing) => existing.intersect(set),
+            None => set,
         };
-        if let Some(range) = condition_range(*datatype, op, &value) {
-            let merged = match ranges.remove(&column) {
-                Some(existing) => existing.intersect(range),
-                None => range,
-            };
-            ranges.insert(column, merged);
-        }
+        sets.insert(column, merged);
     }
-    ranges
+    sets
 }
 
-/// The KeyRange covering every row the ranges allow, for a key made of
-/// `key_columns` (positions, in key order): equalities on its leading
-/// columns, then the range on the next one. None when the conditions don't
-/// limit the key's first column at all.
-pub(crate) fn key_range(
+/// The column a WHERE conjunct limits, and to what — a comparison with a
+/// constant, or an OR of equalities on one column (what `IN` becomes).
+/// None when it can't be used for a seek (see the module comment).
+pub(crate) fn condition_set(f: &EvalExpr, types: &[DataType]) -> Option<(usize, ColumnSet)> {
+    let mut terms = vec![];
+    or_terms(f, &mut terms);
+    if let [single] = terms.as_slice() {
+        let (column, op, value) = column_comparison(single)?;
+        let range = condition_range(*types.get(column)?, op, &value)?;
+        return Some((column, ColumnSet::from_range(range)));
+    }
+    let mut column = None;
+    let mut points = vec![];
+    for t in terms {
+        let (c, op, value) = column_comparison(t)?;
+        if op != BinaryOp::Eq || column.is_some_and(|col| col != c) {
+            return None;
+        }
+        column = Some(c);
+        let range = condition_range(*types.get(c)?, op, &value)?;
+        match ColumnSet::from_range(range) {
+            ColumnSet::Points(p) => points.extend(p),
+            ColumnSet::Range(_) => return None,
+        }
+    }
+    Some((column?, ColumnSet::points(points)))
+}
+
+/// The stored values of a `datatype` column equal to `value`, by the
+/// evaluator's `=`: none for NULL (or a double constant no integer equals),
+/// both zeros for a double zero. None when the types can't be compared (see
+/// the module comment).
+pub(crate) fn equal_points(datatype: DataType, value: &ValueItem) -> Option<Vec<ValueItem>> {
+    match ColumnSet::from_range(condition_range(datatype, BinaryOp::Eq, value)?) {
+        ColumnSet::Points(p) => Some(p),
+        ColumnSet::Range(_) => None,
+    }
+}
+
+fn or_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
+    match e {
+        EvalExpr::Binary {
+            lhs,
+            op: BinaryOp::Or,
+            rhs,
+        } => {
+            or_terms(lhs, out);
+            or_terms(rhs, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// At most this many key ranges from one seek; a longer product of IN
+/// lists stops using further key columns.
+const MAX_RANGES: usize = 256;
+
+/// The key ranges covering every row the sets allow, for a key made of
+/// `key_columns` (positions, in key order): each combination of the points
+/// on its leading columns, then the range on the next one — ascending and
+/// non-overlapping. Also how many key columns that used: every condition on
+/// those columns is exactly what the ranges read. None when the conditions
+/// don't limit the key's first column at all; no ranges when nothing can
+/// match.
+pub(crate) fn key_ranges(
     key_columns: &[usize],
-    ranges: &HashMap<usize, ColumnRange>,
-) -> Option<KeyRange> {
-    let mut prefix = vec![];
+    sets: &HashMap<usize, ColumnSet>,
+) -> Option<(Vec<KeyRange>, usize)> {
+    let mut prefixes: Vec<Vec<ValueItem>> = vec![vec![]];
+    let mut used = 0;
     for c in key_columns {
-        let Some(range) = ranges.get(c) else {
-            break;
-        };
-        match range.equal_value() {
-            Some(v) => prefix.push(v.clone()),
-            None => {
-                return Some(KeyRange {
-                    prefix,
-                    lower: range.lower.clone(),
-                    upper: range.upper.clone(),
-                });
+        match sets.get(c) {
+            None => break,
+            Some(ColumnSet::Points(points)) => {
+                if prefixes.len() * points.len() > MAX_RANGES {
+                    break;
+                }
+                prefixes = prefixes
+                    .iter()
+                    .flat_map(|p| {
+                        points.iter().map(move |v| {
+                            let mut p = p.clone();
+                            p.push(v.clone());
+                            p
+                        })
+                    })
+                    .collect();
+                used += 1;
+                if prefixes.is_empty() {
+                    break;
+                }
+            }
+            Some(ColumnSet::Range(r)) => {
+                let ranges = prefixes
+                    .into_iter()
+                    .map(|prefix| KeyRange {
+                        prefix,
+                        lower: r.lower.clone(),
+                        upper: r.upper.clone(),
+                    })
+                    .collect();
+                return Some((ranges, used + 1));
             }
         }
     }
-    if prefix.is_empty() {
+    if used == 0 {
         return None;
     }
-    Some(KeyRange::prefix(prefix))
+    Some((prefixes.into_iter().map(KeyRange::prefix).collect(), used))
+}
+
+/// The seek's condition for EXPLAIN — `city IN ('a', 'b') AND n > 5` —
+/// given the key's column names, in key order. `ranges` is what key_ranges
+/// produced: every combination of some values on the leading columns, all
+/// with the same bounds on the next.
+pub(crate) fn describe_key_ranges(ranges: &[KeyRange], key_names: &[String]) -> String {
+    let Some(first) = ranges.first() else {
+        return "matches nothing".into();
+    };
+    // Read for NULLS LAST (see optim::picker): a column's non-NULL values,
+    // then its NULLs.
+    if let [values, nulls] = ranges
+        && values.lower == Bound::Excluded(ValueItem::Null)
+        && values.upper == Bound::Unbounded
+        && nulls.prefix.len() == values.prefix.len() + 1
+        && nulls.prefix[..values.prefix.len()] == values.prefix[..]
+        && nulls.prefix.last() == Some(&ValueItem::Null)
+    {
+        let fixed = describe_key_range(&KeyRange::prefix(values.prefix.clone()), key_names);
+        return if fixed.is_empty() {
+            "in index order, NULLs last".into()
+        } else {
+            format!("{fixed}, NULLs last")
+        };
+    }
+    if ranges.len() == 1 {
+        return describe_key_range(first, key_names);
+    }
+    let lit = |v: &ValueItem| EvalExpr::Literal(v.clone()).describe(&[]);
+    let name = |i: usize| key_names.get(i).cloned().unwrap_or_else(|| format!("#{i}"));
+    let mut parts = vec![];
+    for i in 0..first.prefix.len() {
+        let mut values: Vec<&ValueItem> = vec![];
+        for r in ranges {
+            if !values
+                .iter()
+                .any(|v| v.cmp(&&r.prefix[i]) == Ordering::Equal)
+            {
+                values.push(&r.prefix[i]);
+            }
+        }
+        parts.push(match values.as_slice() {
+            [v] => format!("{} = {}", name(i), lit(v)),
+            vs => format!(
+                "{} IN ({})",
+                name(i),
+                vs.iter().map(|v| lit(v)).collect::<Vec<_>>().join(", ")
+            ),
+        });
+    }
+    let bounds = describe_key_range(
+        &KeyRange {
+            prefix: vec![],
+            lower: first.lower.clone(),
+            upper: first.upper.clone(),
+        },
+        &key_names[first.prefix.len().min(key_names.len())..],
+    );
+    if !bounds.is_empty() {
+        parts.push(bounds);
+    }
+    parts.join(" AND ")
 }
 
 /// True when no value can lie within the range's bounds (`x = 1 AND x = 2`,
@@ -378,6 +584,13 @@ mod tests {
     fn cond(l: Box<EvalExpr>, op: BinaryOp, r: Box<EvalExpr>) -> EvalExpr {
         EvalExpr::Binary { lhs: l, op, rhs: r }
     }
+    fn or(l: EvalExpr, r: EvalExpr) -> EvalExpr {
+        EvalExpr::Binary {
+            lhs: Box::new(l),
+            op: BinaryOp::Or,
+            rhs: Box::new(r),
+        }
+    }
     fn int(i: i64) -> ValueItem {
         ValueItem::Integer(i)
     }
@@ -394,46 +607,103 @@ mod tests {
         DataType::Integer,
     ];
 
-    fn ranges(filters: &[EvalExpr]) -> HashMap<usize, ColumnRange> {
-        column_ranges(filters, &TYPES)
+    fn sets(filters: &[EvalExpr]) -> HashMap<usize, ColumnSet> {
+        column_sets(filters, &TYPES)
     }
-    fn range(lower: Bound<ValueItem>, upper: Bound<ValueItem>) -> ColumnRange {
-        ColumnRange { lower, upper }
+    fn range(lower: Bound<ValueItem>, upper: Bound<ValueItem>) -> ColumnSet {
+        ColumnSet::Range(ColumnRange { lower, upper })
+    }
+    fn pts(v: Vec<ValueItem>) -> ColumnSet {
+        ColumnSet::Points(v)
     }
     use Bound::{Excluded, Included, Unbounded};
 
     #[test]
     fn test_each_comparison_and_either_operand_order() {
-        let r = ranges(&[cond(col(0), BinaryOp::Gt, lit(int(5)))]);
+        let r = sets(&[cond(col(0), BinaryOp::Gt, lit(int(5)))]);
         assert_eq!(r[&0], range(Excluded(int(5)), Unbounded));
         // 5 > x is x < 5, and excludes NULL.
-        let r = ranges(&[cond(lit(int(5)), BinaryOp::Gt, col(0))]);
+        let r = sets(&[cond(lit(int(5)), BinaryOp::Gt, col(0))]);
         assert_eq!(r[&0], range(NOT_NULL, Excluded(int(5))));
-        let r = ranges(&[cond(col(1), BinaryOp::Eq, lit(s("x")))]);
-        assert_eq!(r[&1], range(Included(s("x")), Included(s("x"))));
+        let r = sets(&[cond(col(1), BinaryOp::Eq, lit(s("x")))]);
+        assert_eq!(r[&1], pts(vec![s("x")]));
         // Negative literals.
         let neg = Box::new(EvalExpr::Unary {
             op: UnaryOp::Minus,
             field: lit(int(3)),
         });
-        let r = ranges(&[cond(col(0), BinaryOp::GtEq, neg)]);
+        let r = sets(&[cond(col(0), BinaryOp::GtEq, neg)]);
         assert_eq!(r[&0], range(Included(int(-3)), Unbounded));
     }
 
     #[test]
     fn test_conditions_on_one_column_intersect() {
-        let r = ranges(&[
+        let r = sets(&[
             cond(col(0), BinaryOp::Gt, lit(int(5))),
             cond(col(0), BinaryOp::GtEq, lit(int(5))),
             cond(col(0), BinaryOp::LtEq, lit(int(9))),
             cond(col(0), BinaryOp::Lt, lit(int(20))),
         ]);
         assert_eq!(r[&0], range(Excluded(int(5)), Included(int(9))));
+        // Contradictions leave nothing.
+        let r = sets(&[
+            cond(col(0), BinaryOp::Eq, lit(int(1))),
+            cond(col(0), BinaryOp::Eq, lit(int(2))),
+        ]);
+        assert_eq!(r[&0], pts(vec![]));
+        let r = sets(&[
+            cond(col(0), BinaryOp::Gt, lit(int(5))),
+            cond(col(0), BinaryOp::Lt, lit(int(3))),
+        ]);
+        assert_eq!(r[&0], pts(vec![]));
+    }
+
+    #[test]
+    fn test_an_or_of_equalities_is_a_set_of_points() {
+        // x IN (3, 1, 3)
+        let r = sets(&[or(
+            or(
+                cond(col(0), BinaryOp::Eq, lit(int(3))),
+                cond(col(0), BinaryOp::Eq, lit(int(1))),
+            ),
+            cond(col(0), BinaryOp::Eq, lit(int(3))),
+        )]);
+        assert_eq!(r[&0], pts(vec![int(1), int(3)]));
+        // ... AND x > 2
+        let r = sets(&[
+            or(
+                cond(col(0), BinaryOp::Eq, lit(int(3))),
+                cond(col(0), BinaryOp::Eq, lit(int(1))),
+            ),
+            cond(col(0), BinaryOp::Gt, lit(int(2))),
+        ]);
+        assert_eq!(r[&0], pts(vec![int(3)]));
+        // x IN (1, NULL): NULL matches nothing
+        let r = sets(&[or(
+            cond(col(0), BinaryOp::Eq, lit(int(1))),
+            cond(col(0), BinaryOp::Eq, lit(ValueItem::Null)),
+        )]);
+        assert_eq!(r[&0], pts(vec![int(1)]));
+        // Not usable: two columns, or a term that isn't an equality.
+        assert!(
+            sets(&[or(
+                cond(col(0), BinaryOp::Eq, lit(int(1))),
+                cond(col(3), BinaryOp::Eq, lit(int(1))),
+            )])
+            .is_empty()
+        );
+        assert!(
+            sets(&[or(
+                cond(col(0), BinaryOp::Eq, lit(int(1))),
+                cond(col(0), BinaryOp::Gt, lit(int(9))),
+            )])
+            .is_empty()
+        );
     }
 
     #[test]
     fn test_unusable_conditions_are_left_out() {
-        let r = ranges(&[
+        let r = sets(&[
             // type mismatch: an evaluation error the scan must report
             cond(col(0), BinaryOp::Eq, lit(s("x"))),
             // not a comparison with a constant
@@ -447,75 +717,113 @@ mod tests {
 
     #[test]
     fn test_null_matches_nothing() {
-        let r = ranges(&[cond(col(0), BinaryOp::Eq, lit(ValueItem::Null))]);
-        assert_eq!(r[&0], empty());
+        let r = sets(&[cond(col(0), BinaryOp::Eq, lit(ValueItem::Null))]);
+        assert_eq!(r[&0], pts(vec![]));
     }
 
     #[test]
     fn test_an_integer_column_against_doubles_is_exact() {
-        let one = |op, d| ranges(&[cond(col(0), op, lit(dbl(d)))])[&0].clone();
-        assert_eq!(
-            one(BinaryOp::Eq, 5.0),
-            range(Included(int(5)), Included(int(5)))
-        );
-        assert_eq!(one(BinaryOp::Eq, 5.5), empty());
+        let one = |op, d| sets(&[cond(col(0), op, lit(dbl(d)))])[&0].clone();
+        assert_eq!(one(BinaryOp::Eq, 5.0), pts(vec![int(5)]));
+        assert_eq!(one(BinaryOp::Eq, 5.5), pts(vec![]));
         assert_eq!(one(BinaryOp::Gt, 5.5), range(Included(int(6)), Unbounded));
         assert_eq!(one(BinaryOp::Gt, 5.0), range(Excluded(int(5)), Unbounded));
         assert_eq!(one(BinaryOp::Lt, 5.5), range(NOT_NULL, Included(int(5))));
         assert_eq!(one(BinaryOp::Lt, -5.5), range(NOT_NULL, Included(int(-6))));
-        assert_eq!(one(BinaryOp::GtEq, 1e19), empty());
+        assert_eq!(one(BinaryOp::GtEq, 1e19), pts(vec![]));
         assert_eq!(one(BinaryOp::LtEq, 1e19), range(NOT_NULL, Unbounded));
     }
 
     #[test]
     fn test_a_double_column_covers_both_zeros() {
-        let one = |op, d| ranges(&[cond(col(2), op, lit(dbl(d)))])[&2].clone();
-        assert_eq!(
-            one(BinaryOp::Eq, 0.0),
-            range(Included(dbl(-0.0)), Included(dbl(0.0)))
-        );
-        assert_eq!(
-            one(BinaryOp::Eq, -0.0),
-            range(Included(dbl(-0.0)), Included(dbl(0.0)))
-        );
+        let one = |op, d| sets(&[cond(col(2), op, lit(dbl(d)))])[&2].clone();
+        assert_eq!(one(BinaryOp::Eq, 0.0), pts(vec![dbl(-0.0), dbl(0.0)]));
+        assert_eq!(one(BinaryOp::Eq, -0.0), pts(vec![dbl(-0.0), dbl(0.0)]));
         assert_eq!(
             one(BinaryOp::Gt, -0.0),
             range(Excluded(dbl(0.0)), Unbounded)
         );
         assert_eq!(one(BinaryOp::Lt, 0.0), range(NOT_NULL, Excluded(dbl(-0.0))));
         // An integer constant converts only when exact.
-        let r = ranges(&[cond(col(2), BinaryOp::Eq, lit(int(3)))]);
-        assert_eq!(r[&2], range(Included(dbl(3.0)), Included(dbl(3.0))));
-        assert!(ranges(&[cond(col(2), BinaryOp::Eq, lit(int(i64::MAX)))]).is_empty());
+        let r = sets(&[cond(col(2), BinaryOp::Eq, lit(int(3)))]);
+        assert_eq!(r[&2], pts(vec![dbl(3.0)]));
+        assert!(sets(&[cond(col(2), BinaryOp::Eq, lit(int(i64::MAX)))]).is_empty());
     }
 
     #[test]
-    fn test_key_range_takes_leading_equalities_then_one_range() {
-        let r = ranges(&[
+    fn test_key_ranges_take_leading_points_then_one_range() {
+        let r = sets(&[
             cond(col(0), BinaryOp::Eq, lit(int(1))),
             cond(col(1), BinaryOp::Gt, lit(s("m"))),
             cond(col(3), BinaryOp::Eq, lit(int(7))),
         ]);
-        // key (0, 1, 3): 0 is equal, 1 a range, and 3 after a range is unused
+        // key (0, 1, 3): 0 is a point, 1 a range, and 3 after a range is unused
         assert_eq!(
-            key_range(&[0, 1, 3], &r),
-            Some(KeyRange {
+            key_ranges(&[0, 1, 3], &r),
+            Some((
+                vec![KeyRange {
+                    prefix: vec![int(1)],
+                    lower: Excluded(s("m")),
+                    upper: Unbounded
+                }],
+                2
+            ))
+        );
+        assert_eq!(
+            key_ranges(&[0, 3], &r),
+            Some((vec![KeyRange::prefix(vec![int(1), int(7)])], 2))
+        );
+        assert_eq!(
+            key_ranges(&[3, 0], &r),
+            Some((vec![KeyRange::prefix(vec![int(7), int(1)])], 2))
+        );
+        assert_eq!(key_ranges(&[2, 0], &r), None);
+    }
+
+    #[test]
+    fn test_key_ranges_expand_every_combination_in_order() {
+        let r = HashMap::from([
+            (0, pts(vec![int(1), int(2)])),
+            (3, pts(vec![int(7), int(8)])),
+        ]);
+        let (ranges, used) = key_ranges(&[0, 3], &r).unwrap();
+        assert_eq!(used, 2);
+        let prefixes: Vec<_> = ranges.iter().map(|k| k.prefix.clone()).collect();
+        assert_eq!(
+            prefixes,
+            vec![
+                vec![int(1), int(7)],
+                vec![int(1), int(8)],
+                vec![int(2), int(7)],
+                vec![int(2), int(8)],
+            ]
+        );
+        assert_eq!(
+            describe_key_ranges(&ranges, &["a".into(), "b".into()]),
+            "a IN (1, 2) AND b IN (7, 8)"
+        );
+        // Read for NULLS LAST.
+        let split = vec![
+            KeyRange {
                 prefix: vec![int(1)],
-                lower: Excluded(s("m")),
-                upper: Unbounded
-            })
-        );
-        // key (0, 3): both equalities
+                lower: NOT_NULL,
+                upper: Unbounded,
+            },
+            KeyRange::prefix(vec![int(1), ValueItem::Null]),
+        ];
         assert_eq!(
-            key_range(&[0, 3], &r),
-            Some(KeyRange::prefix(vec![int(1), int(7)]))
+            describe_key_ranges(&split, &["a".into(), "b".into()]),
+            "a = 1, NULLs last"
         );
-        // key (3, 0) likewise; key (2, ...) not limited by anything
-        assert_eq!(
-            key_range(&[3, 0], &r),
-            Some(KeyRange::prefix(vec![int(7), int(1)]))
-        );
-        assert_eq!(key_range(&[2, 0], &r), None);
+        // Nothing can match: no ranges at all.
+        let r = HashMap::from([(0, pts(vec![]))]);
+        assert_eq!(key_ranges(&[0], &r), Some((vec![], 1)));
+        assert_eq!(describe_key_ranges(&[], &["a".into()]), "matches nothing");
+        // Past MAX_RANGES the next column isn't used.
+        let many: Vec<_> = (0..300).map(int).collect();
+        let r = HashMap::from([(0, pts(vec![int(1), int(2)])), (3, pts(many))]);
+        let (ranges, used) = key_ranges(&[0, 3], &r).unwrap();
+        assert_eq!((ranges.len(), used), (2, 1));
     }
 
     #[test]
@@ -539,10 +847,6 @@ mod tests {
             Some(0)
         );
         assert_eq!(values_in_range(&r(Included(int(10)), Unbounded)), None);
-        assert_eq!(
-            describe_key_range(&r(NOT_NULL, NOT_NULL), &["id".into()]),
-            "id matches nothing"
-        );
     }
 
     #[test]
@@ -568,5 +872,21 @@ mod tests {
             upper: Excluded(int(3)),
         };
         assert_eq!(describe_key_range(&r, &["a".into()]), "a < 3");
+        let both = vec![
+            KeyRange {
+                prefix: vec![int(1)],
+                lower: Excluded(int(5)),
+                upper: Unbounded,
+            },
+            KeyRange {
+                prefix: vec![int(2)],
+                lower: Excluded(int(5)),
+                upper: Unbounded,
+            },
+        ];
+        assert_eq!(
+            describe_key_ranges(&both, &["a".into(), "b".into()]),
+            "a IN (1, 2) AND b > 5"
+        );
     }
 }

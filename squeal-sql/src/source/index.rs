@@ -57,7 +57,7 @@ impl<F> IndexSource<F>
 where
     F: DBFile<Item = F> + 'static,
 {
-    /// The entries of `index` within `range` (see optim::picker's
+    /// The entries of `index` within `ranges` (see optim::picker's
     /// IndexSeek/IndexLookup), expected to be `rows` many; `lookup` fetches
     /// each entry's row from the table.
     #[allow(clippy::too_many_arguments)]
@@ -67,7 +67,7 @@ where
         index: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
-        range: KeyRange,
+        ranges: Vec<KeyRange>,
         lookup: bool,
         rows: Option<usize>,
     ) -> Result<Self, SchemaError> {
@@ -77,8 +77,12 @@ where
             .iter()
             .map(|f| f.name.clone())
             .collect();
-        let seek = crate::plan::sarg::describe_key_range(&range, &key_names);
-        let cursor = db.key_range_scan(table.indices[index].db_table_id, txn, range)?;
+        let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
+        let cursor = db.key_ranges_scan(
+            table.indices[index].db_table_id,
+            txn.map(|t| t.id()),
+            ranges,
+        )?;
         let mut source = Self::with_cursor(table, index, cursor, stats)?;
         source.seek = Some((seek, rows));
         source.lookup = lookup.then_some(db);
@@ -210,7 +214,12 @@ where
             } else {
                 "IndexSeek"
             })
-            .detail(format!("{using} ({seek})"))
+            .detail(if seek.is_empty() {
+                // All of it, read for its order.
+                format!("{using} (in index order)")
+            } else {
+                format!("{using} ({seek})")
+            })
             .rows(*rows),
             None => PlanNode::new("IndexScan")
                 .detail(using)

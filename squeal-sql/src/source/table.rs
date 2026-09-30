@@ -65,26 +65,39 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    /// The rows of `table` within `range` of its PRIMARY KEY (see
+    /// The rows of `table` within `ranges` of its PRIMARY KEY (see
     /// optim::picker::AccessPath::TableSeek), expected to be `rows` many.
     pub(crate) fn seek(
         db: Arc<Db<F>>,
         table: Arc<SqlTable>,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
-        range: KeyRange,
+        ranges: Vec<KeyRange>,
         rows: Option<usize>,
     ) -> Result<Self, SchemaError> {
         let key_names: Vec<String> = table
             .primary_key()
             .map(|pk| pk.fields.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default();
-        let seek = crate::plan::sarg::describe_key_range(&range, &key_names);
-        let cursor = db.key_range_scan(table.db_table_id, txn, range)?;
+        let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
+        let cursor = db.key_ranges_scan(table.db_table_id, txn.map(|t| t.id()), ranges)?;
         let mut source = Self::new(db, table, txn, stats)?;
         source.cursor = RowCursor::Seek(cursor);
         source.seek = Some((seek, rows));
         Ok(source)
+    }
+
+    fn key_names(&self) -> String {
+        self.table
+            .primary_key()
+            .map(|pk| {
+                pk.fields
+                    .iter()
+                    .map(|f| f.name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default()
     }
 
     // `txn` only needs to live for this call — table_scan_in_txn only
@@ -130,6 +143,14 @@ where
 {
     fn plan(&self) -> PlanNode {
         match &self.seek {
+            // All of it, read through its key for the order.
+            Some((seek, rows)) if seek.is_empty() => PlanNode::new("TableScan")
+                .detail(format!(
+                    "{} (in {} order)",
+                    self.table.name,
+                    self.key_names()
+                ))
+                .rows(*rows),
             Some((seek, rows)) => PlanNode::new("TableSeek")
                 .detail(format!("{} ({seek})", self.table.name))
                 .rows(*rows),

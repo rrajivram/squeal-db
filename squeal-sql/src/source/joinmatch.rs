@@ -8,7 +8,8 @@ use crate::{error::SchemaError, source::join::JoinType};
 // SortJoinSource can only differ in HOW they find candidate pairs, never in
 // WHAT counts as a match or what an outer join emits for the rest:
 //   - when two rows match (`keys_match`) and how they order (`cmp_keys`,
-//     which agrees with `keys_match`: Equal exactly when they match),
+//     which agrees with `keys_match` — Equal exactly when they match —
+//     except for NULL keys: they order (first) but match nothing),
 //   - which side's unmatched rows the join type keeps,
 //   - the NULL-padded row an unmatched row is paired with,
 //   - assembling an output row (left columns, then right columns).
@@ -43,12 +44,18 @@ impl JoinMatcher {
         })
     }
 
-    // Join-key equality. NULL == NULL here (ValueItem's own equality), so
-    // rows with NULL keys join each other — the behavior HashedSource has
-    // always had, kept identical for every algorithm. This is the one place
-    // to change if NULL keys should instead never match (SQL semantics).
+    // Join-key equality, as SQL's `=`: a NULL in either key matches
+    // nothing (a NULL-keyed row of an outer join's kept side comes out
+    // NULL-extended). This is the one place every join algorithm decides a
+    // match, so they all agree — including the index nested-loop join,
+    // which never finds a NULL key by seeking.
     pub(crate) fn keys_match(&self, left: &IndexKey, right: &IndexKey) -> bool {
-        self.cmp_keys(left, right) == Ordering::Equal
+        let has_null = |row: &IndexKey, fields: &[usize]| {
+            fields.iter().any(|&i| matches!(row[i], ValueItem::Null))
+        };
+        !has_null(left, &self.left_fields)
+            && !has_null(right, &self.right_fields)
+            && self.cmp_keys(left, right) == Ordering::Equal
     }
 
     // Lexicographic over the join-key fields, in ValueItem's total order —
@@ -149,10 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn test_null_keys_match_each_other_and_sort_first() {
+    fn test_null_keys_match_nothing_and_sort_first() {
         let m = JoinMatcher::new(JoinType::Inner, &[0], &[0], 1, 1).unwrap();
         let null = IndexKey::new_from_owned(vec![ValueItem::Null]).unwrap();
-        assert!(m.keys_match(&null, &null));
+        assert!(!m.keys_match(&null, &null));
+        assert!(!m.keys_match(&null, &row(&[1])));
         assert_eq!(m.cmp_keys(&null, &row(&[i64::MIN])), Ordering::Less);
     }
 

@@ -22,9 +22,12 @@ use crate::{
         eval::EvalExpr,
         funcs::{FuncArgs, FuncTrait},
         logical::TableQuery,
-        sarg::{column_comparison, column_ranges, is_empty, key_range, values_in_range},
+        sarg::{
+            ColumnSet, column_comparison, column_sets, condition_set, is_empty, key_ranges,
+            values_in_range,
+        },
     },
-    source::join::JoinType,
+    source::{join::JoinType, nestloop::JoinSeek},
     table::SqlTable,
 };
 
@@ -41,7 +44,11 @@ pub(crate) struct ItemNeeds {
     /// The WHERE conjuncts that read only this item and may be applied
     /// before any join (see Conjunct::pushable), rewritten to positions
     /// within the item's own row — what a seek can use (see plan::sarg).
+    /// The first `stated` are WHERE's own; the rest are comparisons
+    /// implied through join equalities (see derived_comparisons), for seeks
+    /// only.
     pub filters: Vec<EvalExpr>,
+    pub stated: usize,
 }
 
 /// One ItemNeeds per entry of `flat_tables`.
@@ -93,6 +100,7 @@ pub(crate) fn analyze_query<F: DBFile + 'static>(
             .pushable_to(t)
             .filter_map(|c| c.local_expr(&conjuncts))
             .collect();
+        n.stated = n.filters.len();
     }
     let item_of = |pos: usize| {
         (0..starts.len())
@@ -237,26 +245,63 @@ fn every_position(e: &EvalExpr) -> Vec<usize> {
 /// How to read one FROM item that is a real table.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AccessPath {
-    /// Every row, from the table.
+    /// Every row, from the table, in no particular order.
     TableScan,
-    /// The rows within a range of the table's own key — its PRIMARY KEY:
-    /// the table's tree is keyed by it, so this needs no index at all.
-    TableSeek(KeyRange),
+    /// The rows within ranges of the table's own key — its PRIMARY KEY:
+    /// the table's tree is keyed by it, so this needs no index at all. One
+    /// unrestricted range reads the whole table in key order.
+    TableSeek(Vec<KeyRange>),
     /// Every entry of a covering index (see IndexSource).
     IndexScan(usize),
-    /// A range of a covering index.
-    IndexSeek(usize, KeyRange),
-    /// A range of an index that does NOT cover the query, fetching each
+    /// Ranges of a covering index.
+    IndexSeek(usize, Vec<KeyRange>),
+    /// Ranges of an index that does NOT cover the query, fetching each
     /// entry's row from the table.
-    IndexLookup(usize, KeyRange),
+    IndexLookup(usize, Vec<KeyRange>),
 }
 
-/// The chosen path, and how many rows it is expected to produce (None
-/// without statistics).
+/// The chosen path, and what the rest of the plan can rely on about it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Access {
     pub path: AccessPath,
+    /// Expected rows (None without statistics).
     pub rows: Option<usize>,
+    /// Columns (positions within the table's row) whose WHERE conditions
+    /// the path reads exactly — every row it produces satisfies them, and
+    /// no row it skips could have — so they need not be checked again.
+    pub enforced: Vec<usize>,
+    /// The rows come out in the order asked for (see OrderWanted).
+    pub sorted: bool,
+}
+
+/// An order the query wants its rows in — ORDER BY over plain columns of
+/// the one table — and how many it keeps (LIMIT).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OrderWanted {
+    /// Columns (positions within the table's row), ascending, each with
+    /// whether NULLs come first.
+    pub columns: Vec<(usize, bool)>,
+    pub limit: Option<usize>,
+}
+
+// Whether a key's order is the wanted one (see pick_access's order_of).
+enum Order {
+    No,
+    Yes,
+    // Yes, reading the first free key column's NULLs after its other values.
+    NullsLast,
+}
+
+// A path under consideration: its key columns (what its rows are ordered
+// by, when they are ordered at all) and ranges.
+struct Candidate {
+    path: AccessPath,
+    rows: usize,
+    // Bytes read, before any sort or LIMIT adjustment.
+    cost: usize,
+    key: Vec<usize>,
+    ordered: bool,
+    used: usize,
 }
 
 /// How to read `table` given what the query needs from it.
@@ -264,19 +309,22 @@ pub(crate) struct Access {
 /// With statistics, the cheapest path by estimated bytes read. Scans read
 /// every row sequentially: per row, a tree entry and the row (table) or an
 /// entry and the row identity (index). Seeks read only the rows the key
-/// range allows, estimated from column statistics, plus one page for the
-/// descent; an IndexLookup also reads one page per row from the table,
-/// since the rows it fetches are scattered.
+/// ranges allow, estimated from column statistics, plus one page per range
+/// for the descent; an IndexLookup also reads one page per row from the
+/// table, since the rows it fetches are scattered. (A page, or the whole
+/// index or table when that is smaller.) When an order is wanted,
+/// a path that doesn't produce it pays for a sort, and one that does can
+/// stop after LIMIT rows.
 ///
 /// Without statistics, only what is safe without them: a seek on the
 /// table's primary key (it reads a subset of what a scan reads), or an
-/// index whose every key column is fixed by an equality on a unique index
-/// (one row).
+/// index whose every key column is fixed by an equality on a unique index.
 pub(crate) fn pick_access(
     table: &SqlTable,
     stats: Option<&ComputedTableStat>,
     needs: &ItemNeeds,
     page_size: usize,
+    order: Option<&OrderWanted>,
 ) -> Access {
     let fields = table.fields();
     let position = |name: &str| {
@@ -292,7 +340,7 @@ pub(crate) fn pick_access(
             .collect()
     };
     let types: Vec<DataType> = fields.iter().map(|f| f.datatype).collect();
-    let ranges = column_ranges(&needs.filters, &types);
+    let sets = column_sets(&needs.filters, &types);
     let primary = table.indices.iter().position(|i| i.is_primary);
     let pk_columns = primary
         .map(|p| columns_of(&table.indices[p]))
@@ -300,144 +348,323 @@ pub(crate) fn pick_access(
     let table_seek = if pk_columns.is_empty() {
         None
     } else {
-        key_range(&pk_columns, &ranges)
+        key_ranges(&pk_columns, &sets)
+    };
+    let enforced = |key: &[usize], used: usize| key[..used].to_vec();
+    // Whether rows ordered by `key` (within `ranges`, None for all of it)
+    // come out in the wanted order: after the key columns every range fixes
+    // to one value, the wanted columns must follow the key. A wanted column
+    // the ranges fix is constant, so it can be skipped. NULLs sort first in
+    // a key, so a NULLS LAST column must be one no NULL can reach (NOT
+    // NULL, or limited by a condition, which never matches NULL).
+    //
+    // One exception: the first such column may hold NULLs wanted last when
+    // the ranges don't limit it — read its non-NULL values, then its NULLs
+    // (see ordered_ranges).
+    let order_of = |key: &[usize], ranges: Option<&[KeyRange]>| -> Order {
+        let Some(order) = order else {
+            return Order::No;
+        };
+        let fixed = match ranges {
+            None => 0,
+            Some(rs) => (0..rs.first().map_or(0, |r| r.prefix.len()))
+                .take_while(|&i| rs.iter().all(|r| r.prefix[i] == rs[0].prefix[i]))
+                .count(),
+        };
+        let mut rest = key[fixed..].iter();
+        let mut answer = Order::Yes;
+        let mut first = true;
+        for (c, nulls_first) in &order.columns {
+            if key[..fixed].contains(c) {
+                continue;
+            }
+            if rest.next() != Some(c) {
+                return Order::No;
+            }
+            if !nulls_first && fields[*c].nullable && !sets.contains_key(c) {
+                let one_open_range = ranges.is_none_or(|rs| {
+                    matches!(rs, [r] if r.prefix.len() == fixed
+                        && r.lower == Bound::Unbounded
+                        && r.upper == Bound::Unbounded)
+                });
+                if !first || !one_open_range {
+                    return Order::No;
+                }
+                answer = Order::NullsLast;
+            }
+            first = false;
+        }
+        answer
+    };
+    // A candidate's key ranges (None: all of it, unordered or in key order)
+    // and whether it gives the wanted order — with NULLs-last split into two
+    // ranges read in turn: the non-NULL values of the first free key
+    // column, then its NULLs.
+    let ordered_ranges =
+        |key: &[usize], ranges: Option<Vec<KeyRange>>| -> (Option<Vec<KeyRange>>, bool) {
+            match order_of(key, ranges.as_deref()) {
+                Order::No => (ranges, false),
+                Order::Yes => (ranges, true),
+                Order::NullsLast => {
+                    let prefix = ranges
+                        .and_then(|rs| rs.into_iter().next())
+                        .map_or(vec![], |r| r.prefix);
+                    let mut null = prefix.clone();
+                    null.push(ValueItem::Null);
+                    let split = vec![
+                        KeyRange {
+                            prefix,
+                            lower: Bound::Excluded(ValueItem::Null),
+                            upper: Bound::Unbounded,
+                        },
+                        KeyRange::prefix(null),
+                    ];
+                    (Some(split), true)
+                }
+            }
+        };
+    let gives_order = |key: &[usize], ranges: Option<&[KeyRange]>| -> bool {
+        !matches!(order_of(key, ranges), Order::No)
     };
 
     let Some((stats, self_index, index_stats)) =
         stats.and_then(|s| Some((s, s.self_index.as_ref()?, s.indices.as_ref()?)))
     else {
-        if let Some(range) = table_seek {
+        if let Some((ranges, used)) = table_seek {
+            let sorted = gives_order(&pk_columns, Some(&ranges));
             return Access {
-                path: AccessPath::TableSeek(range),
+                path: AccessPath::TableSeek(ranges),
                 rows: None,
+                enforced: enforced(&pk_columns, used),
+                sorted,
             };
         }
         for (i, index) in table.indices.iter().enumerate() {
             let key = columns_of(index);
-            if let Some(range) = key_range(&key, &ranges)
+            if let Some((ranges, used)) = key_ranges(&key, &sets)
                 && (index.is_primary || index.is_unique)
-                && range.prefix.len() == key.len()
+                && used == key.len()
+                && ranges.iter().all(|r| r.prefix.len() == key.len())
             {
                 let covered: BTreeSet<usize> = key.iter().chain(&pk_columns).copied().collect();
+                let sorted = gives_order(&key, Some(&ranges));
+                let rows = Some(ranges.len());
                 let path = if needs.columns.is_subset(&covered) {
-                    AccessPath::IndexSeek(i, range)
+                    AccessPath::IndexSeek(i, ranges)
                 } else {
-                    AccessPath::IndexLookup(i, range)
+                    AccessPath::IndexLookup(i, ranges)
                 };
                 return Access {
                     path,
-                    rows: Some(1),
+                    rows,
+                    enforced: enforced(&key, used),
+                    sorted,
                 };
             }
         }
         return Access {
             path: AccessPath::TableScan,
             rows: None,
+            enforced: vec![],
+            sorted: false,
         };
     };
 
     let rows = stats.table_stat.row_count;
-    let estimate = |key: &[usize], range: &KeyRange, unique: bool| -> usize {
-        if is_empty(range) {
-            return 0;
-        }
-        if unique && range.prefix.len() == key.len() {
-            return 1;
-        }
-        let mut fraction = 1.0;
-        for c in &key[..range.prefix.len()] {
-            fraction /= stats
-                .table_stat
-                .col_stats
-                .get(c)
-                .map_or(10.0, |s| s.unique.max(1) as f64);
-        }
-        if let Some(c) = key.get(range.prefix.len())
-            && !matches!(
-                (&range.lower, &range.upper),
-                (Bound::Unbounded, Bound::Unbounded)
-            )
-        {
-            fraction *= range_fraction(stats.table_stat.col_stats.get(c), range);
-        }
-        let mut est = ((rows as f64 * fraction).ceil() as usize)
-            .max(1)
-            .min(rows.max(1));
-        // A range on a unique key's last column matches at most one row per
-        // value in it: `id >= 10 AND id < 13` is at most 3 rows, with or
-        // without statistics on id.
-        if unique
-            && range.prefix.len() + 1 == key.len()
-            && let Some(n) = values_in_range(range)
-        {
-            est = est.min(n as usize);
-        }
-        est
+    let estimate = |key: &[usize], ranges: &[KeyRange], unique: bool| -> usize {
+        let one = |range: &KeyRange| -> usize {
+            if is_empty(range) {
+                return 0;
+            }
+            if unique && range.prefix.len() == key.len() {
+                return 1;
+            }
+            let mut fraction = 1.0;
+            for c in &key[..range.prefix.len()] {
+                fraction /= stats
+                    .table_stat
+                    .col_stats
+                    .get(c)
+                    .map_or(10.0, |s| s.unique.max(1) as f64);
+            }
+            if let Some(c) = key.get(range.prefix.len())
+                && !matches!(
+                    (&range.lower, &range.upper),
+                    (Bound::Unbounded, Bound::Unbounded)
+                )
+            {
+                fraction *= range_fraction(stats.table_stat.col_stats.get(c), range);
+            }
+            let mut est = ((rows as f64 * fraction).ceil() as usize)
+                .max(1)
+                .min(rows.max(1));
+            // A range on a unique key's last column matches at most one row
+            // per value in it: `id >= 10 AND id < 13` is at most 3 rows,
+            // with or without statistics on id.
+            if unique
+                && range.prefix.len() + 1 == key.len()
+                && let Some(n) = values_in_range(range)
+            {
+                est = est.min(n as usize);
+            }
+            est
+        };
+        ranges.iter().map(one).sum::<usize>().min(rows.max(1))
     };
     // No PRIMARY KEY: the identity is the generated row id, one integer.
     let identity_bytes = primary.map_or(8, |p| index_stats[p].row_size);
     let table_row = self_index.row_size + stats.row_size;
 
-    // A seek on the primary key reads a subset of what scanning the same
-    // table reads, so it is never the worse of the two — whatever the
-    // (possibly stale) statistics say.
-    let (mut best, mut best_cost) = match table_seek {
-        Some(range) => {
-            let est = estimate(&pk_columns, &range, true);
-            let cost = (est * table_row + page_size).min(rows * table_row);
-            (
-                Access {
-                    path: AccessPath::TableSeek(range),
-                    rows: Some(est),
-                },
-                cost,
-            )
-        }
-        None => (
-            Access {
-                path: AccessPath::TableScan,
-                rows: Some(rows),
-            },
-            rows * table_row,
-        ),
-    };
-    let mut consider = |path: AccessPath, est: usize, cost: usize| {
-        if cost < best_cost {
-            best = Access {
-                path,
-                rows: Some(est),
-            };
-            best_cost = cost;
-        }
-    };
+    // Ties go to the earliest candidate, so a primary key seek (whose cost
+    // is capped at the scan's) comes first.
+    let mut candidates = vec![];
+    if let Some((ranges, used)) = table_seek {
+        let est = estimate(&pk_columns, &ranges, true);
+        // A seek on the primary key reads a subset of what scanning the
+        // same table reads, so it is never the worse of the two — whatever
+        // the (possibly stale) statistics say.
+        let descent = page_size.min(rows * table_row);
+        let cost = (est * table_row + descent * ranges.len()).min(rows * table_row);
+        candidates.push(Candidate {
+            ordered: gives_order(&pk_columns, Some(&ranges)),
+            path: AccessPath::TableSeek(ranges),
+            rows: est,
+            cost,
+            key: pk_columns.clone(),
+            used,
+        });
+    } else if !pk_columns.is_empty() && gives_order(&pk_columns, None) {
+        // The whole table, in primary key order.
+        candidates.push(Candidate {
+            path: AccessPath::TableSeek(vec![KeyRange::prefix(vec![])]),
+            rows,
+            cost: rows * table_row,
+            key: pk_columns.clone(),
+            ordered: true,
+            used: 0,
+        });
+    }
+    candidates.push(Candidate {
+        path: AccessPath::TableScan,
+        rows,
+        cost: rows * table_row,
+        key: vec![],
+        ordered: false,
+        used: 0,
+    });
     for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
         let key = columns_of(index);
+        let unique = index.is_primary || index.is_unique;
         let covered: BTreeSet<usize> = key.iter().chain(&pk_columns).copied().collect();
         let covering = needs.columns.is_subset(&covered);
         let entry = stat.row_size + identity_bytes;
-        match (key_range(&key, &ranges), covering) {
-            (Some(range), true) => {
-                let est = estimate(&key, &range, index.is_primary || index.is_unique);
-                consider(
-                    AccessPath::IndexSeek(i, range),
-                    est,
-                    est * entry + page_size,
-                );
+        // A descent, or a row fetched from the table, reads a page — or all
+        // of the index or table, when that is less.
+        let descent = page_size.min(rows * entry);
+        let fetch = page_size.min(rows * table_row);
+        match (key_ranges(&key, &sets), covering) {
+            (Some((ranges, used)), true) => {
+                let est = estimate(&key, &ranges, unique);
+                let (ranges, ordered) = ordered_ranges(&key, Some(ranges));
+                let ranges = ranges.expect("ranges in, ranges out");
+                let descents = ranges.len();
+                candidates.push(Candidate {
+                    ordered,
+                    path: AccessPath::IndexSeek(i, ranges),
+                    rows: est,
+                    cost: est * entry + descent * descents,
+                    key: key.clone(),
+                    used,
+                });
             }
-            (Some(range), false) => {
-                let est = estimate(&key, &range, index.is_primary || index.is_unique);
-                consider(
-                    AccessPath::IndexLookup(i, range),
-                    est,
-                    est * (entry + page_size) + page_size,
-                );
+            (Some((ranges, used)), false) => {
+                let est = estimate(&key, &ranges, unique);
+                let (ranges, ordered) = ordered_ranges(&key, Some(ranges));
+                let ranges = ranges.expect("ranges in, ranges out");
+                let descents = ranges.len();
+                candidates.push(Candidate {
+                    ordered,
+                    path: AccessPath::IndexLookup(i, ranges),
+                    rows: est,
+                    cost: est * (entry + fetch) + descent * descents,
+                    key: key.clone(),
+                    used,
+                });
             }
-            (None, true) => consider(AccessPath::IndexScan(i), rows, rows * entry),
+            (None, true) => {
+                let (ranges, ordered) = ordered_ranges(&key, None);
+                candidates.push(Candidate {
+                    ordered,
+                    // Split for NULLS LAST: the same entries, in two reads.
+                    path: match ranges {
+                        Some(ranges) => AccessPath::IndexSeek(i, ranges),
+                        None => AccessPath::IndexScan(i),
+                    },
+                    rows,
+                    cost: rows * entry,
+                    key: key.clone(),
+                    used: 0,
+                });
+            }
+            // All of a non-covering index, fetching every row: only ever
+            // worth it for its order, with a LIMIT to stop early.
+            (None, false) if gives_order(&key, None) => {
+                let (ranges, _) = ordered_ranges(&key, None);
+                candidates.push(Candidate {
+                    path: AccessPath::IndexLookup(
+                        i,
+                        ranges.unwrap_or_else(|| vec![KeyRange::prefix(vec![])]),
+                    ),
+                    rows,
+                    cost: rows * (entry + fetch),
+                    key: key.clone(),
+                    ordered: true,
+                    used: 0,
+                });
+            }
             (None, false) => {}
         }
     }
-    best
+
+    // What each candidate costs once the order and LIMIT are accounted for.
+    let all_enforced = |c: &Candidate| {
+        let e = enforced(&c.key, c.used);
+        sets.keys().all(|col| e.contains(col))
+    };
+    let total = |c: &Candidate| -> f64 {
+        let cost = c.cost as f64;
+        match order {
+            None => cost,
+            Some(_) if !c.ordered => {
+                let n = c.rows as f64;
+                cost + n * (n + 1.0).log2() * SORT_BYTES_PER_COMPARE
+            }
+            // In order: with LIMIT n, reading stops after n rows — sooner
+            // than that estimate only if WHERE rejects none of them.
+            Some(o) => match o.limit {
+                Some(n) if all_enforced(c) && c.rows > 0 => {
+                    cost * (n as f64 / c.rows as f64).min(1.0)
+                }
+                _ => cost,
+            },
+        }
+    };
+    let best = candidates
+        .into_iter()
+        .map(|c| (total(&c), c))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, c)| c)
+        .expect("the table scan is always a candidate");
+    Access {
+        enforced: enforced(&best.key, best.used),
+        sorted: best.ordered,
+        rows: Some(best.rows),
+        path: best.path,
+    }
 }
+
+// What sorting costs, in the same units as reading: per comparison.
+const SORT_BYTES_PER_COMPARE: f64 = 8.0;
 
 // The share of a column's non-NULL values a range keeps: by its bounds'
 // position between the column's min and max, for numbers and datetimes;
@@ -471,4 +698,149 @@ fn range_fraction(stat: Option<&ColumnStat>, range: &KeyRange) -> f64 {
         return if lo <= min && min <= hi { 1.0 } else { 0.0 };
     }
     ((hi.min(max) - lo.max(min)) / (max - min)).clamp(0.0, 1.0)
+}
+
+/// Whether to join `table` (the inner side) by seeking it once per outer
+/// row, and by which key: its primary key or an index, whose leading
+/// columns the join's equalities `pairs` — (outer position, inner column,
+/// outer column's type) — fix. Only same-type pairs count, so an outer
+/// value always converts to the inner column's type exactly.
+///
+/// Worth it when `outer_rows` seeks — each a descent plus the rows one key
+/// matches (and, through an index, a fetch per row) — cost less than
+/// `hash_rows` rows of the inner table read for a hash join. Needs
+/// statistics for the inner table and an outer row estimate.
+pub(crate) fn pick_join_seek(
+    table: &SqlTable,
+    stats: Option<&ComputedTableStat>,
+    pairs: &[(usize, usize, DataType)],
+    outer_rows: Option<usize>,
+    hash_rows: usize,
+    page_size: usize,
+) -> Option<JoinSeek> {
+    let outer_rows = outer_rows?;
+    let stats = stats?;
+    let self_index = stats.self_index.as_ref()?;
+    let index_stats = stats.indices.as_ref()?;
+    let fields = table.fields();
+    let position = |name: &str| {
+        fields
+            .iter()
+            .position(|f| f.name.eq_ignore_ascii_case(name))
+    };
+    let columns_of = |index: &crate::table::SqlIndex| -> Vec<usize> {
+        index
+            .fields
+            .iter()
+            .filter_map(|f| position(&f.name))
+            .collect()
+    };
+    let same_type = |a: DataType, b: DataType| {
+        a == b
+            || matches!(
+                (a, b),
+                (DataType::Str(_), DataType::Str(_)) | (DataType::Blob(_), DataType::Blob(_))
+            )
+    };
+    // The outer positions fixing the longest run of `key`'s leading columns.
+    let keys_for = |key: &[usize]| -> Vec<(usize, usize)> {
+        key.iter()
+            .map_while(|col| {
+                pairs
+                    .iter()
+                    .find(|(_, c, t)| c == col && same_type(*t, fields[*col].datatype))
+                    .map(|(o, c, _)| (*o, *c))
+            })
+            .collect()
+    };
+    let rows = stats.table_stat.row_count;
+    let primary = table.indices.iter().position(|i| i.is_primary);
+    let identity_bytes = primary.map_or(8, |p| index_stats[p].row_size);
+    let table_row = self_index.row_size + stats.row_size;
+    let fetch = page_size.min(rows * table_row);
+    let per_key = |key: &[usize], used: &[(usize, usize)], unique: bool| -> usize {
+        if unique && used.len() == key.len() {
+            return 1;
+        }
+        let mut fraction = 1.0;
+        for (_, c) in used {
+            fraction /= stats
+                .table_stat
+                .col_stats
+                .get(c)
+                .map_or(10.0, |s| s.unique.max(1) as f64);
+        }
+        ((rows as f64 * fraction).ceil() as usize).max(1)
+    };
+
+    let mut best: Option<(usize, JoinSeek)> = None;
+    let mut consider =
+        |index: Option<usize>, key: Vec<usize>, unique: bool, entry: usize, row: usize| {
+            let used = keys_for(&key);
+            if used.is_empty() {
+                return;
+            }
+            let rows_per_key = per_key(&key, &used, unique);
+            let descent = page_size.min(rows * entry);
+            let cost = outer_rows * (descent + rows_per_key * row);
+            if best.as_ref().is_none_or(|(c, _)| cost < *c) {
+                best = Some((
+                    cost,
+                    JoinSeek {
+                        index,
+                        keys: used,
+                        rows_per_key,
+                    },
+                ));
+            }
+        };
+    if let Some(p) = primary {
+        consider(
+            None,
+            columns_of(&table.indices[p]),
+            true,
+            self_index.row_size,
+            table_row,
+        );
+    }
+    for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
+        if index.is_primary {
+            continue; // the table's own tree is the better way in
+        }
+        let entry = stat.row_size + identity_bytes;
+        consider(
+            Some(i),
+            columns_of(index),
+            index.is_unique,
+            entry,
+            entry + fetch,
+        );
+    }
+    let (cost, seek) = best?;
+    (cost < hash_rows * table_row).then_some(seek)
+}
+
+/// Rows left of `rows` once `filters` (conditions on `table`'s own row)
+/// have been applied: a condition limiting a column to some values keeps
+/// that many of its distinct values' share; anything else, a third.
+pub(crate) fn filtered_rows(
+    table: &SqlTable,
+    stats: Option<&ComputedTableStat>,
+    rows: usize,
+    filters: &[&EvalExpr],
+) -> usize {
+    let types: Vec<DataType> = table.fields().iter().map(|f| f.datatype).collect();
+    let mut fraction = 1.0;
+    for f in filters {
+        fraction *= match condition_set(f, &types) {
+            Some((column, ColumnSet::Points(points))) => {
+                let distinct = stats
+                    .and_then(|s| s.table_stat.col_stats.get(&column))
+                    .map_or(10.0, |c| c.unique.max(1) as f64);
+                (points.len() as f64 / distinct).min(1.0)
+            }
+            _ => 1.0 / 3.0,
+        };
+    }
+    ((rows as f64 * fraction).ceil() as usize).max(if rows > 0 { 1 } else { 0 })
 }

@@ -106,7 +106,10 @@ fn test_primary_key_conditions_seek_the_table() {
         "{plan}"
     );
     let plan = explain(&c, "select * from t where id = 5.5");
-    assert!(plan.contains("(id matches nothing) (~0 rows)"), "{plan}");
+    assert!(
+        plan.contains("TableSeek t (matches nothing) (~0 rows)"),
+        "{plan}"
+    );
 }
 
 #[test]
@@ -344,4 +347,88 @@ fn test_conditions_do_not_carry_onto_an_outer_joins_null_side() {
         "a.id = 42",
         "a.id + 0 = 42",
     );
+}
+
+// IN (and an OR of equalities on one column) seeks each value.
+#[test]
+fn test_in_lists_seek_each_value() {
+    let c = setup();
+    for (sql, seek, scan) in [
+        (
+            "select * from t where {}",
+            "id in (5, 17, 299, 4000)",
+            "id + 0 in (5, 17, 299, 4000)",
+        ),
+        (
+            "select * from t where {}",
+            "id = 3 or id = 9",
+            "id + 0 = 3 or id + 0 = 9",
+        ),
+        (
+            "select * from t where {}",
+            "id in (1, null)",
+            "id + 0 in (1, null)",
+        ),
+        (
+            "select note from t where {}",
+            "name in ('name0003', 'name0100', 'nobody')",
+            "name || '' in ('name0003', 'name0100', 'nobody')",
+        ),
+        (
+            "select id, n from t where {}",
+            "city in ('city1', 'city2') and n = 7",
+            "city || '' in ('city1', 'city2') and n + 0 = 7",
+        ),
+        (
+            "select id, n from t where {}",
+            "city in ('city1', 'city2') and n in (7, 8)",
+            "city || '' in ('city1', 'city2') and n + 0 in (7, 8)",
+        ),
+        (
+            "select id from t where {}",
+            "id in (1, 2, 3) and id > 1",
+            "id + 0 in (1, 2, 3) and id + 0 > 1",
+        ),
+    ] {
+        agree(&c, sql, seek, scan);
+    }
+    let plan = explain(&c, "select * from t where id in (5, 17)");
+    assert!(
+        plan.contains("TableSeek t (id IN (5, 17)) (~2 rows)"),
+        "{plan}"
+    );
+    let plan = explain(
+        &c,
+        "select id, n from t where city in ('city1', 'city2') and n = 7",
+    );
+    assert!(
+        plan.contains("(city IN ('city1', 'city2') AND n = 7)"),
+        "{plan}"
+    );
+    // NOT IN excludes values: no seek.
+    assert!(!explain(&c, "select id from t where id not in (1, 2)").contains("Seek"));
+}
+
+// A condition the seek reads exactly isn't checked again; the rest are.
+#[test]
+fn test_conditions_a_seek_reads_exactly_are_not_rechecked() {
+    let c = setup();
+    let plan = explain(&c, "select * from t where id = 42");
+    assert!(!plan.contains("Filter"), "{plan}");
+    let plan = explain(
+        &c,
+        "select id from t where city = 'city3' and n = 5 and id > 100",
+    );
+    assert!(plan.contains("Filter (id > 100)"), "{plan}");
+    assert!(plan.contains("(city = 'city3' AND n = 5)"), "{plan}");
+    agree(
+        &c,
+        "select id from t where {}",
+        "city = 'city3' and n = 5 and id > 100",
+        "city || '' = 'city3' and n + 0 = 5 and id + 0 > 100",
+    );
+    // Not on the NULL-extended side of an outer join: there the condition
+    // also removes NULL-extended rows, which only WHERE can do.
+    let sql = "select a.id from t a left join t b on a.id = b.id where b.name = 'name0001'";
+    assert!(explain(&c, sql).contains("Filter"), "{}", explain(&c, sql));
 }

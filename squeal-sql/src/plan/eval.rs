@@ -378,8 +378,49 @@ impl EvalExpr {
                 Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
             }
             Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables)?,
-
-            _ => panic!("Oops here {:?}", expr),
+            // `x IN (a, b)` is `x = a OR x = b`, and NOT IN its negation —
+            // which, with AND/OR/NOT's three-valued logic (see
+            // CrateValueItem::binary), gives SQL's NULL behaviour exactly:
+            // `1 IN (1, NULL)` is true, `2 IN (1, NULL)` is NULL.
+            Expr::InList {
+                expr: lhs,
+                list,
+                negated,
+            } => {
+                let lhs = Self::from_expr(lhs, tables)?;
+                let mut any: Option<EvalExpr> = None;
+                for item in list {
+                    let eq = EvalExpr::Binary {
+                        lhs: lhs.clone(),
+                        op: BinaryOp::Eq,
+                        rhs: Self::from_expr(item, tables)?,
+                    };
+                    any = Some(match any {
+                        None => eq,
+                        Some(prev) => EvalExpr::Binary {
+                            lhs: Box::new(prev),
+                            op: BinaryOp::Or,
+                            rhs: Box::new(eq),
+                        },
+                    });
+                }
+                let any = any
+                    .ok_or_else(|| SchemaError::UserError("IN needs at least one value".into()))?;
+                if *negated {
+                    EvalExpr::Unary {
+                        op: sql_parser::expr::UnaryOp::Not,
+                        field: Box::new(any),
+                    }
+                } else {
+                    any
+                }
+            }
+            other => {
+                return Err(SchemaError::UnsupportedFeature(format!(
+                    "this kind of expression: {}",
+                    describe_unsupported(other)
+                )));
+            }
         };
         Ok(Box::new(eval_expr))
     }
@@ -469,14 +510,31 @@ impl CrateValueItem {
     }
 
     fn binary(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<ValueItem, SchemaError> {
-        // NULL propagates through every operator (matches unary's own
+        // AND/OR use SQL's three-valued logic: a known operand can decide
+        // the answer on its own — `NULL OR TRUE` is TRUE, `NULL AND FALSE`
+        // is FALSE — and only otherwise is a NULL operand the answer.
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let truth = |v: &ValueItem| match v {
+                ValueItem::Boolean(b) => Ok(Some(*b)),
+                ValueItem::Null => Ok(None),
+                _ => Err(SchemaError::InvalidOperationOnOperand(
+                    format!("{op:?}"),
+                    "non-boolean operand".into(),
+                )),
+            };
+            let (l, r) = (truth(lhs)?, truth(rhs)?);
+            let decisive = matches!(op, BinaryOp::Or);
+            return Ok(if l == Some(decisive) || r == Some(decisive) {
+                ValueItem::Boolean(decisive)
+            } else if l.is_none() || r.is_none() {
+                ValueItem::Null
+            } else {
+                ValueItem::Boolean(!decisive)
+            });
+        }
+        // Every other operator: NULL propagates (matches unary's own
         // `ValueItem::Null => ValueItem::Null` passthrough) rather than
-        // erroring or being compared as a value in its own right. This is
-        // deliberately simpler than SQL's full three-valued AND/OR logic
-        // (`NULL AND FALSE` is `FALSE` there, not `NULL`) — nothing else in
-        // this engine has NULL-aware boolean logic yet (there's no WHERE
-        // clause support at all), so that nuance is left for whenever that
-        // lands rather than half-implemented here.
+        // erroring or being compared as a value in its own right.
         if matches!(lhs, ValueItem::Null) || matches!(rhs, ValueItem::Null) {
             return Ok(ValueItem::Null);
         }
@@ -679,6 +737,17 @@ fn compare(
     }
 }
 
+// A short name for an expression kind from_expr doesn't evaluate, for its
+// error message — not the whole debug dump of the syntax tree.
+fn describe_unsupported(expr: &Expr) -> String {
+    let debug = format!("{expr:?}");
+    debug
+        .split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("?")
+        .to_string()
+}
+
 fn operand_error_msg(v1: &str, v2: &str) -> Result<ValueItem, SchemaError> {
     Err(SchemaError::InvalidOperationOnOperand(v1.into(), v2.into()))
 }
@@ -764,13 +833,8 @@ mod tests {
 
     #[test]
     fn test_binary_null_propagates_for_every_op() {
-        for op in [
-            BinaryOp::Plus,
-            BinaryOp::Eq,
-            BinaryOp::Lt,
-            BinaryOp::And,
-            BinaryOp::Concat,
-        ] {
+        // (AND/OR are three-valued instead: see the test below.)
+        for op in [BinaryOp::Plus, BinaryOp::Eq, BinaryOp::Lt, BinaryOp::Concat] {
             assert_eq!(
                 bin(&ValueItem::Null, op, &int(1)).unwrap(),
                 ValueItem::Null,
@@ -1037,6 +1101,29 @@ mod tests {
             bin(&str_cap("apple", 5), BinaryOp::Lt, &str_cap("banana", 500)).unwrap(),
             ValueItem::Boolean(true)
         );
+    }
+
+    #[test]
+    fn test_and_or_are_three_valued() {
+        let (t, f, n) = (
+            ValueItem::Boolean(true),
+            ValueItem::Boolean(false),
+            ValueItem::Null,
+        );
+        let and = |a: &ValueItem, b: &ValueItem| bin(a, BinaryOp::And, b).unwrap();
+        let or = |a: &ValueItem, b: &ValueItem| bin(a, BinaryOp::Or, b).unwrap();
+        assert_eq!(and(&n, &f), f);
+        assert_eq!(and(&f, &n), f);
+        assert_eq!(and(&n, &t), n);
+        assert_eq!(and(&n, &n), n);
+        assert_eq!(or(&n, &t), t);
+        assert_eq!(or(&t, &n), t);
+        assert_eq!(or(&n, &f), n);
+        assert_eq!(or(&n, &n), n);
+        assert_eq!(and(&t, &t), t);
+        assert_eq!(or(&f, &f), f);
+        // Still only booleans.
+        assert!(bin(&n, BinaryOp::And, &int(1)).is_err());
     }
 
     #[test]

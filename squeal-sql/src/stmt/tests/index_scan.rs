@@ -152,7 +152,9 @@ fn test_an_index_scan_sees_the_statements_transaction() {
     run(&c, "insert into t values (100, 'fresh', 'city9', 'n')").unwrap();
     run(&c, "delete from t where id = 0").unwrap();
     let sql = "select name from t where name = 'fresh' or name = 'name00'";
-    assert!(explain(&c, sql).contains("IndexScan"));
+    // An OR of equalities on one column is a seek of those values.
+    let plan = explain(&c, sql);
+    assert!(plan.contains("IndexSeek t using t_name"), "{plan}");
     assert_eq!(rows(&c, sql), vec![vec![s("fresh")]]);
     run(&c, "rollback").unwrap();
     assert_eq!(rows(&c, sql), vec![vec![s("name00")]]);

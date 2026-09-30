@@ -151,9 +151,12 @@ pub struct RangeCursor<F: DBFile + 'static> {
     start: Bound<DBIdType>,
     end: Bound<DBIdType>,
     // Some for key-range scans (see Db::key_range_scan, Db::prefix_scan):
-    // entries before the range are skipped, and the first one after it
-    // ends the scan.
-    range: Option<KeyRange>,
+    // non-overlapping ranges, read one after another in the order given —
+    // entries before the current range are skipped, and the first one after
+    // it (or the end of the tree) moves the scan to the next range,
+    // repositioning at its start, or ends it after the last.
+    ranges: Option<Vec<KeyRange>>,
+    range_idx: usize,
     // Set once an index entry is past end is seen: ascending leaf-chain order
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
@@ -239,7 +242,8 @@ where
             transaction,
             start,
             end,
-            range: None,
+            ranges: None,
+            range_idx: 0,
             done: false,
         })
     }
@@ -253,15 +257,23 @@ where
     // key — the prefix, then the lower bound's value, then NULL (the lowest
     // value of every type) for each remaining field, the length read off an
     // existing entry — and where each entry lies is checked in next().
-    pub(crate) fn new_key_range(
+    //
+    // Several non-overlapping ranges (an `IN` list's values, say) are read
+    // one after another, in the order given, under the one transaction; none
+    // at all reads nothing. Ascending ranges give key order overall; others
+    // don't have to be (NULLs read after the rest, for NULLS LAST).
+    pub(crate) fn new_key_ranges(
         db: Arc<Db<F>>,
         table: TableIdType,
         transaction: Option<TransactionId>,
-        range: KeyRange,
+        ranges: Vec<KeyRange>,
     ) -> Result<Self, StoreError> {
         let transaction = ScanTxn::new(&db, transaction)?;
         let tree = db.table_by_id(table)?;
-        let start = Self::range_start(&tree, &range)?;
+        let start = match ranges.first() {
+            Some(r) => Self::range_start(&tree, r)?,
+            None => Bound::Unbounded,
+        };
         let current_leaf = Self::start_leaf(&tree, &start)?;
         let current_iter = current_leaf.iter();
         Ok(Self {
@@ -272,9 +284,35 @@ where
             transaction,
             start,
             end: Bound::Unbounded,
-            range: Some(range),
-            done: false,
+            done: ranges.is_empty(),
+            ranges: Some(ranges),
+            range_idx: 0,
         })
+    }
+
+    pub(crate) fn new_key_range(
+        db: Arc<Db<F>>,
+        table: TableIdType,
+        transaction: Option<TransactionId>,
+        range: KeyRange,
+    ) -> Result<Self, StoreError> {
+        Self::new_key_ranges(db, table, transaction, vec![range])
+    }
+
+    // Moves to the next of `ranges`, repositioning at its start; false if
+    // there is none.
+    fn next_range(&mut self, tree: &Arc<BPlusTree<F>>) -> Result<bool, StoreError> {
+        let Some(ranges) = &self.ranges else {
+            return Ok(false);
+        };
+        self.range_idx += 1;
+        let Some(range) = ranges.get(self.range_idx) else {
+            return Ok(false);
+        };
+        self.start = Self::range_start(tree, range)?;
+        self.current_leaf = Self::start_leaf(tree, &self.start)?;
+        self.current_iter = self.current_leaf.iter();
+        Ok(true)
     }
 
     // Every entry whose leading fields equal `prefix`, in key order.
@@ -408,7 +446,8 @@ where
                         Bound::Excluded(k) => entry.id >= *k,
                         Bound::Unbounded => false,
                     };
-                    let range_position = match (&self.range, &entry.id) {
+                    let range = self.ranges.as_ref().map(|r| &r[self.range_idx]);
+                    let range_position = match (range, &entry.id) {
                         (Some(r), DBIdType::Rec(k)) => r.position(k),
                         (Some(_), _) => {
                             return Err(StoreError::UnknownError(
@@ -419,6 +458,13 @@ where
                     };
                     if range_position == std::cmp::Ordering::Less {
                         continue;
+                    }
+                    if range_position == std::cmp::Ordering::Greater && !past_end {
+                        // This entry may well be in a later range: the
+                        // repositioned scan reads it again from there.
+                        if self.next_range(&table)? {
+                            continue;
+                        }
                     }
                     if past_end || range_position == std::cmp::Ordering::Greater {
                         self.done = true;
@@ -442,6 +488,9 @@ where
                         _ => continue,
                     }
                 }
+                // The end of the tree ends a range too — the next one may
+                // lie earlier in the key order.
+                None if self.next_range(&table)? => continue,
                 None => return Ok(None),
             }
         }
@@ -454,14 +503,18 @@ where
     // at construction time.
     fn reset(&mut self) -> Result<(), StoreError> {
         let tree = self.db.table_by_id(self.table)?;
-        if let Some(range) = &self.range {
-            // The tree may have been empty when the scan was built.
-            self.start = Self::range_start(&tree, range)?;
+        self.range_idx = 0;
+        self.done = false;
+        if let Some(ranges) = &self.ranges {
+            match ranges.first() {
+                // The tree may have been empty when the scan was built.
+                Some(range) => self.start = Self::range_start(&tree, range)?,
+                None => self.done = true,
+            }
         }
         let current_leaf = Self::start_leaf(&tree, &self.start)?;
         self.current_iter = current_leaf.iter();
         self.current_leaf = current_leaf;
-        self.done = false;
         Ok(())
     }
 }
@@ -1506,6 +1559,73 @@ mod tests {
             drain_keys(&mut db.key_range_scan(tid, None, r).unwrap()).len(),
             2
         );
+    }
+
+    #[test]
+    fn test_key_ranges_scan_reads_each_range_in_turn() {
+        let vals = |i: i64| if i % 7 == 0 { None } else { Some(i % 13) };
+        let mut keys = vec![];
+        for a in 0..300 {
+            for b in 0..20 {
+                keys.push(nk(vals(a), vals(b), a * 100 + b));
+            }
+        }
+        let (db, tid) = prefix_db("key_ranges.db", &keys);
+        let int = ValueItem::Integer;
+        let single = |r: KeyRange| drain_keys(&mut db.key_range_scan(tid, None, r).unwrap());
+        let cases: Vec<Vec<KeyRange>> = vec![
+            // IN (2, 5, 9) on the first field
+            [2, 5, 9]
+                .iter()
+                .map(|v| KeyRange::prefix(vec![int(*v)]))
+                .collect(),
+            // a IN (3, 4) AND b > 10
+            [3, 4]
+                .iter()
+                .map(|v| KeyRange {
+                    prefix: vec![int(*v)],
+                    lower: Bound::Excluded(int(10)),
+                    upper: Bound::Unbounded,
+                })
+                .collect(),
+            // adjacent ranges, the last value, and a value with no rows
+            vec![
+                KeyRange::prefix(vec![int(1), int(1)]),
+                KeyRange::prefix(vec![int(1), int(2)]),
+                KeyRange::prefix(vec![int(12)]),
+                KeyRange::prefix(vec![int(99)]),
+            ],
+        ];
+        for ranges in cases {
+            let expected: Vec<_> = ranges.iter().flat_map(|r| single(r.clone())).collect();
+            assert!(!expected.is_empty());
+            let mut c = db.key_ranges_scan(tid, None, ranges.clone()).unwrap();
+            assert_eq!(drain_keys(&mut c), expected, "{ranges:?}");
+            c.reset().unwrap();
+            assert_eq!(drain_keys(&mut c), expected, "after reset: {ranges:?}");
+        }
+        // Not ascending: each range is read from its own start, in the
+        // order given — the NULL first fields after all the others.
+        let not_null = KeyRange {
+            prefix: vec![],
+            lower: Bound::Excluded(ValueItem::Null),
+            upper: Bound::Unbounded,
+        };
+        let null = KeyRange::prefix(vec![ValueItem::Null]);
+        let expected: Vec<_> = single(not_null.clone())
+            .into_iter()
+            .chain(single(null.clone()))
+            .collect();
+        assert_eq!(expected.len(), keys.len());
+        let mut c = db.key_ranges_scan(tid, None, vec![not_null, null]).unwrap();
+        assert_eq!(drain_keys(&mut c), expected);
+        c.reset().unwrap();
+        assert_eq!(drain_keys(&mut c), expected);
+
+        let mut none = db.key_ranges_scan(tid, None, vec![]).unwrap();
+        assert!(drain_keys(&mut none).is_empty());
+        none.reset().unwrap();
+        assert!(drain_keys(&mut none).is_empty());
     }
 
     #[test]

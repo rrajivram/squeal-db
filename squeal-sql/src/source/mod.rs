@@ -12,6 +12,7 @@ pub mod hash;
 pub mod index;
 pub(crate) mod join;
 mod joinmatch;
+pub(crate) mod nestloop;
 pub mod limit;
 pub mod planinfo;
 pub mod proj;
