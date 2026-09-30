@@ -19,7 +19,7 @@ use crate::{
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     error::SchemaError,
     optim::{
-        picker::{ItemNeeds, analyze_query, pick_index},
+        picker::{AccessPath, ItemNeeds, analyze_query, pick_access},
         table_stats::{ComputedTableStat, compute_table_stats},
     },
     plan::{
@@ -204,8 +204,6 @@ where
                     .map(|f| f.field.clone())
                     .collect::<Vec<_>>(),
             ),
-            // Same layout as the table: see IndexSource.
-            TableRef::IndexScan(t, _) => t.resolved_fields(),
         }
     }
 
@@ -219,7 +217,6 @@ where
             TableRef::Real(_, t) => t.open_source(conn, stat, txn),
             TableRef::Temp(_, t) => t.open_source(conn, stat, txn),
             TableRef::Derived(name, d) => d.take(name),
-            TableRef::IndexScan(t, i) => Ok(Box::new(IndexSource::new(conn, t, *i, txn, stat)?)),
         }
     }
 }
@@ -826,24 +823,58 @@ where
             .collect()
     }
 
-    // Opens one FROM item: a covering index when optim::picker finds one
-    // cheaper than the table (only for a real table with statistics),
-    // otherwise the item itself.
+    // Opens one FROM item. A real table is read the way optim::picker
+    // chooses (a scan or seek of the table or one of its indexes); anything
+    // else is opened as is.
     fn open_item(
         &self,
         item: &TableQuery<F>,
         needs: Option<&ItemNeeds>,
     ) -> Result<Box<dyn Source>, SchemaError> {
-        if let (TableRef::Real(_, table), Some(stats), Some(needs)) =
-            (&item.resolved, &item.stats, needs)
-            && let Some(index) = pick_index(table, stats, needs)
-        {
-            return self.open(
-                &TableRef::IndexScan(table.clone(), index),
-                item.stats.clone(),
-            );
-        }
-        self.open(&item.resolved, item.stats.clone())
+        let (TableRef::Real(_, table), Some(needs)) = (&item.resolved, needs) else {
+            return self.open(&item.resolved, item.stats.clone());
+        };
+        let db = self.conn.database.read().db.clone();
+        let access = pick_access(table, item.stats.as_ref(), needs, db.get_page_data_size());
+        let stats = item.stats.clone();
+        self.conn.with_current_txn(|explicit| {
+            let txn = explicit.or(self.stmt_txn.as_ref());
+            let source: Box<dyn Source> = match access.path {
+                AccessPath::TableScan => return item.resolved.open_source(&self.conn, stats, txn),
+                AccessPath::TableSeek(range) => Box::new(TableSource::seek(
+                    db,
+                    table.clone(),
+                    txn,
+                    stats,
+                    range,
+                    access.rows,
+                )?),
+                AccessPath::IndexScan(i) => {
+                    Box::new(IndexSource::new(&self.conn, table, i, txn, stats)?)
+                }
+                AccessPath::IndexSeek(i, range) => Box::new(IndexSource::seek(
+                    &self.conn,
+                    table,
+                    i,
+                    txn,
+                    stats,
+                    range,
+                    false,
+                    access.rows,
+                )?),
+                AccessPath::IndexLookup(i, range) => Box::new(IndexSource::seek(
+                    &self.conn,
+                    table,
+                    i,
+                    txn,
+                    stats,
+                    range,
+                    true,
+                    access.rows,
+                )?),
+            };
+            Ok(source)
+        })
     }
 
     fn flatten_tables(tables: &[TableQuery<F>]) -> Vec<TableQuery<F>> {

@@ -8,8 +8,8 @@ use crate::constant::RESERVED_TABLE_NAME_PREFIX;
 use crate::constant::SYSTEM_TABLE_NAME;
 use crate::constant::SYSTEM_TABLE_PAGE;
 use crate::constant::timestamp;
-use crate::cursor::RangeCursor;
 use crate::cursor::TableCursor;
+use crate::cursor::{KeyRange, RangeCursor};
 use crate::error::StoreError;
 use crate::generator::Generator;
 use crate::logger::LogRecord;
@@ -1956,7 +1956,18 @@ where
         id: DBIdType,
         txn: &Transaction,
     ) -> Result<Option<Tuple>, StoreError> {
-        let txn_id = txn.id();
+        self.find_as(tid, id, txn.id())
+    }
+
+    /// `find` as the transaction `txn_id` — for a caller holding only the
+    /// id of a transaction someone else keeps open, e.g. a scan fetching
+    /// the rows its index entries point to (see RangeCursor::reader).
+    pub fn find_as(
+        &self,
+        tid: TableIdType,
+        id: DBIdType,
+        txn_id: TransactionId,
+    ) -> Result<Option<Tuple>, StoreError> {
         // A finished transaction no longer pins its snapshot (vacuum may
         // have reclaimed what it could see), so it may not read: the error
         // says why it finished (SnapshotTooOld, or already finished).
@@ -2230,6 +2241,20 @@ where
         prefix: IndexKey,
     ) -> Result<RangeCursor<F>, StoreError> {
         RangeCursor::new_prefix(Arc::clone(self), tid, None, prefix)
+    }
+
+    // Every key within `range` (see KeyRange), under `txn` if given (same
+    // contract as range_scan_bounds_in_txn), else a transaction of its own.
+    pub fn key_range_scan(
+        self: &Arc<Self>,
+        tid: TableIdType,
+        txn: Option<&Transaction>,
+        range: KeyRange,
+    ) -> Result<RangeCursor<F>, StoreError> {
+        if let Some(txn) = txn {
+            self.require_active(&txn.id())?;
+        }
+        RangeCursor::new_key_range(Arc::clone(self), tid, txn.map(|t| t.id()), range)
     }
 
     // prefix_scan under `txn`; same contract as range_scan_bounds_in_txn.

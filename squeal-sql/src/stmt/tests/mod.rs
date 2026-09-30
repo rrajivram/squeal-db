@@ -2189,6 +2189,7 @@ fn test_order_by_desc_without_limit_is_applied() {
 }
 
 mod index_scan;
+mod index_seek;
 
 #[cfg(test)]
 mod join_tests {
@@ -2817,7 +2818,7 @@ fn test_explain_shows_the_filter_predicate_with_column_names() {
     let c = subquery_conn();
     assert_eq!(
         explain(&c, "select id from t1 where cat = 1 and id > 2"),
-        "Projection id\n  Filter ((cat = 1) AND (id > 2))\n    TableScan t1 (~5 rows)"
+        "Projection id\n  Filter ((cat = 1) AND (id > 2))\n    TableSeek t1 (id > 2) (~4 rows)"
     );
 }
 
@@ -3483,6 +3484,29 @@ fn test_min_max_sum_over_an_empty_table_report_null() {
         rows,
         vec![vec![ValueItem::Null, ValueItem::Null, ValueItem::Null]]
     );
+}
+
+#[test]
+fn test_signed_numbers_in_values() {
+    let c = conn();
+    run(&c, "create table n (a integer, b double)").unwrap();
+    run(
+        &c,
+        "insert into n values (-4, -4.5), (+3, +2.5), (-9223372036854775808, 1.0)",
+    )
+    .unwrap();
+    let mut rows = select_rows(&c, "select a, b from n").1;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            vec![ValueItem::Integer(i64::MIN), ValueItem::Double(1.0)],
+            vec![ValueItem::Integer(-4), ValueItem::Double(-4.5)],
+            vec![ValueItem::Integer(3), ValueItem::Double(2.5)],
+        ]
+    );
+    assert!(run(&c, "insert into n values (-9223372036854775809, 1.0)").is_err());
+    assert!(run(&c, "insert into n values (1, -'x')").is_err());
 }
 
 // An unqualified column is found in whichever FROM table has it — it used

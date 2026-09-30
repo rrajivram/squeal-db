@@ -4,9 +4,10 @@ use store::clock::Instant;
 
 use postcard::from_bytes;
 use store::{
+    cursor::KeyRange,
     cursor::{Cursor, RangeCursor},
-    db::DBFile,
-    tuple::DBIdType,
+    db::{DBFile, Db},
+    tuple::{DBIdType, Tuple},
     txn::Transaction,
     valueitem::{IndexKey, ValueItem},
 };
@@ -15,14 +16,17 @@ use crate::{
     error::SchemaError,
     optim::table_stats::ComputedTableStat,
     source::{ProjectableField, QueryStats, Source},
-    table::{SqlIndex, SqlTable},
+    table::{SqlIndex, SqlTable, VersionedRow},
 };
 
-// A full scan of one of a table's indexes, producing rows in the TABLE's
-// own layout: every column in table order, NULL wherever the index holds
-// no value. Same layout as TableSource, so the planner can swap one for the
-// other without renumbering a single column position (see optim::picker —
-// it only picks an index that holds every column the query reads).
+// Reads one of a table's indexes — all of it (IndexScan) or a key range
+// (IndexSeek) — producing rows in the TABLE's own layout: every column in
+// table order, NULL wherever the index holds no value. Same layout as
+// TableSource, so the planner can swap one for the other without
+// renumbering a single column position (see optim::picker — it only picks
+// such an index when it holds every column the query reads). With a row
+// lookup (IndexLookup) each entry's whole row is fetched from the table
+// instead, at the scan's own snapshot, so any index will do.
 //
 // An index entry's key is the indexed columns' values (plus the row's
 // identity, for a non-unique index); its data is the row's identity — for
@@ -39,11 +43,48 @@ pub struct IndexSource<F: DBFile + 'static> {
     // None when the table has no PRIMARY KEY (its identity is a row id,
     // not a column).
     pk_positions: Option<Vec<usize>>,
+    // The seek's condition for EXPLAIN and its estimated row count; None
+    // for a full scan.
+    seek: Option<(String, Option<usize>)>,
+    // Some: fetch each entry's row from the table (IndexLookup).
+    lookup: Option<Arc<Db<F>>>,
+    last_id: Option<DBIdType>,
     stats: Option<ComputedTableStat>,
     next_time: u128,
 }
 
-impl<F: DBFile + 'static> IndexSource<F> {
+impl<F> IndexSource<F>
+where
+    F: DBFile<Item = F> + 'static,
+{
+    /// The entries of `index` within `range` (see optim::picker's
+    /// IndexSeek/IndexLookup), expected to be `rows` many; `lookup` fetches
+    /// each entry's row from the table.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seek(
+        conn: &Arc<Connection<F>>,
+        table: &Arc<SqlTable>,
+        index: usize,
+        txn: Option<&Transaction>,
+        stats: Option<ComputedTableStat>,
+        range: KeyRange,
+        lookup: bool,
+        rows: Option<usize>,
+    ) -> Result<Self, SchemaError> {
+        let db = conn.database.read().db.clone();
+        let key_names: Vec<String> = table.indices[index]
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        let seek = crate::plan::sarg::describe_key_range(&range, &key_names);
+        let cursor = db.key_range_scan(table.indices[index].db_table_id, txn, range)?;
+        let mut source = Self::with_cursor(table, index, cursor, stats)?;
+        source.seek = Some((seek, rows));
+        source.lookup = lookup.then_some(db);
+        Ok(source)
+    }
+
     pub fn new(
         db: &Arc<Connection<F>>,
         table: &Arc<SqlTable>,
@@ -65,6 +106,15 @@ impl<F: DBFile + 'static> IndexSource<F> {
                 std::ops::Bound::Unbounded,
             )?,
         };
+        Self::with_cursor(table, index, cursor, stats)
+    }
+
+    fn with_cursor(
+        table: &Arc<SqlTable>,
+        index: usize,
+        cursor: RangeCursor<F>,
+        stats: Option<ComputedTableStat>,
+    ) -> Result<Self, SchemaError> {
         let table_fields = table.fields();
         let positions = |index: &SqlIndex| -> Result<Vec<usize>, SchemaError> {
             index
@@ -100,9 +150,42 @@ impl<F: DBFile + 'static> IndexSource<F> {
             fields: Arc::from(fields),
             key_positions,
             pk_positions,
+            seek: None,
+            lookup: None,
+            last_id: None,
             stats,
             next_time: 0,
         })
+    }
+
+    // The table row an entry points to, at the scan's snapshot. None if it
+    // isn't visible there, which the entry being visible should rule out.
+    fn fetch_row(
+        &mut self,
+        db: &Arc<Db<F>>,
+        entry: &Tuple,
+    ) -> Result<Option<IndexKey>, SchemaError> {
+        let identity = from_bytes::<IndexKey>(entry.data())?;
+        let id = if self.pk_positions.is_some() {
+            DBIdType::Rec(identity)
+        } else {
+            match identity.values() {
+                [ValueItem::Integer(n)] => DBIdType::Int(*n as u64),
+                other => {
+                    return Err(SchemaError::InternalSchemaError(format!(
+                        "index {} points to a row id that isn't one integer: {other:?}",
+                        self.index_name()
+                    )));
+                }
+            }
+        };
+        let Some(tuple) = db.find_as(self.table.db_table_id, id.clone(), self.cursor.reader())?
+        else {
+            return Ok(None);
+        };
+        let row = from_bytes::<VersionedRow>(tuple.data())?;
+        self.last_id = Some(id);
+        Ok(Some(self.table.reproject(&row)?))
     }
 
     fn index_name(&self) -> String {
@@ -115,11 +198,28 @@ impl<F: DBFile + 'static> IndexSource<F> {
     }
 }
 
-impl<F: DBFile + 'static> Source for IndexSource<F> {
+impl<F> Source for IndexSource<F>
+where
+    F: DBFile<Item = F> + 'static,
+{
     fn plan(&self) -> PlanNode {
-        PlanNode::new("IndexScan")
-            .detail(format!("{} using {}", self.table.name, self.index_name()))
-            .rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
+        let using = format!("{} using {}", self.table.name, self.index_name());
+        match &self.seek {
+            Some((seek, rows)) => PlanNode::new(if self.lookup.is_some() {
+                "IndexLookup"
+            } else {
+                "IndexSeek"
+            })
+            .detail(format!("{using} ({seek})"))
+            .rows(*rows),
+            None => PlanNode::new("IndexScan")
+                .detail(using)
+                .rows(self.stats.as_ref().map(|s| s.table_stat.row_count)),
+        }
+    }
+
+    fn last_id(&self) -> Option<DBIdType> {
+        self.last_id.clone()
     }
 
     fn fields(&self) -> Arc<[ProjectableField]> {
@@ -128,6 +228,19 @@ impl<F: DBFile + 'static> Source for IndexSource<F> {
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
+        if let Some(db) = self.lookup.clone() {
+            loop {
+                let Some(entry) = self.cursor.next()? else {
+                    self.last_id = None;
+                    self.next_time += start.elapsed().as_nanos();
+                    return Ok(None);
+                };
+                if let Some(row) = self.fetch_row(&db, &entry)? {
+                    self.next_time += start.elapsed().as_nanos();
+                    return Ok(Some(row));
+                }
+            }
+        }
         let Some(entry) = self.cursor.next()? else {
             self.next_time += start.elapsed().as_nanos();
             return Ok(None);
@@ -165,6 +278,7 @@ impl<F: DBFile + 'static> Source for IndexSource<F> {
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
+        self.last_id = None;
         Ok(self.cursor.reset()?)
     }
 
@@ -173,7 +287,10 @@ impl<F: DBFile + 'static> Source for IndexSource<F> {
     }
 }
 
-impl<F: DBFile + 'static> Debug for IndexSource<F> {
+impl<F> Debug for IndexSource<F>
+where
+    F: DBFile<Item = F> + 'static,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IndexScan")
             .field("table", &self.table.name)

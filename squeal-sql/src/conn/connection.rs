@@ -542,7 +542,6 @@ pub(crate) enum TableRef<F: DBFile + 'static> {
     // A FROM-clause subquery: the already-built output of an inner query.
     // See DerivedSource for why this is a shared one-shot handle.
     Derived(String, DerivedSource),
-    IndexScan(Arc<SqlTable>, usize),
 }
 
 // The output of a previous query used as a FROM item. A Source is a live,
@@ -642,11 +641,6 @@ impl<F: DBFile + 'static> std::fmt::Debug for TableRef<F> {
                 .finish(),
             TableRef::Temp(name, _) => f.debug_tuple("Temp").field(name).finish(),
             TableRef::Derived(n, _s) => f.debug_tuple("Derived").field(n).finish(),
-            TableRef::IndexScan(t, i) => f
-                .debug_tuple("Index")
-                .field(&t.name)
-                .field(&t.indices[*i].name)
-                .finish(),
         }
     }
 }
@@ -658,7 +652,6 @@ impl<F: DBFile + 'static> Clone for TableRef<F> {
             Self::Temp(s, t) => Self::Temp(s.clone(), t.clone()),
             // Shares the one-shot stream — see DerivedSource.
             Self::Derived(n, d) => Self::Derived(n.clone(), d.clone()),
-            Self::IndexScan(t, i) => Self::IndexScan(t.clone(), *i),
         }
     }
 }

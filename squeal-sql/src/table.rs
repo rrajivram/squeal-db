@@ -1307,7 +1307,40 @@ fn expr_to_value_item(
     expr: &sql_parser::Expr,
     datatype: DataType,
 ) -> Result<ValueItem, SchemaError> {
-    use sql_parser::{expr::Expr, literal::Literal};
+    use sql_parser::{
+        expr::{Expr, UnaryOp},
+        literal::Literal,
+    };
+    // A signed number — `-4.5`, `+3` — parses as a unary operator applied
+    // to the number literal. Negated from its raw text, not by negating
+    // the parsed value, so i64::MIN (whose magnitude doesn't fit an i64)
+    // still works.
+    if let Expr::Unary { op, expr: inner } = expr
+        && let Expr::Literal(Literal::Number(n)) = inner.as_ref()
+        && matches!(op, UnaryOp::Minus | UnaryOp::Plus)
+    {
+        let negative = matches!(op, UnaryOp::Minus);
+        return match datatype {
+            DataType::Integer => {
+                let text = if negative {
+                    format!("-{}", n.raw)
+                } else {
+                    n.raw.clone()
+                };
+                text.parse::<i64>()
+                    .map(ValueItem::Integer)
+                    .map_err(|_| SchemaError::UserError(format!("invalid integer literal: {text}")))
+            }
+            DataType::Double => Ok(ValueItem::Double(if negative {
+                -n.as_f64()
+            } else {
+                n.as_f64()
+            })),
+            _ => Err(SchemaError::UserError(format!(
+                "value {expr:?} does not match column type {datatype:?}"
+            ))),
+        };
+    }
     let literal = match expr {
         Expr::Literal(l) => l,
         _ => {

@@ -4,8 +4,8 @@
 // exhaustive, synchronous rebuild. The lifecycle side (create/load/
 // persist/shutdown, the stats table surviving close/reopen) is in
 // `contract` instead.
+use std::time::Duration;
 use store::clock::Instant;
-use std::time::{Duration};
 
 use store::table::TableIdType;
 use store::valueitem::ValueItem;
@@ -65,14 +65,14 @@ fn test_insert_feeds_schema_stats_row_count_and_column_stats() {
     let stat = wait_for_row_count(&schema, table.db_table_id, 3);
     assert_eq!(stat.name, "customers");
 
-    // `id` is the sole PRIMARY KEY column — excluded from col_stats (see
-    // SchemaStats::table_data's own comment: a lone PRIMARY KEY/UNIQUE
-    // column is already known-unique, nothing to track).
+    // `id` is the sole PRIMARY KEY column: known unique, so no bloom
+    // filter, but its min/max are tracked (a range seek on it needs them)
+    // and every value counts as distinct.
     let id_idx = table.fields().iter().position(|f| f.name == "id").unwrap();
-    assert!(
-        !stat.col_stats.contains_key(&id_idx),
-        "a lone PRIMARY KEY column should not get its own bloom/min/max tracking"
-    );
+    let id_stat = stat.col_stats.get(&id_idx).unwrap();
+    assert_eq!(id_stat.min, ValueItem::Integer(1));
+    assert_eq!(id_stat.max, ValueItem::Integer(3));
+    assert_eq!(id_stat.unique, 3);
 
     let age_idx = table.fields().iter().position(|f| f.name == "age").unwrap();
     let age_stat = stat.col_stats.get(&age_idx).unwrap();
@@ -107,7 +107,11 @@ fn test_analyze_table_exhaustively_rebuilds_stats_from_a_full_scan() {
         .get_table_stats(table.db_table_id)
         .unwrap();
     assert_eq!(stat.row_count, 3);
-    let price_idx = table.fields().iter().position(|f| f.name == "price").unwrap();
+    let price_idx = table
+        .fields()
+        .iter()
+        .position(|f| f.name == "price")
+        .unwrap();
     let price_stat = stat.col_stats.get(&price_idx).unwrap();
     assert_eq!(price_stat.min, ValueItem::Double(4.99));
     assert_eq!(price_stat.max, ValueItem::Double(19.99));
@@ -159,7 +163,11 @@ fn test_analyze_table_resets_stale_stats_before_rebuilding() {
 #[test]
 fn test_null_values_are_excluded_from_min_max_and_unique() {
     let c = conn();
-    execute(&c, "create table t (id integer not null, age integer, primary key(id))").unwrap();
+    execute(
+        &c,
+        "create table t (id integer not null, age integer, primary key(id))",
+    )
+    .unwrap();
     let schema = c.current_schema().unwrap();
     let table = schema.get_table("t").unwrap();
 
@@ -177,10 +185,17 @@ fn test_null_values_are_excluded_from_min_max_and_unique() {
         .unwrap();
     let age_idx = table.fields().iter().position(|f| f.name == "age").unwrap();
     let age_stat = stat.col_stats.get(&age_idx).unwrap();
-    assert_eq!(age_stat.min, ValueItem::Integer(10), "NULL must not win min");
+    assert_eq!(
+        age_stat.min,
+        ValueItem::Integer(10),
+        "NULL must not win min"
+    );
     assert_eq!(age_stat.max, ValueItem::Integer(30));
     assert_eq!(age_stat.null, 1);
-    assert_eq!(age_stat.unique, 2, "NULL must not be counted as a distinct value");
+    assert_eq!(
+        age_stat.unique, 2,
+        "NULL must not be counted as a distinct value"
+    );
 }
 
 #[test]

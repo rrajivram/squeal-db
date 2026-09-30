@@ -48,7 +48,11 @@ pub(crate) struct TableStatStored {
 pub(crate) struct ColumnStatStored {
     id: u32,
     name: String,
-    bloom: Bloom<ValueItem>,
+    // Counts distinct values. None for a column a lone PRIMARY KEY/UNIQUE
+    // index already makes unique: every non-NULL value is distinct, so
+    // `unique` just counts them — but min/max/nulls are still tracked,
+    // since a range seek on the key needs them (see optim::picker).
+    bloom: Option<Bloom<ValueItem>>,
     unique: usize,
     nulls: usize,
     min: Option<ValueItem>,
@@ -106,7 +110,6 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         for t in schema.list_tables() {
             let table = schema.get_table(&t).unwrap();
             let tstat = Self::table_data(&table)?;
-            // we won't collect for single primary or unique keys
             tables.insert(table.db_table_id, tstat);
         }
         Self::spawn(schema, tables, sampling_rate)
@@ -243,8 +246,9 @@ impl<F: DBFile + 'static> SchemaStats<F> {
 
     fn table_data(table: &Arc<SqlTable>) -> Result<TableStatStored, SchemaError> {
         // Field *names* a lone PRIMARY KEY/UNIQUE index already covers —
-        // no bloom/min/max tracking needed, since that column's values
-        // are already known-unique by definition. Was comparing index
+        // no bloom filter needed, since that column's values are already
+        // known-unique by definition (min/max/nulls are still tracked:
+        // see ColumnStatStored::bloom). Was comparing index
         // *positions* (within table.indices) against field *positions*
         // (within table.fields()) — two unrelated numberings that just
         // happened to compile — so this never actually excluded the
@@ -258,20 +262,24 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             .collect();
         let mut col_stats = HashMap::new();
         for (i, f) in table.fields().iter().enumerate() {
-            if !unique_fields.contains(f.name.as_str()) {
-                let bloom = Bloom::new_for_fp_rate(4096, 0.2)
-                    .map_err(|s| SchemaError::UnknownError(s.to_string()))?;
-                let cstat = ColumnStatStored {
-                    id: f.id,
-                    bloom,
-                    unique: 0,
-                    nulls: 0,
-                    min: None,
-                    max: None,
-                    name: f.name.clone(),
-                };
-                col_stats.insert(i, cstat);
-            }
+            let bloom = if unique_fields.contains(f.name.as_str()) {
+                None
+            } else {
+                Some(
+                    Bloom::new_for_fp_rate(4096, 0.2)
+                        .map_err(|s| SchemaError::UnknownError(s.to_string()))?,
+                )
+            };
+            let cstat = ColumnStatStored {
+                id: f.id,
+                bloom,
+                unique: 0,
+                nulls: 0,
+                min: None,
+                max: None,
+                name: f.name.clone(),
+            };
+            col_stats.insert(i, cstat);
         }
         let tstat = TableStatStored {
             id: table.db_table_id,
@@ -412,13 +420,16 @@ fn update_table_stats(
             Some(_) => {}
             None => f.max = Some(v.clone()),
         }
-        if f.unique < 4096 {
-            if !f.bloom.check(v) {
-                f.bloom.set(v);
-                f.unique += 1;
+        match &mut f.bloom {
+            // Known unique: every non-NULL value is a new one.
+            None => f.unique += 1,
+            Some(bloom) if f.unique < 4096 => {
+                if !bloom.check(v) {
+                    bloom.set(v);
+                    f.unique += 1;
+                }
             }
-        } else {
-            f.unique += 1;
+            Some(_) => f.unique += 1,
         }
     }
 }
@@ -500,7 +511,13 @@ impl ColumnStatStored {
         PersistedColumnStat {
             id: self.id,
             name: self.name.clone(),
-            bloom_bytes: self.bloom.to_bytes(),
+            // Empty for a column with no bloom filter (see `bloom`); a real
+            // filter's bytes are never empty.
+            bloom_bytes: self
+                .bloom
+                .as_ref()
+                .map(|b| b.to_bytes())
+                .unwrap_or_default(),
             unique: self.unique,
             nulls: self.nulls,
             min: self.min.clone(),
@@ -512,8 +529,14 @@ impl ColumnStatStored {
         Ok(Self {
             id: p.id,
             name: p.name,
-            bloom: Bloom::from_bytes(p.bloom_bytes)
-                .map_err(|e| SchemaError::UnknownError(e.to_string()))?,
+            bloom: if p.bloom_bytes.is_empty() {
+                None
+            } else {
+                Some(
+                    Bloom::from_bytes(p.bloom_bytes)
+                        .map_err(|e| SchemaError::UnknownError(e.to_string()))?,
+                )
+            },
             unique: p.unique,
             nulls: p.nulls,
             min: p.min,
@@ -611,7 +634,7 @@ mod tests {
         ColumnStatStored {
             id: 7,
             name: "amount".into(),
-            bloom,
+            bloom: Some(bloom),
             unique,
             nulls: 2,
             min: Some(ValueItem::Integer(1)),
@@ -646,7 +669,11 @@ mod tests {
         // still report a plausible-looking `unique` count.
         for v in seeded {
             assert!(
-                restored.bloom.check(&ValueItem::Integer(v as i64)),
+                restored
+                    .bloom
+                    .as_ref()
+                    .unwrap()
+                    .check(&ValueItem::Integer(v as i64)),
                 "value {v} was seen before persisting and must still be flagged as seen"
             );
         }
@@ -691,6 +718,18 @@ mod tests {
     // engine does not control (see SchemaStats::load's exception): bytes it
     // cannot parse must come back as an error, which load turns into "start
     // this table's stats fresh" rather than a failed open.
+    #[test]
+    fn test_a_column_without_a_bloom_filter_round_trips() {
+        let original = ColumnStatStored {
+            bloom: None,
+            ..sample_column(&[1, 2])
+        };
+        let restored = ColumnStatStored::from_persisted(original.to_persisted()).unwrap();
+        assert!(restored.bloom.is_none());
+        assert_eq!(restored.min, original.min);
+        assert_eq!(restored.max, original.max);
+    }
+
     #[test]
     fn test_unparseable_bloom_bytes_are_an_error_not_a_panic() {
         let persisted = PersistedColumnStat {

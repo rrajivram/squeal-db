@@ -633,6 +633,10 @@ fn values_equal(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<bool,
     }
     same_type(lhs, rhs, op)?;
     Ok(match (lhs, rhs) {
+        // Numeric equality, as `<`/`>` (compare, below) and integer-vs-
+        // double already use: -0.0 = 0.0, and a NaN equals nothing.
+        // ValueItem's own equality tells the two zeros apart.
+        (ValueItem::Double(a), ValueItem::Double(b)) => a == b,
         (ValueItem::Str((a, _)), ValueItem::Str((b, _))) => a == b,
         (ValueItem::Blob((a, _)), ValueItem::Blob((b, _))) => a == b,
         _ => lhs == rhs,
@@ -1032,6 +1036,18 @@ mod tests {
         assert_eq!(
             bin(&str_cap("apple", 5), BinaryOp::Lt, &str_cap("banana", 500)).unwrap(),
             ValueItem::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_double_equality_is_numeric() {
+        let eq = |a, b| bin(&dbl(a), BinaryOp::Eq, &dbl(b)).unwrap();
+        assert_eq!(eq(-0.0, 0.0), ValueItem::Boolean(true));
+        assert_eq!(eq(f64::NAN, f64::NAN), ValueItem::Boolean(false));
+        assert_eq!(eq(1.5, 1.5), ValueItem::Boolean(true));
+        assert_eq!(
+            bin(&dbl(-0.0), BinaryOp::NotEq, &dbl(0.0)).unwrap(),
+            ValueItem::Boolean(false)
         );
     }
 

@@ -71,7 +71,8 @@ fn test_primary_key_columns_come_through_a_secondary_index() {
     let c = setup();
     let sql = "select id, name from t where name = 'name07'";
     let plan = explain(&c, sql);
-    assert!(plan.contains("IndexScan t using t_name"), "{plan}");
+    // A seek of it, now that the WHERE can use it (see index_seek).
+    assert!(plan.contains("IndexSeek t using t_name"), "{plan}");
     assert_eq!(
         rows(&c, sql),
         vec![vec![ValueItem::Integer(7), s("name07")]]

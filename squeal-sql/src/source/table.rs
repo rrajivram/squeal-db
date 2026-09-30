@@ -4,7 +4,7 @@ use store::clock::Instant;
 
 use postcard::from_bytes;
 use store::{
-    cursor::{Cursor, TableCursor},
+    cursor::{Cursor, KeyRange, RangeCursor, TableCursor},
     db::{DBFile, Db},
     txn::Transaction,
     valueitem::IndexKey,
@@ -16,8 +16,15 @@ use crate::{
     table::{SqlTable, VersionedRow},
 };
 
+// Reads a table: every row (TableScan), or with a key range the rows
+// within a range of the table's own key — its PRIMARY KEY, which the
+// table's tree is keyed by (TableSeek). Either way rows come out whole, in
+// the table's own layout.
 pub struct TableSource<F: DBFile> {
-    cursor: TableCursor<F>,
+    cursor: RowCursor<F>,
+    // The seek's condition for EXPLAIN (see plan::sarg::describe_key_range)
+    // and its estimated row count; None for a full scan.
+    seek: Option<(String, Option<usize>)>,
     table: Arc<SqlTable>,
     fields: Arc<[ProjectableField]>,
     next_time: u128,
@@ -29,11 +36,57 @@ pub struct TableSource<F: DBFile> {
     last_id: Option<store::tuple::DBIdType>,
 }
 
+enum RowCursor<F: DBFile + 'static> {
+    Scan(TableCursor<F>),
+    Seek(RangeCursor<F>),
+}
+
+impl<F> RowCursor<F>
+where
+    F: DBFile<Item = F> + 'static,
+{
+    fn next(&mut self) -> Result<Option<store::tuple::Tuple>, store::error::StoreError> {
+        match self {
+            RowCursor::Scan(c) => c.next(),
+            RowCursor::Seek(c) => c.next(),
+        }
+    }
+
+    fn reset(&mut self) -> Result<(), store::error::StoreError> {
+        match self {
+            RowCursor::Scan(c) => c.reset(),
+            RowCursor::Seek(c) => c.reset(),
+        }
+    }
+}
+
 impl<F> TableSource<F>
 where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    /// The rows of `table` within `range` of its PRIMARY KEY (see
+    /// optim::picker::AccessPath::TableSeek), expected to be `rows` many.
+    pub(crate) fn seek(
+        db: Arc<Db<F>>,
+        table: Arc<SqlTable>,
+        txn: Option<&Transaction>,
+        stats: Option<ComputedTableStat>,
+        range: KeyRange,
+        rows: Option<usize>,
+    ) -> Result<Self, SchemaError> {
+        let key_names: Vec<String> = table
+            .primary_key()
+            .map(|pk| pk.fields.iter().map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+        let seek = crate::plan::sarg::describe_key_range(&range, &key_names);
+        let cursor = db.key_range_scan(table.db_table_id, txn, range)?;
+        let mut source = Self::new(db, table, txn, stats)?;
+        source.cursor = RowCursor::Seek(cursor);
+        source.seek = Some((seek, rows));
+        Ok(source)
+    }
+
     // `txn` only needs to live for this call — table_scan_in_txn only
     // borrows it to read off its (cheap, owned) TransactionId, which is
     // all TableCursor itself ever keeps (see its own doc comment). Not
@@ -59,7 +112,8 @@ where
             .collect::<Vec<_>>();
         let fields = Arc::from(fields);
         Ok(Self {
-            cursor,
+            cursor: RowCursor::Scan(cursor),
+            seek: None,
             table,
             fields,
             next_time: 0,
@@ -75,9 +129,14 @@ where
     F: DBFile<Item = F>,
 {
     fn plan(&self) -> PlanNode {
-        PlanNode::new("TableScan")
-            .detail(self.table.name.clone())
-            .rows(self.stats.as_ref().map(|s| s.table_stat.row_count))
+        match &self.seek {
+            Some((seek, rows)) => PlanNode::new("TableSeek")
+                .detail(format!("{} ({seek})", self.table.name))
+                .rows(*rows),
+            None => PlanNode::new("TableScan")
+                .detail(self.table.name.clone())
+                .rows(self.stats.as_ref().map(|s| s.table_stat.row_count)),
+        }
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
@@ -114,7 +173,15 @@ where
 
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         Some(vec![(
-            format!("TableScan:{}", self.table.name),
+            format!(
+                "{}:{}",
+                if self.seek.is_some() {
+                    "TableSeek"
+                } else {
+                    "TableScan"
+                },
+                self.table.name
+            ),
             QueryStats {
                 stats: HashMap::from([("next_ns".into(), self.next_time as f64)]),
                 level: 0,
@@ -129,8 +196,12 @@ where
     F: DBFile<Item = F>,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TableScan")
-            .field("table", &self.table.name)
-            .finish()
+        f.debug_struct(if self.seek.is_some() {
+            "TableSeek"
+        } else {
+            "TableScan"
+        })
+        .field("table", &self.table.name)
+        .finish()
     }
 }

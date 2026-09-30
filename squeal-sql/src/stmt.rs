@@ -626,11 +626,6 @@ where
                                 "resolve_table_ref unexpectedly returned Derived".into(),
                             ));
                         }
-                        TableRef::IndexScan(..) => {
-                            return Err(SchemaError::InternalSchemaError(
-                                "resolve_table_ref unexpectedly returned IndexScan".into(),
-                            ));
-                        }
                     }
                 }
                 sql_parser::Statement::Update(update) => {
@@ -854,11 +849,6 @@ where
                         TableRef::Derived(..) => {
                             return Err(SchemaError::UnknownError(
                                 "Can't show indices for a derived table".into(),
-                            ));
-                        }
-                        TableRef::IndexScan(..) => {
-                            return Err(SchemaError::UnknownError(
-                                "Can't show indices for index".into(),
                             ));
                         }
                     };
@@ -1142,9 +1132,6 @@ where
             "{what} is not supported on temp tables (temp.{name})"
         ))),
         TableRef::Derived(..) => Err(SchemaError::InternalSchemaError(format!(
-            "resolve_table_ref unexpectedly returned Derived for {what}"
-        ))),
-        TableRef::IndexScan(..) => Err(SchemaError::InternalSchemaError(format!(
             "resolve_table_ref unexpectedly returned Derived for {what}"
         ))),
     }

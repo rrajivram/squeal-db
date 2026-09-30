@@ -8,8 +8,70 @@ use crate::{
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple},
     txn::{Transaction, TransactionId},
-    valueitem::IndexKey,
+    valueitem::{IndexKey, ValueItem},
 };
+
+/// A contiguous run of an IndexKey-keyed tree's keys: those whose leading
+/// fields equal `prefix`, and whose next field lies within `lower`/`upper`
+/// (compared with ValueItem's total order — NULL lowest). An index seek:
+/// `a = 1 AND b > 5` over keys (a, b, ...) is prefix [1], lower Excluded(5).
+///
+/// Bounds are on that one field, not on whole keys, so an Included upper
+/// bound keeps every longer key that starts with it — `b <= 5` includes
+/// (1, 5, anything) — which a whole-key bound would not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyRange {
+    pub prefix: Vec<ValueItem>,
+    pub lower: Bound<ValueItem>,
+    pub upper: Bound<ValueItem>,
+}
+
+impl KeyRange {
+    /// Every key starting with `prefix`.
+    pub fn prefix(prefix: Vec<ValueItem>) -> Self {
+        Self {
+            prefix,
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        }
+    }
+
+    // Where `key` lies relative to the range: Less (before it), Equal
+    // (inside), Greater (after it). Keys come in ascending order, so the
+    // first Greater ends a scan.
+    fn position(&self, key: &IndexKey) -> std::cmp::Ordering {
+        use std::cmp::Ordering::*;
+        let values = key.values();
+        for (i, p) in self.prefix.iter().enumerate() {
+            match values.get(i).map(|v| v.cmp(p)) {
+                Some(Equal) => {}
+                Some(other) => return other,
+                None => return Greater,
+            }
+        }
+        let bounded = !matches!(
+            (&self.lower, &self.upper),
+            (Bound::Unbounded, Bound::Unbounded)
+        );
+        let Some(v) = values.get(self.prefix.len()) else {
+            return if bounded { Greater } else { Equal };
+        };
+        let before = match &self.lower {
+            Bound::Included(lo) => v < lo,
+            Bound::Excluded(lo) => v <= lo,
+            Bound::Unbounded => false,
+        };
+        if before {
+            return Less;
+        }
+        let after = match &self.upper {
+            Bound::Included(hi) => v > hi,
+            Bound::Excluded(hi) => v >= hi,
+            Bound::Unbounded => false,
+        };
+        if after { Greater } else { Equal }
+    }
+}
 
 pub trait Cursor {
     type Item;
@@ -88,9 +150,10 @@ pub struct RangeCursor<F: DBFile + 'static> {
     transaction: ScanTxn,
     start: Bound<DBIdType>,
     end: Bound<DBIdType>,
-    // Some for prefix scans (see Db::prefix_scan): the scan ends at the
-    // first entry whose leading fields differ from this key's.
-    prefix: Option<IndexKey>,
+    // Some for key-range scans (see Db::key_range_scan, Db::prefix_scan):
+    // entries before the range are skipped, and the first one after it
+    // ends the scan.
+    range: Option<KeyRange>,
     // Set once an index entry is past end is seen: ascending leaf-chain order
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
@@ -176,29 +239,29 @@ where
             transaction,
             start,
             end,
-            prefix: None,
+            range: None,
             done: false,
         })
     }
 
-    // Every entry whose leading fields equal `prefix`, in key order.
+    // Every entry within `range` (see KeyRange), in key order.
     //
-    // Deliberately NOT a range over the short key itself: IndexKey's
-    // ordering calls a short key Equal to every longer key that starts with
-    // it, but the tree routes with strict successor() lookups, so a short
-    // start key can land past some of the prefix's entries. Instead the
-    // start is a full-length key — the prefix followed by each remaining
-    // field's lower_bound(), the shape read off an existing entry — and the
-    // end is a leading-field check in next().
-    pub(crate) fn new_prefix(
+    // Deliberately NOT a range over a short key: IndexKey's ordering calls a
+    // short key Equal to every longer key that starts with it, but the tree
+    // routes with strict successor() lookups, so a short start key can land
+    // past some of the range's entries. Instead the start is a full-length
+    // key — the prefix, then the lower bound's value, then NULL (the lowest
+    // value of every type) for each remaining field, the length read off an
+    // existing entry — and where each entry lies is checked in next().
+    pub(crate) fn new_key_range(
         db: Arc<Db<F>>,
         table: TableIdType,
         transaction: Option<TransactionId>,
-        prefix: IndexKey,
+        range: KeyRange,
     ) -> Result<Self, StoreError> {
         let transaction = ScanTxn::new(&db, transaction)?;
         let tree = db.table_by_id(table)?;
-        let start = Self::prefix_start(&tree, &prefix)?;
+        let start = Self::range_start(&tree, &range)?;
         let current_leaf = Self::start_leaf(&tree, &start)?;
         let current_iter = current_leaf.iter();
         Ok(Self {
@@ -209,34 +272,59 @@ where
             transaction,
             start,
             end: Bound::Unbounded,
-            prefix: Some(prefix),
+            range: Some(range),
             done: false,
         })
     }
 
-    fn prefix_start(
+    // Every entry whose leading fields equal `prefix`, in key order.
+    pub(crate) fn new_prefix(
+        db: Arc<Db<F>>,
+        table: TableIdType,
+        transaction: Option<TransactionId>,
+        prefix: IndexKey,
+    ) -> Result<Self, StoreError> {
+        Self::new_key_range(
+            db,
+            table,
+            transaction,
+            KeyRange::prefix(prefix.values().to_vec()),
+        )
+    }
+
+    /// The transaction this cursor reads as — for looking up, at the same
+    /// snapshot, the rows an index scan's entries point to (see
+    /// Db::find_as).
+    pub fn reader(&self) -> TransactionId {
+        self.transaction.id()
+    }
+
+    fn range_start(
         tree: &Arc<BPlusTree<F>>,
-        prefix: &IndexKey,
+        range: &KeyRange,
     ) -> Result<Bound<DBIdType>, StoreError> {
-        // Any entry shows the shape (all keys of an index share it). An
-        // empty index has no entries to scan: start at the beginning.
+        // Any entry shows the length (all keys of a tree share it). An
+        // empty tree has no entries to scan: start at the beginning.
         let Some(sample) = tree.first_leaf_page()?.iter().next() else {
             return Ok(Bound::Unbounded);
         };
         let DBIdType::Rec(sample) = sample.id else {
             return Err(StoreError::UnknownError(
-                "prefix_scan needs a table keyed by IndexKey".into(),
+                "a key-range scan needs a table keyed by IndexKey".into(),
             ));
         };
-        let n = prefix.values().len();
-        if n > sample.values().len() {
+        let len = sample.values().len();
+        let mut full = range.prefix.clone();
+        if let Bound::Included(v) | Bound::Excluded(v) = &range.lower {
+            full.push(v.clone());
+        }
+        if full.len() > len {
             return Err(StoreError::UnknownError(format!(
-                "prefix has {n} fields but the key has {}",
-                sample.values().len()
+                "key range needs {} fields but the key has {len}",
+                full.len()
             )));
         }
-        let mut full: Vec<_> = prefix.values().to_vec();
-        full.extend(sample.values()[n..].iter().map(|v| v.lower_bound()));
+        full.resize(len, ValueItem::Null);
         Ok(Bound::Included(DBIdType::Rec(IndexKey::new_from(&full)?)))
     }
 
@@ -320,15 +408,19 @@ where
                         Bound::Excluded(k) => entry.id >= *k,
                         Bound::Unbounded => false,
                     };
-                    let off_prefix = match (&self.prefix, &entry.id) {
-                        (Some(p), DBIdType::Rec(k)) => !p
-                            .values()
-                            .iter()
-                            .zip(k.values())
-                            .all(|(a, b)| a.cmp(b) == std::cmp::Ordering::Equal),
-                        _ => false,
+                    let range_position = match (&self.range, &entry.id) {
+                        (Some(r), DBIdType::Rec(k)) => r.position(k),
+                        (Some(_), _) => {
+                            return Err(StoreError::UnknownError(
+                                "a key-range scan needs a table keyed by IndexKey".into(),
+                            ));
+                        }
+                        (None, _) => std::cmp::Ordering::Equal,
                     };
-                    if past_end || off_prefix {
+                    if range_position == std::cmp::Ordering::Less {
+                        continue;
+                    }
+                    if past_end || range_position == std::cmp::Ordering::Greater {
                         self.done = true;
                         return Ok(None);
                     }
@@ -362,9 +454,9 @@ where
     // at construction time.
     fn reset(&mut self) -> Result<(), StoreError> {
         let tree = self.db.table_by_id(self.table)?;
-        if let Some(prefix) = &self.prefix {
-            // The index may have been empty when the scan was built.
-            self.start = Self::prefix_start(&tree, prefix)?;
+        if let Some(range) = &self.range {
+            // The tree may have been empty when the scan was built.
+            self.start = Self::range_start(&tree, range)?;
         }
         let current_leaf = Self::start_leaf(&tree, &self.start)?;
         self.current_iter = current_leaf.iter();
@@ -1292,17 +1384,177 @@ mod tests {
         assert_eq!(drain_keys(&mut db.prefix_scan(tid, p).unwrap()).len(), 2);
     }
 
+    // --- key_range_scan ---
+
+    // (a, b, c) keys where a and b may be NULL, spanning many leaves.
+    fn nk(a: Option<i64>, b: Option<i64>, c: i64) -> IndexKey {
+        let v = |x: Option<i64>| x.map_or(ValueItem::Null, ValueItem::Integer);
+        IndexKey::new_from(&[v(a), v(b), ValueItem::Integer(c)]).unwrap()
+    }
+
+    // Written out independently of KeyRange::position: the leading fields
+    // equal the prefix, and the next field satisfies both bounds.
+    fn in_range(key: &IndexKey, r: &KeyRange) -> bool {
+        let v = key.values();
+        let n = r.prefix.len();
+        if v[..n] != r.prefix[..] {
+            return false;
+        }
+        let x = &v[n];
+        let lower_ok = match &r.lower {
+            Bound::Included(lo) => x >= lo,
+            Bound::Excluded(lo) => x > lo,
+            Bound::Unbounded => true,
+        };
+        let upper_ok = match &r.upper {
+            Bound::Included(hi) => x <= hi,
+            Bound::Excluded(hi) => x < hi,
+            Bound::Unbounded => true,
+        };
+        lower_ok && upper_ok
+    }
+
+    #[test]
+    fn test_key_range_scan_returns_exactly_the_keys_in_range() {
+        let vals = |i: i64| if i % 7 == 0 { None } else { Some(i % 13) };
+        let mut keys = vec![];
+        for a in 0..300 {
+            for b in 0..20 {
+                keys.push(nk(vals(a), vals(b), a * 100 + b));
+            }
+        }
+        let (db, tid) = prefix_db("key_range_exact.db", &keys);
+        let mut all = keys.clone();
+        all.sort_by(|x, y| {
+            x.partial_cmp(y)
+                .unwrap()
+                .then_with(|| x.values().len().cmp(&y.values().len()))
+        });
+        let int = ValueItem::Integer;
+        let bounds = |x: i64| {
+            [
+                Bound::Unbounded,
+                Bound::Included(int(x)),
+                Bound::Excluded(int(x)),
+                Bound::Included(ValueItem::Null),
+                Bound::Excluded(ValueItem::Null),
+            ]
+        };
+        let prefixes = [
+            vec![],
+            vec![int(4)],
+            vec![ValueItem::Null],
+            vec![int(4), int(9)],
+        ];
+        let mut checked = 0;
+        for prefix in &prefixes {
+            for lower in bounds(3) {
+                for upper in bounds(9) {
+                    let r = KeyRange {
+                        prefix: prefix.clone(),
+                        lower: lower.clone(),
+                        upper,
+                    };
+                    let expected: Vec<_> =
+                        all.iter().filter(|k| in_range(k, &r)).cloned().collect();
+                    let got = drain_keys(&mut db.key_range_scan(tid, None, r.clone()).unwrap());
+                    assert_eq!(got.len(), expected.len(), "{r:?}");
+                    assert!(got.iter().all(|k| in_range(k, &r)), "{r:?}");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 100);
+    }
+
+    #[test]
+    fn test_key_range_scan_upper_bound_keeps_longer_keys() {
+        let (db, tid) = prefix_db(
+            "key_range_upper.db",
+            &[
+                nk(Some(1), Some(5), 0),
+                nk(Some(1), Some(5), 9),
+                nk(Some(1), Some(6), 0),
+            ],
+        );
+        let r = KeyRange {
+            prefix: vec![ValueItem::Integer(1)],
+            lower: Bound::Unbounded,
+            upper: Bound::Included(ValueItem::Integer(5)),
+        };
+        assert_eq!(
+            drain_keys(&mut db.key_range_scan(tid, None, r).unwrap()).len(),
+            2
+        );
+    }
+
+    // NULL sorts below every value, so the start key must pad with NULL:
+    // padding with each type's own minimum (read off the first key, which
+    // here has no NULLs) would start past (2, NULL, 0).
+    #[test]
+    fn test_key_range_scan_keeps_nulls_after_the_prefix() {
+        let (db, tid) = prefix_db(
+            "key_range_nulls.db",
+            &[
+                nk(Some(1), Some(5), 0),
+                nk(Some(2), None, 0),
+                nk(Some(2), Some(3), 0),
+            ],
+        );
+        let r = KeyRange::prefix(vec![ValueItem::Integer(2)]);
+        assert_eq!(
+            drain_keys(&mut db.key_range_scan(tid, None, r).unwrap()).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn test_find_as_reads_at_the_scans_snapshot() {
+        let (db, tid) = prefix_db("find_as.db", &[sk(1, "a", 0)]);
+        let txn = db.begin().unwrap();
+        db.insert(
+            tid,
+            Tuple::new_with(DBIdType::Rec(sk(2, "a", 0)), b"v", None, None),
+            &txn,
+        )
+        .unwrap();
+        let c = db
+            .key_range_scan(tid, Some(&txn), KeyRange::prefix(vec![]))
+            .unwrap();
+        assert!(
+            db.find_as(tid, DBIdType::Rec(sk(2, "a", 0)), c.reader())
+                .unwrap()
+                .is_some()
+        );
+        let other = db.begin().unwrap();
+        assert!(
+            db.find(tid, DBIdType::Rec(sk(2, "a", 0)), &other)
+                .unwrap()
+                .is_none()
+        );
+        db.commit(txn).unwrap();
+    }
+
     // --- range/prefix scans under a caller's transaction ---
 
     #[test]
     fn test_scans_in_txn_see_the_transactions_own_uncommitted_rows() {
         let (db, tid) = prefix_db("scan_in_txn.db", &[sk(1, "a", 0), sk(2, "a", 0)]);
         let txn = db.begin().unwrap();
-        db.insert(tid, Tuple::new_with(DBIdType::Rec(sk(2, "b", 0)), b"v", None, None), &txn).unwrap();
+        db.insert(
+            tid,
+            Tuple::new_with(DBIdType::Rec(sk(2, "b", 0)), b"v", None, None),
+            &txn,
+        )
+        .unwrap();
         let p = IndexKey::new_from(&[ValueItem::Integer(2)]).unwrap();
 
         let mut c = db.prefix_scan_in_txn(tid, &txn, p.clone()).unwrap();
-        assert_eq!(drain_keys(&mut c).len(), 2, "prefix scan sees its own insert");
+        assert_eq!(
+            drain_keys(&mut c).len(),
+            2,
+            "prefix scan sees its own insert"
+        );
         c.reset().unwrap();
         assert_eq!(drain_keys(&mut c).len(), 2, "and still does after reset");
 
@@ -1323,7 +1575,11 @@ mod tests {
         let (db, tid) = prefix_db("scan_in_txn_done.db", &[sk(1, "a", 0)]);
         let txn = db.begin().unwrap();
         let mut c = db
-            .prefix_scan_in_txn(tid, &txn, IndexKey::new_from(&[ValueItem::Integer(1)]).unwrap())
+            .prefix_scan_in_txn(
+                tid,
+                &txn,
+                IndexKey::new_from(&[ValueItem::Integer(1)]).unwrap(),
+            )
             .unwrap();
         db.commit(txn).unwrap();
         assert!(c.next().is_err());
