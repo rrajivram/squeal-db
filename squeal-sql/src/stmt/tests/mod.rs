@@ -2188,6 +2188,8 @@ fn test_order_by_desc_without_limit_is_applied() {
     );
 }
 
+mod index_scan;
+
 #[cfg(test)]
 mod join_tests {
     use super::*;
@@ -3480,6 +3482,66 @@ fn test_min_max_sum_over_an_empty_table_report_null() {
     assert_eq!(
         rows,
         vec![vec![ValueItem::Null, ValueItem::Null, ValueItem::Null]]
+    );
+}
+
+// An unqualified column is found in whichever FROM table has it — it used
+// to be "not found" unless it was in the last one.
+#[test]
+fn test_an_unqualified_column_of_an_earlier_from_table() {
+    let c = conn();
+    run(&c, "create table a (x integer)").unwrap();
+    run(&c, "create table b (y integer)").unwrap();
+    run(&c, "insert into a values (1)").unwrap();
+    run(&c, "insert into b values (2)").unwrap();
+    assert_eq!(
+        select_rows(&c, "select x, y from a, b").1,
+        vec![vec![ValueItem::Integer(1), ValueItem::Integer(2)]]
+    );
+    // Still ambiguous when both have it.
+    run(&c, "create table a2 (x integer)").unwrap();
+    assert!(matches!(
+        run(&c, "select x from a, a2"),
+        Err(SchemaError::AmbiguousFieldError(_))
+    ));
+}
+
+// An aggregate inside a scalar call is still one value per group — it
+// used to be treated as a plain projection, one output row per input row.
+#[test]
+fn test_an_aggregate_nested_in_a_scalar_function() {
+    let c = conn();
+    run(
+        &c,
+        "create table t (id integer not null, g integer, note varchar(20), primary key(id))",
+    )
+    .unwrap();
+    let str_ = |v: &str| ValueItem::Str((v.into(), 20));
+    // Empty input: the aggregate's reset value, and arithmetic over it.
+    assert_eq!(
+        select_rows(&c, "select upper(max(note)), count(*) + 1 from t").1,
+        vec![vec![ValueItem::Null, ValueItem::Integer(1)]]
+    );
+    run(
+        &c,
+        "insert into t values (1, 1, 'apple'), (2, 1, 'pear'), (3, 2, 'fig')",
+    )
+    .unwrap();
+    assert_eq!(
+        select_rows(&c, "select upper(max(note)) from t").1,
+        vec![vec![str_("PEAR")]]
+    );
+    // Reset per group: group 2 must not see group 1's max.
+    assert_eq!(
+        select_rows(
+            &c,
+            "select g, upper(max(note)) from t group by g order by g"
+        )
+        .1,
+        vec![
+            vec![ValueItem::Integer(1), str_("PEAR")],
+            vec![ValueItem::Integer(2), str_("FIG")],
+        ]
     );
 }
 

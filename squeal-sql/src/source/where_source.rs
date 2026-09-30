@@ -100,10 +100,7 @@ mod tests {
     use store::valueitem::ValueItem;
 
     use super::*;
-    use crate::{
-        plan::eval::dummy_arc_field,
-        source::test_support::{VecSource, drain},
-    };
+    use crate::source::test_support::{VecSource, drain};
 
     fn src() -> Box<dyn Source> {
         Box::new(VecSource::new(
@@ -118,7 +115,7 @@ mod tests {
 
     fn gt_one() -> EvalExpr {
         EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
+            lhs: Box::new(EvalExpr::Value(0)),
             op: BinaryOp::Gt,
             rhs: Box::new(EvalExpr::Literal(ValueItem::Integer(1))),
         }

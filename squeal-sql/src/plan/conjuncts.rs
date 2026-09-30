@@ -265,7 +265,7 @@ fn equi_edge(
     else {
         return None;
     };
-    let (EvalExpr::Value(a, _, _), EvalExpr::Value(b, _, _)) = (lhs.as_ref(), rhs.as_ref()) else {
+    let (EvalExpr::Value(a), EvalExpr::Value(b)) = (lhs.as_ref(), rhs.as_ref()) else {
         return None;
     };
     let locate = |pos: usize| -> Option<(ColumnRef, DataType)> {
@@ -306,12 +306,10 @@ fn same_type(a: &DataType, b: &DataType) -> bool {
 mod tests {
     use store::valueitem::ValueItem;
 
-    use crate::plan::eval::dummy_arc_field;
-
     use super::*;
 
     fn v(p: usize) -> EvalExpr {
-        EvalExpr::Value(p, dummy_arc_field(), None)
+        EvalExpr::Value(p)
     }
     fn lit(i: i64) -> EvalExpr {
         EvalExpr::Literal(ValueItem::Integer(i))

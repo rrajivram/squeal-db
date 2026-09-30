@@ -1,22 +1,18 @@
-use std::sync::Arc;
-
 use sql_parser::{
     Expr,
     expr::{BinaryOp, UnaryOp},
 };
 use store::{
     db::DBFile,
-    table::TableIdType,
     valueitem::{IndexKey, ValueItem},
 };
 
 use crate::{
     error::SchemaError,
     plan::{
-        funcs::{FuncObj, FuncTrait},
+        funcs::{FuncArgs, FuncObj, FuncTrait},
         logical::TableQuery,
     },
-    table::Field,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,7 +35,7 @@ pub enum EvalExpr {
     // reference to its absolute position has to happen once, at build
     // time in from_expr/validate_field (where each table's own field
     // count is still known), not here.
-    Value(usize, Arc<Field>, Option<TableIdType>),
+    Value(usize),
     Unary {
         op: UnaryOp,
         field: Box<EvalExpr>,
@@ -52,10 +48,6 @@ pub enum EvalExpr {
     Function(FuncObj),
 }
 
-pub(crate) fn dummy_arc_field() -> Arc<Field> {
-    Arc::new(Field::from(""))
-}
-
 impl EvalExpr {
     // A readable rendering for EXPLAIN. `Value(i)` is a flat position into
     // the row this expression reads, so `names` (that row's column names,
@@ -66,7 +58,7 @@ impl EvalExpr {
     pub(crate) fn column_positions(&self) -> Vec<usize> {
         match self {
             Self::None | Self::Literal(_) => vec![],
-            Self::Value(i, _, _) => vec![*i],
+            Self::Value(i) => vec![*i],
             Self::Unary { field, .. } => field.column_positions(),
             Self::Binary { lhs, rhs, .. } => {
                 let mut v = lhs.column_positions();
@@ -89,7 +81,7 @@ impl EvalExpr {
         Some(match self {
             Self::None => Self::None,
             Self::Literal(v) => Self::Literal(v.clone()),
-            Self::Value(i, _, _) => Self::Value(i.checked_sub(offset)?, dummy_arc_field(), None),
+            Self::Value(i) => Self::Value(i.checked_sub(offset)?),
             Self::Unary { op, field } => Self::Unary {
                 op: *op,
                 field: Box::new(field.shifted(offset)?),
@@ -122,7 +114,7 @@ impl EvalExpr {
                 ValueItem::Str((s, _)) => format!("'{s}'"),
                 other => other.to_string(),
             },
-            Self::Value(i, _, _) => Self::column_label(names, *i),
+            Self::Value(i) => Self::column_label(names, *i),
             Self::Unary { op, field } => {
                 let f = field.describe(names);
                 match op {
@@ -175,7 +167,15 @@ impl EvalExpr {
         match self {
             Self::Unary { field, .. } => field.has_aggregate(),
             Self::Binary { lhs, rhs, .. } => lhs.has_aggregate() || rhs.has_aggregate(),
-            Self::Function(f) => f.is_aggregate(),
+            // An aggregate anywhere inside a call's arguments makes the
+            // call aggregate too: `upper(max(x))` is one value per group.
+            Self::Function(f) => {
+                f.is_aggregate()
+                    || f.args().iter().any(|a| match a {
+                        FuncArgs::Field(e) => e.has_aggregate(),
+                        FuncArgs::Wildcard => false,
+                    })
+            }
             _ => false,
         }
     }
@@ -191,7 +191,7 @@ impl EvalExpr {
             Self::Literal(_) | Self::None => {
                 vec![]
             }
-            Self::Value(u, _, _) => {
+            Self::Value(u) => {
                 vec![*u]
             }
             Self::Function(f) => {
@@ -217,11 +217,55 @@ impl EvalExpr {
                 if f.is_aggregate() {
                     vec![f]
                 } else {
-                    vec![]
+                    // A scalar call's arguments may hold aggregates of their
+                    // own (`upper(max(x))`), which need resetting per group.
+                    f.args_mut()
+                        .into_iter()
+                        .flat_map(|a| match a {
+                            FuncArgs::Field(e) => e.get_funcs(),
+                            FuncArgs::Wildcard => vec![],
+                        })
+                        .collect()
                 }
             }
             _ => vec![],
         }
+    }
+
+    // This expression's value for a group that received no rows at all —
+    // the one row a grand-total aggregate (no GROUP BY) still owes over an
+    // empty input. Every aggregate reports its freshly reset `current()`
+    // (COUNT(*) is 0, MAX is NULL) instead of being fed a row that isn't
+    // there, and everything around it is computed from those values, so
+    // `upper(max(x))` and `count(*) + 1` come out right too. A column
+    // reference has no value here: validate_aggreations only lets one
+    // through under a GROUP BY, and a GROUP BY never produces an empty
+    // group.
+    pub(crate) fn eval_empty_group(&self) -> Result<ValueItem, SchemaError> {
+        Ok(match self {
+            Self::Literal(v) => v.clone(),
+            Self::None => ValueItem::Null,
+            Self::Value(..) => {
+                return Err(SchemaError::InternalSchemaError(
+                    "a column reference outside any aggregate in an empty group".into(),
+                ));
+            }
+            Self::Unary { op, field } => CrateValueItem::unary(&field.eval_empty_group()?, op)?,
+            Self::Binary { lhs, op, rhs } => {
+                CrateValueItem::binary(&lhs.eval_empty_group()?, &rhs.eval_empty_group()?, op)?
+            }
+            Self::Function(f) if f.is_aggregate() => f.current(),
+            // A scalar call: evaluate it over its arguments' values.
+            Self::Function(f) => {
+                let mut f = f.clone();
+                for a in f.args_mut() {
+                    if let FuncArgs::Field(e) = a {
+                        **e = EvalExpr::Literal(e.eval_empty_group()?);
+                    }
+                }
+                f.eval(&[])?
+            }
+        })
     }
     pub(crate) fn eval(
         &mut self,
@@ -230,7 +274,7 @@ impl EvalExpr {
     ) -> Result<ValueItem, SchemaError> {
         let v = match self {
             Self::Literal(v) => v,
-            Self::Value(pos, _, _) => &data[0][*pos],
+            Self::Value(pos) => &data[0][*pos],
             Self::Unary { op, field } => {
                 let v = field.eval(data, _index)?;
                 &CrateValueItem::unary(&v, op)?
@@ -324,11 +368,7 @@ impl EvalExpr {
                     let Some(field_id) = field_id else {
                         return Err(SchemaError::FieldNotFound(field));
                     };
-                    Self::Value(
-                        Self::flat_position(tables, table_id, field_id),
-                        table.fields[field_id].clone(),
-                        table.table_id,
-                    )
+                    Self::Value(Self::flat_position(tables, table_id, field_id))
                 } else {
                     let field = idents[0].value.clone();
                     Self::validate_field(&field, tables)?
@@ -351,30 +391,27 @@ impl EvalExpr {
         let mut found = false;
         let mut fid = 0;
         let mut tid = 0;
-        let mut arc_field = None;
         for (sid, t) in tables.iter().enumerate() {
             let f = t
                 .fields
                 .iter()
                 .position(|f| f.name.eq_ignore_ascii_case(field));
-            if f.is_some() && found {
-                return Err(SchemaError::AmbiguousFieldError(field.into()));
-            }
-            found = f.is_some();
             if let Some(fd) = f {
+                if found {
+                    return Err(SchemaError::AmbiguousFieldError(field.into()));
+                }
+                // Once found, stays found: a later table without the
+                // column must not undo it (it used to, so an unqualified
+                // column of any table but the last was "not found").
+                found = true;
                 fid = fd;
                 tid = sid;
-                arc_field = Some(t.fields[fid].clone());
             }
         }
         if !found {
             return Err(SchemaError::FieldNotFound(field.into()));
         }
-        Ok(EvalExpr::Value(
-            Self::flat_position(tables, tid, fid),
-            arc_field.unwrap(),
-            tables[tid].table_id,
-        ))
+        Ok(EvalExpr::Value(Self::flat_position(tables, tid, fid)))
     }
 
     // Where (table_id, field_id) actually lands in UnionJoin's combined
@@ -1036,7 +1073,7 @@ mod tests {
     #[test]
     fn test_has_aggregate_false_for_plain_values_and_literals() {
         assert!(!EvalExpr::Literal(int(1)).has_aggregate());
-        assert!(!EvalExpr::Value(0, dummy_arc_field(), None).has_aggregate());
+        assert!(!EvalExpr::Value(0).has_aggregate());
     }
 
     #[test]

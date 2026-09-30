@@ -26,6 +26,11 @@ pub(crate) trait FuncTrait: Debug {
     /// — `concat(name, upper(name))` — render as itself instead of
     /// collapsing to the column it ultimately reads).
     fn args(&self) -> Vec<&FuncArgs>;
+    /// The same arguments, mutably — how an aggregate nested inside another
+    /// call's argument (`upper(max(x))`) is reached to reset it per group
+    /// (EvalExpr::get_funcs), and how a scalar call is evaluated over its
+    /// arguments' already-computed values (EvalExpr::eval_empty_group).
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs>;
     /// Every raw column position this call's arguments read — used by
     /// EvalExpr::get_non_agg_fields, which already checks is_aggregate()
     /// itself before ever calling this (see its own Self::Function arm),
@@ -102,6 +107,9 @@ macro_rules! func_obj {
             fn args(&self) -> Vec<&FuncArgs> {
                 match self { $(FuncObj::$variant(f) => f.args(),)+ }
             }
+            fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+                match self { $(FuncObj::$variant(f) => f.args_mut(),)+ }
+            }
             fn current(&self) -> ValueItem {
                 match self { $(FuncObj::$variant(f) => f.current(),)+ }
             }
@@ -177,6 +185,10 @@ macro_rules! scalar_fn {
                 vec![&self.args]
             }
 
+            fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+                vec![&mut self.args]
+            }
+
             fn current(&self) -> ValueItem {
                 unreachable!(concat!(
                     $sql_name,
@@ -222,7 +234,10 @@ macro_rules! extremum_fn {
                         $sql_name, $sql_name
                     )));
                 }
-                Ok(Self { args: arg, best: None })
+                Ok(Self {
+                    args: arg,
+                    best: None,
+                })
             }
         }
 
@@ -256,6 +271,10 @@ macro_rules! extremum_fn {
 
             fn args(&self) -> Vec<&FuncArgs> {
                 vec![&self.args]
+            }
+
+            fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+                vec![&mut self.args]
             }
 
             fn current(&self) -> ValueItem {
@@ -449,6 +468,10 @@ impl FuncTrait for Count {
         vec![&self.args]
     }
 
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+        vec![&mut self.args]
+    }
+
     fn current(&self) -> ValueItem {
         let res = if self.distinct {
             self.values.len()
@@ -553,6 +576,10 @@ impl FuncTrait for Avg {
         vec![&self.args]
     }
 
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+        vec![&mut self.args]
+    }
+
     fn current(&self) -> ValueItem {
         if self.count == 0 {
             ValueItem::Null
@@ -650,9 +677,14 @@ impl FuncTrait for Sum {
             ValueItem::Integer(i) => {
                 self.any = true;
                 self.total = match self.total {
-                    ValueItem::Integer(t) => ValueItem::Integer(t.checked_add(i).ok_or_else(|| {
-                        SchemaError::InvalidOperationOnOperand("sum".into(), "integer overflow".into())
-                    })?),
+                    ValueItem::Integer(t) => {
+                        ValueItem::Integer(t.checked_add(i).ok_or_else(|| {
+                            SchemaError::InvalidOperationOnOperand(
+                                "sum".into(),
+                                "integer overflow".into(),
+                            )
+                        })?)
+                    }
                     ValueItem::Double(t) => ValueItem::Double(t + i as f64),
                     _ => unreachable!("total is always Integer or Double"),
                 };
@@ -688,6 +720,10 @@ impl FuncTrait for Sum {
 
     fn args(&self) -> Vec<&FuncArgs> {
         vec![&self.args]
+    }
+
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+        vec![&mut self.args]
     }
 
     fn current(&self) -> ValueItem {
@@ -769,6 +805,10 @@ impl FuncTrait for Concat {
 
     fn args(&self) -> Vec<&FuncArgs> {
         self.args.iter().collect()
+    }
+
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+        self.args.iter_mut().collect()
     }
 
     fn current(&self) -> ValueItem {
@@ -860,7 +900,10 @@ mod tests {
     #[test]
     fn test_lower_lowercases_a_string() {
         let mut lower = Lower::new(vec![literal_arg(ValueItem::Str(("HeLLo".into(), 5)))]).unwrap();
-        assert_eq!(lower.eval(&[]).unwrap(), ValueItem::Str(("hello".into(), 5)));
+        assert_eq!(
+            lower.eval(&[]).unwrap(),
+            ValueItem::Str(("hello".into(), 5))
+        );
     }
 
     #[test]
@@ -1014,7 +1057,11 @@ mod tests {
 
     #[test]
     fn test_concat_coerces_non_string_arguments() {
-        let mut c = Concat::new(args2(ValueItem::Str(("n=".into(), 2)), ValueItem::Integer(5))).unwrap();
+        let mut c = Concat::new(args2(
+            ValueItem::Str(("n=".into(), 2)),
+            ValueItem::Integer(5),
+        ))
+        .unwrap();
         assert_eq!(c.eval(&[]).unwrap(), ValueItem::Str(("n=5".into(), 3)));
     }
 
@@ -1042,13 +1089,18 @@ mod tests {
 
     #[test]
     fn test_concat_rejects_wildcard_arguments() {
-        let err = Concat::new(vec![FuncArgs::Wildcard, literal_arg(ValueItem::Integer(1))]).unwrap_err();
+        let err =
+            Concat::new(vec![FuncArgs::Wildcard, literal_arg(ValueItem::Integer(1))]).unwrap_err();
         assert!(matches!(err, SchemaError::UnsupportedFeature(_)));
     }
 
     #[test]
     fn test_concat_is_not_an_aggregate() {
-        let c = Concat::new(args2(ValueItem::Str(("a".into(), 1)), ValueItem::Str(("b".into(), 1)))).unwrap();
+        let c = Concat::new(args2(
+            ValueItem::Str(("a".into(), 1)),
+            ValueItem::Str(("b".into(), 1)),
+        ))
+        .unwrap();
         assert!(!c.is_aggregate());
     }
 }

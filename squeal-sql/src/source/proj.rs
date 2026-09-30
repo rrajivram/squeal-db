@@ -118,7 +118,7 @@ impl ProjectableField {
         Self {
             display_name: field.name.clone(),
             field: field.clone(),
-            expr: EvalExpr::Value(field_id, field.clone(), None),
+            expr: EvalExpr::Value(field_id),
             source_id,
             field_id,
         }
@@ -131,10 +131,7 @@ mod tests {
     use store::valueitem::ValueItem;
 
     use super::*;
-    use crate::{
-        plan::eval::dummy_arc_field,
-        source::test_support::{VecSource, drain},
-    };
+    use crate::source::test_support::{VecSource, drain};
 
     fn src() -> Box<dyn Source> {
         Box::new(VecSource::new(
@@ -156,8 +153,8 @@ mod tests {
         // column order — to confirm the output follows the projection
         // list, not the source's own layout.
         let fields = vec![
-            field("b", EvalExpr::Value(1, dummy_arc_field(), None)),
-            field("a", EvalExpr::Value(0, dummy_arc_field(), None)),
+            field("b", EvalExpr::Value(1)),
+            field("a", EvalExpr::Value(0)),
         ];
         let mut p = Projection::new(src(), fields);
         assert_eq!(
@@ -172,9 +169,9 @@ mod tests {
     #[test]
     fn test_projection_evaluates_a_computed_expression() {
         let sum = EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
+            lhs: Box::new(EvalExpr::Value(0)),
             op: BinaryOp::Plus,
-            rhs: Box::new(EvalExpr::Value(1, dummy_arc_field(), None)),
+            rhs: Box::new(EvalExpr::Value(1)),
         };
         let mut p = Projection::new(src(), vec![field("a+b", sum)]);
         assert_eq!(
@@ -185,10 +182,7 @@ mod tests {
 
     #[test]
     fn test_projection_fields_reports_the_projection_list_not_the_source() {
-        let fields = vec![field(
-            "only_this",
-            EvalExpr::Value(0, dummy_arc_field(), None),
-        )];
+        let fields = vec![field("only_this", EvalExpr::Value(0))];
         let p = Projection::new(src(), fields);
         let names = p
             .fields()
@@ -200,10 +194,7 @@ mod tests {
 
     #[test]
     fn test_reset_delegates_to_the_underlying_source() {
-        let mut p = Projection::new(
-            src(),
-            vec![field("a", EvalExpr::Value(0, dummy_arc_field(), None))],
-        );
+        let mut p = Projection::new(src(), vec![field("a", EvalExpr::Value(0))]);
         let first_pass = drain(&mut p);
         assert_eq!(first_pass.len(), 2);
 

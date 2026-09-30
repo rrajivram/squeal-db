@@ -144,7 +144,7 @@ fn collect_equi_join_fields(
             op: BinaryOp::Eq,
             rhs,
         } => match (lhs.as_ref(), rhs.as_ref()) {
-            (EvalExpr::Value(l, _, _), EvalExpr::Value(r, _, _)) => {
+            (EvalExpr::Value(l), EvalExpr::Value(r)) => {
                 let (left_pos, right_pos) = match (*l < left_field_count, *r < left_field_count) {
                     (true, false) => (*l, *r - left_field_count),
                     (false, true) => (*r, *l - left_field_count),
@@ -472,10 +472,7 @@ mod hash_join_tests {
     use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
 
     use super::*;
-    use crate::{
-        plan::eval::dummy_arc_field,
-        source::test_support::{VecSource, drain},
-    };
+    use crate::source::test_support::{VecSource, drain};
 
     fn make_db() -> Arc<Db<MemFile>> {
         Db::<MemFile>::create("join_source_test.db").unwrap()
@@ -507,9 +504,9 @@ mod hash_join_tests {
     // has 2 columns).
     fn on_id_eq_user_id() -> EvalExpr {
         EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
+            lhs: Box::new(EvalExpr::Value(0)),
             op: BinaryOp::Eq,
-            rhs: Box::new(EvalExpr::Value(2, dummy_arc_field(), None)),
+            rhs: Box::new(EvalExpr::Value(2)),
         }
     }
 
@@ -613,9 +610,9 @@ mod hash_join_tests {
     fn test_on_expr_comparing_two_columns_from_the_same_side_is_rejected() {
         // left.id (0) = left.val (1) — both positions are < left_field_count.
         let bad_on = EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
+            lhs: Box::new(EvalExpr::Value(0)),
             op: BinaryOp::Eq,
-            rhs: Box::new(EvalExpr::Value(1, dummy_arc_field(), None)),
+            rhs: Box::new(EvalExpr::Value(1)),
         };
         let result = JoinSource::new(
             left_source(),
@@ -648,15 +645,15 @@ mod hash_join_tests {
         ));
         let on_expr = EvalExpr::Binary {
             lhs: Box::new(EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(0, dummy_arc_field(), None)),
+                lhs: Box::new(EvalExpr::Value(0)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(2, dummy_arc_field(), None)),
+                rhs: Box::new(EvalExpr::Value(2)),
             }),
             op: BinaryOp::And,
             rhs: Box::new(EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(1, dummy_arc_field(), None)),
+                lhs: Box::new(EvalExpr::Value(1)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(3, dummy_arc_field(), None)),
+                rhs: Box::new(EvalExpr::Value(3)),
             }),
         };
         let mut join = JoinSource::new(

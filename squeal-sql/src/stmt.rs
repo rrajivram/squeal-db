@@ -291,7 +291,6 @@ where
         resolved: TableRef::Real(schema.clone(), table.clone()),
         joins: vec![],
         stats: None,
-        table_id: None,
     }
 }
 

@@ -12,19 +12,19 @@ use sql_parser::{
     utils::Seq,
     visitor::{Visit, Visitor},
 };
-use store::{clock::Instant, db::DBFile, table::TableIdType, txn::Transaction};
+use store::{clock::Instant, db::DBFile, txn::Transaction};
 
 use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
     constant::DEFAULT_QUERY_MEMORY_LIMIT,
     error::SchemaError,
     optim::{
-        picker::{analyze_query, pick_source_for_proj},
+        picker::{ItemNeeds, analyze_query, pick_index},
         table_stats::{ComputedTableStat, compute_table_stats},
     },
     plan::{
         conjuncts::{Conjuncts, TableShape, null_supplied_tables},
-        eval::{EvalExpr, dummy_arc_field},
+        eval::EvalExpr,
         memory::QueryMemory,
     },
     rslt::resultset::StreamingResultSet,
@@ -204,7 +204,8 @@ where
                     .map(|f| f.field.clone())
                     .collect::<Vec<_>>(),
             ),
-            TableRef::IndexScan(t, i) => t.indices[*i].fields.clone(),
+            // Same layout as the table: see IndexSource.
+            TableRef::IndexScan(t, _) => t.resolved_fields(),
         }
     }
 
@@ -218,7 +219,7 @@ where
             TableRef::Real(_, t) => t.open_source(conn, stat, txn),
             TableRef::Temp(_, t) => t.open_source(conn, stat, txn),
             TableRef::Derived(name, d) => d.take(name),
-            TableRef::IndexScan(t, i) => Ok(Box::new(IndexSource::new(conn, t, *i, txn, None)?)),
+            TableRef::IndexScan(t, i) => Ok(Box::new(IndexSource::new(conn, t, *i, txn, stat)?)),
         }
     }
 }
@@ -242,7 +243,6 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     // anything, nor treat "we already validated this" and "so of course
     // this lookup will succeed" as two separate, unwrap-worthy facts.
     pub(crate) resolved: TableRef<F>,
-    pub(crate) table_id: Option<TableIdType>,
     pub(crate) joins: Vec<JoinRelation<F>>,
     pub(crate) stats: Option<ComputedTableStat>,
 }
@@ -328,9 +328,9 @@ impl WhereJoins {
             .iter()
             .filter(|(item, _, _)| *item == k)
             .map(|(_, a, b)| EvalExpr::Binary {
-                lhs: Box::new(EvalExpr::Value(*a, dummy_arc_field(), None)),
+                lhs: Box::new(EvalExpr::Value(*a)),
                 op: BinaryOp::Eq,
-                rhs: Box::new(EvalExpr::Value(*b, dummy_arc_field(), None)),
+                rhs: Box::new(EvalExpr::Value(*b)),
             })
             .reduce(|l, r| EvalExpr::Binary {
                 lhs: Box::new(l),
@@ -465,7 +465,7 @@ where
                 .iter()
                 .enumerate()
                 .map(|(i, f)| ProjectableField {
-                    expr: EvalExpr::Value(i, f.field.clone(), None),
+                    expr: EvalExpr::Value(i),
                     ..f.clone()
                 })
                 .collect();
@@ -559,28 +559,30 @@ where
         // layout made a plain SELECT read the wrong physical column
         // outright (confirmed via direct repro: an integer column came
         // back holding a string value from an unrelated table).
-        analyze_query(&tables, &projected_fields, &wh_expr);
+        let shapes = Self::table_shapes(&tables, &flat_tables);
+        // GROUP BY is resolved again (and validated) by validate_aggreations;
+        // here it only contributes the columns it reads.
+        let group_by = match &select.group_by {
+            Some(g) => g
+                .exprs
+                .items()
+                .map(|e| EvalExpr::from_expr(e, &flat_tables).map(|e| *e))
+                .collect::<Result<Vec<_>, _>>()?,
+            None => vec![],
+        };
+        let reads: Vec<&EvalExpr> = projected_fields
+            .iter()
+            .map(|f| &f.expr)
+            .chain(&group_by)
+            .collect();
+        let needs = analyze_query(&tables, &flat_tables, &shapes, &reads, wh_expr.as_ref());
+        // needs is in flat order: each FROM item, then its joined relations.
+        let mut needs = needs.iter();
         let mut sources = vec![];
-        let page_size = self.conn.database.read().db.get_page_data_size();
         for table in tables.iter() {
-            let mut combined = if let Some((table, index)) =
-                pick_source_for_proj(page_size, &table.resolved, &projected_fields, &table.stats)
-            {
-                self.open(&TableRef::IndexScan(table.clone(), index), None)?
-            } else {
-                self.open(&table.resolved, table.stats.clone())?
-            };
+            let mut combined = self.open_item(table, needs.next())?;
             for j in &table.joins {
-                let relation = if let Some((table, index)) = pick_source_for_proj(
-                    page_size,
-                    &j.relation.resolved,
-                    &projected_fields,
-                    &j.relation.stats,
-                ) {
-                    self.open(&TableRef::IndexScan(table.clone(), index), None)?
-                } else {
-                    self.open(&j.relation.resolved, j.relation.stats.clone())?
-                };
+                let relation = self.open_item(&j.relation, needs.next())?;
 
                 combined = Box::new(JoinSource::new(
                     combined,
@@ -604,20 +606,6 @@ where
         let links = if sources.len() > 1 {
             // Which tables an outer join in their FROM item NULL-extends,
             // in flat order (each item is a table followed by its joins).
-            let supplied: Vec<bool> = tables
-                .iter()
-                .flat_map(|t| {
-                    null_supplied_tables(&t.joins.iter().map(|j| j.join_type).collect::<Vec<_>>())
-                })
-                .collect();
-            let shapes: Vec<TableShape> = flat_tables
-                .iter()
-                .zip(supplied)
-                .map(|(t, null_supplied)| TableShape {
-                    columns: t.fields.iter().map(|f| f.datatype).collect(),
-                    null_supplied,
-                })
-                .collect();
             // flat_tables is each top-level item followed by its joins.
             let table_item: Vec<usize> = tables
                 .iter()
@@ -746,11 +734,7 @@ where
                             f.clone(),
                             sid,
                             fid,
-                            EvalExpr::Value(
-                                EvalExpr::flat_position(tables, sid, fid),
-                                f.clone(),
-                                t.table_id,
-                            ),
+                            EvalExpr::Value(EvalExpr::flat_position(tables, sid, fid)),
                         ));
                     }
                 }
@@ -770,11 +754,7 @@ where
                             f.clone(),
                             pos,
                             fid,
-                            EvalExpr::Value(
-                                EvalExpr::flat_position(tables, pos, fid),
-                                f.clone(),
-                                tables[pos].table_id,
-                            ),
+                            EvalExpr::Value(EvalExpr::flat_position(tables, pos, fid)),
                         ));
                     }
                     return Ok(v);
@@ -829,6 +809,43 @@ where
     // (mirroring TableWithJoins' own shape — a Join's own `relation` is
     // just a TableFactor, never something with joins of its own), so a
     // joined-in relation's own `.joins` is always empty already.
+    // Each flat table's column types, and whether an outer join in its
+    // FROM item NULL-extends it — what Conjuncts::analyze classifies WHERE
+    // conjuncts against.
+    fn table_shapes(tables: &[TableQuery<F>], flat_tables: &[TableQuery<F>]) -> Vec<TableShape> {
+        let supplied = tables.iter().flat_map(|t| {
+            null_supplied_tables(&t.joins.iter().map(|j| j.join_type).collect::<Vec<_>>())
+        });
+        flat_tables
+            .iter()
+            .zip(supplied)
+            .map(|(t, null_supplied)| TableShape {
+                columns: t.fields.iter().map(|f| f.datatype).collect(),
+                null_supplied,
+            })
+            .collect()
+    }
+
+    // Opens one FROM item: a covering index when optim::picker finds one
+    // cheaper than the table (only for a real table with statistics),
+    // otherwise the item itself.
+    fn open_item(
+        &self,
+        item: &TableQuery<F>,
+        needs: Option<&ItemNeeds>,
+    ) -> Result<Box<dyn Source>, SchemaError> {
+        if let (TableRef::Real(_, table), Some(stats), Some(needs)) =
+            (&item.resolved, &item.stats, needs)
+            && let Some(index) = pick_index(table, stats, needs)
+        {
+            return self.open(
+                &TableRef::IndexScan(table.clone(), index),
+                item.stats.clone(),
+            );
+        }
+        self.open(&item.resolved, item.stats.clone())
+    }
+
     fn flatten_tables(tables: &[TableQuery<F>]) -> Vec<TableQuery<F>> {
         let mut flat = vec![];
         for t in tables {
@@ -935,7 +952,6 @@ where
                     table: sqltable.name.clone(),
                     joins: vec![],
                     stats: compute_table_stats(&self.conn, &schema.name, sqltable)?,
-                    table_id: Some(sqltable.db_table_id),
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
                 TableQuery {
@@ -949,7 +965,6 @@ where
                     resolved: table.clone(),
                     joins: vec![],
                     stats: None,
-                    table_id: None,
                 }
             } else {
                 todo!()
@@ -976,7 +991,6 @@ where
                 resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
                 joins: vec![],
                 stats,
-                table_id: None,
             }
         } else {
             unreachable!("TableFactor is Table or Derived")
@@ -1020,7 +1034,7 @@ where
         let group_by_positions = group_by
             .iter()
             .filter_map(|g| match &g.expr {
-                EvalExpr::Value(u, _, _) => Some(*u),
+                EvalExpr::Value(u) => Some(*u),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1128,7 +1142,6 @@ impl<F: DBFile + 'static> Clone for TableQuery<F> {
             schema: self.schema.clone(),
             table: self.table.clone(),
             stats: self.stats.clone(),
-            table_id: self.table_id,
         }
     }
 }

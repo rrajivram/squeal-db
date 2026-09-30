@@ -6,7 +6,7 @@ use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{
     error::SchemaError,
-    plan::{eval::EvalExpr, funcs::FuncTrait},
+    plan::funcs::FuncTrait,
     source::{ProjectableField, QueryStats, Source, merge_stats},
 };
 
@@ -108,15 +108,8 @@ impl GroupSource {
     fn empty_group_row(&mut self) -> Result<IndexKey, SchemaError> {
         let start = Instant::now();
         let mut out = vec![];
-        for f in &mut self.fields {
-            let agg_value = match &f.expr {
-                EvalExpr::Function(func) if func.is_aggregate() => Some(func.current()),
-                _ => None,
-            };
-            out.push(match agg_value {
-                Some(v) => v,
-                None => f.expr.eval(&[], 0)?,
-            });
+        for f in &self.fields {
+            out.push(f.expr.eval_empty_group()?);
         }
         self.eval_time += start.elapsed().as_nanos();
         Ok(IndexKey::new_from_owned(out)?)
@@ -230,11 +223,9 @@ mod tests {
     use store::valueitem::ValueItem;
 
     use super::*;
+    use crate::plan::eval::EvalExpr;
     use crate::{
-        plan::{
-            eval::dummy_arc_field,
-            funcs::{Avg, Count, FuncArgs, FuncObj, Upper},
-        },
+        plan::funcs::{Avg, Count, FuncArgs, FuncObj, Upper},
         source::test_support::{VecSource, drain},
         table::Field,
     };
@@ -262,15 +253,7 @@ mod tests {
             0,
             0,
             EvalExpr::Function(FuncObj::Avg(
-                Avg::new(
-                    vec![FuncArgs::Field(Box::new(EvalExpr::Value(
-                        pos,
-                        dummy_arc_field(),
-                        None,
-                    )))],
-                    None,
-                )
-                .unwrap(),
+                Avg::new(vec![FuncArgs::Field(Box::new(EvalExpr::Value(pos)))], None).unwrap(),
             )),
         )
     }
