@@ -93,6 +93,13 @@ enum TxnState {
         commit_ts: u64,
         policy: ConflictPolicy,
     },
+    /// Rolled back and fully reverted at clock value `at`. Kept — invisible,
+    /// and not "committed" — while a transaction that began before `at` is
+    /// still active: it may have read one of this transaction's versions
+    /// off a page just before the revert, and "no entry" would tell it the
+    /// writer committed long ago. Its version records are kept as long (see
+    /// `abort_complete`), so that reader walks back to what it should see.
+    Aborted { at: u64 },
 }
 
 #[derive(Debug)]
@@ -209,15 +216,25 @@ impl TransactionManager {
     }
 
     /// Id of the oldest still-active transaction: the retention horizon.
-    /// The oldest transaction that is not finished — Active or Aborting.
-    /// Phase 6: the WAL retention floor. Every LSN a transaction mints is
-    /// above its own id, so nothing at or above this id can be discarded
-    /// while it is in flight.
+    /// The oldest transaction that is not finished — Active, Committing or
+    /// Aborting. Phase 6: the WAL retention floor. Every LSN a transaction
+    /// mints is above its own id, so nothing at or above this id can be
+    /// discarded while it is in flight.
+    ///
+    /// Committing counts: its Commit record may not be queued yet, so a
+    /// checkpoint must not put the floor above it — its page changes would
+    /// be in the checkpoint with nothing left in the log to undo them by if
+    /// the record never became durable.
     pub(crate) fn oldest_in_flight(&self) -> Option<u64> {
         self.states
             .read()
             .iter()
-            .find(|(_, s)| matches!(s, TxnState::Active { .. } | TxnState::Aborting))
+            .find(|(_, s)| {
+                matches!(
+                    s,
+                    TxnState::Active { .. } | TxnState::Committing { .. } | TxnState::Aborting
+                )
+            })
             .map(|(id, _)| id.0)
     }
 
@@ -404,19 +421,32 @@ impl TransactionManager {
     /// below the oldest active id (or all of them, if nothing is active).
     /// Once forgotten, absence means visible — which is exactly what every
     /// remaining reader would have concluded anyway.
-    pub(crate) fn prune_committed(&self) {
+    ///
+    /// Also forgets each aborted transaction no active transaction began
+    /// before the end of (see `TxnState::Aborted`), returning their ids:
+    /// their version records can go now.
+    pub(crate) fn prune_committed(&self) -> Vec<TransactionId> {
         let mut states = self.states.write();
         let horizon = states
             .iter()
             .find(|(_, s)| matches!(s, TxnState::Active { .. }))
             .map(|(id, _)| id.0);
-        states.retain(|_, s| match s {
+        let mut aborted = Vec::new();
+        states.retain(|id, s| match s {
             TxnState::Committed { commit_ts } => match horizon {
                 Some(h) => *commit_ts >= h,
                 None => false,
             },
+            TxnState::Aborted { at } => {
+                let keep = horizon.is_some_and(|h| h < *at);
+                if !keep {
+                    aborted.push(*id);
+                }
+                keep
+            }
             _ => true,
         });
+        aborted
     }
 
     /// Begin aborting `txn`: flip it to Aborting in place so its writes stay
@@ -441,9 +471,23 @@ impl TransactionManager {
     }
 
     /// Finish aborting `txn` — call only after its undo log has been fully
-    /// replayed.
-    pub(crate) fn abort_complete(&self, txn: &TransactionId) {
-        self.states.write().remove(txn);
+    /// replayed. True if it is forgotten outright (the caller may discard
+    /// its version records now); false if it is kept as `Aborted` because
+    /// it `wrote` and some other transaction is active, in which case
+    /// `prune_committed` hands its id back once no such transaction is left.
+    pub(crate) fn abort_complete(&self, txn: &TransactionId, wrote: bool) -> bool {
+        let mut states = self.states.write();
+        let readers = states
+            .iter()
+            .any(|(id, s)| id != txn && matches!(s, TxnState::Active { .. }));
+        if wrote && readers && states.contains_key(txn) {
+            let at = self.clock.next_value();
+            states.insert(*txn, TxnState::Aborted { at });
+            false
+        } else {
+            states.remove(txn);
+            true
+        }
     }
 
     /// Snapshot of transactions whose undo still needs to be replayed.
@@ -486,6 +530,36 @@ mod tests {
         let t1 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         let t2 = mgr.create_transaction(ConflictPolicy::ContinueOnConflict).unwrap();
         assert_ne!(t1, t2);
+    }
+
+    // The two halves of a commit, and what each state means to everyone
+    // else: while Committing, the transaction still holds the WAL floor
+    // (its Commit record may not be queued), a transaction begun before its
+    // timestamp never sees it, and one begun after sees it once it lands.
+    #[test]
+    fn test_committing_holds_the_floor_and_resolves_to_committed_or_active() {
+        let mgr = make_mgr();
+        let before = mgr.create_transaction(ConflictPolicy::default()).unwrap();
+        let w = mgr.create_transaction(ConflictPolicy::default()).unwrap();
+        let ts = mgr.begin_commit(w).unwrap();
+        assert!(ts > w.0);
+        mgr.commit(before, mgr.clock.next_lsn().0).unwrap();
+        assert_eq!(mgr.oldest_in_flight(), Some(w.0), "Committing is in flight");
+        assert!(!mgr.is_transaction_active(&w));
+        assert!(matches!(mgr.begin_commit(w), Err(StoreError::TransactionAlreadyFinished)));
+        assert!(matches!(mgr.abort(w), Err(_)), "a commit under way can't be aborted");
+        // Begun before the timestamp: invisible, without waiting.
+        assert!(!mgr.is_visible(&w, &before));
+        // The record failed to queue: active again, as if commit was never called.
+        mgr.finish_commit(w, false);
+        assert!(mgr.is_transaction_active(&w));
+        // And when it queues: committed at that timestamp.
+        let ts = mgr.begin_commit(w).unwrap();
+        mgr.finish_commit(w, true);
+        assert_eq!(mgr.oldest_in_flight(), None);
+        let after = mgr.create_transaction(ConflictPolicy::default()).unwrap();
+        assert!(after.0 > ts && mgr.is_visible(&w, &after));
+        assert!(!mgr.is_visible(&w, &before));
     }
 
     #[test]

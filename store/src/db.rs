@@ -1596,8 +1596,12 @@ where
         if wrote {
             self.logger.log_new(Operation::Rollback(id))?;
         }
-        self.versions.discard(&id);
-        self.tx_mgr.abort_complete(&id);
+        // Its records go with its state: at once if no one else is active,
+        // else when vacuum forgets it (a reader that picked up one of its
+        // versions just before the revert still needs them to walk back).
+        if self.tx_mgr.abort_complete(&id, wrote) {
+            self.versions.discard(&id);
+        }
         Ok(())
     }
 
@@ -1694,7 +1698,9 @@ where
             }
         }
         let horizon = self.tx_mgr.horizon();
-        self.tx_mgr.prune_committed();
+        for aborted in self.tx_mgr.prune_committed() {
+            self.versions.discard(&aborted);
+        }
         let v = self.versions.vacuum(Some(horizon));
         if v.transactions_forgotten > 0 || !v.tombstones.is_empty() {
             stats
@@ -8800,6 +8806,51 @@ mod tests {
         );
     }
 
+    // Recovery must not let an aborted transaction's undo wipe out a later
+    // committed change to the same row. A checkpoint that runs while a
+    // transaction is in flight captures its uncommitted version; if that
+    // transaction then rolls back and another commits the SAME change (a
+    // delete leaves the row's data as it was, so two deletes of one row
+    // look identical but for who wrote them), redo used to take the
+    // committed record as already applied — same data, same tombstone flag
+    // — and leave the row owned by the aborted transaction, whose undo then
+    // restored the old value: a committed delete lost. (The crash harness
+    // hit this roughly once in ten contended runs.)
+    #[test]
+    fn test_recovery_keeps_a_committed_change_an_aborted_one_in_the_checkpoint_looks_like() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1, b"same"), &t).unwrap();
+        db.insert(tid, row(2, b"old"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        // In flight at the checkpoint: a delete of row 1, an update of row 2
+        // and an insert of row 3. All three are in the checkpoint's pages.
+        let aborted = db.begin().unwrap();
+        db.remove(tid, id(1), &aborted).unwrap();
+        db.update(tid, row(2, b"new"), &aborted).unwrap();
+        db.insert(tid, row(3, b"fresh"), &aborted).unwrap();
+        db.checkpoint().unwrap();
+        db.rollback(aborted).unwrap();
+
+        // The same three changes, committed.
+        let t = db.begin().unwrap();
+        db.remove(tid, id(1), &t).unwrap();
+        db.update(tid, row(2, b"new"), &t).unwrap();
+        db.insert(tid, row(3, b"fresh"), &t).unwrap();
+        db.commit(t).unwrap();
+
+        let (data, log) = db.synced_snapshot();
+        drop(db);
+        let db = TestDB::open_using("txn_test.db", data, log).unwrap();
+        let tid = db.table_id_by_name("rows").unwrap().unwrap();
+        let t = db.begin().unwrap();
+        let read = |k| db.find(tid, id(k), &t).unwrap().map(|r| r.data.to_vec());
+        assert_eq!(read(1), None, "the committed delete");
+        assert_eq!(read(2), Some(b"new".to_vec()), "the committed update");
+        assert_eq!(read(3), Some(b"fresh".to_vec()), "the committed insert");
+    }
+
     // A reader must never lose a version it can still need to a concurrent
     // vacuum. A transaction's id used to be minted before it was registered
     // as active, and the vacuum used a horizon computed before it ran: in
@@ -8819,24 +8870,33 @@ mod tests {
         let corrupt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let missing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let unstable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uncommitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writer = {
             let db = db.clone();
             thread::spawn(move || {
                 for i in 0..3000u64 {
                     let t = db.begin().unwrap();
-                    let _ = db.update(tid, row(i % 4 + 1, format!("v{i}").as_bytes()), &t);
-                    let _ = db.commit(t);
+                    // Every third transaction rolls back: no one may ever
+                    // read what it wrote.
+                    if i % 3 == 0 {
+                        let _ = db.update(tid, row(i % 4 + 1, format!("never{i}").as_bytes()), &t);
+                        let _ = db.rollback(t);
+                    } else {
+                        let _ = db.update(tid, row(i % 4 + 1, format!("v{i}").as_bytes()), &t);
+                        let _ = db.commit(t);
+                    }
                 }
             })
         };
         let readers: Vec<_> = (0..3)
             .map(|_| {
-                let (db, stop, corrupt, missing, unstable) = (
+                let (db, stop, corrupt, missing, unstable, uncommitted) = (
                     db.clone(),
                     stop.clone(),
                     corrupt.clone(),
                     missing.clone(),
                     unstable.clone(),
+                    uncommitted.clone(),
                 );
                 thread::spawn(move || {
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -8845,6 +8905,9 @@ mod tests {
                             match db.find(tid, id(k), &t) {
                                 // One snapshot: reading it again gives the same.
                                 Ok(Some(first)) => {
+                                    if first.data().starts_with(b"never") {
+                                        uncommitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                     if let Ok(Some(again)) = db.find(tid, id(k), &t)
                                         && again.data() != first.data()
                                     {
@@ -8882,11 +8945,12 @@ mod tests {
             (
                 corrupt.load(std::sync::atomic::Ordering::Relaxed),
                 missing.load(std::sync::atomic::Ordering::Relaxed),
-                unstable.load(std::sync::atomic::Ordering::Relaxed)
+                unstable.load(std::sync::atomic::Ordering::Relaxed),
+                uncommitted.load(std::sync::atomic::Ordering::Relaxed)
             ),
-            (0, 0, 0),
+            (0, 0, 0, 0),
             "(versions a reader needed that were gone, rows seen missing, \
-             rows read differently twice in one snapshot)"
+             rows read differently twice in one snapshot, rolled-back writes read)"
         );
     }
 

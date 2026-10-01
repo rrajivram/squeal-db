@@ -130,6 +130,20 @@ const FULL_SLACK: u64 = 16;
 // hold fewer keeps a count cap as well (see BPlusTree::count_cap).
 const MIN_ENTRIES_PER_PAGE: u64 = 4;
 
+// Whether the row on the page is already the version a redo record would
+// write: the same data and tombstone flag, written by the same
+// transaction. The transaction matters. A checkpoint taken while a
+// transaction is in flight captures its uncommitted version; if it then
+// rolls back and another commits a change with the same bytes (two deletes
+// of one row both leave its data as it was), the page's version is still
+// the aborted transaction's, and undo will revert it — so redo must stamp
+// the committed transaction's version over it, not take it as done.
+fn already_applied(current: &Tuple, redo: &Tuple) -> bool {
+    current.data == redo.data
+        && current.is_tombstoned() == redo.is_tombstoned()
+        && current.txn_id == redo.txn_id
+}
+
 pub(crate) struct BPlusTree<F: DBFile + 'static> {
     pub(crate) table: Table,
     buffer: Arc<PageBuffer<F>>,
@@ -370,14 +384,15 @@ where
     /// the key is absent, overwrite if a different occupant is there (a
     /// checkpointed tombstone whose purge was not logged, or a stale log
     /// older than the checkpoint), skip if it is already there.
+    ///
+    /// "Already there" means this transaction's version, not merely the
+    /// same bytes (see `already_applied`).
     pub(crate) fn insert_if_needed(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
         let t = tuple.clone();
         match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
             Ok(match cur {
                 None => Decision::Insert(t),
-                Some(c) if c.data == t.data && c.is_tombstoned() == t.is_tombstoned() => {
-                    Decision::Skip
-                }
+                Some(c) if already_applied(c, &t) => Decision::Skip,
                 Some(_) => Decision::Replace(t),
             })
         })? {
@@ -771,9 +786,7 @@ where
     pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<(), StoreError> {
         self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
             Ok(match cur {
-                Some(c) if c.data == tuple.data && c.is_tombstoned() == tuple.is_tombstoned() => {
-                    Decision::Skip
-                }
+                Some(c) if already_applied(c, &tuple) => Decision::Skip,
                 Some(_) => Decision::Replace(tuple),
                 None => Decision::Skip,
             })

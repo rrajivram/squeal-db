@@ -51,9 +51,13 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   `QueryMemoryExceeded` / no spill, 2 in 40 full-suite runs at 9b53136, 0 in
   25 at 9aff786; never alone (0 in 30). Code unchanged between them; cause
   not found.
-- [ ] `store` `crash_harness_seed_1/2`: recovered state not explained by any
-  commit prefix, ~1 in 12 full-suite runs, before and after this session's
-  changes.
+- [x] `store` crash harness: two bugs, both fixed. Reproduce with the soak
+  under contention (24 `examples/crash` processes at once, debug build):
+  it failed 4-5 of 48 processes before, 0 of 144 since.
+  - recovery lost a committed change that looked like an aborted one in the
+    checkpoint image (redo's "already applied" ignored who wrote the row);
+  - a reader could read a rolled-back write (a finished abort left no state,
+    and no state means "committed long ago").
 - [x] `store` `test_audit_t14...` / `Corruption("version record missing for
   pre_lsn ...")`: fixed — three windows between minting an id or commit
   timestamp and registering it (see the commit). 0 in 30 full runs since.
