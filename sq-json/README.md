@@ -98,8 +98,5 @@ session.commit_transaction()?;
 - **Multikey null keys**: a multikey index stores a null key wherever a path is
   missing along an array branch. On a unique index, this can refuse documents
   that MongoDB would accept.
-- **Space**: store's B+tree leaves use fixed-size slots sized for the
-  largest key (256 bytes plus overhead), so indexes take several times the
-  space their keys need.
 - **DDL during transactions**: creating or dropping a collection or index is
   refused while any transaction is open.
