@@ -5,12 +5,14 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 
 ## Where a primary key lookup's time goes (SQL: 33 us)
 
-- [ ] **Parse (~23 us of 33).** The parse cache (`sql_parser::parse_sql_cached`)
-  removes it only for repeated *identical* text (33 -> 10 us). Lookups
-  differing by a literal never hit. Next step: key the cache by the text with
-  literals replaced by placeholders, and bind the literals into the cached
-  AST (squeal-sql's PreparedStatement already substitutes into INSERT;
-  extend it to WHERE / SELECT).
+- [x] **Parse (~23 us of 33).** Done: texts differing only in literals share
+  one parse (the shape cache in `sql_parser::parse_sql_cached`). Lookup now
+  14.7 us with a new literal, 6.9 us repeated verbatim.
+- [ ] **Shape-cache hit costs ~7.7 us** (new literal vs repeated text): mostly
+  lexing (chumsky lexer), then cloning the template. A hand-written lexer, or
+  cloning only the statement being bound, would cut it.
+- [ ] **squeal-sql planning/execution ~5.6 us** of a repeated-text lookup
+  (store's part is 1.3 us).
 - [x] **Read-only transaction commit (~9.5 us of the remaining 10).** Done:
   `Logger::sync_pending` skips the writer round trip when every queued record
   is synced (counted, not by LSN — records reach the writer out of LSN order).
@@ -35,6 +37,13 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   entries, so first-touch random lookups are ~15-20% slower in a fresh
   process (warm ones are faster). Fix: pages readable without a full decode
   (slotted layout / lazy decode). Store change.
+
+## Bugs
+
+- [ ] The stats collector thread panics (`optim/table_stats.rs:414`, index
+  out of bounds in `update_table_stats`) when a logged row has fewer values
+  than the table has column stats — seen in squeal-sql tests (likely after
+  ALTER TABLE). The panic ends the collector; stats then stop updating.
 
 ## Flaky tests
 

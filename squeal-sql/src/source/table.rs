@@ -81,8 +81,10 @@ where
             .unwrap_or_default();
         let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
         let cursor = db.key_ranges_scan(table.db_table_id, txn.map(|t| t.id()), ranges)?;
-        let mut source = Self::new(db, table, txn, stats)?;
-        source.cursor = RowCursor::Seek(cursor);
+        // Built around the seek's own cursor: opening a scan only to replace
+        // it cost every primary key lookup a copy of the table's first data
+        // page (TableCursor reads a page whole when it starts).
+        let mut source = Self::over(RowCursor::Seek(cursor), table, stats);
         source.seek = Some((seek, rows));
         Ok(source)
     }
@@ -117,6 +119,10 @@ where
             Some(txn) => db.table_scan_in_txn(table.db_table_id, txn)?,
             None => db.table_scan(table.db_table_id)?,
         };
+        Ok(Self::over(RowCursor::Scan(cursor), table, stats))
+    }
+
+    fn over(cursor: RowCursor<F>, table: Arc<SqlTable>, stats: Option<ComputedTableStat>) -> Self {
         let fields = table
             .fields()
             .iter()
@@ -124,15 +130,15 @@ where
             .map(|(i, f)| ProjectableField::from_field(f.clone(), 0, i))
             .collect::<Vec<_>>();
         let fields = Arc::from(fields);
-        Ok(Self {
-            cursor: RowCursor::Scan(cursor),
+        Self {
+            cursor,
             seek: None,
             table,
             fields,
             next_time: 0,
             stats,
             last_id: None,
-        })
+        }
     }
 }
 
