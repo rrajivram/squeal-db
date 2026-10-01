@@ -118,6 +118,14 @@ impl PageTuple for FixedTuplePage {
     fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         self.data.successor(id)
     }
+
+    fn values_in(
+        &self,
+        lower: std::ops::Bound<&DBIdType>,
+        max: usize,
+    ) -> Result<Vec<Tuple>, StoreError> {
+        self.data.values_in(lower, max)
+    }
 }
 
 #[cfg(test)]

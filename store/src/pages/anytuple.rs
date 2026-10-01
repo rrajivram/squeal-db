@@ -160,6 +160,21 @@ impl PageTuple for AnyTuplePage {
     // any borrowed form of the key), so this needs no clone of `id`
     // itself — only the one matched entry (if any) gets cloned, via
     // `Tuple`'s cheap Arc-backed `data` field.
+    fn values_in(
+        &self,
+        lower: std::ops::Bound<&DBIdType>,
+        max: usize,
+    ) -> Result<Vec<Tuple>, StoreError> {
+        let mut out = vec![];
+        for (_, bucket) in self.data.range((lower, std::ops::Bound::Unbounded)) {
+            if out.len() >= max {
+                break;
+            }
+            out.extend(bucket.iter().cloned());
+        }
+        Ok(out)
+    }
+
     fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         use std::ops::Bound::{Excluded, Unbounded};
         Ok(self
@@ -212,6 +227,31 @@ mod tests {
 
     fn make_page() -> AnyTuplePage {
         AnyTuplePage::default()
+    }
+
+    // values_in reads a chunk from a bound on, in key order.
+    #[test]
+    fn test_values_in_reads_a_chunk_from_a_bound() {
+        use std::ops::Bound::*;
+        let mut page = make_page();
+        for i in (1u64..=20).rev() {
+            page.add(Tuple::new(i, b"v")).unwrap();
+        }
+        let ids = |ts: Vec<Tuple>| {
+            ts.into_iter()
+                .map(|t| match t.id {
+                    DBIdType::Int(i) => i,
+                    other => panic!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let five = DBIdType::Int(5);
+        assert_eq!(ids(page.values_in(Unbounded, 3).unwrap()), vec![1, 2, 3]);
+        assert_eq!(ids(page.values_in(Included(&five), 3).unwrap()), vec![5, 6, 7]);
+        assert_eq!(ids(page.values_in(Excluded(&five), 2).unwrap()), vec![6, 7]);
+        let twenty = DBIdType::Int(20);
+        assert!(page.values_in(Excluded(&twenty), 4).unwrap().is_empty());
+        assert_eq!(ids(page.values_in(Included(&twenty), 4).unwrap()), vec![20]);
     }
 
     #[test]

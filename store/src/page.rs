@@ -872,6 +872,20 @@ impl Page {
         self.inner.read().data.last()
     }
 
+    pub(crate) fn first(&self) -> Result<Option<Tuple>, StoreError> {
+        self.inner.read().data.first()
+    }
+
+    // See PageTuple::values_in: a chunk of the page from `lower` on, not a
+    // copy of all of it as iter() makes.
+    pub(crate) fn values_in(
+        &self,
+        lower: std::ops::Bound<&DBIdType>,
+        max: usize,
+    ) -> Result<Vec<Tuple>, StoreError> {
+        self.inner.read().data.values_in(lower, max)
+    }
+
     // The one atomic read anything that needs *both* a header and the raw
     // data bytes together should go through — including buffer.rs's
     // write_page, which used to call header()/to_data_bytes()/to_bytes() as

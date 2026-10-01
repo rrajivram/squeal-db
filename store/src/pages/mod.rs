@@ -45,6 +45,34 @@ pub trait PageTuple {
 
     fn first(&self) -> Result<Option<TupleType>, StoreError>;
 
+    /// Tuples at or after `lower`, in key order: about `max` of them —
+    /// whole buckets of ids that compare equal, never part of one — so a
+    /// caller can walk a page a chunk at a time instead of copying all of
+    /// it (`values`) to read a few entries.
+    fn values_in(
+        &self,
+        lower: std::ops::Bound<&DBIdType>,
+        max: usize,
+    ) -> Result<Vec<TupleType>, StoreError> {
+        use std::ops::Bound::*;
+        let mut out: Vec<TupleType> = vec![];
+        for t in self.values()? {
+            let wanted = match lower {
+                Included(k) => t.id >= *k,
+                Excluded(k) => t.id > *k,
+                Unbounded => true,
+            };
+            if !wanted {
+                continue;
+            }
+            if out.len() >= max && out.last().is_some_and(|l| l.id < t.id) {
+                break;
+            }
+            out.push(t);
+        }
+        Ok(out)
+    }
+
     fn last(&self) -> Result<Option<TupleType>, StoreError>;
 
     // STORE_AUDIT.md P5: the smallest-keyed tuple whose id is strictly

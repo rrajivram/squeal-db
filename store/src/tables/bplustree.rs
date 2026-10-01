@@ -314,7 +314,7 @@ where
                     start.record_size().unwrap(),
                 ));
             } else {
-                if let Some(tuple) = start.iter().next() {
+                if let Some(tuple) = start.first()? {
                     level += 1;
                     let page = from_bytes::<Node>(&tuple.data)?;
                     match page {
@@ -970,7 +970,7 @@ where
     pub(crate) fn first_leaf_page(&self) -> Result<Arc<Page>, StoreError> {
         let mut page = self.buffer.get_page(self.table.first_index_page)?;
         while page.is_flag_set(INNER_NODE) {
-            let Some(entry) = page.iter().next() else {
+            let Some(entry) = page.first()? else {
                 return Ok(page);
             };
             page = match from_bytes::<Node>(&entry.data)? {
@@ -1066,7 +1066,7 @@ where
             let mut cur = self.buffer.get_page(self.table.first_index_page)?;
             let mut cur_id = self.table.first_index_page;
             while cur.is_flag_set(INNER_NODE) {
-                let first = cur.iter().next();
+                let first = cur.first()?;
                 match first.map(|t| from_bytes::<Node>(&t.data)) {
                     Some(Ok(Node::Inner(child))) => {
                         cur_id = child;

@@ -138,6 +138,50 @@ pub struct TableCursor<F: DBFile + 'static> {
     transaction: ScanTxn,
 }
 
+// One index leaf's entries from a starting key on, copied out a chunk at a
+// time: a point lookup reads a handful, a long scan doubles its chunk.
+// Page::iter() copies the whole page up front, which costs a lookup the
+// page's full size — and leaves split by bytes hold hundreds of entries.
+struct LeafEntries {
+    buffered: std::collections::VecDeque<Tuple>,
+    // Where the next chunk starts: the starting key, then past the last
+    // entry read.
+    lower: Bound<DBIdType>,
+    chunk: usize,
+    exhausted: bool,
+}
+
+impl LeafEntries {
+    const FIRST_CHUNK: usize = 8;
+
+    fn from(start: &Bound<DBIdType>) -> Self {
+        LeafEntries {
+            buffered: Default::default(),
+            lower: start.clone(),
+            // A leaf entered at its left edge (the next one along a scan) is
+            // read whole; only where a seek lands starts small.
+            chunk: match start {
+                Bound::Unbounded => usize::MAX,
+                _ => Self::FIRST_CHUNK,
+            },
+            exhausted: false,
+        }
+    }
+
+    fn next(&mut self, leaf: &Page) -> Result<Option<Tuple>, StoreError> {
+        if self.buffered.is_empty() && !self.exhausted {
+            let chunk = leaf.values_in(self.lower.as_ref(), self.chunk)?;
+            match chunk.last() {
+                Some(last) => self.lower = Bound::Excluded(last.id.clone()),
+                None => self.exhausted = true,
+            }
+            self.chunk = self.chunk.saturating_mul(2).max(Self::FIRST_CHUNK);
+            self.buffered.extend(chunk);
+        }
+        Ok(self.buffered.pop_front())
+    }
+}
+
 pub struct RangeCursor<F: DBFile + 'static> {
     db: Arc<Db<F>>,
     table: TableIdType,
@@ -146,7 +190,7 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // its entries are (id, Node::Leaf(data_page_id)) routing tuples that
     // next() resolves to the real row via resolve_index_entry.
     current_leaf: Arc<Page>,
-    current_iter: PageTupleIterator,
+    current_iter: LeafEntries,
     transaction: ScanTxn,
     start: Bound<DBIdType>,
     end: Bound<DBIdType>,
@@ -233,7 +277,7 @@ where
         // find_first_page, which did an exact index lookup and errored
         // with KeyNotFound if `start` wasn't a real row).
         let current_leaf = Self::start_leaf(&db.table_by_id(table)?, &start)?;
-        let current_iter = current_leaf.iter();
+        let current_iter = LeafEntries::from(&start);
         Ok(Self {
             db,
             table,
@@ -275,7 +319,7 @@ where
             None => Bound::Unbounded,
         };
         let current_leaf = Self::start_leaf(&tree, &start)?;
-        let current_iter = current_leaf.iter();
+        let current_iter = LeafEntries::from(&start);
         Ok(Self {
             db,
             table,
@@ -311,7 +355,7 @@ where
         };
         self.start = Self::range_start(tree, range)?;
         self.current_leaf = Self::start_leaf(tree, &self.start)?;
-        self.current_iter = self.current_leaf.iter();
+        self.current_iter = LeafEntries::from(&self.start);
         Ok(true)
     }
 
@@ -343,7 +387,7 @@ where
     ) -> Result<Bound<DBIdType>, StoreError> {
         // Any entry shows the length (all keys of a tree share it). An
         // empty tree has no entries to scan: start at the beginning.
-        let Some(sample) = tree.first_leaf_page()?.iter().next() else {
+        let Some(sample) = tree.first_leaf_page()?.first()? else {
             return Ok(Bound::Unbounded);
         };
         let DBIdType::Rec(sample) = sample.id else {
@@ -386,13 +430,13 @@ where
         // index leaf whose every entry was removed is still in the leaf
         // chain, and must be skipped rather than end the scan.
         loop {
-            if let Some(t) = self.current_iter.next() {
+            if let Some(t) = self.current_iter.next(&self.current_leaf)? {
                 return Ok(Some(t));
             }
             match table.next_leaf_page(&self.current_leaf)? {
                 Some(next_leaf) => {
                     self.current_leaf = next_leaf;
-                    self.current_iter = self.current_leaf.iter();
+                    self.current_iter = LeafEntries::from(&Bound::Unbounded);
                 }
                 None => return Ok(None),
             }
@@ -513,7 +557,7 @@ where
             }
         }
         let current_leaf = Self::start_leaf(&tree, &self.start)?;
-        self.current_iter = current_leaf.iter();
+        self.current_iter = LeafEntries::from(&self.start);
         self.current_leaf = current_leaf;
         Ok(())
     }
