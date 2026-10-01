@@ -18,6 +18,10 @@ impl<T, S> Seq<T, S> {
         std::iter::once(&*self.head).chain(self.tail.iter().map(|(_, t)| t))
     }
 
+    pub fn items_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        std::iter::once(&mut *self.head).chain(self.tail.iter_mut().map(|(_, t)| t))
+    }
+
     pub fn len(&self) -> usize {
         1 + self.tail.len()
     }

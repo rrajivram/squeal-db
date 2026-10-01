@@ -9,6 +9,7 @@
 // this crate and from dependent crates.
 extern crate self as sql_parser;
 
+mod bind;
 mod cache;
 pub mod combo;
 pub mod datatype;
