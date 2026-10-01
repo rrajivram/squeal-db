@@ -45,6 +45,15 @@ pub(crate) struct LsnClock {
     // truth; this pair exists so a waiter can sleep instead of spinning.
     durable_mutex: std::sync::Mutex<()>,
     durable_condvar: std::sync::Condvar,
+    // Records handed to the log writer, counted BEFORE each is queued, and
+    // records it has synced, counted after each batch's fsync. The channel
+    // is FIFO and a record is queued only after it is counted, so once
+    // `synced` reaches a value read from `queued`, every record queued
+    // before that read is durable. (LSNs can't answer this: records reach
+    // the writer out of LSN order, and plenty of minted LSNs — a read-only
+    // commit's timestamp, say — are never logged at all.)
+    queued: AtomicU64,
+    synced: AtomicU64,
 }
 
 impl Default for LsnClock {
@@ -54,6 +63,8 @@ impl Default for LsnClock {
             last_written: AtomicU64::new(0),
             durable_mutex: std::sync::Mutex::new(()),
             durable_condvar: std::sync::Condvar::new(),
+            queued: AtomicU64::new(0),
+            synced: AtomicU64::new(0),
         }
     }
 }
@@ -79,6 +90,12 @@ impl LsnClock {
     /// Advance the durable watermark (monotonic) and wake waiters. Holds
     /// `durable_mutex` around the store so a waiter's check-then-wait can't
     /// miss it.
+    /// Whether every record queued so far has been synced (see `queued`).
+    pub(crate) fn nothing_pending(&self) -> bool {
+        let queued = self.queued.load(std::sync::atomic::Ordering::Acquire);
+        self.synced.load(std::sync::atomic::Ordering::Acquire) >= queued
+    }
+
     pub(crate) fn mark_written(&self, lsn: LsnId) {
         let _guard = self.durable_mutex.lock().unwrap();
         self.last_written
@@ -926,6 +943,8 @@ impl Logger {
                 last_written: AtomicU64::new(0),
                 durable_mutex: std::sync::Mutex::new(()),
                 durable_condvar: std::sync::Condvar::new(),
+                queued: AtomicU64::new(0),
+                synced: AtomicU64::new(0),
             }),
             ..Default::default()
         }
@@ -1043,6 +1062,12 @@ impl Logger {
     pub(crate) fn log(&self, lsn: LsnId, op: Operation) -> Result<(), StoreError> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(tx) = &self.log_tx {
+            // Counted before it is queued — see LsnClock::queued. A failed
+            // send leaves the count ahead for good, so sync_pending just
+            // keeps syncing: safe.
+            self.clock
+                .queued
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             tx.send(LogMsg::Record(LogRecord { lsn, operation: op }))
                 .map_err(|e| StoreError::UnknownError(e.to_string()))?;
         }
@@ -1065,6 +1090,16 @@ impl Logger {
     // synced before returning (there is no separate runner it could still
     // be waiting on), so anything queued before this call is durable by the
     // time it's reached.
+    /// As `sync`, but returns at once when every record queued so far is
+    /// already durable — no round trip to the writer for nothing (a
+    /// read-only commit's barrier, mostly).
+    pub(crate) fn sync_pending(&self) -> Result<(), StoreError> {
+        if self.clock.nothing_pending() {
+            return Ok(());
+        }
+        self.sync()
+    }
+
     pub(crate) fn sync(&self) -> Result<(), StoreError> {
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(tx) = &self.log_tx {
@@ -1359,6 +1394,9 @@ fn log_runner<F: DBFile>(
                 st.current.max_lsn = st.current.max_lsn.max(lsn.0);
                 clock.mark_written(lsn);
             }
+            clock
+                .synced
+                .fetch_add(batch_record_count as u64, std::sync::atomic::Ordering::AcqRel);
             st.publish_counts();
         }
         match special {

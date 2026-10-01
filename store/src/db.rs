@@ -1518,13 +1518,14 @@ where
         // What it must still do is keep the guarantee callers have always
         // had from commit(): when it returns, everything logged BEFORE it is
         // durable (non-transactional records, e.g. sequence chunks, are only
-        // made durable by a later commit's wait). sync() is exactly that
-        // barrier, without appending anything.
+        // made durable by a later commit's wait). sync_pending() is exactly
+        // that barrier, without appending anything — and without a round
+        // trip to the log writer when nothing is waiting to be synced.
         if !self.versions.has_writes(&id) {
             let ts = self.logger.next_lsn().0;
             self.tx_mgr.commit(id, ts)?;
             if durability == Durability::Sync {
-                self.logger.sync()?;
+                self.logger.sync_pending()?;
             }
             return Ok(());
         }
@@ -8481,6 +8482,32 @@ mod tests {
             before,
             "a committed read-only txn must not stay active"
         );
+    }
+
+    // A read-only commit skips the trip to the log writer only when nothing
+    // is waiting to be synced; it must still return only after records
+    // logged before it (a sequence's chunk, here: logged outside any
+    // transaction) are durable.
+    #[test]
+    fn test_a_read_only_commit_leaves_nothing_logged_before_it_unsynced() {
+        let (db, _tid) = make_db_with_table();
+        let clock = db.logger.clock();
+        for i in 0..50 {
+            db.get_generator()
+                .create_generator(format!("seq{i}"), Some(0))
+                .unwrap();
+            let t = db.begin().unwrap();
+            db.commit(t).unwrap();
+            assert!(clock.nothing_pending(), "round {i}: a record logged before the commit is unsynced");
+        }
+        // With nothing pending, a read-only commit is just the bookkeeping.
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            let t = db.begin().unwrap();
+            db.commit(t).unwrap();
+        }
+        assert!(clock.nothing_pending());
+        eprintln!("1000 read-only commits: {:?}", start.elapsed());
     }
 
     // --- lazy tail discovery (was: a full decode of every data page at open) ---

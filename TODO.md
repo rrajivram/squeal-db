@@ -11,10 +11,9 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   literals replaced by placeholders, and bind the literals into the cached
   AST (squeal-sql's PreparedStatement already substitutes into INSERT;
   extend it to WHERE / SELECT).
-- [ ] **Read-only transaction commit (~9.5 us of the remaining 10).** `commit`
-  of a transaction that never wrote still calls `logger.sync()` (a durability
-  barrier for earlier non-transactional records). Skip it when nothing is
-  pending (durable LSN >= last written). Store change — needs approval.
+- [x] **Read-only transaction commit (~9.5 us of the remaining 10).** Done:
+  `Logger::sync_pending` skips the writer round trip when every queued record
+  is synced (counted, not by LSN — records reach the writer out of LSN order).
 - [ ] **Store lookup itself is ~0.7 us** (`Db::find`): a copy-on-write page
   iterator would not move SQL lookups noticeably.
 
@@ -48,4 +47,8 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [ ] `store` `crash_harness_seed_1/2`: recovered state not explained by any
   commit prefix, ~1 in 12 full-suite runs, before and after this session's
   changes.
-- [ ] `store` `test_audit_t14...` (known).
+- [ ] `store` `test_audit_t14...`: under full-suite load (~1-2 in 10 runs,
+  with or without the read-only commit change) a reader that is the OLDEST
+  active transaction gets `Corruption("version record missing for pre_lsn of
+  ...")` — a version it still needs was discarded. A real MVCC retention bug,
+  not just a flaky assertion.
