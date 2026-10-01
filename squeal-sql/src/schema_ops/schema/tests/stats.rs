@@ -205,3 +205,57 @@ fn test_analyze_table_fails_for_an_unknown_table() {
     let err = schema.analyze_table("nope").unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
 }
+
+// ALTER TABLE re-keys a table's column stats to its new layout: before,
+// they stayed keyed by the old column positions, so a row written after a
+// column was dropped was shorter than the stats expected and the
+// collector thread panicked (index out of bounds), ending stats for the
+// whole schema; after an added or renamed column they described the wrong
+// columns.
+#[test]
+fn test_alter_table_rekeys_column_stats_and_the_collector_survives() {
+    let c = conn();
+    execute(
+        &c,
+        "create table t (id integer not null, a integer, b varchar(10), c integer, primary key(id))",
+    )
+    .unwrap();
+    let schema = c.current_schema().unwrap();
+    for i in 0..5 {
+        execute(&c, &format!("insert into t values ({i}, {}, 'b{i}', {})", 100 + i, 200 + i)).unwrap();
+    }
+    schema.analyze_table("t").unwrap();
+    let col = |stat: &TableStat, table: &SqlTable, name: &str| {
+        let i = table.fields().iter().position(|f| f.name == name).unwrap();
+        stat.col_stats.get(&i).cloned().unwrap()
+    };
+    // Drop the column between two others, then keep inserting (the shape
+    // that used to crash the collector).
+    execute(&c, "alter table t drop column a").unwrap();
+    for i in 5..10 {
+        execute(&c, &format!("insert into t values ({i}, 'b{i}', {})", 200 + i)).unwrap();
+    }
+    let table = schema.get_table("t").unwrap();
+    let stat = wait_for_row_count(&schema, table.db_table_id, 10);
+    // c kept its stats and took the new rows' values, at its new position.
+    let c_stat = col(&stat, &table, "c");
+    assert_eq!(c_stat.min, ValueItem::Integer(200));
+    assert_eq!(c_stat.max, ValueItem::Integer(209));
+    assert_eq!(table.fields().len(), stat.col_stats.len());
+
+    // An added column starts fresh; the others keep theirs.
+    execute(&c, "alter table t add column d integer").unwrap();
+    execute(&c, "insert into t values (10, 'b10', 210, 7)").unwrap();
+    let table = schema.get_table("t").unwrap();
+    let stat = wait_for_row_count(&schema, table.db_table_id, 11);
+    assert_eq!(col(&stat, &table, "d").min, ValueItem::Integer(7));
+    assert_eq!(col(&stat, &table, "c").max, ValueItem::Integer(210));
+
+    // A renamed column keeps its stats, under its new name.
+    execute(&c, "alter table t rename column c to cc").unwrap();
+    execute(&c, "insert into t values (11, 'b11', 211, 8)").unwrap();
+    let table = schema.get_table("t").unwrap();
+    let stat = wait_for_row_count(&schema, table.db_table_id, 12);
+    let cc = col(&stat, &table, "cc");
+    assert_eq!((cc.name.as_str(), cc.min, cc.max), ("cc", ValueItem::Integer(200), ValueItem::Integer(211)));
+}

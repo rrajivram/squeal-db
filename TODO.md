@@ -40,10 +40,8 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 
 ## Bugs
 
-- [ ] The stats collector thread panics (`optim/table_stats.rs:414`, index
-  out of bounds in `update_table_stats`) when a logged row has fewer values
-  than the table has column stats — seen in squeal-sql tests (likely after
-  ALTER TABLE). The panic ends the collector; stats then stop updating.
+- [x] Stats collector panic after ALTER TABLE (fixed: stats re-keyed by
+  field id on ALTER; short rows skipped).
 
 ## Flaky tests
 

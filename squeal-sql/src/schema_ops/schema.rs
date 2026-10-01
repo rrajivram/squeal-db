@@ -1311,6 +1311,14 @@ where
             &txn,
         )?;
         self.db.commit(txn)?;
+        // Its column stats were keyed by the old layout: rows in the new
+        // one would land on the wrong columns, or (a column dropped) past
+        // the end. Best-effort, like every stats update.
+        if let Some(stats) = self.stats.lock().as_ref()
+            && let Err(e) = stats.reshape_table(&table)
+        {
+            log::warn!("failed to reshape {:?}'s stats: {e}", table.name);
+        }
         self.tables.write().insert(name, table);
         Ok(())
     }

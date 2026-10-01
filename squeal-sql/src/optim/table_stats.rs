@@ -246,6 +246,39 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         Ok(())
     }
 
+    /// After an ALTER TABLE: keys `table`'s column stats by its new
+    /// layout. A column keeps its stats by its field id (so a renamed one
+    /// keeps them, under its new name), a new one starts fresh, a dropped
+    /// one's are gone, and the row count stands. Waits for rows logged
+    /// before it first, so they land on the layout they were written in.
+    pub(crate) fn reshape_table(&self, table: &Arc<SqlTable>) -> Result<(), SchemaError> {
+        self.flush();
+        let fresh = Self::table_data(table)?;
+        let mut tables = self.tables.write();
+        let Some(stored) = tables.get_mut(&table.db_table_id) else {
+            tables.insert(table.db_table_id, fresh);
+            return Ok(());
+        };
+        let mut old: HashMap<u32, ColumnStatStored> = stored
+            .col_stats
+            .write()
+            .drain()
+            .map(|(_, c)| (c.id, c))
+            .collect();
+        let reshaped = fresh
+            .col_stats
+            .into_inner()
+            .into_iter()
+            .map(|(i, new)| match old.remove(&new.id) {
+                Some(kept) => (i, ColumnStatStored { name: new.name, ..kept }),
+                None => (i, new),
+            })
+            .collect();
+        *stored.col_stats.write() = reshaped;
+        stored.name = table.name.clone();
+        Ok(())
+    }
+
     fn table_data(table: &Arc<SqlTable>) -> Result<TableStatStored, SchemaError> {
         // Field *names* a lone PRIMARY KEY/UNIQUE index already covers —
         // no bloom filter needed, since that column's values are already
@@ -411,7 +444,11 @@ fn update_table_stats(
     };
     table.row_count += 1;
     for (i, f) in table.col_stats.write().iter_mut() {
-        let v = &data[*i];
+        // A row logged in a table's layout before an ALTER TABLE, applied
+        // after it (see SchemaStats::reshape_table), can be short a column.
+        let Some(v) = data.values().get(*i) else {
+            continue;
+        };
         // Null is excluded from min/max/unique entirely, counted only
         // here — matching SQL's own MIN/MAX/COUNT(DISTINCT), which
         // likewise ignore NULL rather than letting it participate.
