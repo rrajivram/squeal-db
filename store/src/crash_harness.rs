@@ -142,12 +142,23 @@ struct CommittedTxn {
     writes: Vec<(Key, Value)>,
 }
 
+/// Every transaction a thread ran this round, for diagnosis: its number
+/// (what its values are stamped with), the engine's id for it (what the WAL
+/// names it by), how it ended, and what it wrote.
+struct TxnTrace {
+    txn_no: u64,
+    engine_id: u64,
+    outcome: String,
+    writes: Vec<(Key, Value)>,
+}
+
 struct WorkerOut {
     thread_idx: usize,
     committed: Vec<CommittedTxn>,
     rolled_back: u64,
     /// The keys this thread ever touched — the domain of its state.
     keys: Vec<Key>,
+    history: Vec<TxnTrace>,
 }
 
 fn encode(thread_idx: usize, seq: u64) -> Vec<u8> {
@@ -256,19 +267,42 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
         if let Some(h) = ckpt_thread {
             h.join().map_err(|_| "checkpoint thread panicked".to_string())?;
         }
+        let mut changes: Vec<String> = Vec::new();
         for h in readers {
-            let (reads, violations, max_segments) =
+            let (reads, violations, max_segments, seen) =
                 h.join().map_err(|_| "long reader panicked".to_string())?;
             report.long_reader_reads += reads;
             report.long_reader_violations += violations;
             report.max_wal_segments = report.max_wal_segments.max(max_segments);
+            changes.extend(seen);
         }
         if report.long_reader_violations > 0 {
-            return Err(format!(
+            let mut msg = format!(
                 "seed {} round {round}: a long-lived reader saw a value change inside its own \
                  transaction ({} violation(s))",
                 cfg.seed, report.long_reader_violations
-            ));
+            );
+            // What it saw, and how each transaction that wrote the key ended.
+            for change in &changes {
+                msg.push_str(&format!("\n  {change}"));
+            }
+            for out in &outs {
+                for t in &out.history {
+                    for (k, v) in &t.writes {
+                        let v = v.as_ref().map(|v| String::from_utf8_lossy(v).into_owned());
+                        if changes.iter().any(|c| c.starts_with(&format!("key {k:?} "))) {
+                            msg.push_str(&format!(
+                                "\n    {k:?}: txn #{} (engine txn {}) wrote {} — {}",
+                                t.txn_no,
+                                t.engine_id,
+                                v.unwrap_or_else(|| "ABSENT".into()),
+                                t.outcome
+                            ));
+                        }
+                    }
+                }
+            }
+            return Err(msg);
         }
         report.checkpoints += checkpoints.load(Ordering::Relaxed);
         // Simulate the crash: drop the live engine without close().
@@ -344,6 +378,7 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
             }
             let Some(k) = accepted else {
                 let mut msg = diagnose(cfg.seed, round, out, &expected, &ambiguous, &actual, cut_seq);
+                explain(&mut msg, out, &expected, &actual, &tables, &segments_for_dump);
                 save_snapshot(&mut msg);
                 return Err(msg);
             };
@@ -444,16 +479,22 @@ fn read_key(db: &Arc<Db<MemFile>>, tables: &[TableIdType], key: Key) -> Result<V
 
 /// One transaction held open across the whole round: every re-read of the
 /// sample must return what the first read returned. Returns (reads,
-/// violations, most WAL segments seen retained).
+/// violations, most WAL segments seen retained, a description of each of
+/// the first few violations).
 fn long_reader(
     db: Arc<Db<MemFile>>,
     tables: Arc<Vec<TableIdType>>,
     stop: Arc<AtomicBool>,
     sample: Vec<Key>,
-) -> (u64, u64, usize) {
+) -> (u64, u64, usize, Vec<String>) {
     let txn = match db.begin() {
         Ok(t) => t,
-        Err(_) => return (0, 0, 0),
+        Err(_) => return (0, 0, 0, vec![]),
+    };
+    let mut seen_changes: Vec<String> = Vec::new();
+    let show = |v: &Value| match v {
+        Some(v) => String::from_utf8_lossy(v).into_owned(),
+        None => "ABSENT".to_string(),
     };
     let mut first: std::collections::HashMap<Key, Value> = std::collections::HashMap::new();
     let (mut reads, mut violations, mut max_segments) = (0u64, 0u64, 0usize);
@@ -466,7 +507,17 @@ fn long_reader(
                 None => {
                     first.insert(*k, v);
                 }
-                Some(seen) if *seen != v => violations += 1,
+                Some(seen) if *seen != v => {
+                    violations += 1;
+                    if seen_changes.len() < 4 {
+                        seen_changes.push(format!(
+                            "key {k:?} first read {}, then {} (reader engine txn {}, read #{reads})",
+                            show(seen),
+                            show(&v),
+                            txn.id().id_num()
+                        ));
+                    }
+                }
                 Some(_) => {}
             }
         }
@@ -474,7 +525,7 @@ fn long_reader(
         thread::sleep(Duration::from_millis(1));
     }
     let _ = db.rollback(txn);
-    (reads, violations, max_segments)
+    (reads, violations, max_segments, seen_changes)
 }
 
 fn states_equal(expected: &State, actual: &State, keys: &[Key]) -> bool {
@@ -520,6 +571,58 @@ fn diagnose(
     lines.join("\n")
 }
 
+// For each key that disagrees: every transaction of this round that wrote
+// it and how that transaction ended, then every WAL record in the recovered
+// snapshot that names the key or one of those transactions.
+fn explain(
+    msg: &mut String,
+    out: &WorkerOut,
+    definite_state: &State,
+    actual: &State,
+    tables: &[TableIdType],
+    segments: &[(String, Vec<u8>)],
+) {
+    for k in &out.keys {
+        if definite_state.get(k).cloned().flatten() == actual.get(k).cloned().flatten() {
+            continue;
+        }
+        msg.push_str(&format!("\n  history of {k:?} this round:"));
+        let mut engine_ids = Vec::new();
+        for t in out.history.iter().filter(|t| t.writes.iter().any(|(wk, _)| wk == k)) {
+            engine_ids.push(t.engine_id);
+            let wrote: Vec<String> = t
+                .writes
+                .iter()
+                .filter(|(wk, _)| wk == k)
+                .map(|(_, v)| match v {
+                    Some(v) => String::from_utf8_lossy(v).into_owned(),
+                    None => "ABSENT".into(),
+                })
+                .collect();
+            msg.push_str(&format!(
+                "\n    txn #{} (engine txn {}): {} — wrote {}",
+                t.txn_no,
+                t.engine_id,
+                t.outcome,
+                wrote.join(", ")
+            ));
+        }
+        let needle = format!("table={} key={}", tables[k.0], k.1);
+        msg.push_str("\n  WAL records naming it or those transactions:");
+        for (path, bytes) in segments {
+            msg.push_str(&format!("\n    segment {path}:"));
+            for line in crate::logger::describe_wal(bytes) {
+                let about_txn = engine_ids.iter().any(|id| {
+                    line.ends_with(&format!("txn={id}")) || line.contains(&format!("txn={id} "))
+                });
+                if line.contains(&needle) || about_txn || line.contains("record(s)") {
+                    msg.push_str(&format!("\n      {line}"));
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker(
     thread_idx: usize,
@@ -541,10 +644,12 @@ fn worker(
     // starts gets a distinct value, so a key's stored bytes name the exact
     // transaction that wrote them (committed or not).
     let mut txn_no: u64 = 0;
+    let mut history: Vec<TxnTrace> = Vec::new();
 
     while !stop.load(Ordering::Relaxed) {
         let Ok(txn) = db.begin() else { continue };
         txn_no += 1;
+        let engine_id = txn.id().id_num();
         let n = 1 + rng.range(0, cfg.max_ops_per_txn as u64);
         // Writes this transaction made, in order, with the value it wrote.
         let mut writes: Vec<(Key, Value)> = Vec::new();
@@ -605,29 +710,47 @@ fn worker(
             }
         }
         let want_commit = !failed && rng.pct() < cfg.commit_probability_pct;
+        let outcome;
         if want_commit {
             match db.commit(txn) {
                 Ok(()) => {
                     let seq = commit_seq.fetch_add(1, Ordering::SeqCst);
                     apply(&mut model, &writes);
-                    committed.push(CommittedTxn { seq, writes });
+                    outcome = format!("committed, seq {seq}");
+                    committed.push(CommittedTxn {
+                        seq,
+                        writes: writes.clone(),
+                    });
                 }
-                Err(_) => {
+                Err(e) => {
                     // A failed commit leaves the transaction active/aborted;
                     // its writes must never become visible.
+                    outcome = format!("commit FAILED: {e}");
                     rolled_back += 1;
                 }
             }
         } else {
-            let _ = db.rollback(txn);
+            let r = db.rollback(txn);
+            outcome = match (failed, r) {
+                (true, Ok(())) => "an operation failed; rolled back".to_string(),
+                (false, Ok(())) => "rolled back".to_string(),
+                (_, Err(e)) => format!("rollback FAILED: {e}"),
+            };
             rolled_back += 1;
         }
+        history.push(TxnTrace {
+            txn_no,
+            engine_id,
+            outcome,
+            writes,
+        });
     }
     WorkerOut {
         thread_idx,
         committed,
         rolled_back,
         keys,
+        history,
     }
 }
 
