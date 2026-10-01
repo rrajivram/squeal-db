@@ -337,7 +337,7 @@ where
         let res: Result<(), SchemaError> = (|| {
             let row_table_id = self.db.create_table_with_index_entry_size(
                 row_table_name.clone(),
-                table.row_size() as u64,
+                table.row_entry_size() as u64,
             )?;
             created_names.push(row_table_name.clone());
             table.db_table_id = row_table_id;

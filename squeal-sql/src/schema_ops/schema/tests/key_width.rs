@@ -93,3 +93,31 @@ fn test_non_unique_index_key_counts_the_appended_row_identity() {
     assert_key_too_wide(r, "idx_v");
     execute(&c, "create unique index uq_v on t(v)").unwrap();
 }
+
+// The row table's entries hold its key, not its row (store keeps rows on
+// data pages): a table whose declared row is wider than a quarter page —
+// sized by row width, 2 entries a 16 KB node, which broke once its tree
+// split — stores and reads back rows like any other.
+#[test]
+fn test_rows_wider_than_a_quarter_page_store_and_read_back() {
+    let c = conn();
+    execute(
+        &c,
+        "create table wide (id integer not null, body varchar(6000), primary key(id))",
+    )
+    .unwrap();
+    for i in 0..300 {
+        execute(&c, &format!("insert into wide values ({i}, 'row {i}')")).unwrap();
+    }
+    let result = c.current_schema().unwrap().select_all("wide", None).unwrap();
+    let mut ids: Vec<i64> = result
+        .rows()
+        .iter()
+        .map(|r| match &r[0] {
+            store::valueitem::ValueItem::Integer(i) => *i,
+            other => panic!("expected an integer id, got {other:?}"),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, (0..300).collect::<Vec<i64>>());
+}

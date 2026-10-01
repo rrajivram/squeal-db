@@ -1062,16 +1062,15 @@ impl SqlTable {
             .find(|i| i.fields.iter().any(|f| f.name == field_name))
     }
 
-    // Every field's byte budget, summed (plus ENTRY_OVERHEAD_BYTES —
-    // see its own comment) — the row-storage table's own
-    // index_entry_size, mirroring SqlIndex::size() (indexed fields only)
-    // but over the whole row, since the full row is what's stored there.
-    pub(crate) fn row_size(&self) -> usize {
-        self.fields()
-            .iter()
-            .map(|f| f.datatype.size())
-            .sum::<usize>()
-            + ENTRY_OVERHEAD_BYTES
+    // The row-storage table's own index_entry_size: the width of its key
+    // (the PRIMARY KEY's columns, or the rowid — see Schema::row_key) plus
+    // ENTRY_OVERHEAD_BYTES, as SqlIndex::size() does for an index. Not the
+    // row's width: store keeps a row on its table's data pages, and the
+    // tree's entries hold only the key and that page's id. (Sizing by the
+    // whole row starved wide tables of fanout — a varchar(4000) column
+    // left 4 entries a 16 KB page — and broke tables wider than that.)
+    pub(crate) fn row_entry_size(&self) -> usize {
+        self.identity_size() + ENTRY_OVERHEAD_BYTES
     }
 
     // The position of `field` within this table's own declared field
