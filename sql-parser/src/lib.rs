@@ -9,6 +9,7 @@
 // this crate and from dependent crates.
 extern crate self as sql_parser;
 
+mod cache;
 pub mod combo;
 pub mod datatype;
 pub mod ddl;
@@ -29,6 +30,7 @@ pub mod visitor;
 
 use chumsky::{IterParser, Parser, error::Rich, extra, prelude::end};
 
+pub use crate::cache::{CacheStats, cache_stats, parse_sql_cached};
 pub use crate::{
     expr::{Expr, Placeholder},
     ident::{Ident, ObjectName},

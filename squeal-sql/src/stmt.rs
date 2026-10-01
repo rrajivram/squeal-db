@@ -18,7 +18,8 @@ use crate::{
 pub struct Statement<F: DBFile> {
     id: uuid::Uuid,
     sql: String,
-    stmts: Vec<sql_parser::Statement>,
+    // Shared with the parser's cache (see sql_parser::parse_sql_cached).
+    stmts: Arc<[sql_parser::Statement]>,
     conn: Arc<Connection<F>>,
     // Option<_>, not a bare ResultType: a result — streaming ones
     // especially, see ResultType::StreamingResult — can't be cheaply
@@ -163,7 +164,7 @@ where
         // FK enforcement, transaction handling, ...) unchanged, since a
         // fully-substituted Insert is indistinguishable from one a
         // caller typed as a literal statement.
-        self.stmt.stmts = vec![sql_parser::Statement::Insert(substituted)];
+        self.stmt.stmts = vec![sql_parser::Statement::Insert(substituted)].into();
         self.stmt.results.clear();
         self.stmt.current_result = None;
         self.stmt.execute()?;
@@ -387,7 +388,7 @@ where
     F: DBFile<Item = F>,
 {
     pub(crate) fn new(sql: &str, conn: Arc<Connection<F>>) -> Result<Self, SchemaError> {
-        let stmts = sql_parser::parse_sql(sql)?;
+        let stmts = sql_parser::parse_sql_cached(sql)?;
         Self::semantic_validate(&stmts)?;
         Ok(Self {
             id: Uuid::new_v4(),
@@ -439,7 +440,7 @@ where
     }
 
     pub fn execute(&mut self) -> Result<(), SchemaError> {
-        for stmt in &self.stmts {
+        for stmt in self.stmts.iter() {
             match stmt {
                 sql_parser::Statement::ShowSchemas(_) => {
                     let schemas = self
