@@ -1073,6 +1073,19 @@ impl SqlTable {
         self.identity_size() + ENTRY_OVERHEAD_BYTES
     }
 
+    // A row's width as the cost model counts it (see optim::picker's
+    // table_row): every field's budget plus ENTRY_OVERHEAD_BYTES — what
+    // the row table's entry budget was before row_entry_size, and what the
+    // planner's constants are calibrated against. Taken from the schema,
+    // not the tree, so plans don't depend on how a table's tree was sized.
+    pub(crate) fn costed_row_size(&self) -> usize {
+        self.fields()
+            .iter()
+            .map(|f| f.datatype.size())
+            .sum::<usize>()
+            + ENTRY_OVERHEAD_BYTES
+    }
+
     // The position of `field` within this table's own declared field
     // order — used to pull a PRIMARY KEY/index's values back out of a
     // full row (built in that same order by rows_from_insert).

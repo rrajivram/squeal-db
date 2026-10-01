@@ -580,7 +580,7 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
     table: &Arc<SqlTable>,
 ) -> Result<Option<ComputedTableStat>, SchemaError> {
     if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.db_table_id)? {
-        let (levels, nodes_per_page, record_size) = conn
+        let (levels, nodes_per_page, _) = conn
             .database
             .read()
             .db
@@ -608,7 +608,9 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
                 levels,
                 nodes_per_page,
                 unique: true,
-                row_size: record_size,
+                // The schema's row width, not the tree's entry budget (now
+                // the key's — see SqlTable::row_entry_size).
+                row_size: table.costed_row_size(),
             }),
             row_size,
         }));
