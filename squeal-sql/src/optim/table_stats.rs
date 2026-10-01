@@ -102,6 +102,8 @@ pub struct ColumnStat {
 enum StatMsg {
     Shutdown,
     InsertLogStat((TableIdType, IndexKey)),
+    // Answered once every message sent before it has been applied.
+    Flush(Sender<()>),
 }
 
 impl<F: DBFile + 'static> SchemaStats<F> {
@@ -334,6 +336,19 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         update_table_stats(&self.tables, table, record);
     }
 
+    // Waits until the collector has applied every row logged so far — what
+    // ANALYZE needs before it recounts, or a row logged before it could be
+    // applied after, counted twice.
+    pub(crate) fn flush(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (done, wait) = bounded(1);
+            if self.tx.send(StatMsg::Flush(done)).is_ok() {
+                let _ = wait.recv();
+            }
+        }
+    }
+
     pub(crate) fn shutdown(self) {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -369,6 +384,9 @@ fn stat_collector(
                 if val < rate {
                     update_table_stats(&stat, table, data);
                 }
+            }
+            StatMsg::Flush(done) => {
+                let _ = done.send(());
             }
         }
     }

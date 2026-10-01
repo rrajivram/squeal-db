@@ -2615,6 +2615,11 @@ fn subquery_conn() -> Arc<Connection<MemFile>> {
     for (id, val) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
         run(&c, &format!("insert into t2 values ({id}, {val})")).unwrap();
     }
+    // Row estimates come from statistics a background collector keeps on a
+    // best-effort basis (it drops rows under load); ANALYZE makes them
+    // exact for the EXPLAIN tests that print them.
+    run(&c, "analyze table t1").unwrap();
+    run(&c, "analyze table t2").unwrap();
     c
 }
 

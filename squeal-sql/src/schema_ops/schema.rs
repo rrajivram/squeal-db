@@ -1203,6 +1203,9 @@ where
         let Some(stats) = guard.as_ref() else {
             return Ok(());
         };
+        // Rows the collector hasn't applied yet would otherwise land on
+        // top of the recount below.
+        stats.flush();
         stats.drop_table_stats(table.db_table_id);
         stats.add_table(table.clone())?;
         let mut cursor = self.db.table_scan(table.db_table_id)?;
