@@ -54,8 +54,6 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [ ] `store` `crash_harness_seed_1/2`: recovered state not explained by any
   commit prefix, ~1 in 12 full-suite runs, before and after this session's
   changes.
-- [ ] `store` `test_audit_t14...`: under full-suite load (~1-2 in 10 runs,
-  with or without the read-only commit change) a reader that is the OLDEST
-  active transaction gets `Corruption("version record missing for pre_lsn of
-  ...")` — a version it still needs was discarded. A real MVCC retention bug,
-  not just a flaky assertion.
+- [x] `store` `test_audit_t14...` / `Corruption("version record missing for
+  pre_lsn ...")`: fixed — three windows between minting an id or commit
+  timestamp and registering it (see the commit). 0 in 30 full runs since.

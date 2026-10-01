@@ -1529,12 +1529,20 @@ where
             }
             return Ok(());
         }
-        let commit_lsn = self.logger.log_new(Operation::Commit(id))?;
+        // The commit timestamp is minted under the lock transaction ids are
+        // minted under, and readers wait out the short Committing state (see
+        // TransactionManager::is_visible): minting it first and marking the
+        // transaction committed later let a reader begin in between, see
+        // this transaction as still running — though it committed "before"
+        // the reader — and walk back for a pre-image a vacuum could then
+        // discard (Corruption: version record missing), or read two
+        // different versions in one snapshot.
+        let commit_lsn = LsnId(self.tx_mgr.begin_commit(id)?);
+        let logged = self.logger.log(commit_lsn, Operation::Commit(id));
         // THE commit point for every other thread. Versions are never
-        // discarded here — retention is the horizon's decision — so there
-        // is no window where a walker sees "not committed" and "pre-image
-        // gone" at once (the race STORE_AUDIT.md T14 was about).
-        self.tx_mgr.commit(id, commit_lsn.0)?;
+        // discarded here — retention is the horizon's decision.
+        self.tx_mgr.finish_commit(id, logged.is_ok());
+        logged?;
         self.versions.mark_committed(id, commit_lsn.0);
         self.maintenance_wake();
         // STORE_AUDIT.md T1: don't report success until the record is
@@ -1685,9 +1693,9 @@ where
                 }
             }
         }
-        let horizon = self.tx_mgr.oldest_active();
+        let horizon = self.tx_mgr.horizon();
         self.tx_mgr.prune_committed();
-        let v = self.versions.vacuum(horizon);
+        let v = self.versions.vacuum(Some(horizon));
         if v.transactions_forgotten > 0 || !v.tombstones.is_empty() {
             stats
                 .vacuums_with_work
@@ -8789,6 +8797,96 @@ mod tests {
             missing.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "row 1 always exists (only ever updated, never removed) — a concurrent find() must              never observe it as missing, even mid-relocation"
+        );
+    }
+
+    // A reader must never lose a version it can still need to a concurrent
+    // vacuum. A transaction's id used to be minted before it was registered
+    // as active, and the vacuum used a horizon computed before it ran: in
+    // either gap a vacuum could see "nothing active", discard a writer's
+    // pre-image committed after the reader's snapshot, and the reader then
+    // hit `Corruption("version record missing for pre_lsn ...")`. Vacuum
+    // runs back to back here so the gaps are hit often.
+    #[test]
+    fn test_a_reader_never_loses_a_version_to_a_concurrent_vacuum() {
+        let (db, tid) = make_db_with_table();
+        let t = db.begin().unwrap();
+        for k in 1..=4 {
+            db.insert(tid, row(k, b"v0"), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let corrupt = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let missing = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let unstable = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = {
+            let db = db.clone();
+            thread::spawn(move || {
+                for i in 0..3000u64 {
+                    let t = db.begin().unwrap();
+                    let _ = db.update(tid, row(i % 4 + 1, format!("v{i}").as_bytes()), &t);
+                    let _ = db.commit(t);
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (db, stop, corrupt, missing, unstable) = (
+                    db.clone(),
+                    stop.clone(),
+                    corrupt.clone(),
+                    missing.clone(),
+                    unstable.clone(),
+                );
+                thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let t = db.begin().unwrap();
+                        for k in 1..=4 {
+                            match db.find(tid, id(k), &t) {
+                                // One snapshot: reading it again gives the same.
+                                Ok(Some(first)) => {
+                                    if let Ok(Some(again)) = db.find(tid, id(k), &t)
+                                        && again.data() != first.data()
+                                    {
+                                        unstable.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                Ok(None) => {
+                                    missing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(StoreError::Corruption(_)) => {
+                                    corrupt.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(e) => panic!("{e:?}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        let vacuum = {
+            let (db, stop) = (db.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    db.maintenance_pass().unwrap();
+                }
+            })
+        };
+        writer.join().unwrap();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.join().unwrap();
+        }
+        vacuum.join().unwrap();
+        assert_eq!(
+            (
+                corrupt.load(std::sync::atomic::Ordering::Relaxed),
+                missing.load(std::sync::atomic::Ordering::Relaxed),
+                unstable.load(std::sync::atomic::Ordering::Relaxed)
+            ),
+            (0, 0, 0),
+            "(versions a reader needed that were gone, rows seen missing, \
+             rows read differently twice in one snapshot)"
         );
     }
 

@@ -86,6 +86,13 @@ enum TxnState {
     /// Committed at `commit_ts` (the LSN of its Commit record). Retained
     /// until every active reader began after it (see `prune_committed`).
     Committed { commit_ts: u64 },
+    /// Between `begin_commit` and `finish_commit`: its commit timestamp is
+    /// minted (under the lock ids are minted under) and its Commit record
+    /// is being queued. Transient — see `is_visible`.
+    Committing {
+        commit_ts: u64,
+        policy: ConflictPolicy,
+    },
 }
 
 #[derive(Debug)]
@@ -214,6 +221,23 @@ impl TransactionManager {
             .map(|(id, _)| id.0)
     }
 
+    /// The retention horizon: no transaction active now, or begun after
+    /// this call, has an id below it — the oldest active id, or with none
+    /// active, the next id to be minted (both read under the lock ids are
+    /// minted under). A committed version with `commit_ts` below it is
+    /// visible to every snapshot that could still read, so its pre-images
+    /// can go. Never "no limit": a horizon read with nothing active is
+    /// stale the moment a transaction begins, and must not license
+    /// discarding what that transaction will need.
+    pub(crate) fn horizon(&self) -> u64 {
+        let states = self.states.read();
+        states
+            .iter()
+            .find(|(_, s)| matches!(s, TxnState::Active { .. }))
+            .map(|(id, _)| id.0)
+            .unwrap_or_else(|| self.clock.next_value())
+    }
+
     pub(crate) fn oldest_active(&self) -> Option<u64> {
         self.states
             .read()
@@ -235,8 +259,14 @@ impl TransactionManager {
         &self,
         policy: ConflictPolicy,
     ) -> Result<TransactionId, StoreError> {
+        // Minted under the lock that registers it: a horizon read under it
+        // (see `horizon`) either sees this transaction active, or was read
+        // before this id existed — and so is at most this id. Minting first
+        // left a gap where a vacuum saw nothing active and discarded
+        // versions this transaction's snapshot still needed.
+        let mut states = self.states.write();
         let txn = TransactionId(self.clock.next_lsn().0);
-        self.states.write().insert(txn, TxnState::Active { policy });
+        states.insert(txn, TxnState::Active { policy });
         Ok(txn)
     }
 
@@ -282,10 +312,24 @@ impl TransactionManager {
         if writer == reader {
             return true;
         }
-        match self.states.read().get(writer) {
-            None => true,
-            Some(TxnState::Committed { commit_ts }) => *commit_ts < reader.0,
-            Some(_) => false,
+        loop {
+            match self.states.read().get(writer) {
+                None => return true,
+                Some(TxnState::Committed { commit_ts }) => return *commit_ts < reader.0,
+                // Committing after this reader began: invisible to it,
+                // however the commit ends.
+                Some(TxnState::Committing { commit_ts, .. }) if *commit_ts > reader.0 => {
+                    return false;
+                }
+                // Committing before this reader began: visible once its
+                // Commit record is queued, invisible if that fails. Wait
+                // for the answer (one channel send) rather than guess: a
+                // guess of "invisible" here, then "visible" on the next
+                // read, was two answers in one snapshot.
+                Some(TxnState::Committing { .. }) => {}
+                Some(_) => return false,
+            }
+            std::thread::yield_now();
         }
     }
 
@@ -308,6 +352,42 @@ impl TransactionManager {
 
     /// Mark committed at `commit_ts` (the Commit record's LSN). The one
     /// atomic commit point every other thread observes.
+    /// First half of committing a transaction that wrote: mints its commit
+    /// timestamp under the lock transaction ids are minted under, so no
+    /// transaction can begin between the timestamp existing and readers
+    /// seeing it (see `is_visible`). Returns the timestamp, which the
+    /// caller logs the Commit record under before `finish_commit`.
+    pub(crate) fn begin_commit(&self, txn: TransactionId) -> Result<u64, StoreError> {
+        let mut states = self.states.write();
+        match states.get_mut(&txn) {
+            Some(state @ TxnState::Active { .. }) => {
+                let TxnState::Active { policy } = *state else {
+                    unreachable!("matched Active");
+                };
+                let commit_ts = self.clock.next_lsn().0;
+                *state = TxnState::Committing { commit_ts, policy };
+                Ok(commit_ts)
+            }
+            _ => Err(StoreError::TransactionAlreadyFinished),
+        }
+    }
+
+    /// Second half: committed if its Commit record was queued, else back
+    /// to active (the caller's commit fails and it can retry or roll back).
+    pub(crate) fn finish_commit(&self, txn: TransactionId, logged: bool) {
+        let mut states = self.states.write();
+        if let Some(state @ TxnState::Committing { .. }) = states.get_mut(&txn) {
+            let TxnState::Committing { commit_ts, policy } = *state else {
+                unreachable!("matched Committing");
+            };
+            *state = if logged {
+                TxnState::Committed { commit_ts }
+            } else {
+                TxnState::Active { policy }
+            };
+        }
+    }
+
     pub(crate) fn commit(&self, txn: TransactionId, commit_ts: u64) -> Result<(), StoreError> {
         let mut states = self.states.write();
         match states.get_mut(&txn) {
