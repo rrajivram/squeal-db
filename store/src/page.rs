@@ -717,8 +717,13 @@ impl Page {
     // physical data-region size (page_data_size), reserving room for the
     // page-serialization framing (e.g. the tuple-count varint) that no
     // individual tuple's size() accounts for. See USABLE_DATA_MARGIN.
-    fn usable_data_size(&self) -> DBSizeType {
+    pub(crate) fn usable_data_size(&self) -> DBSizeType {
         self.page_data_size.saturating_sub(USABLE_DATA_MARGIN)
+    }
+
+    /// Bytes the page's tuples take, as can_store counts them.
+    pub(crate) fn used_data_size(&self) -> DBSizeType {
+        self.inner.read().page_used_size
     }
 
     // Some(n) for a fixed-record page (FixedTuplePage, record_size = n at

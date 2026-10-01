@@ -9,7 +9,7 @@ use crate::{
     db::{DBFile, DBSizeType},
     error::StoreError,
     logger::{Logger, LsnId},
-    page::{Page, PageId},
+    page::{Page, PageId, USABLE_DATA_MARGIN},
     table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple},
     txn::{TransactionId, TransactionManager},
@@ -117,6 +117,19 @@ const LEAF_NODE: usize = 5;
 //   passes all of them with real margin to spare.
 pub(crate) const MAX_ENTRY_BYTES: u64 = 48;
 
+// A node is full — splits before taking another entry — when it has less
+// free space than one entry of the table's largest size plus this slack:
+// a child split rewrites one routing entry (its page id may grow by a few
+// varint bytes) besides adding the separator. Sized by bytes, not count,
+// so small keys pack a page however large the table's key budget.
+const FULL_SLACK: u64 = 16;
+
+// A full page split at its byte midpoint leaves each half below
+// usable/2 + one entry; for either half to then take another entry, a
+// page must hold at least four largest-size ones. A table whose pages
+// hold fewer keeps a count cap as well (see BPlusTree::count_cap).
+const MIN_ENTRIES_PER_PAGE: u64 = 4;
+
 pub(crate) struct BPlusTree<F: DBFile + 'static> {
     pub(crate) table: Table,
     buffer: Arc<PageBuffer<F>>,
@@ -162,6 +175,23 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // not throughput, is Phase 1's goal here (see STORE_AUDIT.md's P-item
     // performance findings, deliberately deferred).
     relocation_lock: std::sync::RwLock<()>,
+    // Nodes split by bytes (see is_full). A table whose entry budget is so
+    // large that a page holds fewer than MIN_ENTRIES_PER_PAGE of them also
+    // keeps the original cap of nodes_per_page - 1 entries a node: there a
+    // byte-midpoint split can't promise room in either half, and the count
+    // cap is what always has. None for every other table.
+    count_cap: Option<usize>,
+}
+
+// See BPlusTree::count_cap. Derived from nodes_per_page (persisted), so a
+// table splits the same way after a reopen as when it was created: its
+// entry budget is at most page_size / nodes_per_page.
+fn count_cap<F: DBFile<Item = F> + 'static>(table: &Table, buffer: &PageBuffer<F>) -> Option<usize> {
+    let pg = buffer.page_size();
+    let npp = table.nodes_per_page.max(1) as DBSizeType;
+    let usable = pg.saturating_sub(buffer.page_overhead() as DBSizeType + USABLE_DATA_MARGIN);
+    let budget = pg / npp;
+    (usable < MIN_ENTRIES_PER_PAGE * (budget + FULL_SLACK)).then_some(table.nodes_per_page)
 }
 
 impl<F: DBFile> BPlusTree<F>
@@ -226,6 +256,7 @@ where
             nodes_per_page: count as usize,
         };
         Ok(Self {
+            count_cap: count_cap(&table, &buffer),
             table,
             buffer,
             txn_mgr,
@@ -263,6 +294,7 @@ where
         Ok(Self {
             last_data_page: AtomicU64::new(t.first_data_page.into()),
             tail_known: std::sync::atomic::AtomicBool::new(false),
+            count_cap: count_cap(&t, &buffer),
             table: t,
             buffer,
             txn_mgr,
@@ -534,8 +566,7 @@ where
                     _ => break,
                 }
             }
-            if handle.page.count()? < self.table.nodes_per_page - 1 && handle.page.can_store(probe)
-            {
+            if !self.is_full(&handle.page)? && handle.page.can_store(probe) {
                 return Ok(handle);
             }
             // Needs a split: only the locked top-down descent can do that.
@@ -546,7 +577,7 @@ where
             let handle = self
                 .buffer
                 .get_page_mut(self.table.first_index_page, LockLevel::Index)?;
-            if handle.page.count()? == self.table.nodes_per_page - 1 {
+            if self.is_full(&handle.page)? {
                 self.split_root_page(handle, &probe.id, lsn)?;
             } else {
                 drop(handle);
@@ -1178,8 +1209,7 @@ where
         // Crabbing: now that we hold this node's lock, release the parent's.
         drop(parent);
         if handle.page.is_flag_set(LEAF_NODE) {
-            let count = handle.page.count()?;
-            if count == self.table.nodes_per_page - 1 {
+            if self.is_full(&handle.page)? {
                 if self.is_root_page(start) {
                     // Root leaf filled between the unlocked pre-check in
                     // leaf_for_write and this locked arrival: split it now
@@ -1216,7 +1246,7 @@ where
         // A full inner node can't take the separator a child split would
         // add: back out so leaf_for_write retries from the root, where the
         // level above will split this node first (split_if_needed).
-        if handle.page.count()? == self.table.nodes_per_page - 1 {
+        if self.is_full(&handle.page)? {
             return Err(StoreError::PageCapacityError);
         }
         // STORE_AUDIT.md P5: successor(id), falling back to last() when the
@@ -1276,7 +1306,9 @@ where
         lsn: LsnId,
     ) -> Result<SplitOutcome, StoreError> {
         let handle = self.buffer.get_page_mut(page_id, LockLevel::Index)?;
-        if handle.page.count()? == self.table.nodes_per_page - 1 || !handle.page.can_store(tuple) {
+        // Full only: a page that isn't has room for any legal entry, and one
+        // too large for the table fails with TupleTooLarge at the leaf.
+        if self.is_full(&handle.page)? {
             if self.is_root_page(page_id) {
                 // STORE_AUDIT.md S8: a caller-discipline invariant (the
                 // root is always split via split_root_page, from
@@ -1315,6 +1347,25 @@ where
             // one is done with it.
             Ok(SplitOutcome::NoSplitNeeded(handle))
         }
+    }
+
+    // Whether `page` must split before taking another entry: less free
+    // space than this table's largest entry (its record_size) plus
+    // FULL_SLACK, or (for a table with a count_cap) as many entries as the
+    // cap allows. Pages from before record_size existed fall back to the
+    // budget nodes_per_page implies.
+    fn is_full(&self, page: &Page) -> Result<bool, StoreError> {
+        if let Some(cap) = self.count_cap
+            && page.count()? >= cap - 1
+        {
+            return Ok(true);
+        }
+        let usable = page.usable_data_size();
+        let max = match page.record_size() {
+            Some(n) => n as DBSizeType,
+            None => usable / self.table.nodes_per_page.max(1) as DBSizeType,
+        };
+        Ok(page.used_data_size() + max + FULL_SLACK > usable)
     }
 
     fn is_root_page(&self, page_id: PageId) -> bool {
@@ -1359,10 +1410,21 @@ where
             *incoming_id > values.last().unwrap().id
         };
         if is_rightmost_append {
-            values.len() - 1
-        } else {
-            values.len() / 2
+            return values.len() - 1;
         }
+        // The byte midpoint: the first cut leaving at least half the bytes
+        // on the left, so each half has room again (see MIN_ENTRIES_PER_PAGE).
+        let total: DBSizeType = values.iter().map(Tuple::size).sum();
+        let mut left = 0;
+        let mut mid = values.len() - 1;
+        for (i, t) in values.iter().enumerate() {
+            left += t.size();
+            if 2 * left >= total {
+                mid = i + 1;
+                break;
+            }
+        }
+        mid.clamp(1, values.len() - 1)
     }
 
     // Splits must carry a fixed-record (index) page's per-entry budget
@@ -1531,7 +1593,7 @@ where
         // correct for re-splitting an inner root, so gating on "already
         // inner" here was the only thing wrong: it made every second split
         // silently no-op, permanently capping the tree at 2 levels.
-        if handle.page.count()? != self.table.nodes_per_page - 1 {
+        if !self.is_full(&handle.page)? {
             return Ok(());
         }
         let values = handle.page.iter().collect::<Vec<_>>();
@@ -1607,7 +1669,7 @@ mod tests {
 
     use postcard::{from_bytes, to_allocvec};
 
-    use super::{BPlusTree, INNER_NODE, LEAF_NODE, MAX_ENTRY_BYTES, Node};
+    use super::{BPlusTree, FULL_SLACK, INNER_NODE, LEAF_NODE, MAX_ENTRY_BYTES, MIN_ENTRIES_PER_PAGE, Node};
     use crate::{
         buffer::PageBuffer,
         constant::FIRST_USER_PAGE,
@@ -1615,7 +1677,7 @@ mod tests {
         error::StoreError,
         logger::Logger,
         memfile::MemFile,
-        page::{Page, PageId},
+        page::{Page, PageId, USABLE_DATA_MARGIN},
         tuple::{DBIdType, Tuple},
         txn::{TransactionId, TransactionManager},
         valueitem::{IndexKey, ValueItem},
@@ -1750,6 +1812,25 @@ mod tests {
         TransactionId::from(1u64)
     }
 
+    // A small page that still splits by bytes for MAX_ENTRY_BYTES entries
+    // (these tests' header reserves no high-key space): about 28 small Int
+    // entries a node, so a few dozen inserts split the root and a couple
+    // of thousand grow the tree past two levels.
+    const SMALL_PAGE: u64 = 512;
+
+    // Inserts ids from 1 until the root has split (become an inner node);
+    // returns how many were inserted.
+    fn insert_until_root_splits(tree: &BPlusTree<MemFile>) -> u64 {
+        for i in 1u64.. {
+            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
+            let root = tree.buffer.get_page(tree.table.first_index_page).unwrap();
+            if root.is_flag_set(INNER_NODE) {
+                return i;
+            }
+        }
+        unreachable!()
+    }
+
     // update()/remove() log an undo record keyed off the *stored* tuple's own
     // txn_id field — Tuple::new() always leaves that None, which makes
     // log_undo fail with "Missing transaction". Tests that update/remove a
@@ -1763,8 +1844,8 @@ mod tests {
     //   1. Every leaf is at the same depth from the root (perfect balance;
     //      this is what distinguishes a B+tree from a general BST).
     //   2. Within any node, entry ids are strictly ascending.
-    //   3. Every node holds at most nodes_per_page - 1 entries (the split
-    //      threshold this implementation enforces).
+    //   3. Every node's entries fit its usable bytes (splits are by bytes —
+    //      see is_full).
     // Walks the whole tree and returns every leaf's depth (root = depth 0),
     // asserting (2) and (3) along the way. Callers assert (1) themselves
     // (comparing min/max of the returned depths) so a violation shows the
@@ -1777,11 +1858,11 @@ mod tests {
             out: &mut Vec<usize>,
         ) {
             let page = tree.buffer.get_page(page_id).unwrap();
-            let count = page.count().unwrap();
             assert!(
-                count < tree.table.nodes_per_page,
-                "page {page_id:?} holds {count} entries, over the max of {}",
-                tree.table.nodes_per_page - 1
+                page.used_data_size() <= page.usable_data_size(),
+                "page {page_id:?} holds {} bytes, over its {} usable",
+                page.used_data_size(),
+                page.usable_data_size()
             );
             let mut prev: Option<DBIdType> = None;
             for row in page.iter() {
@@ -1912,10 +1993,9 @@ mod tests {
     // isolates the chain-wiring itself from the rest of RangeCursor.
     #[test]
     fn test_leaf_pages_chain_across_multiple_splits_in_ascending_order() {
-        let page_size = MAX_ENTRY_BYTES * 4; // nodes_per_page = 4
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
 
-        for i in 1u64..=40 {
+        for i in 1u64..=400 {
             tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
         }
 
@@ -1936,7 +2016,7 @@ mod tests {
 
         assert_eq!(
             seen,
-            (1u64..=40).collect::<Vec<_>>(),
+            (1u64..=400).collect::<Vec<_>>(),
             "walking the leaf chain from the first leaf must visit every \
              key exactly once, in ascending order, regardless of how many \
              splits happened along the way"
@@ -1945,12 +2025,10 @@ mod tests {
 
     #[test]
     fn test_root_splits_into_inner_node() {
-        // page_size = MAX_ENTRY_BYTES * 4 → nodes_per_page = 4; split fires after 3 index entries.
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
-
-        // table.nodes_per_page = 4; split fires after 3 index entries, so 5 inserts exercises post-split.
-        for i in 1u64..=5 {
+        // A small page fills with a few dozen entries; 60 inserts split
+        // the root and then some of its children.
+        let tree = make_tree(SMALL_PAGE);
+        for i in 1u64..=60 {
             tree.insert(Tuple::new(i, b"x"), txn()).unwrap();
         }
 
@@ -1959,9 +2037,9 @@ mod tests {
             ip.is_flag_set(INNER_NODE),
             "root must become an inner node after split"
         );
-        // The root gains its first 2 child pointers from its own split; a 5th
-        // insert then overflows the right child, splitting it too and adding a
-        // 3rd pointer back to the root — that's correct B+ tree growth, not a bug.
+        // The root gains its first 2 child pointers from its own split; later
+        // inserts overflow a child, splitting it too and adding more pointers
+        // back to the root — that's correct B+ tree growth, not a bug.
         assert!(
             ip.count().unwrap() >= 2,
             "inner root must hold at least 2 child pointers, got {}",
@@ -1978,11 +2056,8 @@ mod tests {
     // not just insert_index's leaf-level path).
     #[test]
     fn test_index_routing_entries_carry_no_live_txn_id() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
-        for i in 1u64..=5 {
-            tree.insert(Tuple::new(i, b"x"), txn()).unwrap();
-        }
+        let tree = make_tree(SMALL_PAGE);
+        insert_until_root_splits(&tree);
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(ip.is_flag_set(INNER_NODE), "sanity: root must have split");
         let entries: Vec<_> = ip.iter().collect();
@@ -2047,15 +2122,15 @@ mod tests {
     // instead of falling through to the last entry's child the way find_page
     // and remove_index_entry already do. That gap only exists once the tree
     // is 3+ levels deep (the root always carries a u64::MAX sentinel as its
-    // last entry, so it never runs off the end) — with nodes_per_page=4 here,
-    // the root splits a second time (creating non-root inner nodes) well
-    // before 20 sequential inserts, and every key after that point which
-    // exceeds the current maximum exercises exactly this fallthrough.
+    // last entry, so it never runs off the end) — with small pages here, the
+    // root splits a second time (creating non-root inner nodes) well before
+    // 2000 sequential inserts, and every key after that point which exceeds
+    // the current maximum exercises exactly this fallthrough.
     fn test_sequential_inserts_past_root_second_split_do_not_panic() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
+        assert_eq!(tree.count_cap, None, "SMALL_PAGE trees split by bytes");
 
-        for i in 1u64..=40 {
+        for i in 1u64..=2000 {
             tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
         }
 
@@ -2074,7 +2149,7 @@ mod tests {
             "test setup must grow the tree to 3+ levels to exercise the bug"
         );
 
-        for i in 1u64..=40 {
+        for i in 1u64..=2000 {
             assert_eq!(
                 tree.find(DBIdType::Int(i)).unwrap().unwrap().data.to_vec(),
                 b"v",
@@ -2101,8 +2176,7 @@ mod tests {
 
     #[test]
     fn test_btree_stays_balanced_and_shallow_under_random_order_inserts() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
 
         // Deterministic shuffle (xorshift), no external RNG dependency.
         let mut ids: Vec<u64> = (1u64..=2000).collect();
@@ -2145,8 +2219,7 @@ mod tests {
     // regardless of where in a page the split point falls.
     #[test]
     fn test_leaf_chain_remains_complete_and_ordered_under_random_inserts() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
 
         let mut ids: Vec<u64> = (1u64..=2000).collect();
         let mut state: u64 = 0x243F_6A88_85A3_08D3;
@@ -2213,8 +2286,7 @@ mod tests {
     // further appends, which is exactly the access pattern sequential
     // insertion produces.
     fn test_btree_stays_shallow_under_sequential_inserts() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
         for i in 1u64..=2000 {
             tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
         }
@@ -2237,12 +2309,8 @@ mod tests {
 
     #[test]
     fn test_root_split_both_children_are_leaves() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
-
-        for i in 1u64..=4 {
-            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
-        }
+        let tree = make_tree(SMALL_PAGE);
+        insert_until_root_splits(&tree);
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         let entries: Vec<_> = ip.iter().collect();
@@ -2270,12 +2338,8 @@ mod tests {
         // not silently become an unbounded AnyTuplePage the way alloc_page
         // used to hand back.
         let index_entry_size = MAX_ENTRY_BYTES;
-        let page_size = index_entry_size * 4;
-        let tree = make_tree_with_entry_size(page_size, index_entry_size);
-
-        for i in 1u64..=4 {
-            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
-        }
+        let tree = make_tree_with_entry_size(SMALL_PAGE, index_entry_size);
+        insert_until_root_splits(&tree);
 
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         let entries: Vec<_> = ip.iter().collect();
@@ -2311,12 +2375,8 @@ mod tests {
         // split first, then confirm the budget still holds no matter which
         // leaf the next insert actually lands on.
         let index_entry_size = MAX_ENTRY_BYTES;
-        let page_size = index_entry_size * 4;
-        let tree = make_tree_with_entry_size(page_size, index_entry_size);
-
-        for i in 1u64..=4 {
-            tree.insert(Tuple::new(i, b"y"), txn()).unwrap();
-        }
+        let tree = make_tree_with_entry_size(SMALL_PAGE, index_entry_size);
+        insert_until_root_splits(&tree);
 
         let big_key =
             DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str(("z".repeat(90), 90))]).unwrap());
@@ -2502,11 +2562,10 @@ mod tests {
 
     #[test]
     fn test_find_after_root_split_left_and_right_subtrees() {
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
 
-        // table.nodes_per_page = 4; split fires after 3 inserts (see test_root_splits_into_inner_node).
-        for i in 1u64..=5 {
+        // Enough to split the root and one of its children.
+        for i in 1u64..=60 {
             tree.insert(Tuple::new(i, format!("v{i}").as_bytes()), txn())
                 .unwrap();
         }
@@ -2514,7 +2573,7 @@ mod tests {
         let ip = tree.buffer.get_page(tree.table.first_index_page).unwrap();
         assert!(ip.is_flag_set(INNER_NODE), "sanity: root must have split");
 
-        for i in 1u64..=5 {
+        for i in 1u64..=60 {
             let found = tree.find(DBIdType::Int(i)).unwrap();
             assert_eq!(
                 found.map(|t| t.data.to_vec()),
@@ -2527,14 +2586,16 @@ mod tests {
 
     #[test]
     fn test_find_after_root_split_with_string_ids() {
-        // MAX_ENTRY_BYTES * 4 → nodes_per_page = 4 regardless of id type.
-        let page_size = MAX_ENTRY_BYTES * 4;
-        let tree = make_tree(page_size);
+        let tree = make_tree(SMALL_PAGE);
 
-        // table.nodes_per_page = 4; 5 string-keyed inserts exercise both a root split
-        // and a child split, exactly the scenario broken before DBIdType::Ord
-        // was made hash-consistent with AnyTuplePage's iteration order.
-        let keys = ["alpha", "bravo", "charlie", "delta", "echo"];
+        // Enough string-keyed inserts for both a root split and a child
+        // split, exactly the scenario broken before DBIdType::Ord was made
+        // hash-consistent with AnyTuplePage's iteration order.
+        let names: Vec<String> = ["alpha", "bravo", "charlie", "delta", "echo"]
+            .iter()
+            .flat_map(|w| (0..8).map(move |i| format!("{w}{i}")))
+            .collect();
+        let keys: Vec<&str> = names.iter().map(String::as_str).collect();
         for k in &keys {
             let id = DBIdType::from(k.to_string());
             tree.insert(Tuple::new_with(id, k.as_bytes(), None, None), txn())
@@ -2910,6 +2971,71 @@ mod tests {
         );
     }
 
+    // Nodes split by bytes, not by count: a table whose budget allows
+    // 320-byte entries but holds small ones packs a page full of them (it
+    // used to split at page_size / index_entry_size - 1 = 11 entries here).
+    #[test]
+    fn test_small_entries_pack_a_page_whatever_the_entry_budget() {
+        let tree = make_tree_with_entry_size(4096, 320);
+        for i in 1u64..=2000 {
+            tree.insert(Tuple::new(i, b"v"), txn()).unwrap();
+        }
+        let mut leaves = 0;
+        let mut entries = 0;
+        let mut leaf = tree.find_leaf_page(&DBIdType::Int(1)).unwrap();
+        loop {
+            leaves += 1;
+            entries += leaf.count().unwrap();
+            match tree.next_leaf_page(&leaf).unwrap() {
+                Some(next) => leaf = next,
+                None => break,
+            }
+        }
+        assert_eq!(entries, 2000);
+        assert!(
+            entries / leaves > 100,
+            "{entries} entries in {leaves} leaves: nodes must fill by bytes, not stop at {}",
+            tree.table.nodes_per_page - 1
+        );
+        assert!(leaf_depths(&tree).iter().all(|d| *d <= 2));
+        for i in 1u64..=2000 {
+            assert!(tree.find(DBIdType::Int(i)).unwrap().is_some(), "id {i}");
+        }
+    }
+
+    // A budget too large for MIN_ENTRIES_PER_PAGE entries a page keeps the
+    // original count cap (nodes_per_page = 4096 / 1000 = 4: at most 3
+    // entries a node), and still grows, splits and finds correctly.
+    #[test]
+    fn test_wide_entry_budgets_keep_the_count_cap() {
+        let tree = make_tree_with_entry_size(4096, 1000);
+        assert_eq!(tree.count_cap, Some(4));
+        let mut ids: Vec<u64> = (1u64..=300).collect();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in (1..ids.len()).rev() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ids.swap(i, (x % (i as u64 + 1)) as usize);
+        }
+        for i in &ids {
+            tree.insert(Tuple::new(*i, b"v"), txn()).unwrap();
+        }
+        let mut leaf = tree.find_leaf_page(&DBIdType::Int(1)).unwrap();
+        loop {
+            assert!(leaf.count().unwrap() <= 3, "a capped node holds at most 3 entries");
+            match tree.next_leaf_page(&leaf).unwrap() {
+                Some(next) => leaf = next,
+                None => break,
+            }
+        }
+        let depths = leaf_depths(&tree);
+        assert_eq!(depths.iter().min(), depths.iter().max(), "balanced");
+        for i in 1u64..=300 {
+            assert!(tree.find(DBIdType::Int(i)).unwrap().is_some(), "id {i}");
+        }
+    }
+
     #[test]
     fn test_custom_index_entry_size_supports_normal_insert_find_remove_roundtrip() {
         // Deliberately NOT MAX_ENTRY_BYTES-derived, and small enough to force
@@ -3123,7 +3249,10 @@ mod tests {
         // runs out at a lower count than nodes_per_page assumes — the exact
         // mismatch the fix guards against.
         let index_entry_size = 30u64;
-        let tree = make_tree_with_entry_size(180, index_entry_size);
+        let page_size = crate::page::page_overhead(0) as u64
+            + USABLE_DATA_MARGIN
+            + MIN_ENTRIES_PER_PAGE * (index_entry_size + FULL_SLACK);
+        let tree = make_tree_with_entry_size(page_size, index_entry_size);
         {
             let mut handle = tree
                 .buffer
@@ -3140,13 +3269,7 @@ mod tests {
                 page.add_tuple(filler(i)).unwrap();
                 i += 1;
             }
-            assert!(
-                i < tree.table.nodes_per_page as u64 - 1,
-                "test setup assumption broken: the page filled by count, not aggregate \
-                 bytes (i={i}, nodes_per_page={}) — this no longer exercises the \
-                 aggregate-vs-record_size masking case",
-                tree.table.nodes_per_page
-            );
+            assert!(i > 1, "test setup: the leaf must hold several entries");
             tree.buffer.write_locked_page(handle).unwrap();
         }
         let big_key =

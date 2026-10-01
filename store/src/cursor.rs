@@ -632,29 +632,29 @@ mod tests {
         );
     }
 
-    // Small page size (nodes_per_page = 256/64 = 4) forces several INDEX
-    // leaf splits over 60 sequential inserts, so this exercises
+    // A small page (a few dozen index entries a leaf) forces many INDEX
+    // leaf splits over 600 sequential inserts, so this exercises
     // RangeCursor's leaf-to-leaf walk across multiple leaves end to end
     // (not just within a single starting leaf, like the basic test above).
     #[test]
     fn test_range_scan_spans_multiple_leaf_splits() {
         let db = Db::<MemFile>::create_with_page_size_and_max_index_key_size(
             "range_multi_leaf.db",
-            256,
+            512,
             8,
         )
         .unwrap();
         let tid = db.create_table("rows".to_string()).unwrap();
 
         let t = db.begin().unwrap();
-        for i in 1u64..=60 {
+        for i in 1u64..=600 {
             db.insert(tid, Tuple::new(i, format!("v{i}").as_bytes()), &t)
                 .unwrap();
         }
         db.commit(t).unwrap();
 
-        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(10), DBIdType::Int(50)));
-        assert_eq!(found, (10u64..50).collect::<Vec<_>>());
+        let found = int_ids(&scan_range(&db, tid, DBIdType::Int(10), DBIdType::Int(500)));
+        assert_eq!(found, (10u64..500).collect::<Vec<_>>());
     }
 
     // Regression test for the fix to the bug this test used to document:
