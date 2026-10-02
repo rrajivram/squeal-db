@@ -13,6 +13,7 @@ use crate::{
     plan::{eval::EvalExpr, memory::QueryMemory},
     source::{
         ComputedTableStat, ProjectableField, QueryStats, Source, hash::HashedSource, merge_stats,
+        where_source::WhereSource,
     },
 };
 
@@ -78,17 +79,35 @@ impl<F: DBFile + 'static> JoinSource<F> {
             JoinType::Cross => Box::new(UnionJoin::new(vec![left_source, right_source])?),
             _ => {
                 let left_field_count = left_source.fields().len();
-                let (left_fields, right_fields) =
-                    equi_join_fields(&on_expr, left_field_count).map_err(SchemaError::UserError)?;
-                Box::new(HashedSource::new(
-                    left_source,
-                    right_source,
-                    db,
-                    mem,
-                    &left_fields,
-                    &right_fields,
-                    join_type,
-                )?)
+                let (left_fields, right_fields, residual) =
+                    split_on_condition(&on_expr, left_field_count);
+                match (join_type, left_fields.is_empty(), residual) {
+                    // No column equality to hash on, and nothing but matched
+                    // pairs to produce: every pair, filtered.
+                    (JoinType::Inner, true, Some(residual)) => Box::new(WhereSource::new(
+                        Box::new(UnionJoin::new(vec![left_source, right_source])?),
+                        residual,
+                    )?),
+                    // With no key columns every row hashes alike, and the
+                    // residual alone decides each pair — still the hash
+                    // join's work, which knows what an outer join owes its
+                    // unmatched rows.
+                    (_, _, residual) => {
+                        let hashed = HashedSource::new(
+                            left_source,
+                            right_source,
+                            db,
+                            mem,
+                            &left_fields,
+                            &right_fields,
+                            join_type,
+                        )?;
+                        Box::new(match residual {
+                            Some(residual) => hashed.with_residual(residual),
+                            None => hashed,
+                        })
+                    }
+                }
             }
         };
         Ok(Self {
@@ -100,78 +119,71 @@ impl<F: DBFile + 'static> JoinSource<F> {
     }
 }
 
-// Resolves an ON clause down to the equi-join field positions
-// HashedSource needs: a plain equality between a left and a right
-// column (`a.x = b.y`), or an AND-chain of such (composite keys). Every
-// EvalExpr::Value(pos) here is a flat offset into the combined left++
-// right row (see EvalExpr::Value's own doc comment) — positions below
-// `left_field_count` are left columns, at or above it are right columns
-// (offset by `left_field_count` to become right-row-relative, which is
-// what HashedSource's own left_fields/right_fields expect: positions
-// within each SIDE's own row, not the combined space).
-fn equi_join_fields(
+// Splits an ON condition into what a hash join can hash on and the rest.
+//
+// Its AND-ed terms that equate a left column with a right column
+// (`a.x = b.y`) are the join key: the positions come back per SIDE (the
+// right ones lowered by `left_field_count`, which is what HashedSource's
+// own left_fields/right_fields expect — positions within each side's own
+// row). Every other term — one that reads a single table, compares with
+// something other than `=`, or computes — is AND-ed into the residual,
+// which still reads the combined left ++ right row (see EvalExpr::Value)
+// and is checked on each pair whose keys match (JoinMatcher::matches).
+fn split_on_condition(
     on_expr: &EvalExpr,
     left_field_count: usize,
-) -> Result<(Vec<usize>, Vec<usize>), String> {
+) -> (Vec<usize>, Vec<usize>, Option<EvalExpr>) {
+    fn terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
+        match e {
+            EvalExpr::Binary {
+                lhs,
+                op: BinaryOp::And,
+                rhs,
+            } => {
+                terms(lhs, out);
+                terms(rhs, out);
+            }
+            other => out.push(other),
+        }
+    }
+    let mut all = vec![];
+    terms(on_expr, &mut all);
     let mut left_fields = vec![];
     let mut right_fields = vec![];
-    collect_equi_join_fields(
-        on_expr,
-        left_field_count,
-        &mut left_fields,
-        &mut right_fields,
-    )?;
-    Ok((left_fields, right_fields))
-}
-
-fn collect_equi_join_fields(
-    expr: &EvalExpr,
-    left_field_count: usize,
-    left_fields: &mut Vec<usize>,
-    right_fields: &mut Vec<usize>,
-) -> Result<(), String> {
-    match expr {
-        EvalExpr::Binary {
-            lhs,
-            op: BinaryOp::And,
-            rhs,
-        } => {
-            collect_equi_join_fields(lhs, left_field_count, left_fields, right_fields)?;
-            collect_equi_join_fields(rhs, left_field_count, left_fields, right_fields)
-        }
-        EvalExpr::Binary {
+    let mut residual: Option<EvalExpr> = None;
+    for term in all {
+        if let EvalExpr::Binary {
             lhs,
             op: BinaryOp::Eq,
             rhs,
-        } => match (lhs.as_ref(), rhs.as_ref()) {
-            (EvalExpr::Value(l), EvalExpr::Value(r)) => {
-                let (left_pos, right_pos) = match (*l < left_field_count, *r < left_field_count) {
-                    (true, false) => (*l, *r - left_field_count),
-                    (false, true) => (*r, *l - left_field_count),
-                    _ => {
-                        return Err(
-                            "hash join ON clause must equate one left column with one right \
-                             column, not two columns from the same side"
-                                .into(),
-                        );
-                    }
-                };
-                left_fields.push(left_pos);
-                right_fields.push(right_pos);
-                Ok(())
+        } = term
+            && let (EvalExpr::Value(l), EvalExpr::Value(r)) = (lhs.as_ref(), rhs.as_ref())
+        {
+            match (*l < left_field_count, *r < left_field_count) {
+                (true, false) => {
+                    left_fields.push(*l);
+                    right_fields.push(*r - left_field_count);
+                    continue;
+                }
+                (false, true) => {
+                    left_fields.push(*r);
+                    right_fields.push(*l - left_field_count);
+                    continue;
+                }
+                // Two columns of one side: a condition like any other.
+                _ => {}
             }
-            _ => Err(
-                "hash join only supports equi-join conditions between plain columns, not \
-                      computed expressions"
-                    .into(),
-            ),
-        },
-        _ => Err(
-            "hash join ON clause must be an equality, or an AND of equalities, between a \
-                  left and a right column"
-                .into(),
-        ),
+        }
+        residual = Some(match residual {
+            Some(rest) => EvalExpr::Binary {
+                lhs: Box::new(rest),
+                op: BinaryOp::And,
+                rhs: Box::new(term.clone()),
+            },
+            None => term.clone(),
+        });
     }
+    (left_fields, right_fields, residual)
 }
 
 impl<F: DBFile + 'static> Source for JoinSource<F> {
@@ -606,25 +618,162 @@ mod hash_join_tests {
         ]));
     }
 
-    #[test]
-    fn test_on_expr_comparing_two_columns_from_the_same_side_is_rejected() {
-        // left.id (0) = left.val (1) — both positions are < left_field_count.
-        let bad_on = EvalExpr::Binary {
-            lhs: Box::new(EvalExpr::Value(0)),
-            op: BinaryOp::Eq,
-            rhs: Box::new(EvalExpr::Value(1)),
-        };
-        let result = JoinSource::new(
+    // ---- ON conditions with more than key equalities ----
+
+    fn binary(lhs: EvalExpr, op: BinaryOp, rhs: EvalExpr) -> EvalExpr {
+        EvalExpr::Binary {
+            lhs: Box::new(lhs),
+            op,
+            rhs: Box::new(rhs),
+        }
+    }
+
+    fn joined(on: EvalExpr, join_type: JoinType) -> Vec<Vec<ValueItem>> {
+        let mut join = JoinSource::new(
             left_source(),
             right_source(),
-            bad_on,
-            JoinType::Inner,
+            on,
+            join_type,
             make_db(),
             QueryMemory::new(1024 * 1024),
+        )
+        .unwrap();
+        let mut rows = drain(&mut join);
+        rows.sort();
+        rows
+    }
+
+    fn row(values: [Option<i64>; 4]) -> Vec<ValueItem> {
+        values
+            .iter()
+            .map(|v| v.map_or(ValueItem::Null, ValueItem::Integer))
+            .collect()
+    }
+
+    // id = user_id AND <a term on one table>: the term decides matches, it
+    // does not filter the result — an outer join still owes the kept side's
+    // rows whose key matches all fail it.
+    #[test]
+    fn test_a_term_on_one_table_is_part_of_the_match_for_every_join_type() {
+        // right.amount (3) > 9002: of the key matches, only user 3's.
+        let on_right = || {
+            binary(
+                on_id_eq_user_id(),
+                BinaryOp::And,
+                binary(
+                    EvalExpr::Value(3),
+                    BinaryOp::Gt,
+                    EvalExpr::Literal(ValueItem::Integer(9002)),
+                ),
+            )
+        };
+        let pair = row([Some(3), Some(300), Some(3), Some(9003)]);
+        assert_eq!(joined(on_right(), JoinType::Inner), vec![pair.clone()]);
+        assert_eq!(
+            joined(on_right(), JoinType::Left),
+            vec![
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                pair.clone(),
+            ]
         );
-        assert!(
-            matches!(result, Err(SchemaError::UserError(_))),
-            "{result:?}"
+        assert_eq!(
+            joined(on_right(), JoinType::Right),
+            vec![
+                row([None, None, Some(2), Some(9002)]),
+                row([None, None, Some(99), Some(9099)]),
+                pair.clone(),
+            ]
+        );
+        assert_eq!(
+            joined(on_right(), JoinType::Full),
+            vec![
+                row([None, None, Some(2), Some(9002)]),
+                row([None, None, Some(99), Some(9099)]),
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                pair.clone(),
+            ]
+        );
+        // left.val (1) > 200, on the side a LEFT JOIN keeps: id 2 stays,
+        // unmatched.
+        let on_left = binary(
+            on_id_eq_user_id(),
+            BinaryOp::And,
+            binary(
+                EvalExpr::Value(1),
+                BinaryOp::Gt,
+                EvalExpr::Literal(ValueItem::Integer(200)),
+            ),
+        );
+        assert_eq!(
+            joined(on_left, JoinType::Left),
+            vec![
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                pair,
+            ]
+        );
+    }
+
+    // No column equality at all: every pair is tried against the condition.
+    #[test]
+    fn test_a_join_with_no_equality_matches_by_its_condition_alone() {
+        // left.id (0) > right.user_id (2): only 3 > 2.
+        let on = || binary(EvalExpr::Value(0), BinaryOp::Gt, EvalExpr::Value(2));
+        let pair = row([Some(3), Some(300), Some(2), Some(9002)]);
+        assert_eq!(joined(on(), JoinType::Inner), vec![pair.clone()]);
+        assert_eq!(
+            joined(on(), JoinType::Left),
+            vec![
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                pair.clone(),
+            ]
+        );
+        assert_eq!(
+            joined(on(), JoinType::Full),
+            vec![
+                row([None, None, Some(3), Some(9003)]),
+                row([None, None, Some(99), Some(9099)]),
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                pair,
+            ]
+        );
+        // An equality on an expression is such a condition too:
+        // left.id + 1 = right.user_id pairs 1 with 2 and 2 with 3.
+        let on = binary(
+            binary(
+                EvalExpr::Value(0),
+                BinaryOp::Plus,
+                EvalExpr::Literal(ValueItem::Integer(1)),
+            ),
+            BinaryOp::Eq,
+            EvalExpr::Value(2),
+        );
+        assert_eq!(
+            joined(on, JoinType::Inner),
+            vec![
+                row([Some(1), Some(100), Some(2), Some(9002)]),
+                row([Some(2), Some(200), Some(3), Some(9003)]),
+            ]
+        );
+    }
+
+    // left.id = left.val equates two columns of one side: not a join key,
+    // a condition on the left row (which no row here meets).
+    #[test]
+    fn test_an_equality_within_one_side_is_a_condition_not_a_key() {
+        let on = || binary(EvalExpr::Value(0), BinaryOp::Eq, EvalExpr::Value(1));
+        assert_eq!(joined(on(), JoinType::Inner), Vec::<Vec<ValueItem>>::new());
+        assert_eq!(
+            joined(on(), JoinType::Left),
+            vec![
+                row([Some(1), Some(100), None, None]),
+                row([Some(2), Some(200), None, None]),
+                row([Some(3), Some(300), None, None]),
+            ]
         );
     }
 

@@ -176,18 +176,23 @@ impl MemTable {
     // comment) — every entry sharing `hash`, checked with the real
     // equality (a hash match is necessary, not sufficient), each marked
     // matched as found.
-    fn probe(&mut self, matcher: &JoinMatcher, right: &IndexKey, hash: u64) -> VecDeque<IndexKey> {
+    fn probe(
+        &mut self,
+        matcher: &JoinMatcher,
+        right: &IndexKey,
+        hash: u64,
+    ) -> Result<VecDeque<IndexKey>, SchemaError> {
         let mut matches = VecDeque::new();
         let Some(positions) = self.index.get(&hash) else {
-            return matches;
+            return Ok(matches);
         };
         for &i in positions {
-            if matcher.keys_match(&self.entries[i].left_value, right) {
+            if matcher.matches(&self.entries[i].left_value, right)? {
                 matches.push_back(self.entries[i].left_value.clone());
                 self.matched[i] = true;
             }
         }
-        matches
+        Ok(matches)
     }
 }
 
@@ -280,7 +285,7 @@ impl<F: DBFile + 'static> RunTable<F> {
             match self.run.get_slot_at(page_index, row_index)? {
                 Some(bytes) => {
                     let v: HashValue = from_bytes(&bytes)?;
-                    if matcher.keys_match(&v.left_value, right) {
+                    if matcher.matches(&v.left_value, right)? {
                         matches.push_back(v.left_value);
                         self.matched.set(index);
                     }
@@ -443,6 +448,14 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // factor >= 1.0 does that — but about keeping linear-probe chains short:
     // 1.9 ends a full build at ~0.53 load.
     const INITIAL_CAPACITY_FACTOR: f64 = 1.9;
+
+    /// Adds the part of the ON condition that is not a key equality (see
+    /// JoinMatcher::matches): an expression over the query's joined row,
+    /// its left table's columns then its right's.
+    pub(crate) fn with_residual(mut self, residual: crate::plan::eval::EvalExpr) -> Self {
+        self.matcher = self.matcher.with_residual(residual, self.swapped);
+        self
+    }
 
     /// Whether to build the hash table from the right side (swapping it to
     /// the left) rather than the left, given each side's statistics: the
@@ -638,7 +651,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
         let start_time = Instant::now();
         let hash = self.get_hash(right, &self.right_fields);
         let matches = match &mut self.table {
-            BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash),
+            BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash)?,
             BuildTable::Run(rt) => rt.probe(&self.matcher, right, hash)?,
         };
         self.probe_time += start_time.elapsed().as_nanos();
@@ -869,6 +882,20 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
             .map(|(l, r)| format!("build({}) = probe({})", name(&left, l), name(&right, r)))
             .collect::<Vec<_>>()
             .join(" AND ");
+        // The rest of the ON condition, in the query's own column order.
+        let keys = match self.matcher.residual() {
+            Some(residual) => {
+                let (first, second) = if self.swapped { (&right, &left) } else { (&left, &right) };
+                let names: Vec<String> = first
+                    .iter()
+                    .chain(second.iter())
+                    .map(|f| f.display_name.clone())
+                    .collect();
+                let rest = residual.describe(&names);
+                if keys.is_empty() { rest } else { format!("{keys} AND {rest}") }
+            }
+            None => keys,
+        };
         // `join_type` already describes the physical sides (see new()); say
         // so when they were swapped relative to the query text.
         let swapped = if self.swapped { ", sides swapped" } else { "" };

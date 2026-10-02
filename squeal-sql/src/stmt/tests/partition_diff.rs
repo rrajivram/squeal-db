@@ -2,11 +2,9 @@
 // the same table, with the same rows, does when it is not partitioned. No
 // expected results are written down: the plain table is the oracle.
 //
-// QUERIES is what agrees today, and must keep agreeing (pruning, when it
-// comes, has to pass this unchanged). KNOWN_DIFFERENCES is what does not:
-// an #[ignore]d test states that they should agree, and a second test
-// fails the day one of them starts to, so the list cannot go stale.
-//     cargo test -p squeal-sql partition_diff -- --ignored
+// QUERIES must keep agreeing: pruning, when it comes, has to pass this
+// unchanged. A query found to differ goes into a list of its own with an
+// #[ignore]d test saying it should agree (there is none at present).
 use super::*;
 
 pub(super) type Outcome = Result<Vec<Vec<ValueItem>>, String>;
@@ -202,6 +200,24 @@ pub(super) const QUERIES: &[&str] = &[
     "select d.day, b.k from days d join {t}_big b on b.id = d.day",
     "select d.day, b.k from days d left join {t}_big b on b.id = d.day",
     "select d.day, b.id from days d join {t}_big b on b.k = d.day",
+    // ON with more than column equalities: the plain table is sought per
+    // row, the partitioned one hash-joined — two ways to one answer.
+    "select d.day, b.k from days d join {t}_big b on b.id = d.day and b.v = 1",
+    "select d.day, b.k from days d join {t}_big b on b.id = d.day and b.id > 9",
+    "select d.day, b.k from days d join {t}_big b on b.id = d.day and d.day < 20",
+    "select d.day, b.k from days d left join {t}_big b on b.id = d.day and b.v = 1",
+    "select d.day, b.id from days d join {t}_big b on b.k = d.day and b.v = 0",
+    "select d.day, b.k from days d join {t}_big b on b.id = d.day + 0",
+    "select d.day, b.k from days d left join {t}_big b on b.id > d.day and b.id < d.day + 3",
+    "select e.id, d.label from {t}_ev e join days d on e.day = d.day and d.day = 10",
+    "select e.id, d.label from {t}_ev e join days d on e.day = d.day and e.cat = 1",
+    "select e.id, d.label from {t}_ev e join days d on e.day < d.day where e.id < 4",
+    "select e.id, d.label from {t}_ev e left join days d on e.day = d.day and d.day > 9",
+    "select e.id, d.label from {t}_ev e right join days d on e.day = d.day and e.cat = 1",
+    "select e.id, d.label from {t}_ev e full join days d on e.day = d.day and e.cat = 1",
+    "select d.label, e.id from days d join {t}_ev e on e.day = d.day and e.id = 5",
+    "select d.label, e.id from days d left join {t}_ev e on e.day = d.day and e.cat = 1",
+    "select d.label, e.id from days d full join {t}_ev e on e.day = d.day and d.day > 9",
     "select d.day, b.k from days d join {t}_big b on b.id = d.day where b.v = 1",
     "select d.day, b.k from days d, {t}_big b where b.id = d.day and b.v = 1",
     "select e.id, b.k from {t}_ev e join {t}_big b on b.id = e.id and b.v = e.cat",
@@ -233,19 +249,6 @@ pub(super) const ORDERED: &[&str] = &[
     "select b.id from {t}_big b where b.id > 995 order by b.id limit 10",
     "select e.id from {t}_ev e join days d on e.day = d.day order by e.id desc limit 4",
     "select e.id from days d join {t}_ev e on e.day = d.day order by e.day limit 4",
-];
-
-// What the two answer differently today. Each is a join INTO the table
-// whose ON has more than column equalities. The plain table is sought per
-// outer row (a nested-loop join), which checks the whole ON condition; a
-// table in several partitions is not sought (see
-// QueryVisitor::nested_loop_join), so the join falls back to a hash join,
-// which refuses such a condition.
-pub(super) const KNOWN_DIFFERENCES: &[&str] = &[
-    "select d.day, b.k from days d join {t}_big b on b.id = d.day and b.v = 1",
-    "select d.day, b.k from days d join {t}_big b on b.id = d.day and b.id > 9",
-    "select d.day, b.k from days d join {t}_big b on b.id = d.day and d.day < 20",
-    "select d.day, b.k from days d left join {t}_big b on b.id = d.day and b.v = 1",
 ];
 
 fn show(o: &Outcome) -> String {
@@ -301,32 +304,6 @@ fn test_a_partitioned_table_returns_ordered_rows_in_the_same_order() {
             "the plain table does not answer {q}: {plain:?}"
         );
         assert_eq!(part, plain, "{q}");
-    }
-}
-
-#[test]
-#[ignore = "known failure: a join into a partitioned table cannot have non-equality ON terms"]
-fn test_joins_with_extra_on_terms_into_a_partitioned_table_answer_as_the_plain_one_does() {
-    let c = twin_conn();
-    let diffs = differences(&c, KNOWN_DIFFERENCES);
-    assert!(
-        diffs.is_empty(),
-        "{} differ:\n{}",
-        diffs.len(),
-        diffs.join("\n")
-    );
-}
-
-// Keeps KNOWN_DIFFERENCES honest: when one of them starts agreeing, this
-// fails, and the query belongs in QUERIES from then on.
-#[test]
-fn test_every_known_difference_is_still_one() {
-    let c = twin_conn();
-    for q in KNOWN_DIFFERENCES {
-        assert!(
-            difference(&c, q).is_some(),
-            "{q}\nnow agrees: move it from KNOWN_DIFFERENCES to QUERIES"
-        );
     }
 }
 

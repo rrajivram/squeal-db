@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use store::valueitem::{IndexKey, ValueItem};
 
-use crate::{error::SchemaError, source::join::JoinType};
+use crate::{error::SchemaError, plan::eval::EvalExpr, source::join::JoinType};
 
 // The matching rules every equi-join algorithm shares, so HashedSource and
 // SortJoinSource can only differ in HOW they find candidate pairs, never in
@@ -23,6 +23,12 @@ pub(crate) struct JoinMatcher {
     right_fields: Vec<usize>,
     left_null: IndexKey,
     right_null: IndexKey,
+    // The rest of the ON condition, beyond the key equalities: two rows
+    // match only if it is true of them too. It reads the row the QUERY
+    // joins (its left table's columns, then its right's), which is this
+    // matcher's (right, left) when the algorithm swapped the sides — the
+    // flag. In a cell because evaluating an expression needs it mutably.
+    residual: Option<(std::cell::RefCell<EvalExpr>, bool)>,
 }
 
 #[allow(dead_code)]
@@ -41,7 +47,46 @@ impl JoinMatcher {
             right_fields: right_fields.to_vec(),
             left_null: IndexKey::new_from_owned(vec![ValueItem::Null; left_width])?,
             right_null: IndexKey::new_from_owned(vec![ValueItem::Null; right_width])?,
+            residual: None,
         })
+    }
+
+    // `residual` is the part of the ON condition that is not a key
+    // equality; `swapped` says this matcher's sides are the query's in
+    // reverse.
+    pub(crate) fn with_residual(mut self, residual: EvalExpr, swapped: bool) -> Self {
+        self.residual = Some((std::cell::RefCell::new(residual), swapped));
+        self
+    }
+
+    pub(crate) fn residual(&self) -> Option<EvalExpr> {
+        self.residual.as_ref().map(|(e, _)| e.borrow().clone())
+    }
+
+    // Whether the join pairs these two rows: their keys match, and the rest
+    // of the ON condition is true of them (NULL is not true). This — not
+    // keys_match alone — decides which pairs come out AND which rows count
+    // as unmatched for an outer join: `a LEFT JOIN b ON a.k = b.k AND b.v =
+    // 1` keeps a row of `a` whose only key matches have another `v`.
+    pub(crate) fn matches(&self, left: &IndexKey, right: &IndexKey) -> Result<bool, SchemaError> {
+        if !self.keys_match(left, right) {
+            return Ok(false);
+        }
+        let Some((residual, swapped)) = &self.residual else {
+            return Ok(true);
+        };
+        let row = if *swapped {
+            self.combine(right, left)?
+        } else {
+            self.combine(left, right)?
+        };
+        match residual.borrow_mut().eval(&[row], 0)? {
+            ValueItem::Boolean(b) => Ok(b),
+            ValueItem::Null => Ok(false),
+            _ => Err(SchemaError::InternalSchemaError(
+                "Output of a join's ON condition is not boolean.".into(),
+            )),
+        }
     }
 
     // Join-key equality, as SQL's `=`: a NULL in either key matches

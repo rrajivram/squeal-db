@@ -13,6 +13,31 @@ use super::*;
 // (what is missing, the query, an equivalent that runs today)
 const GAPS: &[(&str, &str, &str)] = &[
     (
+        "JOIN ... USING",
+        "select e.id from plain_ev e join days d using (day)",
+        "select e.id from plain_ev e join days d on e.day = d.day",
+    ),
+    (
+        "WITH (a common table expression)",
+        "with x as (select id, day from plain_ev where cat = 1) select id from x where day > 10",
+        "select id from (select id, day from plain_ev where cat = 1) x where day > 10",
+    ),
+    (
+        // id % 7 = 0 are the rows whose cat is NULL (see twin_conn).
+        "IS NULL",
+        "select id from plain_ev where cat is null",
+        "select id from plain_ev where id % 7 = 0",
+    ),
+    (
+        "IS NOT NULL",
+        "select id from plain_ev where cat is not null",
+        "select id from plain_ev where id % 7 <> 0",
+    ),
+];
+
+// Gaps since closed: the same check, now part of the suite.
+const CLOSED: &[(&str, &str, &str)] = &[
+    (
         "join ON with a term on one table (hash join)",
         "select e.id, d.label from plain_ev e join days d on e.day = d.day and d.day = 10",
         "select e.id, d.label from plain_ev e join days d on e.day = d.day where d.day = 10",
@@ -45,33 +70,16 @@ const GAPS: &[(&str, &str, &str)] = &[
         "select d.day, b.k from days d join plain_big b on b.id = d.day + 0",
         "select d.day, b.k from days d join plain_big b on b.id = d.day",
     ),
-    (
-        "JOIN ... USING",
-        "select e.id from plain_ev e join days d using (day)",
-        "select e.id from plain_ev e join days d on e.day = d.day",
-    ),
-    (
-        "WITH (a common table expression)",
-        "with x as (select id, day from plain_ev where cat = 1) select id from x where day > 10",
-        "select id from (select id, day from plain_ev where cat = 1) x where day > 10",
-    ),
-    (
-        // id % 7 = 0 are the rows whose cat is NULL (see twin_conn).
-        "IS NULL",
-        "select id from plain_ev where cat is null",
-        "select id from plain_ev where id % 7 = 0",
-    ),
-    (
-        "IS NOT NULL",
-        "select id from plain_ev where cat is not null",
-        "select id from plain_ev where id % 7 <> 0",
-    ),
 ];
 
 fn check(what: &str) {
+    check_in(GAPS, what)
+}
+
+fn check_in(list: &[(&str, &str, &str)], what: &str) {
     let c = twin_conn();
     let mut checked = 0;
-    for (gap, query, equivalent) in GAPS.iter().filter(|g| g.0 == what) {
+    for (gap, query, equivalent) in list.iter().filter(|g| g.0 == what) {
         let want = outcome(&c, equivalent);
         assert!(want.is_ok(), "{gap}: the equivalent does not run: {want:?}");
         assert!(
@@ -85,27 +93,15 @@ fn check(what: &str) {
 }
 
 #[test]
-#[ignore = "known gap: a hash join's ON takes only column equalities"]
-fn test_join_on_may_restrict_one_table() {
-    check("join ON with a term on one table (hash join)");
-}
-
-#[test]
-#[ignore = "known gap: a hash join's ON takes only column equalities"]
-fn test_left_join_on_may_restrict_the_inner_table() {
-    check("LEFT JOIN ON with a term on the inner table");
-}
-
-#[test]
-#[ignore = "known gap: joins need an equality"]
-fn test_join_on_an_inequality() {
-    check("join on an inequality");
-}
-
-#[test]
-#[ignore = "known gap: a hash join's keys must be plain columns"]
-fn test_join_on_an_expression() {
-    check("join on an expression");
+fn test_a_join_on_condition_may_be_more_than_column_equalities() {
+    for what in [
+        "join ON with a term on one table (hash join)",
+        "LEFT JOIN ON with a term on the inner table",
+        "join on an inequality",
+        "join on an expression",
+    ] {
+        check_in(CLOSED, what);
+    }
 }
 
 #[test]
