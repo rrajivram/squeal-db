@@ -699,7 +699,10 @@ impl TableStatStored {
 
 /// `stats` as for a read of only the partitions `parts` (positions in
 /// `table.partitions`): the rows they hold, by their own counts when the
-/// table has any, else an equal share each. Everything else as it is.
+/// table has any, else an equal share each. Column statistics are kept per
+/// table, so they are narrowed from what is known: the partition column's
+/// lowest and highest values to the kept partitions' bounds, and every
+/// column's distinct values and NULLs to the share of rows kept.
 pub(crate) fn for_partitions(
     table: &SqlTable,
     stats: &ComputedTableStat,
@@ -719,6 +722,35 @@ pub(crate) fn for_partitions(
             .map(|p| counts.get(&table.partitions[*p].id).copied().unwrap_or(0))
             .sum()
     };
+    let (rows, kept) = (stats.table_stat.row_count, scoped.table_stat.row_count);
+    for c in scoped.table_stat.col_stats.values_mut() {
+        if rows > 0 {
+            c.null = c.null * kept / rows;
+        }
+        c.unique = c.unique.min(kept);
+    }
+    if let Some((column, _)) = table.partition_column()
+        && let Some(by) = &table.partitioning
+        && by.kind == crate::partition::PartitionKind::Range
+        && let Some(c) = scoped.table_stat.col_stats.get_mut(&column)
+        && let (Some(first), Some(last)) = (parts.iter().min(), parts.iter().max())
+    {
+        use crate::partition::PartitionBound;
+        // From the bound below the first kept partition; up to the last
+        // kept one's bound (exclusive: the stats' max is a value, so it is
+        // left alone unless already above).
+        if let Some(PartitionBound::LessThan(low)) =
+            first.checked_sub(1).map(|p| &table.partitions[p].bound)
+            && c.min.cmp(low).is_lt()
+        {
+            c.min = low.clone();
+        }
+        if let PartitionBound::LessThan(high) = &table.partitions[*last].bound
+            && c.max.cmp(high).is_ge()
+        {
+            c.max = high.clone();
+        }
+    }
     scoped
 }
 
@@ -728,17 +760,25 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
     table: &Arc<SqlTable>,
 ) -> Result<Option<ComputedTableStat>, SchemaError> {
     if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.id)? {
-        // The shape of the trees (depth, entries per page) is read off the
-        // first partition's: statistics are still kept per table, not per
-        // partition.
-        let first = &table.partitions[0];
-        let (levels, nodes_per_page, _) =
-            conn.database.read().db.btree_range_params(first.rows())?;
+        // The shape of each tree (depth, entries per page): a partitioned
+        // table has one per partition, and a seek's cost is set by the
+        // deepest it may have to descend.
+        let db = conn.database.read().db.clone();
+        let deepest = |tree: &dyn Fn(&crate::partition::Partition) -> TableIdType| {
+            let mut best: Option<(usize, usize, usize)> = None;
+            for p in &table.partitions {
+                let params = db.btree_range_params(tree(p))?;
+                if best.is_none_or(|b| params.0 > b.0) {
+                    best = Some(params);
+                }
+            }
+            Ok::<_, SchemaError>(best.expect("a table has at least one partition"))
+        };
+        let (levels, nodes_per_page, _) = deepest(&|p| p.rows())?;
         let mut indices = vec![];
         for (i, index) in table.indices.iter().enumerate() {
             let unique = index.is_primary || index.is_unique;
-            let (levels, nodes_per_page, record_size) =
-                conn.database.read().db.btree_range_params(first.index(i))?;
+            let (levels, nodes_per_page, record_size) = deepest(&|p| p.index(i))?;
             indices.push(IndexStat {
                 levels,
                 nodes_per_page,

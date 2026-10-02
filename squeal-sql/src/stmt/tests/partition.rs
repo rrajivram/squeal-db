@@ -1070,3 +1070,25 @@ fn test_an_order_leading_with_the_range_column_reads_partitions_in_turn() {
     assert_eq!(got, want);
     assert_eq!(got.len(), 300);
 }
+
+// The statistics a pruned read is planned with: the partition column's
+// range narrowed to the kept partitions, distinct counts capped by their
+// rows.
+#[test]
+fn test_a_pruned_reads_column_statistics_are_narrowed_to_its_partitions() {
+    let c = range_conn();
+    run(&c, "analyze table events").unwrap();
+    let table = table(&c, "events");
+    let stats = crate::optim::table_stats::compute_table_stats(&c, DEFAULT_SCHEMA_NAME, &table)
+        .unwrap()
+        .unwrap();
+    let mid = crate::optim::table_stats::for_partitions(&table, &stats, &[1]);
+    assert_eq!(mid.table_stat.row_count, 2);
+    let day = &mid.table_stat.col_stats[&1];
+    // The bound, exclusive, as the highest value: a limit, for estimates.
+    assert_eq!((day.min.clone(), day.max.clone()), (Integer(10), Integer(20)));
+    assert!(mid.table_stat.col_stats.values().all(|c| c.unique <= 2));
+    let late = crate::optim::table_stats::for_partitions(&table, &stats, &[1, 2]);
+    let day = &late.table_stat.col_stats[&1];
+    assert_eq!((day.min.clone(), day.max.clone()), (Integer(10), Integer(29)));
+}
