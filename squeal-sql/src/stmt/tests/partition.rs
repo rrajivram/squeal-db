@@ -828,3 +828,84 @@ fn test_analyze_counts_the_rows_of_every_partition() {
         .unwrap();
     assert_eq!(stat.row_count, 4);
 }
+
+// big: 3000 rows in three RANGE partitions on id (none above 3000), with an
+// index on k; few: a handful of keys. A join from few into big seeks big per
+// row rather than reading it all.
+fn seek_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(
+        &c,
+        "create table big (id integer not null, k integer, u integer, primary key(id)) \
+         partition by range (id) (partition b0 values less than (1000), \
+         partition b1 values less than (2000), partition b2 values less than (3000))",
+    )
+    .unwrap();
+    for chunk in 0..6 {
+        let values: Vec<String> = (chunk * 500..(chunk + 1) * 500)
+            .map(|id| format!("({id}, {}, {})", id % 50, id * 7))
+            .collect();
+        run(&c, &format!("insert into big values {}", values.join(", "))).unwrap();
+    }
+    run(&c, "create index big_k on big (k)").unwrap();
+    // Distinct values, but not the partition column: a unique index would
+    // be refused, so a plain one.
+    run(&c, "create index big_u on big (u)").unwrap();
+    run(&c, "create table few (n integer not null, primary key(n))").unwrap();
+    run(&c, "insert into few values (5), (1500), (2999), (7000)").unwrap();
+    run(&c, "analyze table big").unwrap();
+    run(&c, "analyze table few").unwrap();
+    c
+}
+
+#[test]
+fn test_a_join_seeks_into_a_partitioned_table_routing_by_its_key() {
+    let c = seek_conn();
+    // On the partition column: each row seeks the one partition it routes
+    // to — and 7000, which none takes, seeks nothing.
+    let plan = explain(&c, "select f.n, b.k from few f join big b on b.id = f.n");
+    assert!(plan.contains("NestedLoopJoin"), "{plan}");
+    assert!(plan.contains("the one of 3 partitions its key routes to"), "{plan}");
+    assert_eq!(
+        rows(&c, "select f.n, b.k from few f join big b on b.id = f.n"),
+        vec![
+            vec![Integer(5), Integer(5)],
+            vec![Integer(1500), Integer(0)],
+            vec![Integer(2999), Integer(49)]
+        ]
+    );
+    assert_eq!(
+        rows(&c, "select f.n, b.k from few f left join big b on b.id = f.n"),
+        vec![
+            vec![Integer(5), Integer(5)],
+            vec![Integer(1500), Integer(0)],
+            vec![Integer(2999), Integer(49)],
+            vec![Integer(7000), ValueItem::Null]
+        ]
+    );
+    // On another column: each row seeks every partition its WHERE leaves.
+    // few.n * 7 = big.u for 5 and 1500 (ids 5 and 1500), none else.
+    run(&c, "create table sevens (u integer not null, primary key(u))").unwrap();
+    run(&c, "insert into sevens values (35), (10500), (20993), (2)").unwrap();
+    run(&c, "analyze table sevens").unwrap();
+    let sql = "select s.u, b.id from sevens s join big b on b.u = s.u";
+    let plan = explain(&c, sql);
+    assert!(plan.contains("NestedLoopJoin"), "{plan}");
+    assert!(plan.contains("each of 3 partitions"), "{plan}");
+    assert_eq!(
+        rows(&c, sql),
+        vec![
+            vec![Integer(35), Integer(5)],
+            vec![Integer(10500), Integer(1500)],
+            vec![Integer(20993), Integer(2999)]
+        ]
+    );
+    // Pruned to one 1000-row partition, reading it beats four seeks: the
+    // plan may be either; the rows are these.
+    let sql = "select s.u, b.id from sevens s join big b on b.u = s.u where b.id < 1000";
+    assert_eq!(rows(&c, sql), vec![vec![Integer(35), Integer(5)]]);
+    let sql = "select s.u, b.id from sevens s left join big b on b.u = s.u";
+    assert_eq!(rows(&c, sql).len(), 4);
+    // Many matches per key: whichever join wins, the same rows.
+    assert_eq!(ints(&c, "select count(*) from few f join big b on b.k = f.n"), [60]);
+}

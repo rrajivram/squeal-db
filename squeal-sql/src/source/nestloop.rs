@@ -58,11 +58,26 @@ pub(crate) struct NestedLoopJoin<F: DBFile + 'static> {
     join_type: JoinType,
     fields: Arc<[ProjectableField]>,
     inner_width: usize,
-    // The outer row being matched, its inner cursor, and whether anything
-    // matched it yet.
-    current: Option<(IndexKey, RangeCursor<F>, bool)>,
+    // The inner table's partitions that may hold a match (positions in its
+    // `partitions`): each is sought in turn.
+    parts: Vec<usize>,
+    // When the join key includes the inner table's partition column: the
+    // outer row's position holding it, and its type. Each outer row then
+    // seeks only the partition its value routes to.
+    route_by: Option<(usize, DataType)>,
+    current: Option<Current<F>>,
     lookups: usize,
     time_spent: u128,
+}
+
+// The outer row being matched: the partition being sought and its cursor,
+// the partitions still to seek, and whether anything matched it yet.
+struct Current<F: DBFile + 'static> {
+    outer: IndexKey,
+    part: usize,
+    cursor: RangeCursor<F>,
+    todo: Vec<usize>,
+    matched: bool,
 }
 
 impl<F> NestedLoopJoin<F>
@@ -78,6 +93,7 @@ where
         seek: JoinSeek,
         on_expr: EvalExpr,
         join_type: JoinType,
+        parts: Vec<usize>,
     ) -> Result<Self, SchemaError> {
         if !matches!(join_type, JoinType::Inner | JoinType::Left) {
             return Err(SchemaError::InternalSchemaError(format!(
@@ -90,6 +106,12 @@ where
             .iter()
             .map(|(_, c)| inner_fields[*c].datatype)
             .collect();
+        let route_by = table.partition_column().and_then(|(column, field)| {
+            seek.keys
+                .iter()
+                .find(|(_, c)| *c == column)
+                .map(|(o, _)| (*o, field.datatype))
+        });
         let fields: Vec<ProjectableField> = outer
             .fields()
             .iter()
@@ -113,6 +135,8 @@ where
             on_expr,
             join_type,
             fields: Arc::from(fields),
+            parts,
+            route_by,
             current: None,
             lookups: 0,
             time_spent: 0,
@@ -140,23 +164,40 @@ where
         prefixes.into_iter().map(KeyRange::prefix).collect()
     }
 
-    // The inner table's one partition: a join seeks a single tree per
-    // outer row, so the planner only builds this over a table that has
-    // exactly one (see QueryVisitor::nested_loop_join).
-    fn partition(&self) -> &crate::partition::Partition {
-        &self.table.partitions[0]
+    // The tree sought in partition `part`.
+    fn tree(&self, part: usize) -> store::table::TableIdType {
+        let partition = &self.table.partitions[part];
+        match self.seek.index {
+            None => partition.rows(),
+            Some(i) => partition.index(i),
+        }
     }
 
-    fn tree(&self) -> store::table::TableIdType {
-        match self.seek.index {
-            None => self.partition().rows(),
-            Some(i) => self.partition().index(i),
-        }
+    // The partitions an outer row's match may be in, in reverse (popped
+    // from the end): the one its partition-column value routes to, when
+    // the key has it — none for a NULL, which matches nothing.
+    fn parts_for(&self, outer: &IndexKey) -> Vec<usize> {
+        let mut parts = match (self.route_by, &self.table.partitioning) {
+            (Some((pos, datatype)), Some(by)) => {
+                let mut routed: Vec<usize> = equal_points(datatype, &outer[pos])
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|v| by.route(&self.table.partitions, v))
+                    .filter(|p| self.parts.contains(p))
+                    .collect();
+                routed.sort();
+                routed.dedup();
+                routed
+            }
+            _ => self.parts.clone(),
+        };
+        parts.reverse();
+        parts
     }
 
     // The inner row an entry of the sought tree gives: the row itself for
     // the table's own tree, or the row its identity points to for an index.
-    fn inner_row(&self, entry: &Tuple) -> Result<Option<IndexKey>, SchemaError> {
+    fn inner_row(&self, part: usize, entry: &Tuple) -> Result<Option<IndexKey>, SchemaError> {
         let tuple = match self.seek.index {
             None => entry.clone(),
             Some(_) => {
@@ -175,7 +216,10 @@ where
                         }
                     }
                 };
-                match self.db.find_as(self.partition().rows(), id, self.reader)? {
+                match self
+                    .db
+                    .find_as(self.table.partitions[part].rows(), id, self.reader)?
+                {
                     Some(t) => t,
                     None => return Ok(None),
                 }
@@ -193,28 +237,43 @@ where
 
     fn step(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         loop {
-            if let Some((outer, cursor, _)) = &mut self.current {
-                match cursor.next()? {
+            if let Some(cur) = &mut self.current {
+                match cur.cursor.next()? {
                     Some(entry) => {
-                        let outer = outer.clone();
-                        let Some(inner) = self.inner_row(&entry)? else {
+                        let (outer, part) = (cur.outer.clone(), cur.part);
+                        let Some(inner) = self.inner_row(part, &entry)? else {
                             continue;
                         };
                         let row = Self::combine(&outer, inner.values())?;
                         let on = self.on_expr.eval(std::slice::from_ref(&row), 0)?;
                         if on == ValueItem::Boolean(true) {
-                            if let Some((_, _, matched)) = &mut self.current {
-                                *matched = true;
+                            if let Some(cur) = &mut self.current {
+                                cur.matched = true;
                             }
                             return Ok(Some(row));
                         }
                         continue;
                     }
+                    // This partition is done: on to the next, if any.
                     None => {
-                        let (outer, _, matched) = self.current.take().expect("current");
-                        if !matched && matches!(self.join_type, JoinType::Left) {
+                        if let Some(part) = cur.todo.pop() {
+                            let outer = cur.outer.clone();
+                            let ranges = self.ranges_for(&outer);
+                            let cursor = self.db.key_ranges_scan(
+                                self.tree(part),
+                                Some(self.reader),
+                                ranges,
+                            )?;
+                            let cur = self.current.as_mut().expect("current");
+                            cur.part = part;
+                            cur.cursor = cursor;
+                            self.lookups += 1;
+                            continue;
+                        }
+                        let cur = self.current.take().expect("current");
+                        if !cur.matched && matches!(self.join_type, JoinType::Left) {
                             let nulls = vec![ValueItem::Null; self.inner_width];
-                            return Ok(Some(Self::combine(&outer, &nulls)?));
+                            return Ok(Some(Self::combine(&cur.outer, &nulls)?));
                         }
                     }
                 }
@@ -222,12 +281,27 @@ where
             let Some(outer) = self.outer.next()? else {
                 return Ok(None);
             };
+            let mut todo = self.parts_for(&outer);
+            let Some(part) = todo.pop() else {
+                // No partition can hold a match.
+                if matches!(self.join_type, JoinType::Left) {
+                    let nulls = vec![ValueItem::Null; self.inner_width];
+                    return Ok(Some(Self::combine(&outer, &nulls)?));
+                }
+                continue;
+            };
             let ranges = self.ranges_for(&outer);
             self.lookups += 1;
             let cursor = self
                 .db
-                .key_ranges_scan(self.tree(), Some(self.reader), ranges)?;
-            self.current = Some((outer, cursor, false));
+                .key_ranges_scan(self.tree(part), Some(self.reader), ranges)?;
+            self.current = Some(Current {
+                outer,
+                part,
+                cursor,
+                todo,
+                matched: false,
+            });
         }
     }
 
@@ -265,13 +339,28 @@ where
             .map(|(i, o)| format!("{i} = outer {o}"))
             .collect::<Vec<_>>()
             .join(" AND ");
+        // Which of a partitioned table's partitions each outer row seeks.
+        let table = if !self.table.is_partitioned() {
+            self.table.name.clone()
+        } else {
+            let total = self.table.partitions.len();
+            let of = if self.parts.len() == total {
+                format!("{total} partitions")
+            } else {
+                format!("{} of {total} partitions", self.parts.len())
+            };
+            if self.route_by.is_some() {
+                format!("{} (the one of {of} its key routes to)", self.table.name)
+            } else {
+                format!("{} (each of {of})", self.table.name)
+            }
+        };
         let inner_plan = match self.seek.index {
-            None => PlanNode::new("TableSeek").detail(format!("{} ({condition})", self.table.name)),
+            None => PlanNode::new("TableSeek").detail(format!("{table} ({condition})")),
             Some(i) => {
                 let index = &self.table.indices[i];
                 let name = index.name.clone().unwrap_or_else(|| format!("index #{i}"));
-                PlanNode::new("IndexLookup")
-                    .detail(format!("{} using {name} ({condition})", self.table.name))
+                PlanNode::new("IndexLookup").detail(format!("{table} using {name} ({condition})"))
             }
         };
         PlanNode::new("NestedLoopJoin")

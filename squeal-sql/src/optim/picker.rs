@@ -741,6 +741,9 @@ pub(crate) fn pick_join_seek(
     stats: Option<&ComputedTableStat>,
     pairs: &[(usize, usize, DataType)],
     outer_rows: Option<usize>,
+    // Trees each outer row descends: one per partition sought. The rows
+    // that match are in one of them or another, so they are fetched once.
+    trees: usize,
     hash_rows: usize,
     hash_extra: f64,
     page_size: usize,
@@ -809,7 +812,7 @@ pub(crate) fn pick_join_seek(
             }
             let rows_per_key = per_key(&key, &used, unique);
             let descent = page_size.min(rows * entry);
-            let cost = outer_rows * (descent + rows_per_key * (row + TREE_ROW_BYTES));
+            let cost = outer_rows * (trees * descent + rows_per_key * (row + TREE_ROW_BYTES));
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {
                 best = Some((
                     cost,

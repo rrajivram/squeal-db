@@ -1718,11 +1718,9 @@ where
         else {
             return Ok(None);
         };
-        // A seek reads one tree per outer row; a table in several
-        // partitions has one per partition.
-        if table.partitions.len() != 1 {
-            return Ok(None);
-        }
+        // A table in several partitions has a tree to seek in each: those
+        // its own WHERE leaves (see NestedLoopJoin::parts_for).
+        let parts = crate::partition::partitions_to_read(table, &needs.filters);
         let Some(reader) = self
             .conn
             .with_current_txn(|explicit| explicit.or(self.stmt_txn.as_ref()).map(|t| t.id()))
@@ -1781,11 +1779,18 @@ where
             let read = (hash_rows * (self_index.row_size + stats.row_size)) as f64;
             hash_extra = hash_extra.min(merge - read);
         }
+        // Each outer row seeks every partition kept, unless the key has the
+        // partition column, which names the one.
+        let routed = table
+            .partition_column()
+            .is_some_and(|(column, _)| pairs.iter().any(|(_, c, _)| *c == column));
+        let fanout = if routed { 1 } else { parts.len().max(1) };
         let Some(seek) = pick_join_seek(
             table,
             relation.stats.as_ref(),
             &pairs,
             outer_rows,
+            fanout,
             hash_rows,
             hash_extra,
             page_size,
@@ -1802,6 +1807,7 @@ where
             seek,
             on_expr.clone(),
             join_type,
+            parts,
         )?;
         Ok(Some((Box::new(join), rows_per_key)))
     }
