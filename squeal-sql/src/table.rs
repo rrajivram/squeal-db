@@ -15,6 +15,7 @@ use store::valueitem::{IndexKey, ValueItem};
 use crate::constant::{DEFAULT_VAR_SIZE, MAX_TABLE_NAME_LEN};
 use crate::datatype::DataType;
 use crate::error::SchemaError;
+use crate::partition::{Partition, PartitionBound, PartitionKind, Partitioning};
 use crate::schema_ops::schema::Schema;
 
 // A store-level Tuple wraps whatever's actually stored (row or index
@@ -44,11 +45,11 @@ pub struct SqlTable {
     pub(crate) versions: Vec<SchemaVersion>,
     pub(crate) indices: Vec<SqlIndex>,
     pub(crate) foreign_keys: Vec<SqlForeignKey>,
-    // The table's own row-storage backing table — distinct from each
-    // index's own db_table_id below. Set by Schema::create_table once
-    // the backing table actually exists; TableIdType::none() until then
-    // (mirrors SqlIndex::db_table_id's own convention).
-    pub(crate) db_table_id: TableIdType,
+    // What this table's statistics are keyed by (see optim::table_stats):
+    // the id of the rows tree of the first partition it was created with.
+    // It stays the same when partitions come and go. Set by
+    // Schema::create_table; TableIdType::none() until then.
+    pub(crate) id: TableIdType,
     // The next never-yet-used Field::id — starts at the initial column
     // count (see TableBuilder::build) and only ever increases, one per
     // alter_add_column, even across a column that's since been dropped:
@@ -56,6 +57,15 @@ pub struct SqlTable {
     // same name still gets a fresh id and can't be confused with the
     // original by reproject.
     pub(crate) next_field_id: u32,
+    // How the rows are split between `partitions`; None for a table that
+    // is not partitioned. See crate::partition.
+    pub(crate) partitioning: Option<Partitioning>,
+    // Where the rows are: never empty. A table that is not partitioned has
+    // one, holding every row. Each has its own rows tree and its own tree
+    // per index (set by Schema::create_table once they exist).
+    pub(crate) partitions: Vec<Partition>,
+    // The next never-yet-used Partition::id.
+    pub(crate) next_partition_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,7 +100,6 @@ pub(crate) struct VersionedRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqlIndex {
     pub(crate) name: Option<String>,
-    pub(crate) db_table_id: TableIdType,
     pub(crate) is_primary: bool,
     pub(crate) is_unique: bool,
     // Same reasoning as SchemaVersion::fields — built once, cloned
@@ -422,8 +431,11 @@ impl TableBuilder {
             }],
             indices: vec![],
             foreign_keys: vec![],
-            db_table_id: TableIdType::none(),
+            id: TableIdType::none(),
             next_field_id,
+            partitioning: None,
+            partitions: vec![],
+            next_partition_id: 1,
         };
         for i in &self.indices {
             // Built as a Vec (needs .push() while resolving each name
@@ -441,9 +453,9 @@ impl TableBuilder {
                 is_primary: i.is_primary,
                 is_unique: i.is_unique,
                 fields: fields.into(),
-                db_table_id: TableIdType::none(),
             });
         }
+        table.partitions = vec![Partition::whole(table.indices.len())];
         for fk in &self.foreign_keys {
             // Case-insensitive: table names are lowercased everywhere
             // else in this crate (see e.g. Statement's own table-name
@@ -591,7 +603,96 @@ fn inline_foreign_key(column: &ColumnDef) -> Option<Result<SqlForeignKey, Schema
 // tests/catalog_versioning.rs against bytes captured from the pre-envelope
 // encoder: to change any of those structs, FIRST freeze the current shapes as
 // `...V1Shape` copies and branch on the version here, THEN edit the live ones.
-pub(crate) const CATALOG_ROW_VERSION: u16 = 1;
+//
+// Version 2 (partitions): a table's trees moved from `SqlTable::db_table_id`
+// and each `SqlIndex::db_table_id` into its partitions (see
+// crate::partition), and `SqlTable` gained `id`, `partitioning`,
+// `partitions` and `next_partition_id`. Version 1 is frozen below as
+// `SqlTableV1Shape`/`SqlIndexV1Shape`; `SchemaVersion`, `Field` and
+// `SqlForeignKey` did not change and are shared by both. The version-2 body
+// is pinned the same way, by a row captured when it was introduced.
+pub(crate) const CATALOG_ROW_VERSION: u16 = 2;
+
+// A version-1 (or legacy) catalog row's body. Frozen: never edit.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SqlTableV1Shape {
+    name: String,
+    versions: Vec<SchemaVersion>,
+    indices: Vec<SqlIndexV1Shape>,
+    foreign_keys: Vec<SqlForeignKey>,
+    db_table_id: TableIdType,
+    next_field_id: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SqlIndexV1Shape {
+    name: Option<String>,
+    db_table_id: TableIdType,
+    is_primary: bool,
+    is_unique: bool,
+    fields: Arc<[Arc<Field>]>,
+}
+
+// A version-1 table is one that is not partitioned: its trees become its
+// one partition's.
+impl From<SqlTableV1Shape> for SqlTable {
+    fn from(v1: SqlTableV1Shape) -> Self {
+        let mut whole = Partition::whole(0);
+        whole.set_rows(v1.db_table_id);
+        for (i, index) in v1.indices.iter().enumerate() {
+            whole.set_index(i, index.db_table_id);
+        }
+        SqlTable {
+            name: v1.name,
+            versions: v1.versions,
+            indices: v1
+                .indices
+                .into_iter()
+                .map(|i| SqlIndex {
+                    name: i.name,
+                    is_primary: i.is_primary,
+                    is_unique: i.is_unique,
+                    fields: i.fields,
+                })
+                .collect(),
+            foreign_keys: v1.foreign_keys,
+            id: v1.db_table_id,
+            next_field_id: v1.next_field_id,
+            partitioning: None,
+            partitions: vec![whole],
+            next_partition_id: 1,
+        }
+    }
+}
+
+#[cfg(test)]
+impl SqlTableV1Shape {
+    // What a build before partitions wrote for `table`, which must be one
+    // that is not partitioned.
+    pub(crate) fn from_table(table: &SqlTable) -> Self {
+        assert!(table.partitioning.is_none() && table.partitions.len() == 1);
+        let part = &table.partitions[0];
+        Self {
+            name: table.name.clone(),
+            versions: table.versions.clone(),
+            indices: table
+                .indices
+                .iter()
+                .enumerate()
+                .map(|(i, index)| SqlIndexV1Shape {
+                    name: index.name.clone(),
+                    db_table_id: part.index(i),
+                    is_primary: index.is_primary,
+                    is_unique: index.is_unique,
+                    fields: index.fields.clone(),
+                })
+                .collect(),
+            foreign_keys: table.foreign_keys.clone(),
+            db_table_id: part.rows(),
+            next_field_id: table.next_field_id,
+        }
+    }
+}
 
 impl SqlTable {
     pub(crate) fn encode_catalog_row(&self) -> Result<Vec<u8>, SchemaError> {
@@ -609,10 +710,12 @@ impl SqlTable {
     pub(crate) fn decode_catalog_row(bytes: &[u8]) -> Result<SqlTable, SchemaError> {
         use crate::envelope::{Opened, open, unsupported};
         match open(bytes, "catalog")? {
-            Opened::Versioned { version: 1, body } => Ok(postcard::from_bytes(body)?),
+            Opened::Versioned { version: 2, body } => Ok(postcard::from_bytes(body)?),
+            // Legacy: bare postcard of the version-1 shape, no envelope.
+            Opened::Versioned { version: 1, body } | Opened::Legacy(body) => {
+                Ok(postcard::from_bytes::<SqlTableV1Shape>(body)?.into())
+            }
             Opened::Versioned { version, .. } => Err(unsupported("catalog", version)),
-            // Legacy: bare postcard of SqlTable, identical to version 1's body.
-            Opened::Legacy(body) => Ok(postcard::from_bytes(body)?),
         }
     }
 }
@@ -673,7 +776,133 @@ impl SqlTable {
             tb.with_foreign_key(fk.column, fk.name, fk.ref_table, fk.ref_column);
         }
 
-        tb.build()
+        let mut table = tb.build()?;
+        if let Some(by) = &value.partition_by {
+            let kind = match by.kind {
+                either::Either::Left(_) => PartitionKind::Range,
+                either::Either::Right(_) => PartitionKind::List,
+            };
+            let column = by.column.value.to_lowercase();
+            let field = table
+                .fields()
+                .iter()
+                .find(|f| f.name == column)
+                .cloned()
+                .ok_or_else(|| {
+                    SchemaError::UserError(format!(
+                        "PARTITION BY: table {:?} has no column named {column:?}",
+                        table.name
+                    ))
+                })?;
+            if !matches!(
+                field.datatype,
+                DataType::Integer
+                    | DataType::Double
+                    | DataType::Datetime
+                    | DataType::Str(_)
+                    | DataType::Boolean
+            ) {
+                return Err(SchemaError::UserError(format!(
+                    "PARTITION BY: column {column:?} of type {:?} cannot be partitioned by",
+                    field.datatype
+                )));
+            }
+            let partitioning = Partitioning {
+                kind,
+                field_id: field.id,
+            };
+            let indices = table.indices.len();
+            let partitions = by
+                .partitions
+                .items()
+                .enumerate()
+                .map(|(i, def)| {
+                    Ok(Partition::new(
+                        i as u32,
+                        partition_name(def)?,
+                        PartitionBound::from_sql(def, kind, field.datatype)?,
+                        indices,
+                    ))
+                })
+                .collect::<Result<Vec<_>, SchemaError>>()?;
+            partitioning.check(&partitions)?;
+            table.next_partition_id = partitions.len() as u32;
+            table.partitions = partitions;
+            table.partitioning = Some(partitioning);
+            table.check_partition_keys()?;
+        }
+        Ok(table)
+    }
+
+    // The trees of a table that has one partition: its rows tree, and its
+    // tree for the index at `index` in `indices`.
+    #[cfg(test)]
+    pub(crate) fn rows_tree(&self) -> TableIdType {
+        self.partitions[0].rows()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_tree(&self, index: usize) -> TableIdType {
+        self.partitions[0].index(index)
+    }
+
+    pub(crate) fn is_partitioned(&self) -> bool {
+        self.partitioning.is_some()
+    }
+
+    // The partition column and its position in a row of the table's
+    // current layout; None for a table that is not partitioned.
+    pub(crate) fn partition_column(&self) -> Option<(usize, &Arc<Field>)> {
+        let by = self.partitioning.as_ref()?;
+        self.fields()
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.id == by.field_id)
+    }
+
+    // The partition (a position in `partitions`) that `row`, a full row in
+    // the table's current layout, belongs in. An error when no partition
+    // takes its partition column's value.
+    pub(crate) fn partition_for(&self, row: &[ValueItem]) -> Result<usize, SchemaError> {
+        let (Some(by), Some((pos, field))) = (&self.partitioning, self.partition_column()) else {
+            return Ok(0);
+        };
+        by.route(&self.partitions, &row[pos]).ok_or_else(|| {
+            SchemaError::UserError(format!(
+                "table {:?} has no partition for {} = {}",
+                self.name, field.name, row[pos]
+            ))
+        })
+    }
+
+    // Each partition enforces a PRIMARY KEY/UNIQUE constraint over its own
+    // rows only (indexes are local — see crate::partition). That enforces
+    // it over the whole table only if equal keys always land in the same
+    // partition, i.e. the key includes the partition column.
+    pub(crate) fn check_partition_keys(&self) -> Result<(), SchemaError> {
+        let Some((_, column)) = self.partition_column() else {
+            return Ok(());
+        };
+        for index in &self.indices {
+            if (index.is_primary || index.is_unique)
+                && !index.fields.iter().any(|f| f.id == column.id)
+            {
+                return Err(SchemaError::UserError(format!(
+                    "table {:?} is partitioned by {:?}: its {} must include that column",
+                    self.name,
+                    column.name,
+                    if index.is_primary {
+                        "PRIMARY KEY".to_string()
+                    } else {
+                        format!(
+                            "unique index {:?}",
+                            index.name.as_deref().unwrap_or("<unnamed>")
+                        )
+                    }
+                )));
+            }
+        }
+        Ok(())
     }
 
     // The byte footprint of a row's own identity (its PRIMARY KEY, or
@@ -702,7 +931,13 @@ impl SqlTable {
     // only, so the reference has to be resolvable from that one column
     // alone.
     pub(crate) fn unique_index_on(&self, column: &str) -> Option<&SqlIndex> {
-        self.indices.iter().find(|i| {
+        self.unique_index_position(column).map(|i| &self.indices[i])
+    }
+
+    // unique_index_on's index as a position in `indices` — what finds its
+    // tree in each partition.
+    pub(crate) fn unique_index_position(&self, column: &str) -> Option<usize> {
+        self.indices.iter().position(|i| {
             (i.is_primary || i.is_unique) && i.fields.len() == 1 && i.fields[0].name == column
         })
     }
@@ -905,6 +1140,12 @@ impl SqlTable {
                 self.name
             )));
         }
+        if self.partition_column().is_some_and(|(_, f)| f.name == name) {
+            return Err(SchemaError::UserError(format!(
+                "Column {name:?} is what table {:?} is partitioned by",
+                self.name
+            )));
+        }
         if let Some(idx) = self.index_referencing(name) {
             return Err(SchemaError::UserError(format!(
                 "Column {name:?} is used by index {:?} — drop the index first",
@@ -1025,7 +1266,7 @@ impl SqlTable {
     // name to its Arc<Field>, checking the store-level backing-table
     // name isn't taken, creating and backfilling that backing table
     // before this ever gets called (the fully-built SqlIndex it hands
-    // in — db_table_id included — is just appended here).
+    // in is just appended here; its trees go into the partitions).
     pub(crate) fn alter_add_index(&mut self, index: SqlIndex) -> Result<(), SchemaError> {
         if let Some(name) = &index.name
             && self
@@ -1315,7 +1556,7 @@ pub(crate) fn coerce_selected_value(
 // function calls, subqueries, arithmetic, ...). Reserved-capacity
 // validation for Str/Blob (does the literal actually fit within the
 // column's declared length) happens later, in IndexKey::new_from.
-fn expr_to_value_item(
+pub(crate) fn expr_to_value_item(
     expr: &sql_parser::Expr,
     datatype: DataType,
 ) -> Result<ValueItem, SchemaError> {
@@ -1447,4 +1688,15 @@ fn index_from_constraint(constraint: &TableConstraint) -> Option<IndexHolder> {
         }),
         _ => None,
     }
+}
+
+// A partition's name as declared, lowercased like every other name here.
+pub(crate) fn partition_name(def: &sql_parser::ddl::PartitionDef) -> Result<String, SchemaError> {
+    let name = def.name.value.to_lowercase();
+    if name.is_empty() || name.len() > MAX_TABLE_NAME_LEN {
+        return Err(SchemaError::UserError(format!(
+            "a partition name must be 1 to {MAX_TABLE_NAME_LEN} characters long"
+        )));
+    }
+    Ok(name)
 }

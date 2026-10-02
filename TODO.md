@@ -47,6 +47,41 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   into a column the sort and grouping read; the SELECT list and HAVING may
   use the same expression).
 
+## Partitions
+
+Done: every table is a list of partitions with their own trees
+(`squeal-sql/src/partition.rs`); `CREATE TABLE ... PARTITION BY RANGE|LIST`,
+`ALTER TABLE ... ADD|DROP PARTITION`; INSERT/UPDATE/DELETE/COPY route rows by
+the partition column; queries read every partition (`source/append.rs`).
+
+- [ ] Pruning: skip partitions a WHERE rules out (`plan/sarg.rs` ranges
+  against partition bounds), and show how many were read in EXPLAIN.
+- [ ] Order across partitions: a partitioned table never reports its rows as
+  sorted, so ORDER BY / merge join / grouped-input always sort. RANGE
+  partitions read in bound order are sorted by the partition column.
+- [ ] Join seeks: a nested-loop join into a partitioned table is not planned
+  (hash join instead); it needs a seek per partition, or pruning to one.
+- [ ] Statistics are per table: tree shape is read off the first partition,
+  and DROP PARTITION leaves the row count stale until ANALYZE.
+- [ ] DROP PARTITION leaves the partition's trees in the store, unreferenced
+  (their pages are not reused). Reclaiming them needs a `drop_table` in store
+  that is safe against a scan still reading the tree. Store change.
+- [ ] DDL is not excluded from concurrent DML: a row inserted while ADD
+  PARTITION checks the DEFAULT partition, or into a partition while it is
+  dropped, is not caught. Same as every other ALTER here.
+- [ ] No way to list a table's partitions from SQL except EXPLAIN (a
+  `SHOW PARTITIONS`, or DESCRIBE showing them).
+- [ ] External partitions (Parquet): a new `PartitionStorage` variant.
+
+## Gaps found on the way (not partition-specific)
+
+- [ ] `IS NULL` / `IS NOT NULL` are not supported by squeal-sql's evaluator
+  (`UnsupportedFeature("this kind of expression: IsNull")`).
+- [ ] A join's ON with a non-column term (`on a.x = b.x and b.y = 3`) fails
+  when it runs as a hash join ("hash join only supports equi-join conditions
+  between plain columns").
+- [ ] DROP TABLE and TRUNCATE parse but squeal-sql does not execute them.
+
 ## Flaky tests
 
 - [ ] `squeal-sql` `source::sortjoin` spill tests

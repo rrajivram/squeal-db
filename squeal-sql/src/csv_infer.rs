@@ -134,6 +134,7 @@ pub(crate) fn synthetic_create_table(
         .collect();
 
     CreateTable {
+        partition_by: None,
         create: kw::Create::new(dummy_span()),
         table: kw::Table::new(dummy_span()),
         if_not_exists: if_not_exists.then(|| {

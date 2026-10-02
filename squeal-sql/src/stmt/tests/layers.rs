@@ -120,14 +120,8 @@ fn layers() {
         drain(&mut stmt);
     }
     per_op("SQL count(*) (index seek on the primary key)", 10, start);
-    let pk_index = c
-        .current_schema()
-        .unwrap()
-        .get_table("orders")
-        .unwrap()
-        .primary_key()
-        .unwrap()
-        .db_table_id;
+    let table = c.current_schema().unwrap().get_table("orders").unwrap();
+    let pk_index = table.index_tree(table.indices.iter().position(|i| i.is_primary).unwrap());
     let range = || KeyRange {
         prefix: vec![],
         lower: std::ops::Bound::Included(ValueItem::Str(("ORD0100000".into(), 12))),

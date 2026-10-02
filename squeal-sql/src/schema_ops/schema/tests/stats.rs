@@ -62,7 +62,7 @@ fn test_insert_feeds_schema_stats_row_count_and_column_stats() {
     execute(&c, "insert into customers values (2, 40, 'sf')").unwrap();
     execute(&c, "insert into customers values (3, 25, 'nyc')").unwrap();
 
-    let stat = wait_for_row_count(&schema, table.db_table_id, 3);
+    let stat = wait_for_row_count(&schema, table.id, 3);
     assert_eq!(stat.name, "customers");
 
     // `id` is the sole PRIMARY KEY column: known unique, so no bloom
@@ -104,7 +104,7 @@ fn test_analyze_table_exhaustively_rebuilds_stats_from_a_full_scan() {
         .lock()
         .as_ref()
         .unwrap()
-        .get_table_stats(table.db_table_id)
+        .get_table_stats(table.id)
         .unwrap();
     assert_eq!(stat.row_count, 3);
     let price_idx = table
@@ -132,7 +132,7 @@ fn test_analyze_table_resets_stale_stats_before_rebuilding() {
             .lock()
             .as_ref()
             .unwrap()
-            .get_table_stats(table.db_table_id)
+            .get_table_stats(table.id)
             .unwrap()
             .row_count,
         1
@@ -147,7 +147,7 @@ fn test_analyze_table_resets_stale_stats_before_rebuilding() {
             .lock()
             .as_ref()
             .unwrap()
-            .get_table_stats(table.db_table_id)
+            .get_table_stats(table.id)
             .unwrap()
             .row_count,
         3,
@@ -181,7 +181,7 @@ fn test_null_values_are_excluded_from_min_max_and_unique() {
         .lock()
         .as_ref()
         .unwrap()
-        .get_table_stats(table.db_table_id)
+        .get_table_stats(table.id)
         .unwrap();
     let age_idx = table.fields().iter().position(|f| f.name == "age").unwrap();
     let age_stat = stat.col_stats.get(&age_idx).unwrap();
@@ -236,7 +236,7 @@ fn test_alter_table_rekeys_column_stats_and_the_collector_survives() {
         execute(&c, &format!("insert into t values ({i}, 'b{i}', {})", 200 + i)).unwrap();
     }
     let table = schema.get_table("t").unwrap();
-    let stat = wait_for_row_count(&schema, table.db_table_id, 10);
+    let stat = wait_for_row_count(&schema, table.id, 10);
     // c kept its stats and took the new rows' values, at its new position.
     let c_stat = col(&stat, &table, "c");
     assert_eq!(c_stat.min, ValueItem::Integer(200));
@@ -247,7 +247,7 @@ fn test_alter_table_rekeys_column_stats_and_the_collector_survives() {
     execute(&c, "alter table t add column d integer").unwrap();
     execute(&c, "insert into t values (10, 'b10', 210, 7)").unwrap();
     let table = schema.get_table("t").unwrap();
-    let stat = wait_for_row_count(&schema, table.db_table_id, 11);
+    let stat = wait_for_row_count(&schema, table.id, 11);
     assert_eq!(col(&stat, &table, "d").min, ValueItem::Integer(7));
     assert_eq!(col(&stat, &table, "c").max, ValueItem::Integer(210));
 
@@ -255,7 +255,7 @@ fn test_alter_table_rekeys_column_stats_and_the_collector_survives() {
     execute(&c, "alter table t rename column c to cc").unwrap();
     execute(&c, "insert into t values (11, 'b11', 211, 8)").unwrap();
     let table = schema.get_table("t").unwrap();
-    let stat = wait_for_row_count(&schema, table.db_table_id, 12);
+    let stat = wait_for_row_count(&schema, table.id, 12);
     let cc = col(&stat, &table, "cc");
     assert_eq!((cc.name.as_str(), cc.min, cc.max), ("cc", ValueItem::Integer(200), ValueItem::Integer(211)));
 }

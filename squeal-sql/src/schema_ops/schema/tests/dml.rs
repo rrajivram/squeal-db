@@ -48,7 +48,7 @@ fn test_insert_stores_a_row_keyed_by_primary_key() {
 
     let s = conn.current_schema().unwrap();
     let table = s.get_table("users").unwrap();
-    let row = find_row(&s, table.db_table_id, pk_key(1)).unwrap();
+    let row = find_row(&s, table.rows_tree(), pk_key(1)).unwrap();
     assert_eq!(
         row,
         vec![ValueItem::Integer(1), ValueItem::Str(("alice".into(), 50))]
@@ -69,7 +69,7 @@ fn test_insert_auto_generates_distinct_row_ids_without_a_primary_key() {
     // both readable).
     let mut found = Vec::new();
     for candidate in 0..10u64 {
-        if let Some(row) = find_row(&s, table.db_table_id, DBIdType::Int(candidate)) {
+        if let Some(row) = find_row(&s, table.rows_tree(), DBIdType::Int(candidate)) {
             found.push(row);
         }
     }
@@ -91,10 +91,10 @@ fn test_insert_populates_secondary_unique_index() {
 
     let s = conn.current_schema().unwrap();
     let table = s.get_table("users").unwrap();
-    let idx = table.indices.iter().find(|i| !i.is_primary).unwrap();
+    let idx = table.indices.iter().position(|i| !i.is_primary).unwrap();
     let identity = find_index_entry(
         &s,
-        idx.db_table_id,
+        table.index_tree(idx),
         DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str(("a@example.com".into(), 50))]).unwrap()),
     )
     .unwrap();
@@ -139,7 +139,7 @@ fn test_insert_multi_row_batch_is_atomic_on_constraint_violation() {
     let s = conn.current_schema().unwrap();
     let table = s.get_table("users").unwrap();
     assert!(
-        find_row(&s, table.db_table_id, pk_key(1)).is_none(),
+        find_row(&s, table.rows_tree(), pk_key(1)).is_none(),
         "neither row from the failed batch must have been committed"
     );
 }
@@ -167,15 +167,15 @@ fn test_insert_accepts_date_and_time_string_literals_into_a_datetime_column() {
     let s = conn.current_schema().unwrap();
     let table = s.get_table("events").unwrap();
     assert_eq!(
-        find_row(&s, table.db_table_id, pk_key(1)).unwrap()[1],
+        find_row(&s, table.rows_tree(), pk_key(1)).unwrap()[1],
         ValueItem::Datetime(18365 * 86400)
     );
     assert_eq!(
-        find_row(&s, table.db_table_id, pk_key(2)).unwrap()[1],
+        find_row(&s, table.rows_tree(), pk_key(2)).unwrap()[1],
         ValueItem::Datetime(12 * 3600 + 53 * 60 + 24)
     );
     assert_eq!(
-        find_row(&s, table.db_table_id, pk_key(3)).unwrap()[1],
+        find_row(&s, table.rows_tree(), pk_key(3)).unwrap()[1],
         ValueItem::Datetime(18365 * 86400 + 12 * 3600 + 53 * 60 + 24)
     );
 }
@@ -283,6 +283,6 @@ fn test_insert_explicit_columns_fill_omitted_nullable_columns_with_null() {
 
     let s = conn.current_schema().unwrap();
     let table = s.get_table("users").unwrap();
-    let row = find_row(&s, table.db_table_id, pk_key(1)).unwrap();
+    let row = find_row(&s, table.rows_tree(), pk_key(1)).unwrap();
     assert_eq!(row, vec![ValueItem::Integer(1), ValueItem::Null]);
 }

@@ -67,6 +67,11 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
                     }
                 }
             }
+            for def in c.partition_by.iter().flat_map(|p| p.partitions.items()) {
+                for e in def.values.exprs() {
+                    expr(e, out);
+                }
+            }
         }
         // A literal @path only — no expression anywhere in this
         // statement's grammar for a placeholder to appear in.
@@ -76,11 +81,15 @@ fn stmt<'a>(s: &'a Statement, out: &mut Vec<&'a Placeholder>) {
                 expr(&item.expr, out);
             }
         }
-        Statement::AlterTable(a) => {
-            if let AlterTableOp::AddColumn(_, _, col) = &a.operation {
-                column_def(col, out);
+        Statement::AlterTable(a) => match &a.operation {
+            AlterTableOp::AddColumn(_, _, col) => column_def(col, out),
+            AlterTableOp::AddPartition(_, def) => {
+                for e in def.values.exprs() {
+                    expr(e, out);
+                }
             }
-        }
+            _ => {}
+        },
         Statement::Explain(_, inner) => stmt(inner, out),
         Statement::Prepare(p) => stmt(&p.statement, out),
         Statement::Execute(e) => {

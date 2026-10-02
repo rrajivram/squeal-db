@@ -34,6 +34,8 @@ use crate::{
 // too (see Schema's index maintenance).
 pub struct IndexSource<F: DBFile + 'static> {
     table: Arc<SqlTable>,
+    // Which of the table's partitions this reads the index of.
+    part: usize,
     index: usize,
     cursor: RangeCursor<F>,
     fields: Arc<[ProjectableField]>,
@@ -57,13 +59,14 @@ impl<F> IndexSource<F>
 where
     F: DBFile<Item = F> + 'static,
 {
-    /// The entries of `index` within `ranges` (see optim::picker's
-    /// IndexSeek/IndexLookup), expected to be `rows` many; `lookup` fetches
-    /// each entry's row from the table.
+    /// The entries of `index` in the table's partition `part` within
+    /// `ranges` (see optim::picker's IndexSeek/IndexLookup), expected to be
+    /// `rows` many; `lookup` fetches each entry's row from the partition.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn seek(
         conn: &Arc<Connection<F>>,
         table: &Arc<SqlTable>,
+        part: usize,
         index: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
@@ -79,11 +82,11 @@ where
             .collect();
         let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
         let cursor = db.key_ranges_scan(
-            table.indices[index].db_table_id,
+            table.partitions[part].index(index),
             txn.map(|t| t.id()),
             ranges,
         )?;
-        let mut source = Self::with_cursor(table, index, cursor, stats)?;
+        let mut source = Self::with_cursor(table, part, index, cursor, stats)?;
         source.seek = Some((seek, rows));
         source.lookup = lookup.then_some(db);
         Ok(source)
@@ -92,29 +95,30 @@ where
     pub fn new(
         db: &Arc<Connection<F>>,
         table: &Arc<SqlTable>,
+        part: usize,
         index: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
     ) -> Result<Self, SchemaError> {
         let db = &db.database.read().db;
+        let tree = table.partitions[part].index(index);
         let cursor = match txn {
             Some(tx) => db.range_scan_bounds_in_txn(
-                table.indices[index].db_table_id,
+                tree,
                 tx,
                 std::ops::Bound::Unbounded,
                 std::ops::Bound::Unbounded,
             )?,
-            None => db.range_scan_bounds(
-                table.indices[index].db_table_id,
-                std::ops::Bound::Unbounded,
-                std::ops::Bound::Unbounded,
-            )?,
+            None => {
+                db.range_scan_bounds(tree, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)?
+            }
         };
-        Self::with_cursor(table, index, cursor, stats)
+        Self::with_cursor(table, part, index, cursor, stats)
     }
 
     fn with_cursor(
         table: &Arc<SqlTable>,
+        part: usize,
         index: usize,
         cursor: RangeCursor<F>,
         stats: Option<ComputedTableStat>,
@@ -149,6 +153,7 @@ where
             .collect::<Vec<_>>();
         Ok(Self {
             table: table.clone(),
+            part,
             index,
             cursor,
             fields: Arc::from(fields),
@@ -183,8 +188,8 @@ where
                 }
             }
         };
-        let Some(tuple) = db.find_as(self.table.db_table_id, id.clone(), self.cursor.reader())?
-        else {
+        let rows = self.table.partitions[self.part].rows();
+        let Some(tuple) = db.find_as(rows, id.clone(), self.cursor.reader())? else {
             return Ok(None);
         };
         let row = from_bytes::<VersionedRow>(tuple.data())?;
@@ -207,7 +212,14 @@ where
     F: DBFile<Item = F> + 'static,
 {
     fn plan(&self) -> PlanNode {
-        let using = format!("{} using {}", self.table.name, self.index_name());
+        let using = format!(
+            "{} using {}",
+            crate::source::table::partition_label(&self.table, self.part),
+            self.index_name()
+        );
+        // Row estimates are for the whole table: shown on the step reading
+        // all of its partitions (AppendSource), not on each partition's.
+        let shown = |rows: Option<usize>| rows.filter(|_| !self.table.is_partitioned());
         match &self.seek {
             Some((seek, rows)) => PlanNode::new(if self.lookup.is_some() {
                 "IndexLookup"
@@ -220,10 +232,10 @@ where
             } else {
                 format!("{using} ({seek})")
             })
-            .rows(*rows),
+            .rows(shown(*rows)),
             None => PlanNode::new("IndexScan")
                 .detail(using)
-                .rows(self.stats.as_ref().map(|s| s.table_stat.row_count)),
+                .rows(shown(self.stats.as_ref().map(|s| s.table_stat.row_count))),
         }
     }
 

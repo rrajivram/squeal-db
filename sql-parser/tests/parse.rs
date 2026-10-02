@@ -1,6 +1,6 @@
 use sql_parser::{
     Expr, Statement,
-    ddl::{AlterTableOp, ColumnOption, TableConstraintKind},
+    ddl::{AlterTableOp, ColumnOption, PartitionValues, TableConstraintKind},
     dml::InsertSource,
     expr::{BinaryOp, FunctionArg, Placeholder, UnaryOp},
     literal::{Literal, NumberValue},
@@ -928,4 +928,99 @@ fn alter_table_add_and_drop_foreign_key() {
         panic!("expected ALTER TABLE");
     };
     assert!(matches!(a.operation, AlterTableOp::AddColumn(..)));
+}
+
+#[test]
+fn create_table_partition_by() {
+    let Statement::CreateTable(c) = one(
+        "CREATE TABLE t (id INT, day INT) PARTITION BY RANGE (day) ( \
+           PARTITION p0 VALUES LESS THAN (10), \
+           PARTITION p1 VALUES LESS THAN (-5 + 30), \
+           PARTITION p2 VALUES LESS THAN MAXVALUE, \
+           PARTITION p3 VALUES LESS THAN (MAXVALUE))",
+    ) else {
+        panic!("expected CREATE TABLE");
+    };
+    let by = c.partition_by.expect("PARTITION BY");
+    assert!(by.kind.is_left(), "RANGE");
+    assert_eq!(by.column.value, "day");
+    let parts: Vec<_> = by.partitions.items().collect();
+    assert_eq!(parts.len(), 4);
+    assert_eq!(parts[0].name.value, "p0");
+    assert!(matches!(parts[0].values, PartitionValues::LessThan(..)));
+    assert_eq!(parts[1].values.exprs().len(), 1);
+    assert!(matches!(parts[2].values, PartitionValues::LessThanMax(..)));
+    assert!(matches!(
+        parts[3].values,
+        PartitionValues::LessThanMaxParen(..)
+    ));
+
+    let Statement::CreateTable(c) = one("CREATE TABLE t (r VARCHAR(2)) PARTITION BY LIST (r) \
+         (PARTITION a VALUES IN ('x', 'y', NULL), PARTITION b DEFAULT)")
+    else {
+        panic!("expected CREATE TABLE");
+    };
+    let by = c.partition_by.expect("PARTITION BY");
+    assert!(by.kind.is_right(), "LIST");
+    let parts: Vec<_> = by.partitions.items().collect();
+    assert_eq!(parts[0].values.exprs().len(), 3);
+    assert!(matches!(parts[1].values, PartitionValues::Default(_)));
+
+    // Not partitioned.
+    let Statement::CreateTable(c) = one("CREATE TABLE t (id INT)") else {
+        panic!("expected CREATE TABLE");
+    };
+    assert!(c.partition_by.is_none());
+    assert!(parse_sql("CREATE TABLE t (id INT) PARTITION BY RANGE (id)").is_err());
+    assert!(
+        parse_sql("CREATE TABLE t (id INT) PARTITION BY HASH (id) (PARTITION p DEFAULT)").is_err()
+    );
+}
+
+#[test]
+fn alter_table_add_and_drop_partition() {
+    let Statement::AlterTable(a) = one("ALTER TABLE t ADD PARTITION p VALUES LESS THAN (20)")
+    else {
+        panic!("expected ALTER TABLE");
+    };
+    let AlterTableOp::AddPartition(_, def) = a.operation else {
+        panic!("expected ADD PARTITION, got {:?}", a.operation);
+    };
+    assert_eq!(def.name.value, "p");
+    for sql in [
+        "ALTER TABLE t ADD PARTITION p VALUES IN (1, 2)",
+        "ALTER TABLE t ADD PARTITION p DEFAULT",
+        "ALTER TABLE t ADD PARTITION p VALUES LESS THAN MAXVALUE",
+    ] {
+        let Statement::AlterTable(a) = one(sql) else {
+            panic!("expected ALTER TABLE");
+        };
+        assert!(
+            matches!(a.operation, AlterTableOp::AddPartition(..)),
+            "{sql}"
+        );
+    }
+    let Statement::AlterTable(a) = one("ALTER TABLE t DROP PARTITION p") else {
+        panic!("expected ALTER TABLE");
+    };
+    assert!(matches!(a.operation, AlterTableOp::DropPartition(..)));
+
+    // The column forms are still themselves: with the COLUMN keyword a
+    // column may even be named `partition`.
+    for (sql, add) in [
+        ("ALTER TABLE t ADD c INT", true),
+        ("ALTER TABLE t ADD COLUMN partition INT DEFAULT 5", true),
+        ("ALTER TABLE t DROP c", false),
+        ("ALTER TABLE t DROP partition", false),
+        ("ALTER TABLE t DROP COLUMN partition", false),
+    ] {
+        let Statement::AlterTable(a) = one(sql) else {
+            panic!("expected ALTER TABLE");
+        };
+        if add {
+            assert!(matches!(a.operation, AlterTableOp::AddColumn(..)), "{sql}");
+        } else {
+            assert!(matches!(a.operation, AlterTableOp::DropColumn(..)), "{sql}");
+        }
+    }
 }

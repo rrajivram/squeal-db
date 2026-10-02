@@ -16,12 +16,12 @@ fn row_count(schema: &NamedSchema, table: &SqlTable) -> Option<usize> {
         .stats
         .lock()
         .as_ref()
-        .and_then(|s| s.get_table_stats(table.db_table_id))
+        .and_then(|s| s.get_table_stats(table.id))
         .map(|t| t.row_count)
 }
 
 fn stats_key(table: &SqlTable) -> DBIdType {
-    DBIdType::Int(table.db_table_id.as_u64())
+    DBIdType::Int(table.id.as_u64())
 }
 
 fn stats_row_bytes(schema: &NamedSchema, table: &SqlTable) -> Vec<u8> {

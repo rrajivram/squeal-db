@@ -140,10 +140,17 @@ where
         prefixes.into_iter().map(KeyRange::prefix).collect()
     }
 
+    // The inner table's one partition: a join seeks a single tree per
+    // outer row, so the planner only builds this over a table that has
+    // exactly one (see QueryVisitor::nested_loop_join).
+    fn partition(&self) -> &crate::partition::Partition {
+        &self.table.partitions[0]
+    }
+
     fn tree(&self) -> store::table::TableIdType {
         match self.seek.index {
-            None => self.table.db_table_id,
-            Some(i) => self.table.indices[i].db_table_id,
+            None => self.partition().rows(),
+            Some(i) => self.partition().index(i),
         }
     }
 
@@ -168,7 +175,7 @@ where
                         }
                     }
                 };
-                match self.db.find_as(self.table.db_table_id, id, self.reader)? {
+                match self.db.find_as(self.partition().rows(), id, self.reader)? {
                     Some(t) => t,
                     None => return Ok(None),
                 }

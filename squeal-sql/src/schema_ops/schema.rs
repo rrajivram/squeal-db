@@ -17,6 +17,7 @@ use crate::{
     constant::MAX_TABLE_NAME_LEN,
     error::SchemaError,
     optim::table_stats::{SchemaStats, TableStat},
+    partition::{Partition, PartitionBound},
     rslt::resultset::ResultSet,
     table::{Field, SqlForeignKey, SqlIndex, SqlTable, VersionedRow},
 };
@@ -224,9 +225,88 @@ where
         Ok(())
     }
 
+    // What an index's trees are named after: its own name, or for an
+    // unnamed one (an inline PRIMARY KEY/UNIQUE) the table's name and the
+    // index's position.
+    fn index_base_name(table: &SqlTable, index: usize) -> String {
+        table.indices[index]
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}{}", table.name, index))
+    }
+
+    // What a partition's trees' names end in: nothing for the one
+    // partition of a table that is not partitioned (its trees are named as
+    // they were before partitions existed), else the partition's id — not
+    // its name, so a partition added under a dropped one's name gets trees
+    // of its own.
+    fn partition_suffix(table: &SqlTable, part: &Partition) -> String {
+        if table.is_partitioned() {
+            format!("#p{}", part.id)
+        } else {
+            String::new()
+        }
+    }
+
+    // The store names of a partition's trees: its rows tree, then one per
+    // index of the table.
+    fn tree_names(&self, table: &SqlTable, part: &Partition) -> (String, Vec<String>) {
+        let suffix = Self::partition_suffix(table, part);
+        (
+            self.qualify(&format!("{}{suffix}", table.name)),
+            (0..table.indices.len())
+                .map(|i| self.qualify(&format!("{}{suffix}", Self::index_base_name(table, i))))
+                .collect(),
+        )
+    }
+
+    // Creates `part`'s trees under `names` (see tree_names) and records
+    // their ids in it. Every name created is pushed onto `created`, so a
+    // caller that fails later can drop them: they are DDL, which a
+    // rollback does not undo.
+    fn create_partition_trees(
+        &self,
+        table: &SqlTable,
+        part: &mut Partition,
+        names: &(String, Vec<String>),
+        created: &mut Vec<String>,
+    ) -> Result<(), SchemaError> {
+        let identity_size = table.identity_size();
+        let rows = self
+            .db
+            .create_table_with_index_entry_size(names.0.clone(), table.row_entry_size() as u64)?;
+        created.push(names.0.clone());
+        part.set_rows(rows);
+        for (i, (index, name)) in table.indices.iter().zip(&names.1).enumerate() {
+            let id = self.db.create_table_with_index_entry_size(
+                name.clone(),
+                index.size(identity_size) as u64,
+            )?;
+            created.push(name.clone());
+            part.set_index(i, id);
+        }
+        Ok(())
+    }
+
+    // Whether `table` has a row whose key in its index `index` (a position
+    // in `table.indices`) is `key`, in any of its partitions.
+    fn index_has_key(
+        &self,
+        table: &SqlTable,
+        index: usize,
+        key: &DBIdType,
+        txn: &Transaction,
+    ) -> Result<bool, SchemaError> {
+        for part in &table.partitions {
+            if self.db.find(part.index(index), key.clone(), txn)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn create_table(self: &Arc<Self>, table: SqlTable) -> Result<(), SchemaError> {
         let mut table = table;
-        let row_table_name = self.qualify(&table.name);
         let rowid_seq_name = self.rowid_seq_name(&table.name);
         let has_primary_key = table.primary_key().is_some();
 
@@ -258,25 +338,28 @@ where
         // create_table_with_index_entry_size isn't undone by
         // self.db.rollback(txn): it's DDL, not a row-level, undo-logged
         // operation the way insert/update/remove are).
-        if self.db.table_id_by_name(&row_table_name)?.is_some() {
-            return Err(SchemaError::BadTableName(format!(
-                "Table name {} is already in use",
-                table.name
-            )));
-        }
-        let mut index_names = Vec::with_capacity(table.indices.len());
-        for (count, i) in table.indices.iter().enumerate() {
-            let iname = i
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("{}{}", table.name, count));
-            let qualified = self.qualify(&iname);
-            if self.db.table_id_by_name(&qualified)?.is_some() {
+        // One set of trees per partition (see crate::partition): its rows
+        // tree, then one per index.
+        let tree_names: Vec<(String, Vec<String>)> = table
+            .partitions
+            .iter()
+            .map(|p| self.tree_names(&table, p))
+            .collect();
+        for (rows_name, index_names) in &tree_names {
+            if self.db.table_id_by_name(rows_name)?.is_some() {
                 return Err(SchemaError::BadTableName(format!(
-                    "Index name {iname} is already in use"
+                    "Table name {} is already in use",
+                    table.name
                 )));
             }
-            index_names.push(qualified);
+            for (i, qualified) in index_names.iter().enumerate() {
+                if self.db.table_id_by_name(qualified)?.is_some() {
+                    return Err(SchemaError::BadTableName(format!(
+                        "Index name {} is already in use",
+                        Self::index_base_name(&table, i)
+                    )));
+                }
+            }
         }
         // Self-referential foreign keys (ref_table == this table) were
         // already fully validated inside TableBuilder::build(), which
@@ -325,23 +408,10 @@ where
         // else can have discovered these tables yet (the SqlTable row
         // isn't in self.tables, and table_exists/get_table can't see it
         // either, until the whole create_table call succeeds).
-        let mut created_names: Vec<String> = Vec::with_capacity(table.indices.len() + 1);
+        let mut created_names: Vec<String> = Vec::new();
         let mut created_generator = false;
         // Computed before the mutable borrow below (table.indices.iter_mut())
-        // makes an immutable one unavailable — every one of these
-        // indices is always PRIMARY KEY/UNIQUE today (see SqlIndex::
-        // size's own doc comment), so this never actually adds anything
-        // here, but it's the same real value CREATE INDEX's own sizing
-        // uses, not a stand-in.
-        let identity_size = table.identity_size();
         let res: Result<(), SchemaError> = (|| {
-            let row_table_id = self.db.create_table_with_index_entry_size(
-                row_table_name.clone(),
-                table.row_entry_size() as u64,
-            )?;
-            created_names.push(row_table_name.clone());
-            table.db_table_id = row_table_id;
-
             if !has_primary_key {
                 self.db
                     .get_generator()
@@ -349,19 +419,12 @@ where
                 created_generator = true;
             }
 
-            table
-                .indices
-                .iter_mut()
-                .zip(&index_names)
-                .try_for_each(|(i, qualified)| {
-                    let size = i.size(identity_size);
-                    let iid = self
-                        .db
-                        .create_table_with_index_entry_size(qualified.clone(), size as u64)?;
-                    i.db_table_id = iid;
-                    created_names.push(qualified.clone());
-                    Ok::<(), SchemaError>(())
-                })?;
+            let mut partitions = std::mem::take(&mut table.partitions);
+            for (part, names) in partitions.iter_mut().zip(&tree_names) {
+                self.create_partition_trees(&table, part, names, &mut created_names)?;
+            }
+            table.id = partitions[0].rows();
+            table.partitions = partitions;
 
             self.db.insert(
                 self.sys_table_id,
@@ -539,7 +602,10 @@ where
             DBIdType::Rec(ik) => ik.clone(),
             DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
         };
-        for index in &table.indices {
+        // The partition the row's own values put it in: its rows tree and
+        // its index trees are the ones written.
+        let part = &table.partitions[table.partition_for(&row)?];
+        for (i, index) in table.indices.iter().enumerate() {
             let mut values = table.extract_field_values(&index.fields, &row);
             // A PRIMARY KEY/UNIQUE index's own declared fields are
             // already unique by definition — that's what makes the
@@ -554,7 +620,7 @@ where
             }
             let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
             self.db.insert(
-                index.db_table_id,
+                part.index(i),
                 Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
                 txn,
             )?;
@@ -571,7 +637,7 @@ where
             values: IndexKey::new_from_owned(row)?,
         };
         self.db.insert(
-            table.db_table_id,
+            part.rows(),
             Tuple::new_with(
                 row_key.clone(),
                 &to_allocvec(&row_data)?,
@@ -589,7 +655,7 @@ where
         // worth threading commit/rollback awareness into an already-
         // lossy background collector for.
         if let Some(stats) = self.stats.lock().as_ref() {
-            stats.log_stat(table.db_table_id, row_data.values.clone());
+            stats.log_stat(table.id, row_data.values.clone());
         }
         Ok(())
     }
@@ -621,15 +687,18 @@ where
             DBIdType::Rec(ik) => ik.clone(),
             DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
         };
-        for index in &table.indices {
+        // The partition the row is in is the one its values put it in (see
+        // insert_one_row_in_txn).
+        let part = &table.partitions[table.partition_for(row)?];
+        for (i, index) in table.indices.iter().enumerate() {
             let mut values = table.extract_field_values(&index.fields, row);
             if !index.is_primary && !index.is_unique {
                 values.extend_from_slice(identity.values());
             }
             let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-            self.db.remove(index.db_table_id, index_key, txn)?;
+            self.db.remove(part.index(i), index_key, txn)?;
         }
-        self.db.remove(table.db_table_id, row_key.clone(), txn)?;
+        self.db.remove(part.rows(), row_key.clone(), txn)?;
         Ok(())
     }
 
@@ -740,15 +809,17 @@ where
                     table.name, fk.column, fk.ref_table
                 ))
             })?;
-            let index = ref_table.unique_index_on(&fk.ref_column).ok_or_else(|| {
-                SchemaError::UnknownError(format!(
-                    "foreign key on {:?}.{} references {:?}.{}, which is no longer a \
+            let index = ref_table
+                .unique_index_position(&fk.ref_column)
+                .ok_or_else(|| {
+                    SchemaError::UnknownError(format!(
+                        "foreign key on {:?}.{} references {:?}.{}, which is no longer a \
                      PRIMARY KEY/UNIQUE column",
-                    table.name, fk.column, fk.ref_table, fk.ref_column
-                ))
-            })?;
+                        table.name, fk.column, fk.ref_table, fk.ref_column
+                    ))
+                })?;
             let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
-            if self.db.find(index.db_table_id, key, txn)?.is_none() {
+            if !self.index_has_key(&ref_table, index, &key, txn)? {
                 return Err(SchemaError::UserError(format!(
                     "insert on table {:?} violates foreign key {:?}: no row in {:?} with {} = {value:?}",
                     table.name,
@@ -787,14 +858,16 @@ where
         let mut rows = Vec::new();
         let start = Instant::now();
         let mut count = 0;
-        let mut cursor = match txn {
-            Some(txn) => self.db.table_scan_in_txn(table.db_table_id, txn)?,
-            None => self.db.table_scan(table.db_table_id)?,
-        };
-        while let Some(tuple) = cursor.next()? {
-            let row = from_bytes::<VersionedRow>(tuple.data())?;
-            rows.push(table.reproject(&row)?.values().to_vec());
-            count += 1;
+        for part in &table.partitions {
+            let mut cursor = match txn {
+                Some(txn) => self.db.table_scan_in_txn(part.rows(), txn)?,
+                None => self.db.table_scan(part.rows())?,
+            };
+            while let Some(tuple) = cursor.next()? {
+                let row = from_bytes::<VersionedRow>(tuple.data())?;
+                rows.push(table.reproject(&row)?.values().to_vec());
+                count += 1;
+            }
         }
         let message = format!("{} rows in {} ms", count, start.elapsed().as_millis());
         Ok(ResultSet::new(columns, rows, message))
@@ -889,7 +962,7 @@ where
             .datatype;
         ref_table.validate_foreign_key_target(&fk.ref_column, column_datatype)?;
         let index = ref_table
-            .unique_index_on(&fk.ref_column)
+            .unique_index_position(&fk.ref_column)
             .expect("validate_foreign_key_target above already confirmed this exists");
 
         // Existing rows must already satisfy the constraint — no NOT
@@ -899,24 +972,26 @@ where
         // read: nothing here writes anything, so there's no partial
         // state to roll back on a violation.
         let txn = self.db.begin()?;
-        let mut cursor = self.db.table_scan_in_txn(table.db_table_id, &txn)?;
-        while let Some(tuple) = cursor.next()? {
-            let versioned = from_bytes::<VersionedRow>(tuple.data())?;
-            let row = table.reproject(&versioned)?;
-            let pos = table
-                .fields()
-                .iter()
-                .position(|f| f.name == fk.column)
-                .expect("checked present above");
-            let value = &row.values()[pos];
-            if *value != ValueItem::Null {
-                let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
-                if self.db.find(index.db_table_id, key, &txn)?.is_none() {
-                    return Err(SchemaError::UserError(format!(
-                        "cannot add foreign key: existing row in {table_name:?} has {} = \
-                         {value:?}, which does not exist in {:?}.{}",
-                        fk.column, fk.ref_table, fk.ref_column
-                    )));
+        let pos = table
+            .fields()
+            .iter()
+            .position(|f| f.name == fk.column)
+            .expect("checked present above");
+        for part in &table.partitions {
+            let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
+            while let Some(tuple) = cursor.next()? {
+                let versioned = from_bytes::<VersionedRow>(tuple.data())?;
+                let row = table.reproject(&versioned)?;
+                let value = &row.values()[pos];
+                if *value != ValueItem::Null {
+                    let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
+                    if !self.index_has_key(&ref_table, index, &key, &txn)? {
+                        return Err(SchemaError::UserError(format!(
+                            "cannot add foreign key: existing row in {table_name:?} has {} = \
+                             {value:?}, which does not exist in {:?}.{}",
+                            fk.column, fk.ref_table, fk.ref_column
+                        )));
+                    }
                 }
             }
         }
@@ -982,78 +1057,128 @@ where
                 "Duplicate index name: {name}"
             )));
         }
-        let qualified = self.qualify(&name);
-        if self.db.table_id_by_name(&qualified)?.is_some() {
-            return Err(SchemaError::BadTableName(format!(
-                "Index name {name} is already in use"
+        let column = table.partition_column().map(|(_, f)| f.clone());
+        if let Some(column) = &column
+            && is_unique
+            && !fields.iter().any(|f| f.id == column.id)
+        {
+            // Each partition has its own tree for the index (see
+            // crate::partition): one can only reject a duplicate among its
+            // own rows.
+            return Err(SchemaError::UserError(format!(
+                "table {table_name:?} is partitioned by {:?}: a unique index on it must \
+                 include that column",
+                column.name
             )));
+        }
+        // One tree per partition, holding its rows' entries.
+        let qualified: Vec<String> = table
+            .partitions
+            .iter()
+            .map(|p| self.qualify(&format!("{name}{}", Self::partition_suffix(&table, p))))
+            .collect();
+        for q in &qualified {
+            if self.db.table_id_by_name(q)?.is_some() {
+                return Err(SchemaError::BadTableName(format!(
+                    "Index name {name} is already in use"
+                )));
+            }
         }
 
         let identity_size = table.identity_size();
-        let sizing_index = SqlIndex {
+        let index = SqlIndex {
             name: Some(name.clone()),
-            db_table_id: TableIdType::none(),
             is_primary: false,
             is_unique,
             fields: fields.clone().into(),
         };
         self.check_key_width(
             &format!("index {name:?} on table {table_name:?}"),
-            sizing_index.key_size(identity_size),
-        )?;
-        let index_table_id = self.db.create_table_with_index_entry_size(
-            qualified.clone(),
-            sizing_index.size(identity_size) as u64,
+            index.key_size(identity_size),
         )?;
 
-        let backfill: Result<(), SchemaError> = (|| {
+        let mut created: Vec<String> = vec![];
+        let mut trees: Vec<TableIdType> = vec![];
+        let build: Result<(), SchemaError> = (|| {
+            for q in &qualified {
+                trees.push(self.db.create_table_with_index_entry_size(
+                    q.clone(),
+                    index.size(identity_size) as u64,
+                )?);
+                created.push(q.clone());
+            }
             let txn = self.db.begin()?;
-            let mut cursor = self.db.table_scan_in_txn(table.db_table_id, &txn)?;
-            while let Some(tuple) = cursor.next()? {
-                let versioned = from_bytes::<VersionedRow>(tuple.data())?;
-                let row = table.reproject(&versioned)?;
-                let identity = match tuple.id() {
-                    DBIdType::Rec(ik) => ik.clone(),
-                    DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
-                };
-                let mut values = table.extract_field_values(&fields, row.values());
-                if !is_unique {
-                    values.extend_from_slice(identity.values());
+            for (part, tree) in table.partitions.iter().zip(&trees) {
+                let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
+                while let Some(tuple) = cursor.next()? {
+                    let versioned = from_bytes::<VersionedRow>(tuple.data())?;
+                    let row = table.reproject(&versioned)?;
+                    let identity = match tuple.id() {
+                        DBIdType::Rec(ik) => ik.clone(),
+                        DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+                    };
+                    let mut values = table.extract_field_values(&fields, row.values());
+                    if !is_unique {
+                        values.extend_from_slice(identity.values());
+                    }
+                    let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
+                    self.db
+                        .insert(
+                            *tree,
+                            Tuple::new_with(
+                                index_key,
+                                &to_allocvec(&identity)?,
+                                Some(txn.id()),
+                                None,
+                            ),
+                            &txn,
+                        )
+                        .map_err(|e| match e {
+                            StoreError::DuplicateKey(_) if is_unique => {
+                                SchemaError::UserError(format!(
+                                    "cannot create unique index {name:?}: table {table_name:?} \
+                                     has duplicate values for column(s) {column_names:?}"
+                                ))
+                            }
+                            other => other.into(),
+                        })?;
                 }
-                let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-                self.db
-                    .insert(
-                        index_table_id,
-                        Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
-                        &txn,
-                    )
-                    .map_err(|e| match e {
-                        StoreError::DuplicateKey(_) if is_unique => {
-                            SchemaError::UserError(format!(
-                                "cannot create unique index {name:?}: table {table_name:?} has \
-                             duplicate values for column(s) {column_names:?}"
-                            ))
-                        }
-                        other => other.into(),
-                    })?;
             }
             self.db.commit(txn)?;
             Ok(())
         })();
-        if let Err(e) = backfill {
-            let _ = self.db.drop_table(&qualified);
+        let drop_created = |created: &[String]| {
+            for q in created {
+                let _ = self.db.drop_table(q);
+            }
+        };
+        if let Err(e) = build {
+            drop_created(&created);
             return Err(e);
         }
 
-        let index = SqlIndex {
-            name: Some(name),
-            db_table_id: index_table_id,
-            is_primary: false,
-            is_unique,
-            fields: fields.into(),
-        };
-        if let Err(e) = self.alter_table(table_name, |t| t.alter_add_index(index)) {
-            let _ = self.db.drop_table(&qualified);
+        let added = self.alter_table(table_name, |t| {
+            // The partitions the trees were built for must still be the
+            // table's.
+            if t.partitions.len() != trees.len()
+                || t.partitions
+                    .iter()
+                    .zip(&table.partitions)
+                    .any(|(a, b)| a.id != b.id)
+            {
+                return Err(SchemaError::UserError(format!(
+                    "table {table_name:?}'s partitions changed while index {name:?} was built"
+                )));
+            }
+            let position = t.indices.len();
+            t.alter_add_index(index)?;
+            for (part, tree) in t.partitions.iter_mut().zip(&trees) {
+                part.set_index(position, *tree);
+            }
+            Ok(())
+        });
+        if let Err(e) = added {
+            drop_created(&created);
             return Err(e);
         }
         Ok(())
@@ -1206,12 +1331,14 @@ where
         // Rows the collector hasn't applied yet would otherwise land on
         // top of the recount below.
         stats.flush();
-        stats.drop_table_stats(table.db_table_id);
+        stats.drop_table_stats(table.id);
         stats.add_table(table.clone())?;
-        let mut cursor = self.db.table_scan(table.db_table_id)?;
-        while let Some(tuple) = cursor.next()? {
-            let row = from_bytes::<VersionedRow>(tuple.data())?;
-            stats.record_row_sync(table.db_table_id, table.reproject(&row)?);
+        for part in &table.partitions {
+            let mut cursor = self.db.table_scan(part.rows())?;
+            while let Some(tuple) = cursor.next()? {
+                let row = from_bytes::<VersionedRow>(tuple.data())?;
+                stats.record_row_sync(table.id, table.reproject(&row)?);
+            }
         }
         Ok(())
     }
@@ -1246,7 +1373,7 @@ where
             let Some(table) = self.get_table(&name) else {
                 continue;
             };
-            let Some(stat) = stats.get_table_stats(table.db_table_id) else {
+            let Some(stat) = stats.get_table_stats(table.id) else {
                 continue;
             };
             if stat.col_stats.is_empty() {
@@ -1276,6 +1403,111 @@ where
             }
         }
         rows
+    }
+
+    // ALTER TABLE ... ADD PARTITION: a new, empty partition with its own
+    // trees. Only where no existing row could belong in it: a RANGE
+    // partition goes above the highest bound (so not after MAXVALUE), and a
+    // LIST partition's values must be ones no other partition lists and no
+    // row in the DEFAULT partition has.
+    pub(crate) fn add_partition(
+        self: &Arc<Self>,
+        table_name: &str,
+        def: &sql_parser::ddl::PartitionDef,
+    ) -> Result<(), SchemaError> {
+        let table = self.get_table(table_name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        let (Some(by), Some((pos, field))) = (&table.partitioning, table.partition_column()) else {
+            return Err(SchemaError::UserError(format!(
+                "Table {table_name:?} is not partitioned"
+            )));
+        };
+        let mut part = Partition::new(
+            table.next_partition_id,
+            crate::table::partition_name(def)?,
+            PartitionBound::from_sql(def, by.kind, field.datatype)?,
+            table.indices.len(),
+        );
+        let mut partitions = table.partitions.clone();
+        partitions.push(part.clone());
+        by.check(&partitions)?;
+
+        if let PartitionBound::In(values) = &part.bound
+            && let Some(default) = table
+                .partitions
+                .iter()
+                .find(|p| p.bound == PartitionBound::Default)
+        {
+            let mut cursor = self.db.table_scan(default.rows())?;
+            while let Some(tuple) = cursor.next()? {
+                let row = table.reproject(&from_bytes::<VersionedRow>(tuple.data())?)?;
+                let value = &row.values()[pos];
+                if values.iter().any(|v| v.cmp(value).is_eq()) {
+                    return Err(SchemaError::UserError(format!(
+                        "cannot add partition {:?}: partition {:?} already holds rows with {} = \
+                         {value}",
+                        part.name, default.name, field.name
+                    )));
+                }
+            }
+        }
+
+        let names = self.tree_names(&table, &part);
+        let mut created = vec![];
+        let added = self
+            .create_partition_trees(&table, &mut part, &names, &mut created)
+            .and_then(|()| {
+                self.alter_table(table_name, |t| {
+                    // Built against the partitions and indexes `table` had.
+                    if t.next_partition_id != part.id || t.indices.len() != table.indices.len() {
+                        return Err(SchemaError::UserError(format!(
+                            "table {table_name:?} changed while partition {:?} was added",
+                            part.name
+                        )));
+                    }
+                    t.partitions.push(part.clone());
+                    t.next_partition_id += 1;
+                    Ok(())
+                })
+            });
+        if added.is_err() {
+            for name in &created {
+                let _ = self.db.drop_table(name);
+            }
+        }
+        added
+    }
+
+    // ALTER TABLE ... DROP PARTITION: the partition and every row in it
+    // are gone from the table. Its trees are left in the store, no longer
+    // referred to by anything: store's drop_table frees a tree's pages at
+    // once, which a scan still reading them (one that opened the table
+    // before this ran) would not survive.
+    pub(crate) fn drop_partition(
+        self: &Arc<Self>,
+        table_name: &str,
+        partition: &str,
+    ) -> Result<(), SchemaError> {
+        self.alter_table(table_name, |t| {
+            if !t.is_partitioned() {
+                return Err(SchemaError::UserError(format!(
+                    "Table {table_name:?} is not partitioned"
+                )));
+            }
+            let Some(i) = t.partitions.iter().position(|p| p.name == partition) else {
+                return Err(SchemaError::UserError(format!(
+                    "Table {table_name:?} has no partition named {partition:?}"
+                )));
+            };
+            if t.partitions.len() == 1 {
+                return Err(SchemaError::UserError(format!(
+                    "cannot drop {partition:?}: it is table {table_name:?}'s only partition"
+                )));
+            }
+            t.partitions.remove(i);
+            Ok(())
+        })
     }
 
     fn alter_table(

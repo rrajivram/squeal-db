@@ -112,7 +112,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         for t in schema.list_tables() {
             let table = schema.get_table(&t).unwrap();
             let tstat = Self::table_data(&table)?;
-            tables.insert(table.db_table_id, tstat);
+            tables.insert(table.id, tstat);
         }
         Self::spawn(schema, tables, sampling_rate)
     }
@@ -161,7 +161,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         for t in schema.list_tables() {
             let table = schema.get_table(&t).unwrap();
             tables
-                .entry(table.db_table_id)
+                .entry(table.id)
                 .or_insert(Self::table_data(&table)?);
         }
         Self::spawn(schema, tables, sampling_rate)
@@ -242,7 +242,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
 
     pub(crate) fn add_table(&self, table: Arc<SqlTable>) -> Result<(), SchemaError> {
         let tstat = Self::table_data(&table)?;
-        self.tables.write().insert(table.db_table_id, tstat);
+        self.tables.write().insert(table.id, tstat);
         Ok(())
     }
 
@@ -255,8 +255,8 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         self.flush();
         let fresh = Self::table_data(table)?;
         let mut tables = self.tables.write();
-        let Some(stored) = tables.get_mut(&table.db_table_id) else {
-            tables.insert(table.db_table_id, fresh);
+        let Some(stored) = tables.get_mut(&table.id) else {
+            tables.insert(table.id, fresh);
             return Ok(());
         };
         let mut old: HashMap<u32, ColumnStatStored> = stored
@@ -317,7 +317,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             col_stats.insert(i, cstat);
         }
         let tstat = TableStatStored {
-            id: table.db_table_id,
+            id: table.id,
             name: table.name.clone(),
             row_count: 0,
             col_stats: RwLock::new(col_stats),
@@ -634,20 +634,18 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
     schema: &str,
     table: &Arc<SqlTable>,
 ) -> Result<Option<ComputedTableStat>, SchemaError> {
-    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.db_table_id)? {
-        let (levels, nodes_per_page, _) = conn
-            .database
-            .read()
-            .db
-            .btree_range_params(table.db_table_id)?;
+    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.id)? {
+        // The shape of the trees (depth, entries per page) is read off the
+        // first partition's: statistics are still kept per table, not per
+        // partition.
+        let first = &table.partitions[0];
+        let (levels, nodes_per_page, _) =
+            conn.database.read().db.btree_range_params(first.rows())?;
         let mut indices = vec![];
-        for index in &table.indices {
+        for (i, index) in table.indices.iter().enumerate() {
             let unique = index.is_primary || index.is_unique;
-            let (levels, nodes_per_page, record_size) = conn
-                .database
-                .read()
-                .db
-                .btree_range_params(index.db_table_id)?;
+            let (levels, nodes_per_page, record_size) =
+                conn.database.read().db.btree_range_params(first.index(i))?;
             indices.push(IndexStat {
                 levels,
                 nodes_per_page,

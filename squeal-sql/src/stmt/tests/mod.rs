@@ -2194,6 +2194,7 @@ mod index_seek;
 mod merge_join;
 mod nested_loop;
 mod ordering;
+mod partition;
 
 #[cfg(test)]
 mod join_tests {

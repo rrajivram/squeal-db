@@ -78,6 +78,15 @@ fn stmt(s: &mut Statement, out: &mut Binder) {
                     }
                 }
             }
+            for def in c
+                .partition_by
+                .iter_mut()
+                .flat_map(|p| p.partitions.items_mut())
+            {
+                for e in def.values.exprs_mut() {
+                    expr(e, out);
+                }
+            }
         }
         // A literal @path only — no expression anywhere in this
         // statement's grammar for a placeholder to appear in.
@@ -87,11 +96,15 @@ fn stmt(s: &mut Statement, out: &mut Binder) {
                 expr(&mut item.expr, out);
             }
         }
-        Statement::AlterTable(a) => {
-            if let AlterTableOp::AddColumn(_, _, col) = &mut a.operation {
-                column_def(col, out);
+        Statement::AlterTable(a) => match &mut a.operation {
+            AlterTableOp::AddColumn(_, _, col) => column_def(col, out),
+            AlterTableOp::AddPartition(_, def) => {
+                for e in def.values.exprs_mut() {
+                    expr(e, out);
+                }
             }
-        }
+            _ => {}
+        },
         Statement::Explain(_, inner) => stmt(inner, out),
         Statement::Prepare(p) => stmt(&mut p.statement, out),
         Statement::Execute(e) => {

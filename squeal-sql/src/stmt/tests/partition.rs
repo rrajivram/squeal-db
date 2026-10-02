@@ -1,0 +1,755 @@
+// Partitioned tables, end to end through SQL: CREATE TABLE ... PARTITION BY,
+// ALTER TABLE ADD/DROP PARTITION, and rows going to (and being read back
+// from) the partition their partition column's value puts them in. What a
+// query reads is every partition, one after the other (source::append):
+// skipping the ones a WHERE rules out is not done yet.
+use store::cursor::Cursor;
+
+use super::*;
+use crate::partition::PartitionBound;
+
+use ValueItem::Integer;
+
+fn rows(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<Vec<ValueItem>> {
+    let mut stmt = c.clone().create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    let mut rows = take_streaming_result(&mut stmt, 0).1;
+    rows.sort();
+    rows
+}
+
+fn ints(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<i64> {
+    rows(c, sql)
+        .into_iter()
+        .map(|r| match r[0] {
+            Integer(n) => n,
+            ref other => panic!("expected an integer, got {other:?}"),
+        })
+        .collect()
+}
+
+fn err(c: &Arc<Connection<MemFile>>, sql: &str) -> String {
+    match run(c, sql) {
+        Ok(()) => panic!("expected an error from: {sql}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn table(c: &Arc<Connection<MemFile>>, name: &str) -> Arc<SqlTable> {
+    c.current_schema().unwrap().get_table(name).unwrap()
+}
+
+// How many rows each partition's own rows tree holds, by partition name.
+fn rows_per_partition(c: &Arc<Connection<MemFile>>, name: &str) -> Vec<(String, usize)> {
+    let t = table(c, name);
+    let db = c.database.read().db.clone();
+    t.partitions
+        .iter()
+        .map(|p| {
+            let mut cursor = db.table_scan(p.rows()).unwrap();
+            let mut n = 0;
+            while cursor.next().unwrap().is_some() {
+                n += 1;
+            }
+            (p.name.clone(), n)
+        })
+        .collect()
+}
+
+fn counts(c: &Arc<Connection<MemFile>>, name: &str) -> Vec<usize> {
+    rows_per_partition(c, name)
+        .into_iter()
+        .map(|p| p.1)
+        .collect()
+}
+
+// events: id, day (the RANGE partition column), three partitions.
+fn range_conn() -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(
+        &c,
+        "create table events (id integer not null, day integer not null, note varchar(10), \
+         primary key(id, day)) \
+         partition by range (day) ( \
+           partition early values less than (10), \
+           partition mid values less than (20), \
+           partition late values less than (30))",
+    )
+    .unwrap();
+    for (id, day) in [(1, 5), (2, 9), (3, 10), (4, 19), (5, 20), (6, 29)] {
+        run(
+            &c,
+            &format!("insert into events values ({id}, {day}, 'n{id}')"),
+        )
+        .unwrap();
+    }
+    c
+}
+
+#[test]
+fn test_a_range_partitioned_table_stores_each_row_in_its_bounds_partition() {
+    let c = range_conn();
+    let t = table(&c, "events");
+    assert!(t.is_partitioned());
+    assert_eq!(
+        t.partitions
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect::<Vec<_>>(),
+        ["early", "mid", "late"]
+    );
+    assert_eq!(t.partitions[1].bound, PartitionBound::LessThan(Integer(20)));
+    // A bound is exclusive: day 10 is mid's, day 20 late's.
+    assert_eq!(counts(&c, "events"), [2, 2, 2]);
+    // Each partition has trees of its own, for its rows and for each index.
+    let mut trees: Vec<_> = t
+        .partitions
+        .iter()
+        .flat_map(|p| [p.rows(), p.index(0)])
+        .collect();
+    trees.sort();
+    trees.dedup();
+    assert_eq!(trees.len(), 6);
+    assert_eq!(ints(&c, "select id from events"), [1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn test_queries_read_every_partition() {
+    let c = range_conn();
+    assert_eq!(
+        ints(&c, "select id from events where day >= 10"),
+        [3, 4, 5, 6]
+    );
+    assert_eq!(ints(&c, "select id from events where note = 'n4'"), [4]);
+    // A primary key lookup seeks each partition's tree.
+    assert_eq!(
+        ints(&c, "select day from events where id = 5 and day = 20"),
+        [20]
+    );
+    assert_eq!(ints(&c, "select count(*) from events"), [6]);
+    assert_eq!(
+        rows(
+            &c,
+            "select day / 10, count(*) from events group by day / 10"
+        ),
+        vec![
+            vec![Integer(0), Integer(2)],
+            vec![Integer(1), Integer(2)],
+            vec![Integer(2), Integer(2)]
+        ]
+    );
+    // ORDER BY sorts: partitions are not read in key order.
+    let mut stmt = c
+        .clone()
+        .create_statement("select id from events order by id desc limit 3")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(
+        take_streaming_result(&mut stmt, 0).1,
+        vec![vec![Integer(6)], vec![Integer(5)], vec![Integer(4)]]
+    );
+    let mut stmt = c
+        .clone()
+        .create_statement("select id from events order by id")
+        .unwrap();
+    stmt.execute().unwrap();
+    assert_eq!(
+        take_streaming_result(&mut stmt, 0).1,
+        (1..=6).map(|n| vec![Integer(n)]).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_explain_shows_each_partition_under_an_append() {
+    let c = range_conn();
+    run(&c, "analyze table events").unwrap();
+    assert_eq!(
+        explain(&c, "select * from events"),
+        "Projection id, day, note\n  Append events (3 partitions) (~6 rows)\n    \
+         TableScan events partition early (< 10)\n    \
+         TableScan events partition mid (< 20)\n    \
+         TableScan events partition late (< 30)"
+    );
+    let plan = explain(&c, "select note from events where id = 5 and day = 20");
+    assert!(plan.contains("Append events (3 partitions)"), "{plan}");
+    assert_eq!(
+        plan.matches("TableSeek events partition").count(),
+        3,
+        "{plan}"
+    );
+}
+
+#[test]
+fn test_joins_with_a_partitioned_table_on_either_side() {
+    let c = range_conn();
+    run(
+        &c,
+        "create table days (day integer not null, label varchar(10), primary key(day))",
+    )
+    .unwrap();
+    for day in [5, 10, 29, 40] {
+        run(&c, &format!("insert into days values ({day}, 'd{day}')")).unwrap();
+    }
+    assert_eq!(
+        ints(&c, "select e.id from events e join days d on e.day = d.day"),
+        [1, 3, 6]
+    );
+    // The partitioned table as the inner side: joined on its key columns,
+    // which a table in one partition would be sought by per outer row.
+    assert_eq!(
+        ints(
+            &c,
+            "select e.id from days d join events e on e.day = d.day where e.id = 3"
+        ),
+        [3]
+    );
+    assert_eq!(
+        rows(
+            &c,
+            "select d.day, e.id from days d left join events e on e.day = d.day"
+        ),
+        vec![
+            vec![Integer(5), Integer(1)],
+            vec![Integer(10), Integer(3)],
+            vec![Integer(29), Integer(6)],
+            vec![Integer(40), ValueItem::Null]
+        ]
+    );
+    assert_eq!(
+        ints(&c, "select e.id from events e, days d where e.day = d.day"),
+        [1, 3, 6]
+    );
+}
+
+#[test]
+fn test_a_value_no_partition_takes_is_an_error_and_null_goes_to_the_first() {
+    let c = range_conn();
+    let e = err(&c, "insert into events values (7, 30, 'x')");
+    assert!(e.contains("no partition for day = 30"), "{e}");
+    assert_eq!(counts(&c, "events"), [2, 2, 2]);
+    // The whole statement fails, its earlier rows included.
+    let e = err(&c, "insert into events values (8, 1, 'x'), (9, 99, 'x')");
+    assert!(e.contains("no partition"), "{e}");
+    assert_eq!(ints(&c, "select count(*) from events"), [6]);
+
+    run(
+        &c,
+        "create table n (id integer not null, k integer) \
+         partition by range (k) (partition a values less than (10), \
+         partition b values less than maxvalue)",
+    )
+    .unwrap();
+    run(
+        &c,
+        "insert into n values (1, null), (2, 5), (3, 10), (4, 1000000)",
+    )
+    .unwrap();
+    assert_eq!(counts(&c, "n"), [2, 2]);
+    assert_eq!(
+        ints(&c, "select id from n where k < 10"),
+        [2],
+        "NULL is not below 10"
+    );
+    assert_eq!(ints(&c, "select count(*) from n"), [4]);
+}
+
+#[test]
+fn test_update_moves_a_row_whose_partition_column_changes() {
+    let c = range_conn();
+    run(&c, "update events set day = 25 where id = 1").unwrap();
+    assert_eq!(counts(&c, "events"), [1, 2, 3]);
+    assert_eq!(ints(&c, "select day from events where id = 1"), [25]);
+    // Within its partition.
+    run(
+        &c,
+        "update events set note = 'changed', day = day + 1 where id = 3",
+    )
+    .unwrap();
+    assert_eq!(counts(&c, "events"), [1, 2, 3]);
+    assert_eq!(
+        ints(&c, "select day from events where note = 'changed'"),
+        [11]
+    );
+    // Every row, each to wherever it now belongs.
+    run(&c, "update events set day = day - 5").unwrap();
+    assert_eq!(ints(&c, "select day from events"), [4, 6, 14, 15, 20, 24]);
+    assert_eq!(counts(&c, "events"), [2, 2, 2]);
+    // To a value no partition takes: nothing changes.
+    let e = err(&c, "update events set day = 30 where id = 2");
+    assert!(e.contains("no partition"), "{e}");
+    assert_eq!(ints(&c, "select day from events where id = 2"), [4]);
+    assert_eq!(counts(&c, "events"), [2, 2, 2]);
+}
+
+#[test]
+fn test_delete_removes_rows_from_their_partitions() {
+    let c = range_conn();
+    run(&c, "delete from events where day >= 19").unwrap();
+    assert_eq!(counts(&c, "events"), [2, 1, 0]);
+    assert_eq!(ints(&c, "select id from events"), [1, 2, 3]);
+    // The key is free again.
+    run(&c, "insert into events values (4, 19, 'again')").unwrap();
+    run(&c, "delete from events").unwrap();
+    assert_eq!(counts(&c, "events"), [0, 0, 0]);
+}
+
+#[test]
+fn test_a_rolled_back_transaction_leaves_every_partition_as_it_was() {
+    let c = range_conn();
+    run(&c, "begin").unwrap();
+    run(
+        &c,
+        "insert into events values (7, 1, 'x'), (8, 15, 'x'), (9, 25, 'x')",
+    )
+    .unwrap();
+    run(&c, "update events set day = 28 where id = 1").unwrap();
+    assert_eq!(ints(&c, "select count(*) from events"), [9]);
+    assert_eq!(ints(&c, "select day from events where id = 1"), [28]);
+    run(&c, "rollback").unwrap();
+    assert_eq!(ints(&c, "select id from events"), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(ints(&c, "select day from events where id = 1"), [5]);
+    assert_eq!(counts(&c, "events"), [2, 2, 2]);
+}
+
+#[test]
+fn test_keys_are_unique_across_partitions_because_they_include_the_partition_column() {
+    let c = range_conn();
+    let e = err(&c, "insert into events values (1, 5, 'dup')");
+    assert!(e.to_lowercase().contains("duplicate"), "{e}");
+    // The same id on another day is a different key.
+    run(&c, "insert into events values (1, 15, 'ok')").unwrap();
+    assert_eq!(ints(&c, "select day from events where id = 1"), [5, 15]);
+
+    // A key that leaves the partition column out could repeat in another
+    // partition unnoticed: refused.
+    let e = err(
+        &c,
+        "create table bad (id integer not null, day integer not null, primary key(id)) \
+         partition by range (day) (partition p values less than (10))",
+    );
+    assert!(e.contains("PRIMARY KEY must include that column"), "{e}");
+    let e = err(
+        &c,
+        "create table bad (id integer not null, day integer not null, code integer not null, \
+         primary key(id, day), unique(code)) \
+         partition by range (day) (partition p values less than (10))",
+    );
+    assert!(e.contains("must include that column"), "{e}");
+    let e = err(&c, "create unique index u on events (id)");
+    assert!(e.contains("must include that column"), "{e}");
+    run(&c, "create unique index u on events (day, id)").unwrap();
+}
+
+#[test]
+fn test_an_index_on_a_partitioned_table_is_built_and_kept_per_partition() {
+    let c = range_conn();
+    run(&c, "create index by_note on events (note)").unwrap();
+    let t = table(&c, "events");
+    let index = t
+        .indices
+        .iter()
+        .position(|i| i.name.as_deref() == Some("by_note"))
+        .unwrap();
+    let db = c.database.read().db.clone();
+    let entries = |t: &SqlTable| -> Vec<usize> {
+        t.partitions
+            .iter()
+            .map(|p| {
+                let mut cursor = db.table_scan(p.index(index)).unwrap();
+                let mut n = 0;
+                while cursor.next().unwrap().is_some() {
+                    n += 1;
+                }
+                n
+            })
+            .collect()
+    };
+    assert_eq!(
+        entries(&t),
+        [2, 2, 2],
+        "backfilled from each partition's rows"
+    );
+    run(&c, "insert into events values (7, 12, 'n7')").unwrap();
+    run(&c, "update events set day = 29 where id = 1").unwrap();
+    run(&c, "delete from events where id = 2").unwrap();
+    assert_eq!(entries(&t), [0, 3, 3]);
+    run(&c, "analyze table events").unwrap();
+    assert_eq!(ints(&c, "select id from events where note = 'n7'"), [7]);
+    assert_eq!(ints(&c, "select day from events where note = 'n1'"), [29]);
+}
+
+// regions: id, region (the LIST partition column).
+fn list_conn(default: bool) -> Arc<Connection<MemFile>> {
+    let c = conn();
+    run(
+        &c,
+        &format!(
+            "create table regions (id integer not null, region varchar(8), amount integer) \
+             partition by list (region) ( \
+               partition west values in ('ca', 'or', 'wa'), \
+               partition east values in ('ny', 'ma'){})",
+            if default {
+                ", partition other default"
+            } else {
+                ""
+            }
+        ),
+    )
+    .unwrap();
+    c
+}
+
+#[test]
+fn test_a_list_partitioned_table_routes_listed_values_and_the_rest_to_default() {
+    let c = list_conn(true);
+    run(
+        &c,
+        "insert into regions values (1, 'ca', 10), (2, 'ny', 20), (3, 'wa', 30), \
+         (4, 'tx', 40), (5, null, 50)",
+    )
+    .unwrap();
+    assert_eq!(
+        rows_per_partition(&c, "regions"),
+        [
+            ("west".to_string(), 2),
+            ("east".to_string(), 1),
+            ("other".to_string(), 2)
+        ]
+    );
+    assert_eq!(ints(&c, "select id from regions where region = 'wa'"), [3]);
+    assert_eq!(ints(&c, "select sum(amount) from regions"), [150]);
+    run(&c, "update regions set region = 'ma' where id = 4").unwrap();
+    assert_eq!(counts(&c, "regions"), [2, 2, 1]);
+
+    // With no DEFAULT partition, an unlisted value (NULL included) has
+    // nowhere to go.
+    let c = list_conn(false);
+    let e = err(&c, "insert into regions values (4, 'tx', 40)");
+    assert!(e.contains("no partition for region = tx"), "{e}");
+    let e = err(&c, "insert into regions values (5, null, 50)");
+    assert!(e.contains("no partition"), "{e}");
+    run(&c, "insert into regions values (1, 'or', 10)").unwrap();
+    assert_eq!(counts(&c, "regions"), [1, 0]);
+}
+
+#[test]
+fn test_create_table_rejects_partitions_that_do_not_split_the_values() {
+    let c = conn();
+    let cols = "create table t (id integer not null, k integer, s varchar(4), b bytea)";
+    for (clause, wants) in [
+        (
+            "partition by range (nope) (partition a values less than (1))",
+            "no column named",
+        ),
+        (
+            "partition by range (b) (partition a values less than (1))",
+            "cannot be partitioned by",
+        ),
+        (
+            "partition by range (k) (partition a values less than (10), \
+             partition b values less than (10))",
+            "must be above",
+        ),
+        (
+            "partition by range (k) (partition a values less than maxvalue, \
+             partition b values less than (10))",
+            "must be above",
+        ),
+        (
+            "partition by range (k) (partition a values less than (1), \
+             partition A values less than (2))",
+            "duplicate partition name",
+        ),
+        (
+            "partition by range (k) (partition a values in (1))",
+            "VALUES LESS THAN",
+        ),
+        (
+            "partition by range (k) (partition a values less than ('x'))",
+            "",
+        ),
+        (
+            "partition by range (k) (partition a values less than (null))",
+            "cannot be NULL",
+        ),
+        (
+            "partition by list (k) (partition a values less than (1))",
+            "VALUES IN or DEFAULT",
+        ),
+        (
+            "partition by list (k) (partition a values in (1, 2), partition b values in (2))",
+            "more than one partition",
+        ),
+        (
+            "partition by list (k) (partition a default, partition b default)",
+            "only one DEFAULT",
+        ),
+    ] {
+        let e = err(&c, &format!("{cols} {clause}"));
+        assert!(e.contains(wants), "{clause}: {e}");
+        assert!(
+            c.current_schema().unwrap().get_table("t").is_none(),
+            "{clause}: nothing was created"
+        );
+    }
+    // A partitioned temp table is refused.
+    let e = err(
+        &c,
+        "create table temp.t (k integer) partition by range (k) \
+         (partition a values less than (1))",
+    );
+    assert!(e.contains("PARTITION BY"), "{e}");
+}
+
+// Statements differing only in literals share one parse (sql_parser's
+// shape cache), with each statement's own literals bound back in: a
+// partition's bounds are such literals.
+#[test]
+fn test_partition_bounds_are_each_statements_own_literals() {
+    let c = conn();
+    for (name, bound) in [("a", 10), ("b", 500)] {
+        run(
+            &c,
+            &format!(
+                "create table {name} (k integer) partition by range (k) \
+                 (partition p values less than ({bound}))"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            table(&c, name).partitions[0].bound,
+            PartitionBound::LessThan(Integer(bound))
+        );
+    }
+    run(&c, "alter table a add partition q values less than (20)").unwrap();
+    run(&c, "alter table b add partition q values less than (600)").unwrap();
+    assert_eq!(
+        table(&c, "a").partitions[1].bound,
+        PartitionBound::LessThan(Integer(20))
+    );
+    assert_eq!(
+        table(&c, "b").partitions[1].bound,
+        PartitionBound::LessThan(Integer(600))
+    );
+}
+
+#[test]
+fn test_add_partition_extends_a_range_above_its_highest_bound() {
+    let c = range_conn();
+    run(&c, "create index by_note on events (note)").unwrap();
+    for (sql, wants) in [
+        (
+            "alter table events add partition x values less than (30)",
+            "must be above",
+        ),
+        (
+            "alter table events add partition x values less than (15)",
+            "must be above",
+        ),
+        (
+            "alter table events add partition late values less than (40)",
+            "duplicate partition",
+        ),
+        (
+            "alter table events add partition x values in (40)",
+            "VALUES LESS THAN",
+        ),
+        (
+            "alter table events add partition x default",
+            "VALUES LESS THAN",
+        ),
+    ] {
+        let e = err(&c, sql);
+        assert!(e.contains(wants), "{sql}: {e}");
+    }
+    assert_eq!(table(&c, "events").partitions.len(), 3);
+
+    run(
+        &c,
+        "alter table events add partition later values less than (40)",
+    )
+    .unwrap();
+    run(&c, "insert into events values (7, 30, 'n7'), (8, 39, 'n8')").unwrap();
+    assert_eq!(counts(&c, "events"), [2, 2, 2, 2]);
+    assert_eq!(ints(&c, "select id from events where day >= 30"), [7, 8]);
+    // The new partition has a tree for every index the table has.
+    let t = table(&c, "events");
+    assert_ne!(t.partitions[3].index(1), store::table::TableIdType::none());
+    assert_ne!(t.partitions[3].index(1), t.partitions[2].index(1));
+
+    run(
+        &c,
+        "alter table events add partition rest values less than maxvalue",
+    )
+    .unwrap();
+    run(&c, "insert into events values (9, 1000, 'n9')").unwrap();
+    let e = err(
+        &c,
+        "alter table events add partition beyond values less than (5000)",
+    );
+    assert!(e.contains("MAXVALUE can only be the last"), "{e}");
+    assert_eq!(counts(&c, "events"), [2, 2, 2, 2, 1]);
+
+    run(&c, "create table plain (k integer)").unwrap();
+    let e = err(&c, "alter table plain add partition p values less than (1)");
+    assert!(e.contains("is not partitioned"), "{e}");
+}
+
+#[test]
+fn test_add_partition_to_a_list_takes_only_values_nothing_else_holds() {
+    let c = list_conn(true);
+    run(
+        &c,
+        "insert into regions values (1, 'tx', 10), (2, 'ca', 20)",
+    )
+    .unwrap();
+    let e = err(&c, "alter table regions add partition dup values in ('ny')");
+    assert!(e.contains("more than one partition"), "{e}");
+    let e = err(&c, "alter table regions add partition two default");
+    assert!(e.contains("only one DEFAULT"), "{e}");
+    // Rows with the value are already in the DEFAULT partition.
+    let e = err(
+        &c,
+        "alter table regions add partition south values in ('fl', 'tx')",
+    );
+    assert!(e.contains("already holds rows with region = tx"), "{e}");
+    assert_eq!(table(&c, "regions").partitions.len(), 3);
+
+    run(
+        &c,
+        "alter table regions add partition south values in ('fl', 'ga')",
+    )
+    .unwrap();
+    run(&c, "insert into regions values (3, 'fl', 30)").unwrap();
+    assert_eq!(
+        rows_per_partition(&c, "regions"),
+        [
+            ("west".to_string(), 1),
+            ("east".to_string(), 0),
+            ("other".to_string(), 1),
+            ("south".to_string(), 1)
+        ]
+    );
+}
+
+#[test]
+fn test_drop_partition_removes_it_and_its_rows() {
+    let c = range_conn();
+    run(&c, "alter table events drop partition mid").unwrap();
+    assert_eq!(ints(&c, "select id from events"), [1, 2, 5, 6]);
+    assert_eq!(
+        rows_per_partition(&c, "events"),
+        [("early".to_string(), 2), ("late".to_string(), 2)]
+    );
+    // What was mid's range is now late's: everything below 30 and not
+    // below early's bound.
+    run(&c, "insert into events values (7, 15, 'n7')").unwrap();
+    assert_eq!(counts(&c, "events"), [2, 3]);
+
+    let e = err(&c, "alter table events drop partition nope");
+    assert!(e.contains("no partition named"), "{e}");
+    run(&c, "alter table events drop partition LATE").unwrap();
+    assert_eq!(ints(&c, "select id from events"), [1, 2]);
+    let e = err(&c, "insert into events values (8, 15, 'n8')");
+    assert!(e.contains("no partition"), "{e}");
+    let e = err(&c, "alter table events drop partition early");
+    assert!(e.contains("only partition"), "{e}");
+
+    // A partition added under a dropped one's name is a new, empty one.
+    run(
+        &c,
+        "alter table events add partition mid values less than (20)",
+    )
+    .unwrap();
+    assert_eq!(counts(&c, "events"), [2, 0]);
+    run(&c, "insert into events values (3, 10, 'back')").unwrap();
+    assert_eq!(ints(&c, "select id from events"), [1, 2, 3]);
+
+    run(&c, "create table plain (k integer)").unwrap();
+    let e = err(&c, "alter table plain drop partition p");
+    assert!(e.contains("is not partitioned"), "{e}");
+}
+
+#[test]
+fn test_the_partition_column_cannot_be_dropped_but_other_columns_alter_as_usual() {
+    let c = list_conn(true);
+    run(
+        &c,
+        "insert into regions values (1, 'ca', 10), (2, 'tx', 20)",
+    )
+    .unwrap();
+    let e = err(&c, "alter table regions drop column region");
+    assert!(e.contains("is partitioned by"), "{e}");
+    run(&c, "alter table regions drop column amount").unwrap();
+    run(
+        &c,
+        "alter table regions add column note varchar(4) default 'x'",
+    )
+    .unwrap();
+    // Renamed, it is still the partition column (by field id).
+    run(&c, "alter table regions rename column region to area").unwrap();
+    run(
+        &c,
+        "insert into regions values (3, 'ny', 'y'), (4, 'zz', 'z')",
+    )
+    .unwrap();
+    assert_eq!(counts(&c, "regions"), [1, 1, 2]);
+    assert_eq!(ints(&c, "select id from regions where note = 'x'"), [1, 2]);
+    assert_eq!(ints(&c, "select id from regions where area = 'ny'"), [3]);
+}
+
+#[test]
+fn test_a_foreign_key_finds_its_row_in_whichever_partition_holds_it() {
+    let c = conn();
+    run(
+        &c,
+        "create table parents (pid integer not null, primary key(pid)) \
+         partition by range (pid) (partition a values less than (10), \
+         partition b values less than (20))",
+    )
+    .unwrap();
+    run(&c, "insert into parents values (1), (15)").unwrap();
+    run(
+        &c,
+        "create table kids (id integer not null, parent integer references parents(pid))",
+    )
+    .unwrap();
+    run(&c, "insert into kids values (1, 1), (2, 15), (3, null)").unwrap();
+    let e = err(&c, "insert into kids values (4, 7)");
+    assert!(e.contains("violates foreign key"), "{e}");
+
+    run(
+        &c,
+        "create table more (id integer not null, parent integer)",
+    )
+    .unwrap();
+    run(&c, "insert into more values (1, 15)").unwrap();
+    run(
+        &c,
+        "alter table more add foreign key (parent) references parents(pid)",
+    )
+    .unwrap();
+    run(&c, "insert into more values (2, 16)").unwrap_err();
+}
+
+#[test]
+fn test_analyze_counts_the_rows_of_every_partition() {
+    let c = range_conn();
+    run(&c, "analyze table events").unwrap();
+    let schema = c.current_schema().unwrap();
+    let stat = schema
+        .clone()
+        .get_table_stats(table(&c, "events").id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stat.row_count, 6);
+    // The table's statistics stay its own when the partition they were
+    // first keyed by is dropped.
+    run(&c, "alter table events drop partition early").unwrap();
+    run(&c, "analyze table events").unwrap();
+    let stat = schema
+        .get_table_stats(table(&c, "events").id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stat.row_count, 4);
+}

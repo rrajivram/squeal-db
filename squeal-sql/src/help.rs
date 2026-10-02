@@ -86,6 +86,18 @@ pub const SQL_HELP: &[HelpSection] = &[
                 "(plus common aliases: INT, INT64, REAL, STRING, ...)",
             ),
             (
+                "CREATE TABLE t (...) PARTITION BY RANGE (col) (PARTITION p VALUES LESS THAN (v) | MAXVALUE, ...)",
+                "store rows in partitions by col's value: each holds what is below its bound",
+            ),
+            (
+                "CREATE TABLE t (...) PARTITION BY LIST (col) (PARTITION p VALUES IN (v, ...) | DEFAULT, ...)",
+                "each partition holds the values it lists; DEFAULT takes the rest",
+            ),
+            (
+                "ALTER TABLE t ADD PARTITION p VALUES ... | DROP PARTITION p",
+                "add an empty partition; drop one and its rows",
+            ),
+            (
                 "CREATE TABLE [IF NOT EXISTS] t AS COPY FROM @path",
                 "infer columns/types from a CSV's first rows, create t, load every row",
             ),

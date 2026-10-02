@@ -9,6 +9,7 @@ pub mod error;
 pub mod help;
 pub(crate) mod numeric;
 pub mod optim;
+pub mod partition;
 pub mod plan;
 pub mod rslt;
 pub mod schema_ops;

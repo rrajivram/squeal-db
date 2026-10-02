@@ -318,9 +318,15 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    let mut source: Box<dyn crate::source::Source> = Box::new(
-        crate::source::table::TableSource::new(schema.db.clone(), table.clone(), txn, None)?,
-    );
+    let mut source = crate::source::append::over_partitions(table, None, |part| {
+        Ok(Box::new(crate::source::table::TableSource::new(
+            schema.db.clone(),
+            table.clone(),
+            part,
+            txn,
+            None,
+        )?) as Box<dyn crate::source::Source>)
+    })?;
     if let Some(expr) = where_expr {
         source = Box::new(crate::source::where_source::WhereSource::new(source, expr)?);
     }
@@ -755,6 +761,12 @@ where
                         AlterColumnOp::DropForeignKey(name) => {
                             schema.drop_foreign_key(table_name, &name)?
                         }
+                        AlterColumnOp::AddPartition(def) => {
+                            schema.add_partition(table_name, &def)?
+                        }
+                        AlterColumnOp::DropPartition(name) => {
+                            schema.drop_partition(table_name, &name)?
+                        }
                     }
                     self.results.push(Some(ResultType::ResultString(format!(
                         "Table {table_name:?} altered"
@@ -1011,6 +1023,11 @@ fn validate_create_table(c: &sql_parser::ddl::CreateTable) -> Result<(), SchemaE
     validate_table_name(&c.name.to_dotted())?;
 
     let parts: Vec<&str> = c.name.idents().map(|i| i.value.as_str()).collect();
+    if temp::temp_table_name(&parts).is_some() && c.partition_by.is_some() {
+        return Err(SchemaError::UserError(
+            "CREATE TABLE temp.<table> doesn't support PARTITION BY".into(),
+        ));
+    }
     if temp::temp_table_name(&parts).is_some() && c.constraints().next().is_some() {
         return Err(SchemaError::UserError(
             "CREATE TABLE temp.<table> doesn't support constraints (PRIMARY KEY/UNIQUE/FOREIGN \
@@ -1222,6 +1239,8 @@ enum AlterColumnOp {
     Rename(String, String),
     AddForeignKey(crate::table::SqlForeignKey),
     DropForeignKey(String),
+    AddPartition(Box<sql_parser::ddl::PartitionDef>),
+    DropPartition(String),
 }
 
 // Deliberately strict, same spirit as parse_select_star: accepts exactly
@@ -1240,7 +1259,8 @@ fn parse_alter_table(
     let unsupported = |what: &str| {
         Err(SchemaError::UserError(format!(
             "ALTER TABLE only supports a single ADD COLUMN / DROP COLUMN / RENAME COLUMN / \
-             ADD FOREIGN KEY / DROP CONSTRAINT right now — {what} is not supported yet"
+             ADD FOREIGN KEY / DROP CONSTRAINT / ADD PARTITION / DROP PARTITION right now — \
+             {what} is not supported yet"
         )))
     };
     let table_name = alter.name.clone();
@@ -1265,6 +1285,13 @@ fn parse_alter_table(
         },
         AlterTableOp::DropConstraint(_, _, name) => {
             AlterColumnOp::DropForeignKey(name.value.to_lowercase())
+        }
+        AlterTableOp::AddPartition(_, def) => {
+            crate::table::partition_name(def)?;
+            AlterColumnOp::AddPartition(Box::new(def.clone()))
+        }
+        AlterTableOp::DropPartition(_, _, name) => {
+            AlterColumnOp::DropPartition(name.value.to_lowercase())
         }
         AlterTableOp::RenameTo(..) => return unsupported("RENAME TABLE"),
     };

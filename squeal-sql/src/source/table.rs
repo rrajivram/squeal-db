@@ -26,6 +26,8 @@ pub struct TableSource<F: DBFile> {
     // and its estimated row count; None for a full scan.
     seek: Option<(String, Option<usize>)>,
     table: Arc<SqlTable>,
+    // Which of the table's partitions this reads.
+    part: usize,
     fields: Arc<[ProjectableField]>,
     next_time: u128,
     stats: Option<ComputedTableStat>,
@@ -65,11 +67,13 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    /// The rows of `table` within `ranges` of its PRIMARY KEY (see
-    /// optim::picker::AccessPath::TableSeek), expected to be `rows` many.
+    /// The rows of `table`'s partition `part` within `ranges` of its PRIMARY
+    /// KEY (see optim::picker::AccessPath::TableSeek), expected to be `rows`
+    /// many.
     pub(crate) fn seek(
         db: Arc<Db<F>>,
         table: Arc<SqlTable>,
+        part: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
         ranges: Vec<KeyRange>,
@@ -80,11 +84,12 @@ where
             .map(|pk| pk.fields.iter().map(|f| f.name.clone()).collect())
             .unwrap_or_default();
         let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
-        let cursor = db.key_ranges_scan(table.db_table_id, txn.map(|t| t.id()), ranges)?;
+        let cursor =
+            db.key_ranges_scan(table.partitions[part].rows(), txn.map(|t| t.id()), ranges)?;
         // Built around the seek's own cursor: opening a scan only to replace
         // it cost every primary key lookup a copy of the table's first data
         // page (TableCursor reads a page whole when it starts).
-        let mut source = Self::over(RowCursor::Seek(cursor), table, stats);
+        let mut source = Self::over(RowCursor::Seek(cursor), table, part, stats);
         source.seek = Some((seek, rows));
         Ok(source)
     }
@@ -109,20 +114,41 @@ where
     // Connection::with_current_txn's closure outlive the closure itself;
     // reset() below doesn't need it back either, since TableCursor
     // already remembers its own transaction internally.
+    //
+    // Reads every row of the table's partition `part`.
     pub(crate) fn new(
         db: Arc<Db<F>>,
         table: Arc<SqlTable>,
+        part: usize,
         txn: Option<&Transaction>,
         stats: Option<ComputedTableStat>,
     ) -> Result<Self, SchemaError> {
+        let rows = table.partitions[part].rows();
         let cursor = match txn {
-            Some(txn) => db.table_scan_in_txn(table.db_table_id, txn)?,
-            None => db.table_scan(table.db_table_id)?,
+            Some(txn) => db.table_scan_in_txn(rows, txn)?,
+            None => db.table_scan(rows)?,
         };
-        Ok(Self::over(RowCursor::Scan(cursor), table, stats))
+        Ok(Self::over(RowCursor::Scan(cursor), table, part, stats))
     }
 
-    fn over(cursor: RowCursor<F>, table: Arc<SqlTable>, stats: Option<ComputedTableStat>) -> Self {
+    // What EXPLAIN calls what this reads: the table, and which partition of
+    // it when it has several.
+    fn label(&self) -> String {
+        partition_label(&self.table, self.part)
+    }
+
+    // Row estimates are for the whole table: shown on the step reading all
+    // of its partitions (AppendSource), not on each partition's.
+    fn shown_rows(&self, rows: Option<usize>) -> Option<usize> {
+        rows.filter(|_| !self.table.is_partitioned())
+    }
+
+    fn over(
+        cursor: RowCursor<F>,
+        table: Arc<SqlTable>,
+        part: usize,
+        stats: Option<ComputedTableStat>,
+    ) -> Self {
         let fields = table
             .fields()
             .iter()
@@ -134,11 +160,25 @@ where
             cursor,
             seek: None,
             table,
+            part,
             fields,
             next_time: 0,
             stats,
             last_id: None,
         }
+    }
+}
+
+// The table's name, and its partition's when the table is partitioned.
+pub(crate) fn partition_label(table: &SqlTable, part: usize) -> String {
+    if table.is_partitioned() {
+        format!(
+            "{} partition {}",
+            table.name,
+            table.partitions[part].describe()
+        )
+    } else {
+        table.name.clone()
     }
 }
 
@@ -151,18 +191,14 @@ where
         match &self.seek {
             // All of it, read through its key for the order.
             Some((seek, rows)) if seek.is_empty() => PlanNode::new("TableScan")
-                .detail(format!(
-                    "{} (in {} order)",
-                    self.table.name,
-                    self.key_names()
-                ))
-                .rows(*rows),
+                .detail(format!("{} (in {} order)", self.label(), self.key_names()))
+                .rows(self.shown_rows(*rows)),
             Some((seek, rows)) => PlanNode::new("TableSeek")
-                .detail(format!("{} ({seek})", self.table.name))
-                .rows(*rows),
+                .detail(format!("{} ({seek})", self.label()))
+                .rows(self.shown_rows(*rows)),
             None => PlanNode::new("TableScan")
-                .detail(self.table.name.clone())
-                .rows(self.stats.as_ref().map(|s| s.table_stat.row_count)),
+                .detail(self.label())
+                .rows(self.shown_rows(self.stats.as_ref().map(|s| s.table_stat.row_count))),
         }
     }
 

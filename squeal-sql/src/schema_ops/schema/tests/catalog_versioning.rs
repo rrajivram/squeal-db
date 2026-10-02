@@ -80,7 +80,8 @@ fn test_the_catalog_row_body_shape_is_byte_stable() {
     // copy of the old shape being kept.
     let legacy = unhex(LEGACY_RICH_ROW_HEX);
     let t = SqlTable::decode_catalog_row(&legacy).unwrap();
-    assert_eq!(postcard::to_allocvec(&t).unwrap(), legacy);
+    let v1 = crate::table::SqlTableV1Shape::from_table(&t);
+    assert_eq!(postcard::to_allocvec(&v1).unwrap(), legacy);
 }
 
 #[test]
@@ -92,8 +93,9 @@ fn test_new_catalog_rows_are_enveloped_and_round_trip() {
     let back = SqlTable::decode_catalog_row(&row).unwrap();
     assert_eq!(back.name, "rich");
     assert_eq!(back.versions.len(), t.versions.len());
-    assert_eq!(back.db_table_id, t.db_table_id);
-    // The body is byte-for-byte what a legacy row holds.
+    assert_eq!(back.rows_tree(), t.rows_tree());
+    assert_eq!(back.partitions, t.partitions);
+    // The body is the live shape's own postcard.
     assert_eq!(&row[3..], &postcard::to_allocvec(&*t).unwrap()[..]);
 }
 
@@ -158,7 +160,12 @@ fn test_schema_loads_a_legacy_catalog_row_and_upgrades_it_on_flush() {
     let tx = s.db.begin().unwrap();
     s.db.update(
         s.sys_table_id,
-        Tuple::new_with(key(), &postcard::to_allocvec(&*table).unwrap(), Some(tx.id()), None),
+        Tuple::new_with(
+            key(),
+            &postcard::to_allocvec(&crate::table::SqlTableV1Shape::from_table(&table)).unwrap(),
+            Some(tx.id()),
+            None,
+        ),
         &tx,
     )
     .unwrap();
@@ -168,18 +175,150 @@ fn test_schema_loads_a_legacy_catalog_row_and_upgrades_it_on_flush() {
     let s2 = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone()).unwrap();
     let loaded = s2.get_table("users").expect("a legacy catalog row must still load");
     assert_eq!(loaded.name, "users");
-    assert_eq!(loaded.db_table_id, table.db_table_id);
+    assert_eq!(loaded.rows_tree(), table.rows_tree());
+    assert_eq!(loaded.id, table.id);
     assert_eq!(loaded.fields().len(), 1);
 
     s2.flush_metadata().unwrap();
     assert_eq!(raw_first_byte(&s2), 0x00, "flush rewrites the row in the envelope");
     let s3 = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone()).unwrap();
-    assert_eq!(s3.get_table("users").unwrap().db_table_id, table.db_table_id);
+    assert_eq!(s3.get_table("users").unwrap().rows_tree(), table.rows_tree());
 
     for schema in [&s2, &s3] {
         schema.persist_and_shutdown_stats().unwrap();
     }
     drop((s, s2, s3, table));
+    db.close().unwrap();
+    NamedMemFile::delete(&path);
+}
+
+// Version 2: the same pinning for the shape partitions introduced. A table
+// with everything version 2 added: a LIST partitioning with a DEFAULT, a
+// string and a NULL among its values, an index (so each partition has an
+// index tree), and a partition added later (so ids are not just positions).
+fn partitioned_table_sql() -> [&'static str; 3] {
+    [
+        "create table parted (id integer not null, region varchar(4) not null, n integer, \
+         primary key(id, region)) \
+         partition by list (region) (partition west values in ('ca', 'wa'), \
+         partition nulls values in (null), partition tmp values in ('zz'), \
+         partition other default)",
+        "alter table parted drop partition tmp",
+        "alter table parted add partition east values in ('ny')",
+    ]
+}
+
+// Captured from `partitioned_table_sql` at the commit that introduced
+// version 2: the body of its catalog row (after the 3-byte envelope).
+// DO NOT edit; it is the proof that version-2 catalogs still load.
+const V2_PARTITIONED_BODY_HEX: &str =
+    "067061727465640103000269640000000106726567696f6e0304000002016e00\
+     01000100010102000269640000000106726567696f6e03040000000303010101\
+     040004776573740302040263610404027761040003010401056e756c6c730301\
+     000005010603056f74686572040009010a040465617374030104026e7904000b\
+     010c05";
+
+fn build_partitioned_table() -> Arc<SqlTable> {
+    let c = conn();
+    for sql in partitioned_table_sql() {
+        execute(&c, sql).unwrap();
+    }
+    c.current_schema().unwrap().get_table("parted").unwrap()
+}
+
+#[test]
+fn test_the_version_2_catalog_row_fixture_decodes_and_its_shape_is_byte_stable() {
+    use crate::partition::{PartitionBound, PartitionKind};
+    let mut row = vec![0x00, 2, 0];
+    row.extend_from_slice(&unhex(V2_PARTITIONED_BODY_HEX));
+    let t = SqlTable::decode_catalog_row(&row).unwrap();
+    assert_eq!(t.name, "parted");
+    assert_eq!(t.partitioning.as_ref().unwrap().kind, PartitionKind::List);
+    assert_eq!(t.partition_column().unwrap().1.name, "region");
+    let parts: Vec<(&str, u32)> = t.partitions.iter().map(|p| (p.name.as_str(), p.id)).collect();
+    assert_eq!(parts, [("west", 0), ("nulls", 1), ("other", 3), ("east", 4)]);
+    assert_eq!(t.next_partition_id, 5);
+    assert_eq!(
+        t.partitions[0].bound,
+        PartitionBound::In(vec![
+            ValueItem::Str(("ca".into(), 4)),
+            ValueItem::Str(("wa".into(), 4))
+        ])
+    );
+    assert_eq!(t.partitions[1].bound, PartitionBound::In(vec![ValueItem::Null]));
+    assert_eq!(t.partitions[2].bound, PartitionBound::Default);
+    assert_eq!(t.id, t.partitions[0].rows(), "keyed by its first partition's rows tree");
+    for p in &t.partitions {
+        assert_ne!(p.rows(), store::table::TableIdType::none());
+        assert_ne!(p.index(0), store::table::TableIdType::none());
+    }
+    // Re-encoding reproduces the captured bytes exactly.
+    assert_eq!(t.encode_catalog_row().unwrap(), row);
+    // And it is what the same statements produce today.
+    assert_eq!(build_partitioned_table().encode_catalog_row().unwrap(), row);
+}
+
+// The real loader, end to end: a partitioned table, its partitions' trees
+// and the rows in them are all there after loading the schema from disk
+// with no clean close.
+#[test]
+fn test_a_partitioned_table_loads_from_disk_with_its_partitions_and_rows() {
+    let path = temp_schema_path("partitioned_table_durable");
+    NamedMemFile::delete(&path);
+    let db = Database::<NamedMemFile>::create(path.clone()).unwrap();
+    let s = db.get_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    create_table_directly(
+        &s,
+        "create table p (id integer not null, k integer not null, primary key(id, k)) \
+         partition by range (k) (partition a values less than (10), \
+         partition b values less than (20))",
+    );
+    let int = ValueItem::Integer;
+    s.insert_rows("p", vec![vec![int(1), int(5)], vec![int(2), int(15)]], None)
+        .unwrap();
+    let stmt = sql_parser::parse_sql("alter table p add partition c values less than (30)")
+        .unwrap()
+        .remove(0);
+    let sql_parser::Statement::AlterTable(alter) = stmt else {
+        panic!("expected ALTER TABLE");
+    };
+    let sql_parser::ddl::AlterTableOp::AddPartition(_, def) = &alter.operation else {
+        panic!("expected ADD PARTITION");
+    };
+    s.add_partition("p", def).unwrap();
+    s.insert_rows("p", vec![vec![int(3), int(25)]], None).unwrap();
+
+    let reloaded = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone())
+        .unwrap();
+    let live = s.get_table("p").unwrap();
+    let disk = reloaded.get_table("p").unwrap();
+    assert_eq!(disk.partitioning, live.partitioning);
+    assert_eq!(disk.partitions, live.partitions);
+    assert_eq!(disk.partitions.len(), 3);
+    assert_eq!(disk.id, live.id);
+    assert_eq!(disk.next_partition_id, 3);
+    let mut rows = reloaded.select_all("p", None).unwrap().rows().to_vec();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![vec![int(1), int(5)], vec![int(2), int(15)], vec![int(3), int(25)]]
+    );
+    // And it still routes: a row for the added partition goes into it.
+    reloaded.insert_rows("p", vec![vec![int(4), int(29)]], None).unwrap();
+    let mut cursor = reloaded.db.table_scan(disk.partitions[2].rows()).unwrap();
+    let mut n = 0;
+    {
+        use store::cursor::Cursor;
+        while cursor.next().unwrap().is_some() {
+            n += 1;
+        }
+    }
+    assert_eq!(n, 2);
+
+    for schema in [&s, &reloaded] {
+        schema.persist_and_shutdown_stats().unwrap();
+    }
+    drop((s, reloaded, live, disk, cursor));
     db.close().unwrap();
     NamedMemFile::delete(&path);
 }

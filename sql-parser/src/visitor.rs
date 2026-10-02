@@ -216,6 +216,11 @@ fn visit_create_table<V: Visitor>(c: &CreateTable, v: &mut V) -> ControlFlow<V::
             TableElement::Constraint(con) => visit_table_constraint(con, v)?,
         }
     }
+    for def in c.partition_by.iter().flat_map(|p| p.partitions.items()) {
+        for e in def.values.exprs() {
+            walk!(v, *e);
+        }
+    }
     ControlFlow::Continue(())
 }
 
@@ -269,7 +274,13 @@ fn visit_alter_table<V: Visitor>(a: &AlterTable, v: &mut V) -> ControlFlow<V::Br
     match &a.operation {
         AlterTableOp::AddColumn(_, _, col) => visit_column_def(col, v)?,
         AlterTableOp::AddConstraint(_, con) => visit_table_constraint(con, v)?,
-        AlterTableOp::DropColumn(..)
+        AlterTableOp::AddPartition(_, def) => {
+            for e in def.values.exprs() {
+                walk!(v, *e);
+            }
+        }
+        AlterTableOp::DropPartition(..)
+        | AlterTableOp::DropColumn(..)
         | AlterTableOp::RenameTo(..)
         | AlterTableOp::RenameColumn(..)
         | AlterTableOp::DropConstraint(..) => {}

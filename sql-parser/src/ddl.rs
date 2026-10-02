@@ -27,7 +27,86 @@ pub struct CreateTable {
     pub lparen: LeftParenthesis,
     pub elements: Seq<TableElement, Comma>,
     pub rparen: RightParenthesis,
+    pub partition_by: Option<PartitionBy>,
 }
+
+/// `PARTITION BY RANGE|LIST (column) (PARTITION name <values>, ...)` — the
+/// partitions are listed in the statement itself (MySQL's form), one
+/// column only.
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct PartitionBy {
+    pub partition: kw::Partition,
+    pub by: kw::By,
+    pub kind: Either<kw::Range, kw::List>,
+    pub lparen: LeftParenthesis,
+    pub column: Ident,
+    pub rparen: RightParenthesis,
+    pub defs_lparen: LeftParenthesis,
+    pub partitions: Seq<PartitionDef, Comma>,
+    pub defs_rparen: RightParenthesis,
+}
+
+/// `PARTITION name <values>`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct PartitionDef {
+    pub partition: kw::Partition,
+    pub name: Ident,
+    pub values: PartitionValues,
+}
+
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub enum PartitionValues {
+    /// `VALUES LESS THAN MAXVALUE` / `VALUES LESS THAN (MAXVALUE)` — before
+    /// the expression form, which would read MAXVALUE as a column name.
+    LessThanMax(kw::Values, kw::Less, kw::Than, kw::Maxvalue),
+    LessThanMaxParen(
+        kw::Values,
+        kw::Less,
+        kw::Than,
+        LeftParenthesis,
+        kw::Maxvalue,
+        RightParenthesis,
+    ),
+    /// `VALUES LESS THAN (expr)` — a RANGE partition's exclusive upper bound.
+    LessThan(
+        kw::Values,
+        kw::Less,
+        kw::Than,
+        LeftParenthesis,
+        Expr,
+        RightParenthesis,
+    ),
+    /// `VALUES IN (expr, ...)` — a LIST partition's values.
+    In(
+        kw::Values,
+        kw::In,
+        LeftParenthesis,
+        Seq<Expr, Comma>,
+        RightParenthesis,
+    ),
+    /// `DEFAULT` — the LIST partition for every value no other one lists.
+    Default(kw::Default),
+}
+
+impl PartitionValues {
+    /// The bound's expressions, for visitors and parameter binding.
+    pub fn exprs(&self) -> Vec<&Expr> {
+        match self {
+            PartitionValues::LessThan(_, _, _, _, e, _) => vec![e],
+            PartitionValues::In(_, _, _, exprs, _) => exprs.items().collect(),
+            _ => vec![],
+        }
+    }
+
+    pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
+        match self {
+            PartitionValues::LessThan(_, _, _, _, e, _) => vec![e],
+            PartitionValues::In(_, _, _, exprs, _) => exprs.items_mut().collect(),
+            _ => vec![],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct ShowTables {
     pub show: kw::Show,
@@ -174,6 +253,12 @@ pub struct AlterTable {
 
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub enum AlterTableOp {
+    /// `ADD PARTITION name <values>` / `DROP PARTITION name` — before the
+    /// column forms, whose optional COLUMN keyword would otherwise let them
+    /// read `partition` as a column name. (A column actually named
+    /// `partition` needs the COLUMN keyword here.)
+    AddPartition(kw::Add, PartitionDef),
+    DropPartition(kw::Drop, kw::Partition, Ident),
     AddColumn(kw::Add, Option<kw::Column>, ColumnDef),
     DropColumn(kw::Drop, Option<kw::Column>, Ident),
     RenameTo(kw::Rename, kw::To, ObjectName),

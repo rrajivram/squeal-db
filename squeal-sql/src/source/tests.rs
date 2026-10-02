@@ -86,7 +86,7 @@ mod direct {
 
         let table = c.current_schema().unwrap().get_table("t").unwrap();
         let db = c.database.read().db.clone();
-        let mut source = TableSource::new(db, table, None, None).unwrap();
+        let mut source = TableSource::new(db, table, 0, None, None).unwrap();
 
         let names: Vec<String> = source
             .fields()
@@ -117,7 +117,7 @@ mod direct {
         run(&c, "create table t (id integer not null, primary key(id))").unwrap();
         let table = c.current_schema().unwrap().get_table("t").unwrap();
         let db = c.database.read().db.clone();
-        let mut source = TableSource::new(db, table, None, None).unwrap();
+        let mut source = TableSource::new(db, table, 0, None, None).unwrap();
         assert_eq!(drain(&mut source), Vec::<Vec<ValueItem>>::new());
     }
 

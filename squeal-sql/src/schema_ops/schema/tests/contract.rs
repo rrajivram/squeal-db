@@ -145,8 +145,8 @@ fn test_schema_state_survives_close_and_reopen() {
     // paths (the SqlTable metadata row vs. store's own table registry)
     // that both need to survive.
     assert_eq!(after.indices.len(), 2);
-    assert_eq!(before.indices[0].db_table_id, after.indices[0].db_table_id);
-    assert_eq!(before.indices[1].db_table_id, after.indices[1].db_table_id);
+    assert_eq!(before.index_tree(0), after.index_tree(0));
+    assert_eq!(before.index_tree(1), after.index_tree(1));
     assert!(s2.db.table_id_by_name("default.users0").unwrap().is_some());
     assert!(s2.db.table_id_by_name("default.users1").unwrap().is_some());
 
@@ -313,7 +313,7 @@ fn test_index_backing_table_naming() {
             let found = s.db.table_id_by_name(backing_name).unwrap();
             assert_eq!(
                 found,
-                Some(t.indices[i].db_table_id),
+                Some(t.index_tree(i)),
                 "backing table {backing_name:?} for `{}`",
                 c.sql
             );
@@ -475,15 +475,15 @@ fn test_a_created_table_is_durable_with_its_real_store_ids_before_any_clean_clos
         let live = s.get_table(name).unwrap();
         let disk = reloaded.get_table(name).unwrap();
         assert_ne!(
-            disk.db_table_id,
+            disk.rows_tree(),
             store::table::TableIdType::none(),
             "{name}: row-storage id must not be the placeholder"
         );
-        assert_eq!(disk.db_table_id, live.db_table_id, "{name}");
+        assert_eq!(disk.rows_tree(), live.rows_tree(), "{name}");
         assert_eq!(disk.indices.len(), live.indices.len(), "{name}");
-        for (d, l) in disk.indices.iter().zip(&live.indices) {
-            assert_ne!(d.db_table_id, store::table::TableIdType::none(), "{name} index");
-            assert_eq!(d.db_table_id, l.db_table_id, "{name} index");
+        for i in 0..disk.indices.len() {
+            assert_ne!(disk.index_tree(i), store::table::TableIdType::none(), "{name} index");
+            assert_eq!(disk.index_tree(i), live.index_tree(i), "{name} index");
         }
     }
 
@@ -491,10 +491,10 @@ fn test_a_created_table_is_durable_with_its_real_store_ids_before_any_clean_clos
     s.create_index("no_pk", "idx_v".into(), &["v".to_string()], false).unwrap();
     let reloaded2 = Schema::<NamedMemFile>::load(DEFAULT_SCHEMA_NAME.to_string(), s.db.clone())
         .unwrap();
-    let live_idx = &s.get_table("no_pk").unwrap().indices[0];
-    let disk_idx = &reloaded2.get_table("no_pk").unwrap().indices[0];
-    assert_ne!(disk_idx.db_table_id, store::table::TableIdType::none());
-    assert_eq!(disk_idx.db_table_id, live_idx.db_table_id);
+    let live_idx = s.get_table("no_pk").unwrap().index_tree(0);
+    let disk_idx = reloaded2.get_table("no_pk").unwrap().index_tree(0);
+    assert_ne!(disk_idx, store::table::TableIdType::none());
+    assert_eq!(disk_idx, live_idx);
 
     for schema in [&s, &reloaded, &reloaded2] {
         schema.persist_and_shutdown_stats().unwrap();

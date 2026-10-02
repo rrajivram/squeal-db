@@ -36,6 +36,7 @@ use crate::{
     source::{
         ProjectableField, Source,
         aggr::AggregatingSource,
+        append::over_partitions,
         column_names,
         group::GroupSource,
         index::IndexSource,
@@ -154,8 +155,12 @@ where
         stats: Option<ComputedTableStat>,
         txn: Option<&Transaction>,
     ) -> Result<Box<dyn Source>, SchemaError> {
-        let ts = TableSource::new(conn.database.read().db.clone(), self.clone(), txn, stats)?;
-        Ok(Box::new(ts) as Box<dyn Source>)
+        let db = conn.database.read().db.clone();
+        let rows = stats.as_ref().map(|s| s.table_stat.row_count);
+        over_partitions(self, rows, |part| {
+            let ts = TableSource::new(db.clone(), self.clone(), part, txn, stats.clone())?;
+            Ok(Box::new(ts) as Box<dyn Source>)
+        })
     }
 }
 
@@ -1683,6 +1688,11 @@ where
         else {
             return Ok(None);
         };
+        // A seek reads one tree per outer row; a table in several
+        // partitions has one per partition.
+        if table.partitions.len() != 1 {
+            return Ok(None);
+        }
         let Some(reader) = self
             .conn
             .with_current_txn(|explicit| explicit.or(self.stmt_txn.as_ref()).map(|t| t.id()))
@@ -1778,52 +1788,52 @@ where
             return Ok((self.open(&item.resolved, item.stats.clone())?, None));
         };
         let db = self.conn.database.read().db.clone();
-        let access = pick_access(
+        // Several partitions are read one after the other, each through
+        // the same path: whatever order a path gives holds within one
+        // partition only, so no order is asked for and none is promised.
+        let one_partition = table.partitions.len() == 1;
+        let mut access = pick_access(
             table,
             item.stats.as_ref(),
             needs,
             db.get_page_data_size(),
-            order,
+            order.filter(|_| one_partition),
         );
+        access.sorted &= one_partition;
         let stats = item.stats.clone();
         let chosen = access.clone();
         let source = self.conn.with_current_txn(|explicit| {
             let txn = explicit.or(self.stmt_txn.as_ref());
-            let source: Box<dyn Source> = match access.path {
-                AccessPath::TableScan => return item.resolved.open_source(&self.conn, stats, txn),
-                AccessPath::TableSeek(range) => Box::new(TableSource::seek(
-                    db,
-                    table.clone(),
-                    txn,
-                    stats,
-                    range,
-                    access.rows,
-                )?),
-                AccessPath::IndexScan(i) => {
-                    Box::new(IndexSource::new(&self.conn, table, i, txn, stats)?)
-                }
-                AccessPath::IndexSeek(i, range) => Box::new(IndexSource::seek(
-                    &self.conn,
-                    table,
-                    i,
-                    txn,
-                    stats,
-                    range,
-                    false,
-                    access.rows,
-                )?),
-                AccessPath::IndexLookup(i, range) => Box::new(IndexSource::seek(
-                    &self.conn,
-                    table,
-                    i,
-                    txn,
-                    stats,
-                    range,
-                    true,
-                    access.rows,
-                )?),
-            };
-            Ok(source)
+            let rows = access.rows;
+            let path = &access.path;
+            if let AccessPath::TableScan = path {
+                return item.resolved.open_source(&self.conn, stats, txn);
+            }
+            over_partitions(table, rows, |part| {
+                let stats = stats.clone();
+                let source: Box<dyn Source> = match path.clone() {
+                    AccessPath::TableScan => unreachable!("opened above"),
+                    AccessPath::TableSeek(range) => Box::new(TableSource::seek(
+                        db.clone(),
+                        table.clone(),
+                        part,
+                        txn,
+                        stats,
+                        range,
+                        rows,
+                    )?),
+                    AccessPath::IndexScan(i) => {
+                        Box::new(IndexSource::new(&self.conn, table, part, i, txn, stats)?)
+                    }
+                    AccessPath::IndexSeek(i, range) => Box::new(IndexSource::seek(
+                        &self.conn, table, part, i, txn, stats, range, false, rows,
+                    )?),
+                    AccessPath::IndexLookup(i, range) => Box::new(IndexSource::seek(
+                        &self.conn, table, part, i, txn, stats, range, true, rows,
+                    )?),
+                };
+                Ok(source)
+            })
         })?;
         Ok((source, Some(chosen)))
     }
