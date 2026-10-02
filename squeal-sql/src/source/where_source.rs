@@ -82,6 +82,11 @@ impl Source for WhereSource {
         Ok(())
     }
 
+    // A filter keeps its input's row layout: the hint applies as it is.
+    fn keep_matching(&mut self, column: usize, values: &[ValueItem]) {
+        self.source.keep_matching(column, values)
+    }
+
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let this_stats = vec![(
             "WhereSource".to_string(),

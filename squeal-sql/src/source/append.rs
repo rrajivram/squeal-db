@@ -37,6 +37,9 @@ pub(crate) struct AppendSource {
     refill: Option<usize>,
     // Expected rows over the partitions read.
     rows: Option<usize>,
+    // Per source: left unread, as no row it holds can be wanted (see
+    // keep_matching).
+    skip: Vec<bool>,
 }
 
 impl AppendSource {
@@ -64,6 +67,7 @@ impl AppendSource {
             current: 0,
             refill: None,
             rows,
+            skip: vec![],
         }
     }
 
@@ -91,8 +95,12 @@ impl AppendSource {
         match (self.heads.as_mut(), self.refill.take()) {
             (None, _) => {
                 let mut heads = Vec::with_capacity(self.sources.len());
-                for s in &mut self.sources {
-                    heads.push(s.next()?);
+                for (i, s) in self.sources.iter_mut().enumerate() {
+                    heads.push(if self.skip.get(i) == Some(&true) {
+                        None
+                    } else {
+                        s.next()?
+                    });
                 }
                 self.heads = Some(heads);
             }
@@ -153,11 +161,9 @@ pub(crate) fn over_partitions(
 // NULLs, below every bound, are in the first partition, so they must come
 // first too (or there must be none).
 fn in_bound_order(table: &SqlTable, order: &[(usize, bool)]) -> bool {
-    let (Some(by), Some((column, field)), Some((first, nulls_first))) = (
-        &table.partitioning,
-        table.partition_column(),
-        order.first(),
-    ) else {
+    let (Some(by), Some((column, field)), Some((first, nulls_first))) =
+        (&table.partitioning, table.partition_column(), order.first())
+    else {
         return false;
     };
     by.kind == crate::partition::PartitionKind::Range
@@ -172,6 +178,7 @@ pub(crate) fn all_partitions(table: &SqlTable) -> Vec<usize> {
 
 impl Source for AppendSource {
     fn plan(&self) -> PlanNode {
+        let skipped = self.skip.iter().filter(|s| **s).count();
         let how = if self.order.is_some() {
             "MergeAppend"
         } else {
@@ -183,6 +190,13 @@ impl Source for AppendSource {
             format!("{} ({total} partitions)", self.table.name)
         } else {
             format!("{} ({read} of {total} partitions)", self.table.name)
+        };
+        // Only after a run (EXPLAIN builds no hash table): how many were
+        // left unread for a join's keys.
+        let detail = if skipped > 0 {
+            format!("{detail}, {skipped} skipped for the join's keys")
+        } else {
+            detail
         };
         PlanNode::new(how)
             .detail(detail)
@@ -199,6 +213,10 @@ impl Source for AppendSource {
             return self.next_merged(&order);
         }
         while let Some(source) = self.sources.get_mut(self.current) {
+            if self.skip.get(self.current) == Some(&true) {
+                self.current += 1;
+                continue;
+            }
             if let Some(row) = source.next()? {
                 return Ok(Some(row));
             }
@@ -219,11 +237,36 @@ impl Source for AppendSource {
         self.current = 0;
         self.heads = None;
         self.refill = None;
+        self.skip.clear();
         Ok(())
     }
 
     fn table_stats(&self) -> Option<ComputedTableStat> {
         self.sources.first()?.table_stats()
+    }
+
+    // Only on the partition column: the partitions none of `values` routes
+    // to are left unread.
+    fn keep_matching(&mut self, column: usize, values: &[ValueItem]) {
+        let (Some(by), Some((pc, field))) =
+            (&self.table.partitioning, self.table.partition_column())
+        else {
+            return;
+        };
+        if pc != column {
+            return;
+        }
+        let wanted: Vec<usize> = values
+            .iter()
+            .flat_map(|v| crate::plan::sarg::equal_points(field.datatype, v).unwrap_or_default())
+            .filter_map(|v| by.route(&self.table.partitions, &v))
+            .collect();
+        if self.skip.is_empty() {
+            self.skip = vec![false; self.parts.len()];
+        }
+        for (skip, p) in self.skip.iter_mut().zip(&self.parts) {
+            *skip |= !wanted.contains(p);
+        }
     }
 
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {

@@ -94,6 +94,14 @@ pub trait Source: Debug + Send {
     fn table_stats(&self) -> Option<ComputedTableStat> {
         None
     }
+    // A hint that only rows whose `column` equals (by `=`) one of `values`
+    // will be wanted: a source that can skip whole parts of its input
+    // without reading them (a partitioned table's partitions) may, and the
+    // rows it then leaves out are only ones that match none. Called before
+    // the source is read; several calls (one per column of a join key)
+    // narrow it together, and a reset forgets them all. Doing nothing is
+    // always correct.
+    fn keep_matching(&mut self, _column: usize, _values: &[store::valueitem::ValueItem]) {}
     // What EXPLAIN shows for this step and (through its own children) the
     // steps feeding it. The default is a bare leaf named by Debug; every
     // real operator overrides it.

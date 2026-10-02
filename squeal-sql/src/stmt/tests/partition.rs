@@ -1092,3 +1092,58 @@ fn test_a_pruned_reads_column_statistics_are_narrowed_to_its_partitions() {
     let day = &late.table_stat.col_stats[&1];
     assert_eq!((day.min.clone(), day.max.clone()), (Integer(10), Integer(29)));
 }
+
+// A hash join whose probe side is a partitioned table joined on its
+// partition column reads only the partitions holding one of the build
+// side's keys — the rows, the same either way.
+#[test]
+fn test_a_hash_join_reads_only_the_probe_partitions_its_keys_route_to() {
+    use crate::source::Source;
+    let c = seek_conn();
+    // On big.id (the partition column), from few (5, 1500, 2999, 7000).
+    let sql = "select f.n, b.k from few f join big b on b.id = f.n";
+    assert_eq!(
+        rows(&c, sql),
+        vec![
+            vec![Integer(5), Integer(5)],
+            vec![Integer(1500), Integer(0)],
+            vec![Integer(2999), Integer(49)]
+        ]
+    );
+    // The append source itself: told keys 5 and 2999, it reads b0 and b2.
+    let table = table(&c, "big");
+    let db = c.database.read().db.clone();
+    let mut append = crate::source::append::over_partitions(&table, &[0, 1, 2], None, None, |p| {
+        Ok(Box::new(crate::source::table::TableSource::new(
+            db.clone(),
+            table.clone(),
+            p,
+            None,
+            None,
+        )?) as Box<dyn Source>)
+    })
+    .unwrap();
+    append.keep_matching(0, &[Integer(5), Integer(2999), Integer(99999)]);
+    let mut n = 0;
+    while append.next().unwrap().is_some() {
+        n += 1;
+    }
+    assert_eq!(n, 2000, "b0 and b2, 1000 rows each");
+    assert!(append.plan().detail.contains("1 skipped for the join's keys"));
+    // A reset forgets it; a hint on another column skips nothing; hints
+    // narrow together.
+    append.reset().unwrap();
+    append.keep_matching(1, &[Integer(5)]);
+    let count = |a: &mut Box<dyn Source>| {
+        let mut n = 0;
+        while a.next().unwrap().is_some() {
+            n += 1;
+        }
+        n
+    };
+    assert_eq!(count(&mut append), 3000);
+    append.reset().unwrap();
+    append.keep_matching(0, &[Integer(5), Integer(1500)]);
+    append.keep_matching(0, &[Integer(1500), Integer(2999)]);
+    assert_eq!(count(&mut append), 1000, "only b1 has a key both allow");
+}

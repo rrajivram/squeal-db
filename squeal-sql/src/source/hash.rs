@@ -12,7 +12,7 @@ use store::{
     db::{DBFile, Db},
     run::Run,
     table::TableIdType,
-    valueitem::IndexKey,
+    valueitem::{IndexKey, ValueItem},
 };
 
 use crate::{
@@ -759,13 +759,43 @@ impl<F: DBFile + 'static> HashedSource<F> {
     fn build_left(&mut self) -> Result<(), SchemaError> {
         let mut row = self.sources[0].next()?;
         let start = Instant::now();
+        // The build side's key values, per key column, while few: the probe
+        // side needs no row matching none of them (see Source::
+        // keep_matching) — unless the join keeps its unmatched rows.
+        let mut keys: Vec<Option<std::collections::BTreeSet<ValueItem>>> =
+            if self.matcher.keeps_unmatched_right() {
+                vec![]
+            } else {
+                vec![Some(Default::default()); self.left_fields.len()]
+            };
         while let Some(r) = row {
+            for (k, column) in keys.iter_mut().zip(&self.left_fields) {
+                if let Some(set) = k {
+                    if !matches!(r[*column], ValueItem::Null) {
+                        set.insert(r[*column].clone());
+                    }
+                    if set.len() > Self::KEEP_MATCHING_MAX_KEYS {
+                        *k = None;
+                    }
+                }
+            }
             self.insert_left(r)?;
             row = self.sources[0].next()?;
+        }
+        for (k, column) in keys.into_iter().zip(self.right_fields.clone()) {
+            if let Some(set) = k {
+                let values: Vec<ValueItem> = set.into_iter().collect();
+                self.sources[1].keep_matching(column, &values);
+            }
         }
         self.left_time += start.elapsed().as_nanos();
         Ok(())
     }
+
+    // How many distinct build-side key values are handed to the probe side
+    // at most (see build_left): past that, skipping parts of it is unlikely
+    // to pay for routing every value.
+    const KEEP_MATCHING_MAX_KEYS: usize = 1024;
 
     // LEFT/FULL only: once the right source is exhausted, every
     // occupied-but-never-matched slot (per `matched`) still owes an
@@ -1703,6 +1733,63 @@ mod tests {
         // Triggers the lazy build_left phase in full (see next()'s own
         // doc comment).
         let _ = source.next().unwrap();
+    }
+
+    // --- the probe side told the build side's keys ---
+
+    // Records what keep_matching hands it.
+    #[derive(Debug)]
+    struct Recording(Box<dyn Source>, Arc<parking_lot::Mutex<Vec<(usize, Vec<ValueItem>)>>>);
+
+    impl Source for Recording {
+        fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+            self.0.next()
+        }
+        fn fields(&self) -> Arc<[ProjectableField]> {
+            self.0.fields()
+        }
+        fn reset(&mut self) -> Result<(), SchemaError> {
+            self.0.reset()
+        }
+        fn keep_matching(&mut self, column: usize, values: &[ValueItem]) {
+            self.1.lock().push((column, values.to_vec()));
+        }
+    }
+
+    #[test]
+    fn test_the_probe_side_is_told_the_build_sides_keys_unless_its_rows_are_kept() {
+        let told = |join_type: JoinType, left: Vec<Vec<ValueItem>>| {
+            let calls = Arc::new(parking_lot::Mutex::new(vec![]));
+            let mut join = HashedSource::new(
+                Box::new(VecSource::new(&["id", "val"], left)),
+                Box::new(Recording(right_source(), calls.clone())),
+                make_db(),
+                QueryMemory::new(1024 * 1024),
+                &[0],
+                &[0],
+                join_type,
+            )
+            .unwrap();
+            drain(&mut join);
+            let calls = calls.lock().clone();
+            calls
+        };
+        let int = ValueItem::Integer;
+        // Distinct, sorted, NULL left out: it matches nothing.
+        let mut left = left_rows();
+        left.push(vec![int(2), int(1)]);
+        left.push(vec![ValueItem::Null, int(1)]);
+        assert_eq!(
+            told(JoinType::Inner, left.clone()),
+            vec![(0, vec![int(1), int(2), int(3)])]
+        );
+        assert_eq!(told(JoinType::Left, left.clone()).len(), 1);
+        // The probe side's unmatched rows are wanted too: no hint.
+        assert!(told(JoinType::Right, left.clone()).is_empty());
+        assert!(told(JoinType::Full, left).is_empty());
+        // Too many keys to be worth it.
+        let many = (0..2000).map(|i| vec![int(i), int(i)]).collect();
+        assert!(told(JoinType::Inner, many).is_empty());
     }
 
     // --- build-side selection by table stats ---
