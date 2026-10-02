@@ -36,6 +36,7 @@ use crate::{
     source::{
         ProjectableField, Source,
         aggr::AggregatingSource,
+        column_names,
         group::GroupSource,
         index::IndexSource,
         join::{JoinSource, JoinType, UnionJoin},
@@ -766,7 +767,15 @@ where
                 hidden += 1;
             }
         }
-        let has_aggregation = projected_fields.iter().any(|f| f.expr.has_aggregate());
+        // HAVING reads the raw rows, like the SELECT list (see GroupSource).
+        let having = match &select.having {
+            Some(h) => Some(*EvalExpr::from_expr(&h.expr, &flat_tables)?),
+            None => None,
+        };
+        // HAVING filters groups, so it makes the query a grouped one even
+        // with no aggregate in the SELECT list.
+        let has_aggregation =
+            having.is_some() || projected_fields.iter().any(|f| f.expr.has_aggregate());
         let projected_field_count = projected_fields.len();
 
         let wh_expr = if let Some(wh) = &select.where_clause {
@@ -802,6 +811,7 @@ where
             .iter()
             .map(|f| &f.expr)
             .chain(&group_by)
+            .chain(&having)
             .collect();
         let needs = analyze_query(&tables, &flat_tables, &shapes, &reads, wh_expr.as_ref());
         // The order ORDER BY wants, when one table's key could provide it:
@@ -1137,6 +1147,20 @@ where
         let projected: Box<dyn Source> = if has_aggregation {
             let key_positions =
                 self.validate_aggreations(&projected_fields, &flat_tables, &select.group_by)?;
+            // Outside an aggregate, HAVING can only read GROUP BY's columns:
+            // any other has no single value for the group.
+            if let Some(having) = &having {
+                let names = column_names(&for_proj.fields());
+                if let Some(pos) = having
+                    .get_non_agg_fields()
+                    .into_iter()
+                    .find(|pos| !key_positions.contains(pos))
+                {
+                    return Err(SchemaError::GroupByMissingField(
+                        names.get(pos).cloned().unwrap_or_else(|| format!("#{pos}")),
+                    ));
+                }
+            }
             // Rows already grouped: a merge join's output, in key order.
             let already_grouped = merged_order.as_ref().is_some_and(|m| {
                 m.gives_group(&WantedOrder {
@@ -1154,11 +1178,11 @@ where
                     &key_positions,
                 )?)
             };
-            Box::new(GroupSource::new(
-                grouped_source,
-                projected_fields.clone(),
-                key_positions,
-            ))
+            let group = GroupSource::new(grouped_source, projected_fields.clone(), key_positions);
+            Box::new(match having {
+                Some(having) => group.with_having(having),
+                None => group,
+            })
         } else {
             Box::new(Projection::new(for_proj, projected_fields.clone()))
         };

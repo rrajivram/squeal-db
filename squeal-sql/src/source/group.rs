@@ -6,7 +6,7 @@ use store::valueitem::{IndexKey, ValueItem};
 
 use crate::{
     error::SchemaError,
-    plan::funcs::FuncTrait,
+    plan::{eval::EvalExpr, funcs::FuncTrait},
     source::{ProjectableField, QueryStats, Source, merge_stats},
 };
 
@@ -37,6 +37,9 @@ pub(crate) struct GroupSource {
     source: Box<dyn Source>,
     fields: Vec<ProjectableField>,
     key_positions: Vec<usize>,
+    // HAVING: read over the raw rows like the SELECT list (its aggregates
+    // accumulate alongside), and a group is output only when it is true.
+    having: Option<EvalExpr>,
     // The next raw row to start a new group with, and its own group key
     // — already pulled from `source` while scanning ahead to find the
     // end of the *previous* group, so it can't be pulled again.
@@ -57,12 +60,18 @@ impl GroupSource {
             source,
             fields,
             key_positions,
+            having: None,
             pending: None,
             started: false,
             done: false,
             time_spent: 0,
             eval_time: 0,
         }
+    }
+
+    pub(crate) fn with_having(mut self, having: EvalExpr) -> Self {
+        self.having = Some(having);
+        self
     }
 
     fn key_of(&self, row: &IndexKey) -> Vec<ValueItem> {
@@ -72,6 +81,11 @@ impl GroupSource {
     fn reset_aggregates(&mut self) -> Result<(), SchemaError> {
         for f in &mut self.fields {
             for func in &mut f.expr.get_funcs() {
+                func.reset()?;
+            }
+        }
+        if let Some(having) = &mut self.having {
+            for func in &mut having.get_funcs() {
                 func.reset()?;
             }
         }
@@ -85,15 +99,33 @@ impl GroupSource {
     // guaranteed to already agree, so re-evaluating them costs a little
     // but changes nothing). Only the *last* call's return value for a
     // given group is ever actually used — see `next()`.
-    fn eval_row(&mut self, row: &IndexKey) -> Result<IndexKey, SchemaError> {
+    //
+    // HAVING is evaluated the same way; the second value is whether the
+    // group passes it, as of this row.
+    fn eval_row(&mut self, row: &IndexKey) -> Result<(IndexKey, bool), SchemaError> {
         let start = Instant::now();
         let data = [row.clone()];
         let mut out = vec![];
         for (i, f) in self.fields.iter_mut().enumerate() {
             out.push(f.expr.eval(&data, i)?);
         }
+        let keep = match &mut self.having {
+            Some(having) => Self::is_true(having.eval(&data, 0)?)?,
+            None => true,
+        };
         self.eval_time += start.elapsed().as_nanos();
-        Ok(IndexKey::new_from_owned(out)?)
+        Ok((IndexKey::new_from_owned(out)?, keep))
+    }
+
+    // A NULL HAVING is "not true", as in WHERE: the group is left out.
+    fn is_true(v: ValueItem) -> Result<bool, SchemaError> {
+        match v {
+            ValueItem::Boolean(b) => Ok(b),
+            ValueItem::Null => Ok(false),
+            _ => Err(SchemaError::InternalSchemaError(
+                "Output of having is not boolean.".into(),
+            )),
+        }
     }
 
     // The one output row a grand-total aggregate (no GROUP BY at all)
@@ -105,14 +137,67 @@ impl GroupSource {
     // logical.rs) guarantees such a field has no live column references
     // when key_positions is empty (no GROUP BY to source one from), so
     // it's safe to evaluate it directly against an empty row.
-    fn empty_group_row(&mut self) -> Result<IndexKey, SchemaError> {
+    //
+    // None when HAVING rejects that group (`HAVING count(*) > 0`).
+    fn empty_group_row(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
         let mut out = vec![];
         for f in &self.fields {
             out.push(f.expr.eval_empty_group()?);
         }
+        let keep = match &self.having {
+            Some(having) => Self::is_true(having.eval_empty_group()?)?,
+            None => true,
+        };
         self.eval_time += start.elapsed().as_nanos();
-        Ok(IndexKey::new_from_owned(out)?)
+        Ok(if keep {
+            Some(IndexKey::new_from_owned(out)?)
+        } else {
+            None
+        })
+    }
+
+    // The next group's output row and whether it passes HAVING; None once
+    // the input is exhausted.
+    fn next_group(&mut self) -> Result<Option<(IndexKey, bool)>, SchemaError> {
+        let first_row = if let Some((row, _key)) = self.pending.take() {
+            Some(row)
+        } else {
+            self.source.next()?
+        };
+
+        let Some(mut current) = first_row else {
+            self.done = true;
+            if !self.started && self.key_positions.is_empty() {
+                self.reset_aggregates()?;
+                return Ok(self.empty_group_row()?.map(|row| (row, true)));
+            }
+            return Ok(None);
+        };
+
+        self.started = true;
+        let current_key = self.key_of(&current);
+        self.reset_aggregates()?;
+
+        let mut last_evaluated = self.eval_row(&current)?;
+        loop {
+            match self.source.next()? {
+                Some(next_row) => {
+                    let next_key = self.key_of(&next_row);
+                    if next_key == current_key {
+                        current = next_row;
+                        last_evaluated = self.eval_row(&current)?;
+                    } else {
+                        self.pending = Some((next_row, next_key));
+                        return Ok(Some(last_evaluated));
+                    }
+                }
+                None => {
+                    self.done = true;
+                    return Ok(Some(last_evaluated));
+                }
+            }
+        }
     }
 }
 
@@ -125,6 +210,10 @@ impl Source for GroupSource {
             .map(|f| output_label(f, &names))
             .collect::<Vec<_>>()
             .join(", ");
+        let outputs = match &self.having {
+            Some(having) => format!("{outputs} having {}", having.describe(&names)),
+            None => outputs,
+        };
         if self.key_positions.is_empty() {
             PlanNode::new("Aggregate")
                 .detail(outputs)
@@ -148,51 +237,20 @@ impl Source for GroupSource {
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
-        if self.done {
-            return Ok(None);
-        }
-
-        let first_row = if let Some((row, _key)) = self.pending.take() {
-            Some(row)
-        } else {
-            self.source.next()?
-        };
-
-        let Some(mut current) = first_row else {
-            self.done = true;
-            if !self.started && self.key_positions.is_empty() {
-                self.reset_aggregates()?;
-                self.time_spent += start.elapsed().as_nanos();
-                return Ok(Some(self.empty_group_row()?));
-            }
-            return Ok(None);
-        };
-
-        self.started = true;
-        let current_key = self.key_of(&current);
-        self.reset_aggregates()?;
-
-        let mut last_evaluated = self.eval_row(&current)?;
-        loop {
-            match self.source.next()? {
-                Some(next_row) => {
-                    let next_key = self.key_of(&next_row);
-                    if next_key == current_key {
-                        current = next_row;
-                        last_evaluated = self.eval_row(&current)?;
-                    } else {
-                        self.pending = Some((next_row, next_key));
-                        self.time_spent += start.elapsed().as_nanos();
-                        return Ok(Some(last_evaluated));
-                    }
+        let mut out = None;
+        while !self.done {
+            match self.next_group()? {
+                Some((row, true)) => {
+                    out = Some(row);
+                    break;
                 }
-                None => {
-                    self.done = true;
-                    self.time_spent += start.elapsed().as_nanos();
-                    return Ok(Some(last_evaluated));
-                }
+                // A group HAVING rejects: on to the next one.
+                Some((_, false)) => continue,
+                None => break,
             }
         }
+        self.time_spent += start.elapsed().as_nanos();
+        Ok(out)
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {

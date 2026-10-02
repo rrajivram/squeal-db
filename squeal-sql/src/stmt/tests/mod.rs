@@ -2871,6 +2871,121 @@ fn test_explain_shows_sort_topn_limit() {
     );
 }
 
+// Runs a SELECT over subquery_conn's tables and returns its rows.
+fn having_rows(sql: &str) -> Vec<Vec<ValueItem>> {
+    let c = subquery_conn();
+    let mut stmt = c.create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    take_streaming_result(&mut stmt, 0).1
+}
+
+// t1's cat 0 has three rows (ids 1, 3, 5) and cat 1 two (ids 2, 4).
+#[test]
+fn test_having_keeps_only_the_groups_it_is_true_for() {
+    use ValueItem::Integer;
+    assert_eq!(
+        having_rows("select cat, count(*) from t1 group by cat having count(*) > 2"),
+        vec![vec![Integer(0), Integer(3)]]
+    );
+    // An aggregate the SELECT list doesn't have.
+    assert_eq!(
+        having_rows("select cat from t1 group by cat having sum(id) = 6"),
+        vec![vec![Integer(1)]]
+    );
+    // A GROUP BY column, and one combined with an aggregate.
+    assert_eq!(
+        having_rows("select cat, count(*) from t1 group by cat having cat = 1"),
+        vec![vec![Integer(1), Integer(2)]]
+    );
+    assert_eq!(
+        having_rows("select cat, count(*) from t1 group by cat having cat = 1 or count(*) = 3"),
+        vec![vec![Integer(0), Integer(3)], vec![Integer(1), Integer(2)]]
+    );
+    assert_eq!(
+        having_rows("select cat, count(*) from t1 group by cat having count(*) > 5"),
+        Vec::<Vec<ValueItem>>::new()
+    );
+}
+
+// WHERE filters rows before they are grouped, HAVING the groups after; and
+// ORDER BY / LIMIT see only the groups HAVING kept.
+#[test]
+fn test_having_runs_after_where_and_before_order_by_and_limit() {
+    use ValueItem::Integer;
+    assert_eq!(
+        having_rows("select cat, count(*) from t1 where id > 1 group by cat having count(*) >= 2"),
+        vec![vec![Integer(0), Integer(2)], vec![Integer(1), Integer(2)]]
+    );
+    assert_eq!(
+        having_rows(
+            "select cat, count(*) as n from t1 group by cat having count(*) >= 2 \
+             order by cat desc limit 1"
+        ),
+        vec![vec![Integer(1), Integer(2)]]
+    );
+    // Over a join.
+    assert_eq!(
+        having_rows(
+            "select t1.cat, sum(t2.val) from t1 join t2 on t1.id = t2.id \
+             group by t1.cat having sum(t2.val) > 40"
+        ),
+        vec![vec![Integer(1), Integer(60)]]
+    );
+}
+
+// With no GROUP BY the whole table is one group, which HAVING keeps or
+// drops — including the one an empty table still produces.
+#[test]
+fn test_having_without_group_by_filters_the_single_group() {
+    use ValueItem::Integer;
+    assert_eq!(
+        having_rows("select count(*) from t1 having count(*) > 3"),
+        vec![vec![Integer(5)]]
+    );
+    assert_eq!(
+        having_rows("select count(*) from t1 having count(*) > 5"),
+        Vec::<Vec<ValueItem>>::new()
+    );
+    assert_eq!(
+        having_rows("select count(*) from t1 where id > 100 having count(*) = 0"),
+        vec![vec![Integer(0)]]
+    );
+    assert_eq!(
+        having_rows("select count(*) from t1 where id > 100 having count(*) > 0"),
+        Vec::<Vec<ValueItem>>::new()
+    );
+}
+
+#[test]
+fn test_having_rejects_a_column_that_is_not_grouped() {
+    let c = subquery_conn();
+    for sql in [
+        "select cat, count(*) from t1 group by cat having id > 1",
+        "select count(*) from t1 having cat = 1",
+    ] {
+        let err = c
+            .clone()
+            .create_statement(sql)
+            .and_then(|mut s| s.execute());
+        assert!(
+            matches!(err, Err(SchemaError::GroupByMissingField(_))),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn test_explain_shows_having() {
+    let c = subquery_conn();
+    assert_eq!(
+        explain(
+            &c,
+            "select cat, count(*) as n from t1 group by cat having count(*) > 2"
+        ),
+        "GroupAggregate by cat: cat, count(*) AS n having (count(*) > 2)\n  Sort cat ASC NULLS FIRST\n    TableScan t1 (~5 rows)"
+    );
+}
+
 #[test]
 fn test_explain_shows_aggregation_grouping_and_distinct() {
     let c = subquery_conn();

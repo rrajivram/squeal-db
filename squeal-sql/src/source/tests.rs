@@ -16,9 +16,7 @@
 //
 // Deliberately NOT covered: nested SELECTs (a subquery in FROM hits
 // `TableRef::Derived => todo!()` in logical.rs — unimplemented, would
-// panic) and HAVING (`select.having` is never read anywhere in the
-// real handle_select path — silently has no effect, not real support).
-// Neither is supported by the engine yet.
+// panic). HAVING is covered in stmt/tests/mod.rs.
 
 use std::sync::Arc;
 
