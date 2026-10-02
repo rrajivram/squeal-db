@@ -130,7 +130,7 @@ fn test_execute_propagates_create_table_errors() {
 #[test]
 fn test_execute_ignores_non_create_table_statements() {
     let c = conn();
-    let mut stmt = c.clone().create_statement("drop table t").unwrap();
+    let mut stmt = c.clone().create_statement("use t").unwrap();
     stmt.execute().unwrap();
     assert!(stmt.results.is_empty());
     assert!(!c.current_schema().unwrap().table_exists("t"));
@@ -1027,7 +1027,7 @@ fn test_get_results_returns_the_first_result_then_takes_it() {
 #[test]
 fn test_get_results_returns_none_when_there_are_no_results() {
     let c = conn();
-    let mut stmt = c.create_statement("drop table t").unwrap();
+    let mut stmt = c.create_statement("use t").unwrap();
     stmt.execute().unwrap();
     assert!(stmt.get_results().unwrap().is_none());
 }

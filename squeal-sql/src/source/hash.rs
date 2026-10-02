@@ -885,14 +885,22 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         // The rest of the ON condition, in the query's own column order.
         let keys = match self.matcher.residual() {
             Some(residual) => {
-                let (first, second) = if self.swapped { (&right, &left) } else { (&left, &right) };
+                let (first, second) = if self.swapped {
+                    (&right, &left)
+                } else {
+                    (&left, &right)
+                };
                 let names: Vec<String> = first
                     .iter()
                     .chain(second.iter())
                     .map(|f| f.display_name.clone())
                     .collect();
                 let rest = residual.describe(&names);
-                if keys.is_empty() { rest } else { format!("{keys} AND {rest}") }
+                if keys.is_empty() {
+                    rest
+                } else {
+                    format!("{keys} AND {rest}")
+                }
             }
             None => keys,
         };

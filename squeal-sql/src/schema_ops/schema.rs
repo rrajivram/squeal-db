@@ -253,16 +253,58 @@ where
         }
     }
 
-    // The store names of a partition's trees: its rows tree, then one per
-    // index of the table.
-    fn tree_names(&self, table: &SqlTable, part: &Partition) -> (String, Vec<String>) {
+    // The store name to create a tree under, given the name it would
+    // ordinarily have. That name may still belong to a tree that nothing
+    // refers to any more — a dropped table's or partition's, which stay in
+    // the store (see drop_table) — and then the new tree gets the first
+    // free `name~N` instead. None if a tree of this schema's tables has the
+    // name: it is in use.
+    fn free_tree_name(&self, name: &str) -> Result<Option<String>, SchemaError> {
+        let Some(holder) = self.db.table_id_by_name(name)? else {
+            return Ok(Some(name.to_string()));
+        };
+        let in_use = self.tables.read().values().any(|t| {
+            t.partitions
+                .iter()
+                .any(|p| p.rows() == holder || (0..t.indices.len()).any(|i| p.index(i) == holder))
+        });
+        if in_use {
+            return Ok(None);
+        }
+        let mut n = 1;
+        loop {
+            let candidate = format!("{name}~{n}");
+            if self.db.table_id_by_name(&candidate)?.is_none() {
+                return Ok(Some(candidate));
+            }
+            n += 1;
+        }
+    }
+
+    // The store names to create a partition's trees under: its rows tree,
+    // then one per index of the table. An error if one is in use.
+    fn tree_names(
+        &self,
+        table: &SqlTable,
+        part: &Partition,
+    ) -> Result<(String, Vec<String>), SchemaError> {
         let suffix = Self::partition_suffix(table, part);
-        (
-            self.qualify(&format!("{}{suffix}", table.name)),
-            (0..table.indices.len())
-                .map(|i| self.qualify(&format!("{}{suffix}", Self::index_base_name(table, i))))
-                .collect(),
-        )
+        let rows = self
+            .free_tree_name(&self.qualify(&format!("{}{suffix}", table.name)))?
+            .ok_or_else(|| {
+                SchemaError::BadTableName(format!("Table name {} is already in use", table.name))
+            })?;
+        let mut indices = vec![];
+        for i in 0..table.indices.len() {
+            let base = Self::index_base_name(table, i);
+            indices.push(
+                self.free_tree_name(&self.qualify(&format!("{base}{suffix}")))?
+                    .ok_or_else(|| {
+                        SchemaError::BadTableName(format!("Index name {base} is already in use"))
+                    })?,
+            );
+        }
+        Ok((rows, indices))
     }
 
     // Creates `part`'s trees under `names` (see tree_names) and records
@@ -349,23 +391,7 @@ where
             .partitions
             .iter()
             .map(|p| self.tree_names(&table, p))
-            .collect();
-        for (rows_name, index_names) in &tree_names {
-            if self.db.table_id_by_name(rows_name)?.is_some() {
-                return Err(SchemaError::BadTableName(format!(
-                    "Table name {} is already in use",
-                    table.name
-                )));
-            }
-            for (i, qualified) in index_names.iter().enumerate() {
-                if self.db.table_id_by_name(qualified)?.is_some() {
-                    return Err(SchemaError::BadTableName(format!(
-                        "Index name {} is already in use",
-                        Self::index_base_name(&table, i)
-                    )));
-                }
-            }
-        }
+            .collect::<Result<_, _>>()?;
         // Self-referential foreign keys (ref_table == this table) were
         // already fully validated inside TableBuilder::build(), which
         // has this table's own shape in hand but no access to the rest
@@ -1079,17 +1105,12 @@ where
             )));
         }
         // One tree per partition, holding its rows' entries.
-        let qualified: Vec<String> = table
-            .partitions
-            .iter()
-            .map(|p| self.qualify(&format!("{name}{}", Self::partition_suffix(&table, p))))
-            .collect();
-        for q in &qualified {
-            if self.db.table_id_by_name(q)?.is_some() {
-                return Err(SchemaError::BadTableName(format!(
-                    "Index name {name} is already in use"
-                )));
-            }
+        let mut qualified: Vec<String> = vec![];
+        for p in &table.partitions {
+            let wanted = self.qualify(&format!("{name}{}", Self::partition_suffix(&table, p)));
+            qualified.push(self.free_tree_name(&wanted)?.ok_or_else(|| {
+                SchemaError::BadTableName(format!("Index name {name} is already in use"))
+            })?);
         }
 
         let identity_size = table.identity_size();
@@ -1414,6 +1435,53 @@ where
         rows
     }
 
+    // DROP TABLE: the table, its indexes and its rows are gone, and its
+    // name is free. Refused while another table's foreign key refers to it.
+    //
+    // Its trees are left in the store, no longer referred to by anything —
+    // store's drop_table frees a tree's pages at once, which a scan still
+    // reading them would not survive (a SELECT outside a transaction holds
+    // no table lock — see conn::tablelock). A table created later under
+    // the same name gets trees of its own (see free_tree_name).
+    pub(crate) fn drop_table(self: &Arc<Self>, table_name: &str) -> Result<(), SchemaError> {
+        let name = table_name.to_lowercase();
+        let table = self.get_table(&name).ok_or_else(|| {
+            SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
+        })?;
+        if let Some(referrer) = self.tables.read().values().find(|t| {
+            t.name != table.name
+                && t.foreign_keys
+                    .iter()
+                    .any(|fk| fk.ref_table.eq_ignore_ascii_case(&table.name))
+        }) {
+            return Err(SchemaError::UserError(format!(
+                "cannot drop table {:?}: a foreign key of table {:?} refers to it",
+                table.name, referrer.name
+            )));
+        }
+        let txn = self.db.begin()?;
+        let ik = IndexKey::new_from(&[ValueItem::Str((name.clone(), MAX_TABLE_NAME_LEN as u32))])?;
+        if let Err(e) = self.db.remove(self.sys_table_id, DBIdType::Rec(ik), &txn) {
+            self.db.rollback(txn)?;
+            return Err(e.into());
+        }
+        self.db.commit(txn)?;
+        self.tables.write().remove(&name);
+        // Best effort from here: the table is gone either way.
+        if table.primary_key().is_none()
+            && let Err(e) = self
+                .db
+                .get_generator()
+                .remove_generator(self.rowid_seq_name(&table.name))
+        {
+            log::warn!("failed to remove {:?}'s row id sequence: {e}", table.name);
+        }
+        if let Some(stats) = self.stats.lock().as_ref() {
+            stats.drop_table_stats(table.id);
+        }
+        Ok(())
+    }
+
     // ALTER TABLE ... ADD PARTITION: a new, empty partition with its own
     // trees. Only where no existing row could belong in it: a RANGE
     // partition goes above the highest bound (so not after MAXVALUE), and a
@@ -1464,7 +1532,7 @@ where
 
         #[cfg(test)]
         crate::testhook::pause("add_partition.checked", &table.name);
-        let names = self.tree_names(&table, &part);
+        let names = self.tree_names(&table, &part)?;
         let mut created = vec![];
         let added = self
             .create_partition_trees(&table, &mut part, &names, &mut created)

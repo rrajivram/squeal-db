@@ -49,30 +49,30 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 
 ## Known-failure tests
 
-Tests of what should hold and does not yet, `#[ignore]`d with the reason.
-A fix is done when its tests pass with the `#[ignore]` taken off.
+Written first as failing tests, then fixed; all now run in the normal suite.
+A new known failure goes in the same files, `#[ignore]`d with its reason.
 
-    cargo test -p squeal-sql -- --ignored partition_races partition_diff sql_gaps
+- [x] `stmt/tests/partition_races.rs` (7): DDL vs DML/DDL, forced
+  interleavings (`src/testhook.rs`). Fixed by table locks
+  (`conn/tablelock.rs`).
+- [x] `stmt/tests/partition_diff.rs` (4 queries): joins into a partitioned
+  table with more than column equalities in ON. Fixed by residual ON terms in
+  the hash join.
+- [x] `stmt/tests/sql_gaps.rs` (9): non-equality ON terms, inequality and
+  expression joins, USING, WITH, IS [NOT] NULL, DROP TABLE, TRUNCATE.
 
-- `stmt/tests/partition_races.rs` — DDL against concurrent DML/DDL, with the
-  interleaving forced through pause points (`src/testhook.rs`). 7 failing:
-  - [ ] ADD PARTITION vs an insert of its value (row left in DEFAULT).
-  - [ ] INSERT vs DROP PARTITION (insert acknowledged, row lost).
-  - [ ] CREATE INDEX vs INSERT, plain and partitioned (row not indexed).
-  - [ ] ALTER vs ALTER, two tests (the later write drops the earlier change;
-    with ADD PARTITION, its rows too).
-  - [ ] DROP PARTITION under an open transaction (its second read differs).
-  `storage_problems` there checks a table at rest: rows in the partition they
-  route to, index trees matching their partition's rows.
-- `stmt/tests/partition_diff.rs` — partitioned vs plain twins, same queries.
-  ~90 agree (kept as a regression test: pruning must pass it unchanged).
-  - [ ] 4 differ: a join into a partitioned table whose ON has more than
-    column equalities (no nested-loop seek, and the hash join refuses it).
-- `stmt/tests/sql_gaps.rs` — not about partitions; each checked against an
-  equivalent query that runs.
-  - [ ] Join ON with a term on one table; LEFT JOIN ON restricting the inner
-    table; join on an inequality; join on an expression (all: hash join).
-  - [ ] JOIN ... USING. WITH. IS [NOT] NULL. DROP TABLE. TRUNCATE.
+Follow-ups from the fixes:
+- [ ] Table locks are per process (`Schema::locks`): enough for one process
+  per database, which is all squeal supports today.
+- [ ] A lock wait gives up after 10 s instead of detecting a deadlock (two
+  transactions each holding a table the other's DDL wants).
+- [ ] DROP TABLE, like DROP PARTITION, leaves its trees in the store
+  unreferenced; a later table of the same name gets `name~N` trees. Reclaiming
+  them needs a store change.
+- [ ] A join with no column equality runs every pair (INNER: a filtered cross
+  join; outer: a hash join with one bucket). Fine for small inputs only.
+- [ ] WITH queries are planned anew per reference (no materialization), and
+  WITH RECURSIVE is refused.
 
 Not written yet: a seeded query generator for the twins, the concurrent
 soak with crash rounds, SQLite as a second oracle (`rusqlite` dev-dependency,
@@ -91,15 +91,13 @@ the partition column; queries read every partition (`source/append.rs`).
   sorted, so ORDER BY / merge join / grouped-input always sort. RANGE
   partitions read in bound order are sorted by the partition column.
 - [ ] Join seeks: a nested-loop join into a partitioned table is not planned
-  (hash join instead); it needs a seek per partition, or pruning to one.
+  (hash join instead, which now gives the same answers); it needs a seek per
+  partition, or pruning to one.
 - [ ] Statistics are per table: tree shape is read off the first partition,
   and DROP PARTITION leaves the row count stale until ANALYZE.
 - [ ] DROP PARTITION leaves the partition's trees in the store, unreferenced
   (their pages are not reused). Reclaiming them needs a `drop_table` in store
   that is safe against a scan still reading the tree. Store change.
-- [ ] DDL is not excluded from concurrent DML: a row inserted while ADD
-  PARTITION checks the DEFAULT partition, or into a partition while it is
-  dropped, is not caught. Same as every other ALTER here.
 - [ ] No way to list a table's partitions from SQL except EXPLAIN (a
   `SHOW PARTITIONS`, or DESCRIBE showing them).
 - [ ] External partitions (Parquet): a new `PartitionStorage` variant.

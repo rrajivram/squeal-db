@@ -9,11 +9,12 @@
 //! transaction that reads a table twice must find the same table.
 //!
 //! So each table has one lock, shared or exclusive:
-//!  - shared: by a statement that writes the table's rows, for as long as
-//!    the statement runs; and by every statement of an explicit transaction
-//!    (reads included), until the transaction ends;
-//!  - exclusive: by a statement that changes the definition, for as long as
-//!    it runs.
+//! - shared: by a statement that writes the table's rows, for as long as
+//!   the statement runs; and by every statement of an explicit transaction
+//!   (reads included), until the transaction ends;
+//! - exclusive: by a statement that changes the definition, for as long as
+//!   it runs.
+//!
 //! A SELECT outside a transaction takes none. Its plan is fixed when it is
 //! built, and every tree it reads stays readable (a dropped partition's or
 //! table's trees are left in the store), so a definition changing under it

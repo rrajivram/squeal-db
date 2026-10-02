@@ -1044,6 +1044,51 @@ where
                         tables.len()
                     ))));
                 }
+                sql_parser::Statement::DropTable(drop) => {
+                    let mut dropped = 0usize;
+                    for name in drop.names.items() {
+                        let parts: Vec<&str> = name.idents().map(|i| i.value.as_str()).collect();
+                        let found = if let Some(temp_name) = temp::temp_table_name(&parts) {
+                            self.conn.temp_tables().remove(&temp_name)
+                        } else {
+                            match self.conn.resolve_object_name_ref(name) {
+                                Ok((table_ref, field)) => {
+                                    reject_qualified_field("DROP TABLE", field)?;
+                                    let (schema, table) = expect_real(table_ref, "DROP TABLE")?;
+                                    schema.drop_table(&table.name)?;
+                                    true
+                                }
+                                Err(SchemaError::BadTableName(_)) => false,
+                                Err(e) => return Err(e),
+                            }
+                        };
+                        if found {
+                            dropped += 1;
+                        } else if drop.if_exists.is_none() {
+                            return Err(SchemaError::BadTableName(format!(
+                                "Table {:?} does not exist",
+                                name.to_dotted()
+                            )));
+                        }
+                    }
+                    self.results.push(Some(ResultType::ResultString(format!(
+                        "{dropped} table(s) dropped"
+                    ))));
+                }
+                // Every row deleted, in the statement's transaction (so it
+                // can be rolled back, and readers see all or none of it):
+                // a DELETE with no WHERE.
+                sql_parser::Statement::Truncate(truncate) => {
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&truncate.name)?;
+                    reject_qualified_field("TRUNCATE", field)?;
+                    let (schema, table) = expect_real(table_ref, "TRUNCATE")?;
+                    let count = with_active_txn(&self.conn, |txn| {
+                        let source = table_scan_source(&schema, &table, None, Some(txn))?;
+                        let matches = drain_with_ids(source)?;
+                        schema.delete_rows_matching(&table.name, matches, txn)
+                    })?;
+                    self.results.push(Some(ResultType::Count(count)));
+                }
                 _ => {}
             }
         }

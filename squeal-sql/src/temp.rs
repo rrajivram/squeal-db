@@ -124,6 +124,11 @@ where
         self.tables.read().get(name).cloned()
     }
 
+    // Removes a temp table: true if there was one of that name.
+    pub(crate) fn remove(&self, name: &str) -> bool {
+        self.tables.write().remove(name).is_some()
+    }
+
     pub(crate) fn create(
         &self,
         db: &Arc<Db<F>>,

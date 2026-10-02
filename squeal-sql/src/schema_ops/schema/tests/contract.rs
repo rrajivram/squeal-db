@@ -87,13 +87,11 @@ fn test_execute_rejects_invalid_schema_definitions() {
 
 #[test]
 fn test_execute_silently_ignores_non_create_table_statements() {
-    // Documents current dispatch behavior: Statement::execute handles
-    // CreateTable, CreateDatabase/Schema, Insert, Query (SELECT), and
-    // transaction control (and panics via todo!() on AlterCollation);
-    // anything else, like DROP TABLE, falls through its wildcard arm as
-    // a silent no-op rather than an error.
+    // A statement with nothing to do here (a bare USE, which names no
+    // database or schema) falls through Statement::execute's wildcard arm
+    // as a silent no-op rather than an error.
     let conn = conn();
-    execute(&conn, "drop table t").unwrap();
+    execute(&conn, "use t").unwrap();
     let s = conn.current_schema().unwrap();
     assert!(!s.table_exists("t"));
 }
@@ -426,24 +424,29 @@ fn test_failed_second_index_creation_drops_the_first_instead_of_leaking_it() {
 }
 
 #[test]
-fn test_create_table_rejects_index_name_colliding_with_an_unrelated_store_table() {
-    // Same validate-first check, from the angle of an index name
-    // colliding with something that isn't even a squeal-sql table's
-    // index — any name already registered in the underlying store::Db
-    // must be rejected the same way. Created directly at the qualified
-    // name a same-named constraint in this schema would resolve to, to
-    // simulate a genuine collision post-qualification.
+fn test_create_table_steps_around_a_store_table_no_table_refers_to() {
+    // A name already registered in the underlying store::Db, by a tree
+    // that is not any table's here: what a dropped table or partition
+    // leaves behind (see Schema::drop_table). The new tree is created
+    // under another name, and the one already there is left alone.
+    // (A name held by a LIVE table's tree is refused: see the tests
+    // above.)
     let conn = conn();
     let s = conn.current_schema().unwrap();
-    s.db.create_table("default.taken".to_string()).unwrap();
+    let taken = s.db.create_table("default.taken".to_string()).unwrap();
 
-    let err = execute(
+    execute(
         &conn,
         "create table t (id integer not null, constraint taken primary key(id))",
     )
-    .unwrap_err();
-    assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
-    assert!(!s.table_exists("t"));
+    .unwrap();
+    let t = s.get_table("t").unwrap();
+    assert_ne!(t.index_tree(0), taken);
+    assert_eq!(s.db.table_id_by_name("default.taken").unwrap(), Some(taken));
+    assert_eq!(
+        s.db.table_id_by_name("default.taken~1").unwrap(),
+        Some(t.index_tree(0))
+    );
 }
 
 // Regression: create_table used to insert the catalog row BEFORE it assigned
