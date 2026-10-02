@@ -42,12 +42,10 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 
 - [x] Stats collector panic after ALTER TABLE (fixed: stats re-keyed by
   field id on ALTER; short rows skipped).
-- [ ] `GROUP BY` with no aggregate and no `HAVING` does not group
-  (`select cat from t group by cat` returns one row per input row):
-  `handle_select` only builds a `GroupSource` when the SELECT list or HAVING
-  makes the query a grouped one. Read from the code, not yet reproduced.
-- [ ] `GROUP BY <expression>` (anything but a plain column) is dropped from
-  the group key without an error (`validate_aggreations`' `filter_map`).
+- [x] `GROUP BY` with no aggregate and no `HAVING` did not group (fixed).
+- [x] `GROUP BY <expression>` was dropped from the group key (fixed: computed
+  into a column the sort and grouping read; the SELECT list and HAVING may
+  use the same expression).
 
 ## Flaky tests
 

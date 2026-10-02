@@ -204,6 +204,28 @@ impl EvalExpr {
         }
     }
 
+    // A column this expression reads that has no single value per group:
+    // one outside every aggregate and outside every part `grouped` says
+    // GROUP BY provides (a grouped column, or a whole grouped expression).
+    pub(crate) fn ungrouped_column(&self, grouped: &dyn Fn(&EvalExpr) -> bool) -> Option<usize> {
+        if grouped(self) {
+            return None;
+        }
+        match self {
+            Self::None | Self::Literal(_) => None,
+            Self::Value(i) => Some(*i),
+            Self::Unary { field, .. } => field.ungrouped_column(grouped),
+            Self::Binary { lhs, rhs, .. } => lhs
+                .ungrouped_column(grouped)
+                .or_else(|| rhs.ungrouped_column(grouped)),
+            Self::Function(f) if f.is_aggregate() => None,
+            Self::Function(f) => f.args().into_iter().find_map(|a| match a {
+                FuncArgs::Field(e) => e.ungrouped_column(grouped),
+                FuncArgs::Wildcard => None,
+            }),
+        }
+    }
+
     pub(crate) fn get_funcs(&mut self) -> Vec<&mut FuncObj> {
         match self {
             Self::Unary { field, .. } => field.get_funcs(),

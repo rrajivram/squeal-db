@@ -2974,6 +2974,69 @@ fn test_having_rejects_a_column_that_is_not_grouped() {
     }
 }
 
+// GROUP BY alone groups: one row per key, no aggregate needed.
+#[test]
+fn test_group_by_without_an_aggregate_returns_one_row_per_group() {
+    use ValueItem::Integer;
+    assert_eq!(
+        having_rows("select cat from t1 group by cat"),
+        vec![vec![Integer(0)], vec![Integer(1)]]
+    );
+    assert_eq!(
+        having_rows("select cat + 1 from t1 group by cat"),
+        vec![vec![Integer(1)], vec![Integer(2)]]
+    );
+}
+
+// ids 1..5: id % 2 is 1 for 1, 3, 5 and 0 for 2, 4.
+#[test]
+fn test_group_by_an_expression_groups_by_its_value() {
+    use ValueItem::Integer;
+    assert_eq!(
+        having_rows("select id % 2, count(*) from t1 group by id % 2"),
+        vec![vec![Integer(0), Integer(2)], vec![Integer(1), Integer(3)]]
+    );
+    // The expression need not be selected, and can sit next to a column.
+    assert_eq!(
+        having_rows("select count(*) from t1 group by id % 2"),
+        vec![vec![Integer(2)], vec![Integer(3)]]
+    );
+    assert_eq!(
+        having_rows("select cat, sum(id) from t1 group by cat, id % 2"),
+        vec![vec![Integer(0), Integer(9)], vec![Integer(1), Integer(6)]]
+    );
+    // Inside a larger expression, and in HAVING.
+    assert_eq!(
+        having_rows("select (id % 2) + 10, count(*) from t1 group by id % 2 having id % 2 = 1"),
+        vec![vec![Integer(11), Integer(3)]]
+    );
+}
+
+#[test]
+fn test_group_by_rejects_what_it_cannot_give_one_value_for() {
+    let c = subquery_conn();
+    for sql in [
+        // id is not grouped: only id % 2 is.
+        "select id from t1 group by id % 2",
+        "select id % 3 from t1 group by id % 2",
+        // Next to an aggregate, too.
+        "select count(*) + id from t1 group by cat",
+        "select cat from t1 group by count(*)",
+    ] {
+        let err = c
+            .clone()
+            .create_statement(sql)
+            .and_then(|mut s| s.execute());
+        assert!(
+            matches!(
+                err,
+                Err(SchemaError::GroupByMissingField(_) | SchemaError::UserError(_))
+            ),
+            "{sql}: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn test_explain_shows_having() {
     let c = subquery_conn();

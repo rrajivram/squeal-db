@@ -772,10 +772,11 @@ where
             Some(h) => Some(*EvalExpr::from_expr(&h.expr, &flat_tables)?),
             None => None,
         };
-        // HAVING filters groups, so it makes the query a grouped one even
-        // with no aggregate in the SELECT list.
-        let has_aggregation =
-            having.is_some() || projected_fields.iter().any(|f| f.expr.has_aggregate());
+        // GROUP BY and HAVING make the query a grouped one even with no
+        // aggregate in the SELECT list.
+        let has_aggregation = select.group_by.is_some()
+            || having.is_some()
+            || projected_fields.iter().any(|f| f.expr.has_aggregate());
         let projected_field_count = projected_fields.len();
 
         let wh_expr = if let Some(wh) = &select.where_clause {
@@ -1145,22 +1146,31 @@ where
         // ever compare equal on their already-evaluated aggregate
         // column. See GroupSource's own doc comment.
         let projected: Box<dyn Source> = if has_aggregation {
-            let key_positions =
-                self.validate_aggreations(&projected_fields, &flat_tables, &select.group_by)?;
-            // Outside an aggregate, HAVING can only read GROUP BY's columns:
-            // any other has no single value for the group.
-            if let Some(having) = &having {
-                let names = column_names(&for_proj.fields());
-                if let Some(pos) = having
-                    .get_non_agg_fields()
-                    .into_iter()
-                    .find(|pos| !key_positions.contains(pos))
-                {
-                    return Err(SchemaError::GroupByMissingField(
-                        names.get(pos).cloned().unwrap_or_else(|| format!("#{pos}")),
-                    ));
-                }
-            }
+            let raw_fields = for_proj.fields();
+            let (key_positions, computed) = self.validate_aggreations(
+                &projected_fields,
+                having.as_ref(),
+                &flat_tables,
+                &select.group_by,
+                &raw_fields,
+            )?;
+            // A GROUP BY expression that is not a plain column is computed
+            // into a column of its own after the raw row's, which the sort
+            // and the grouping then read like any other key column.
+            let for_proj: Box<dyn Source> = if computed.is_empty() {
+                for_proj
+            } else {
+                let fields = raw_fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, f)| ProjectableField {
+                        expr: EvalExpr::Value(i),
+                        ..f.clone()
+                    })
+                    .chain(computed)
+                    .collect();
+                Box::new(Projection::new(for_proj, fields))
+            };
             // Rows already grouped: a merge join's output, in key order.
             let already_grouped = merged_order.as_ref().is_some_and(|m| {
                 m.gives_group(&WantedOrder {
@@ -1969,64 +1979,65 @@ where
         };
         Ok(tq)
     }
-    // Returns the raw table field positions to group by — empty means
-    // "no GROUP BY clause at all," i.e. one implicit group over the
-    // whole table (a bare aggregate like `SELECT COUNT(*) FROM t`), a
-    // legitimate case in its own right, not something to skip grouping
-    // for (see GroupSource, which treats an empty key list the same
-    // way: one group covering every row, even zero rows).
+    // Returns the positions to group by — empty means "no GROUP BY clause
+    // at all," i.e. one implicit group over the whole table (a bare
+    // aggregate like `SELECT COUNT(*) FROM t`), a legitimate case in its
+    // own right, not something to skip grouping for (see GroupSource, which
+    // treats an empty key list the same way: one group covering every row,
+    // even zero rows).
+    //
+    // A plain GROUP BY column is its position in the raw row (`raw`). Any
+    // other GROUP BY expression is returned as a field to compute, and its
+    // position is the one it gets appended after the raw row's columns.
     fn validate_aggreations(
         &self,
         fields: &[ProjectableField],
+        having: Option<&EvalExpr>,
         tables: &[TableQuery<F>],
         group: &Option<GroupByClause>,
-    ) -> Result<Vec<usize>, SchemaError> {
-        let group_by = if let Some(group) = group {
-            let mut v = vec![];
-            for f in group.exprs.items() {
-                v.push(self.handle_expr(f, &None, tables)?);
+        raw: &[ProjectableField],
+    ) -> Result<(Vec<usize>, Vec<ProjectableField>), SchemaError> {
+        let names = column_names(raw);
+        let mut positions = vec![];
+        let mut computed = vec![];
+        // How each computed GROUP BY expression reads (see EvalExpr::
+        // describe): what an expression elsewhere is matched against.
+        let mut computed_text = vec![];
+        for f in group.iter().flat_map(|g| g.exprs.items()) {
+            let field = self.handle_expr(f, &None, tables)?;
+            if field.expr.has_aggregate() {
+                return Err(SchemaError::UserError(
+                    "GROUP BY cannot contain an aggregate".into(),
+                ));
             }
-            v
-        } else {
-            vec![]
+            match &field.expr {
+                EvalExpr::Value(u) => positions.push(*u),
+                expr => {
+                    positions.push(raw.len() + computed.len());
+                    computed_text.push(expr.describe(&names));
+                    computed.push(field);
+                }
+            }
+        }
+        // Standard SQL rule: outside an aggregate, the SELECT list and
+        // HAVING can only read what GROUP BY provides (a grouped column, or
+        // a whole grouped expression) — anything else has no single value
+        // once rows collapse into groups. A GROUP BY column need NOT appear
+        // in the SELECT list at all (`GROUP BY category` alone, selecting
+        // only `count(*)`, is perfectly valid).
+        let grouped = |e: &EvalExpr| match e {
+            EvalExpr::Value(u) => positions.contains(u),
+            EvalExpr::None | EvalExpr::Literal(_) => false,
+            other => computed_text.contains(&other.describe(&names)),
         };
-        let non_agg_fields = fields
-            .iter()
-            .flat_map(|f| f.expr.get_non_agg_fields())
-            .collect::<Vec<_>>();
-        if !non_agg_fields.is_empty() && group_by.is_empty() {
-            let mut names = String::new();
-            for n in fields {
-                if !n.expr.has_aggregate() {
-                    names += format!("{},", n.display_name.clone()).as_str();
-                }
-            }
-            return Err(SchemaError::GroupByMissingField(names));
-        }
-        let group_by_positions = group_by
-            .iter()
-            .filter_map(|g| match &g.expr {
-                EvalExpr::Value(u) => Some(*u),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        // Standard SQL rule, and the reverse of what this checked
-        // before: every non-aggregate SELECT column must appear in
-        // GROUP BY (so its value is well-defined once rows collapse
-        // into groups) — but a GROUP BY column need NOT appear in the
-        // SELECT list at all (`GROUP BY category` alone, selecting only
-        // `count(*)`, is perfectly valid).
-        for n in fields {
-            if n.expr.has_aggregate() {
-                continue;
-            }
-            for pos in n.expr.get_non_agg_fields() {
-                if !group_by_positions.contains(&pos) {
-                    return Err(SchemaError::GroupByMissingField(n.display_name.clone()));
-                }
+        for expr in fields.iter().map(|f| &f.expr).chain(having) {
+            if let Some(pos) = expr.ungrouped_column(&grouped) {
+                return Err(SchemaError::GroupByMissingField(
+                    names.get(pos).cloned().unwrap_or_else(|| format!("#{pos}")),
+                ));
             }
         }
-        Ok(group_by_positions)
+        Ok((positions, computed))
     }
 }
 
