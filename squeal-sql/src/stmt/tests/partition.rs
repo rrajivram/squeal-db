@@ -182,7 +182,10 @@ fn test_explain_shows_each_partition_under_an_append() {
     assert!(!plan.contains("partition early"), "{plan}");
     let plan = explain(&c, "select id from events where day in (1, 25)");
     assert!(plan.contains("(2 of 3 partitions)"), "{plan}");
-    assert!(plan.contains("partition early") && plan.contains("partition late"), "{plan}");
+    assert!(
+        plan.contains("partition early") && plan.contains("partition late"),
+        "{plan}"
+    );
     // Nothing can match: no partition is read at all.
     let plan = explain(&c, "select id from events where day > 100");
     assert!(plan.contains("Append events (0 of 3 partitions)"), "{plan}");
@@ -196,12 +199,24 @@ fn test_pruned_reads_return_exactly_the_matching_rows() {
     let c = range_conn();
     assert_eq!(ints(&c, "select id from events where day = 10"), [3]);
     assert_eq!(ints(&c, "select id from events where day < 10"), [1, 2]);
-    assert_eq!(ints(&c, "select id from events where day > 9 and day < 20"), [3, 4]);
-    assert_eq!(ints(&c, "select id from events where day in (9, 20, 99)"), [2, 5]);
-    assert_eq!(ints(&c, "select id from events where day > 100"), Vec::<i64>::new());
+    assert_eq!(
+        ints(&c, "select id from events where day > 9 and day < 20"),
+        [3, 4]
+    );
+    assert_eq!(
+        ints(&c, "select id from events where day in (9, 20, 99)"),
+        [2, 5]
+    );
+    assert_eq!(
+        ints(&c, "select id from events where day > 100"),
+        Vec::<i64>::new()
+    );
     assert_eq!(ints(&c, "select count(*) from events where day > 100"), [0]);
     // The WHERE still applies within a kept partition.
-    assert_eq!(ints(&c, "select id from events where day >= 19 and id <> 5"), [4, 6]);
+    assert_eq!(
+        ints(&c, "select id from events where day >= 19 and id <> 5"),
+        [4, 6]
+    );
     // UPDATE and DELETE prune too, and still change only matching rows.
     run(&c, "update events set note = 'x' where day >= 20").unwrap();
     assert_eq!(ints(&c, "select id from events where note = 'x'"), [5, 6]);
@@ -215,11 +230,23 @@ fn test_pruned_reads_return_exactly_the_matching_rows() {
     )
     .unwrap();
     assert_eq!(ints(&c, "select id from regions where region = 'ny'"), [2]);
-    assert_eq!(ints(&c, "select id from regions where region = 'zz'"), Vec::<i64>::new());
-    assert_eq!(ints(&c, "select id from regions where region in ('ca', 'tx')"), [1, 3]);
-    assert_eq!(ints(&c, "select id from regions where region > 'm'"), [2, 3]);
+    assert_eq!(
+        ints(&c, "select id from regions where region = 'zz'"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        ints(&c, "select id from regions where region in ('ca', 'tx')"),
+        [1, 3]
+    );
+    assert_eq!(
+        ints(&c, "select id from regions where region > 'm'"),
+        [2, 3]
+    );
     let plan = explain(&c, "select id from regions where region = 'ny'");
-    assert!(plan.contains("(1 of 3 partitions)") && plan.contains("partition east"), "{plan}");
+    assert!(
+        plan.contains("(1 of 3 partitions)") && plan.contains("partition east"),
+        "{plan}"
+    );
 }
 
 // Each partition read in the order wanted, the reads are merged into that
@@ -235,13 +262,18 @@ fn test_an_ordered_read_of_several_partitions_merges_them_instead_of_sorting() {
     )
     .unwrap();
     // ids interleave across the partitions.
-    let values: Vec<String> = (0..300).map(|id| format!("({id}, {})", (id * 37) % 200)).collect();
+    let values: Vec<String> = (0..300)
+        .map(|id| format!("({id}, {})", (id * 37) % 200))
+        .collect();
     run(&c, &format!("insert into m values {}", values.join(", "))).unwrap();
     run(&c, "analyze table m").unwrap();
     let plan = explain(&c, "select id from m order by id limit 5");
     assert!(plan.contains("MergeAppend m (2 partitions)"), "{plan}");
     assert!(!plan.contains("Sort") && !plan.contains("TopN"), "{plan}");
-    let mut stmt = c.clone().create_statement("select id from m order by id").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_statement("select id from m order by id")
+        .unwrap();
     stmt.execute().unwrap();
     let got: Vec<i64> = take_streaming_result(&mut stmt, 0)
         .1
@@ -865,7 +897,10 @@ fn test_a_join_seeks_into_a_partitioned_table_routing_by_its_key() {
     // to — and 7000, which none takes, seeks nothing.
     let plan = explain(&c, "select f.n, b.k from few f join big b on b.id = f.n");
     assert!(plan.contains("NestedLoopJoin"), "{plan}");
-    assert!(plan.contains("the one of 3 partitions its key routes to"), "{plan}");
+    assert!(
+        plan.contains("the one of 3 partitions its key routes to"),
+        "{plan}"
+    );
     assert_eq!(
         rows(&c, "select f.n, b.k from few f join big b on b.id = f.n"),
         vec![
@@ -875,7 +910,10 @@ fn test_a_join_seeks_into_a_partitioned_table_routing_by_its_key() {
         ]
     );
     assert_eq!(
-        rows(&c, "select f.n, b.k from few f left join big b on b.id = f.n"),
+        rows(
+            &c,
+            "select f.n, b.k from few f left join big b on b.id = f.n"
+        ),
         vec![
             vec![Integer(5), Integer(5)],
             vec![Integer(1500), Integer(0)],
@@ -885,7 +923,11 @@ fn test_a_join_seeks_into_a_partitioned_table_routing_by_its_key() {
     );
     // On another column: each row seeks every partition its WHERE leaves.
     // few.n * 7 = big.u for 5 and 1500 (ids 5 and 1500), none else.
-    run(&c, "create table sevens (u integer not null, primary key(u))").unwrap();
+    run(
+        &c,
+        "create table sevens (u integer not null, primary key(u))",
+    )
+    .unwrap();
     run(&c, "insert into sevens values (35), (10500), (20993), (2)").unwrap();
     run(&c, "analyze table sevens").unwrap();
     let sql = "select s.u, b.id from sevens s join big b on b.u = s.u";
@@ -907,5 +949,60 @@ fn test_a_join_seeks_into_a_partitioned_table_routing_by_its_key() {
     let sql = "select s.u, b.id from sevens s left join big b on b.u = s.u";
     assert_eq!(rows(&c, sql).len(), 4);
     // Many matches per key: whichever join wins, the same rows.
-    assert_eq!(ints(&c, "select count(*) from few f join big b on b.k = f.n"), [60]);
+    assert_eq!(
+        ints(&c, "select count(*) from few f join big b on b.k = f.n"),
+        [60]
+    );
+}
+
+// Partitions of very different sizes: a pruned read is estimated by the
+// rows of the partitions it reads, not as a share of the table.
+#[test]
+fn test_a_pruned_read_is_estimated_by_the_rows_of_its_partitions() {
+    let c = conn();
+    run(
+        &c,
+        "create table skew (id integer not null, k integer not null, v integer, \
+         primary key(id, k)) partition by range (k) (partition small values less than (10), \
+         partition large values less than maxvalue)",
+    )
+    .unwrap();
+    // 5 rows in small, 995 in large.
+    let values: Vec<String> = (0..1000)
+        .map(|id| format!("({id}, {}, {id})", if id < 5 { id } else { 10 + id }))
+        .collect();
+    run(
+        &c,
+        &format!("insert into skew values {}", values.join(", ")),
+    )
+    .unwrap();
+    run(&c, "analyze table skew").unwrap();
+    let estimate = |sql: &str| -> usize {
+        let plan = explain(&c, sql);
+        let line = plan
+            .lines()
+            .find(|l| l.contains("Append skew"))
+            .unwrap_or_else(|| panic!("{plan}"));
+        let n = line.rsplit("(~").next().unwrap().trim_end_matches(" rows)");
+        n.parse().unwrap_or_else(|_| panic!("{plan}"))
+    };
+    assert_eq!(estimate("select v from skew where k < 10"), 5);
+    assert_eq!(estimate("select v from skew where k >= 10"), 995);
+    assert_eq!(estimate("select v from skew"), 1000);
+
+    // The counts follow a dropped partition, and survive a reload.
+    run(&c, "alter table skew drop partition large").unwrap();
+    assert_eq!(estimate("select v from skew"), 5);
+    let schema = c.current_schema().unwrap();
+    schema.persist_and_shutdown_stats().ok();
+    let reloaded = crate::schema_ops::schema::Schema::<MemFile>::load(
+        DEFAULT_SCHEMA_NAME.to_string(),
+        schema.db.clone(),
+    )
+    .unwrap();
+    let table = reloaded.get_table("skew").unwrap();
+    let stat = reloaded.clone().get_table_stats(table.id).unwrap().unwrap();
+    assert_eq!(stat.row_count, 5);
+    assert_eq!(stat.partition_rows.get(&table.partitions[0].id), Some(&5));
+    reloaded.persist_and_shutdown_stats().unwrap();
 }

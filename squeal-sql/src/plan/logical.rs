@@ -1678,7 +1678,26 @@ where
             .collect();
         let rows = match (&item.resolved, rows) {
             (TableRef::Real(_, table), Some(rows)) => {
-                Some(filtered_rows(table, item.stats.as_ref(), rows, &remaining))
+                // A read pruned by its partition column's conditions (see
+                // open_item) was estimated by the partitions kept: those
+                // conditions are counted there, not again here.
+                let pruned = table
+                    .partition_column()
+                    .map(|(column, _)| column)
+                    .filter(|_| {
+                        crate::partition::partitions_to_read(table, &needs.filters).len()
+                            < table.partitions.len()
+                    });
+                let estimated: Vec<&EvalExpr> = remaining
+                    .iter()
+                    .copied()
+                    .filter(|f| {
+                        pruned.is_none_or(|column| {
+                            condition_set(f, &types).is_none_or(|(c, _)| c != column)
+                        })
+                    })
+                    .collect();
+                Some(filtered_rows(table, item.stats.as_ref(), rows, &estimated))
             }
             _ => rows,
         };
@@ -1721,6 +1740,10 @@ where
         // A table in several partitions has a tree to seek in each: those
         // its own WHERE leaves (see NestedLoopJoin::parts_for).
         let parts = crate::partition::partitions_to_read(table, &needs.filters);
+        let scoped = relation
+            .stats
+            .as_ref()
+            .map(|s| crate::optim::table_stats::for_partitions(table, s, &parts));
         let Some(reader) = self
             .conn
             .with_current_txn(|explicit| explicit.or(self.stmt_txn.as_ref()).map(|t| t.id()))
@@ -1758,7 +1781,7 @@ where
         let page_size = db.get_page_data_size();
         // What a hash join would read of this table: however it would be
         // read on its own.
-        let hash_rows = pick_access(table, relation.stats.as_ref(), needs, page_size, None)
+        let hash_rows = pick_access(table, scoped.as_ref(), needs, page_size, None)
             .rows
             .unwrap_or(usize::MAX / 2);
         // Building from whichever side HashedSource would (see
@@ -1829,17 +1852,21 @@ where
         // that are each read in the wanted order are merged into it (see
         // AppendSource).
         let parts = crate::partition::partitions_to_read(table, &needs.filters);
+        // Estimated and costed as a read of those partitions' rows.
+        let scoped = item
+            .stats
+            .as_ref()
+            .map(|s| crate::optim::table_stats::for_partitions(table, s, &parts));
         let access = pick_access(
             table,
-            item.stats.as_ref(),
+            scoped.as_ref(),
             needs,
             db.get_page_data_size(),
             order,
         );
-        let merge_order: Option<Vec<(usize, bool)>> = order
-            .filter(|_| access.sorted)
-            .map(|o| o.columns.clone());
-        let stats = item.stats.clone();
+        let merge_order: Option<Vec<(usize, bool)>> =
+            order.filter(|_| access.sorted).map(|o| o.columns.clone());
+        let stats = scoped;
         let chosen = access.clone();
         let source = self.conn.with_current_txn(|explicit| {
             let txn = explicit.or(self.stmt_txn.as_ref());
@@ -1848,9 +1875,13 @@ where
             over_partitions(table, &parts, merge_order.as_deref(), rows, |part| {
                 let stats = stats.clone();
                 let source: Box<dyn Source> = match path.clone() {
-                    AccessPath::TableScan => {
-                        Box::new(TableSource::new(db.clone(), table.clone(), part, txn, stats)?)
-                    }
+                    AccessPath::TableScan => Box::new(TableSource::new(
+                        db.clone(),
+                        table.clone(),
+                        part,
+                        txn,
+                        stats,
+                    )?),
                     AccessPath::TableSeek(range) => Box::new(TableSource::seek(
                         db.clone(),
                         table.clone(),

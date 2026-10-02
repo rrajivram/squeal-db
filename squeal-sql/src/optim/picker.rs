@@ -736,6 +736,7 @@ fn range_fraction(stat: Option<&ColumnStat>, range: &KeyRange) -> f64 {
 /// `hash_rows` rows of the inner table read for a hash join, plus building
 /// the hash table (`hash_extra`, spilling included). Needs
 /// statistics for the inner table and an outer row estimate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pick_join_seek(
     table: &SqlTable,
     stats: Option<&ComputedTableStat>,

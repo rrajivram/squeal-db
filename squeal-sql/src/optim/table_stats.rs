@@ -42,6 +42,9 @@ pub(crate) struct TableStatStored {
     name: String,
     row_count: usize,
     col_stats: RwLock<HashMap<usize, ColumnStatStored>>,
+    // Of row_count, how many each partition holds, by Partition::id: what
+    // a read of some of a partitioned table's partitions is estimated by.
+    partition_rows: HashMap<u32, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +84,8 @@ pub struct TableStat {
     pub(crate) id: TableIdType,
     pub(crate) name: String,
     pub(crate) row_count: usize,
+    // See TableStatStored::partition_rows.
+    pub(crate) partition_rows: HashMap<u32, usize>,
     // Keyed by field index (matching SqlTable::fields()'s own order) —
     // pub(crate), not private, so a caller outside this module (e.g.
     // Schema, for the `!show table stats` CLI command) can render it
@@ -101,7 +106,8 @@ pub struct ColumnStat {
 
 enum StatMsg {
     Shutdown,
-    InsertLogStat((TableIdType, IndexKey)),
+    // The table, the partition (Partition::id) the row went into, the row.
+    InsertLogStat((TableIdType, u32, IndexKey)),
     // Answered once every message sent before it has been applied.
     Flush(Sender<()>),
 }
@@ -173,8 +179,24 @@ impl<F: DBFile + 'static> SchemaStats<F> {
     // "successfully" into nonsense, and this is the cheap cross-check that
     // catches most of that.
     fn decode_persisted_row(tuple: &Tuple) -> Result<TableStatStored, String> {
-        let persisted: PersistedTableStat =
-            from_bytes(tuple.data()).map_err(|e| format!("undecodable: {e}"))?;
+        use crate::envelope::{Opened, open};
+        let (persisted, partition_rows) = match open(tuple.data(), "stats")
+            .map_err(|e| e.to_string())?
+        {
+            Opened::Versioned { version: 2, body } => {
+                let v2: PersistedTableStatV2 =
+                    from_bytes(body).map_err(|e| format!("undecodable: {e}"))?;
+                (v2.table, v2.partition_rows)
+            }
+            // Before per-partition counts: none known.
+            Opened::Legacy(body) => (
+                from_bytes::<PersistedTableStat>(body).map_err(|e| format!("undecodable: {e}"))?,
+                HashMap::new(),
+            ),
+            Opened::Versioned { version, .. } => {
+                return Err(format!("unsupported stats row version {version}"));
+            }
+        };
         if !matches!(tuple.id(), DBIdType::Int(k) if *k == persisted.id.as_u64()) {
             return Err(format!(
                 "row stored under key {:?} claims to be table {:?}",
@@ -182,7 +204,8 @@ impl<F: DBFile + 'static> SchemaStats<F> {
                 persisted.id
             ));
         }
-        TableStatStored::from_persisted(persisted).map_err(|e| format!("bad column stats: {e}"))
+        TableStatStored::from_persisted(persisted, partition_rows)
+            .map_err(|e| format!("bad column stats: {e}"))
     }
 
     fn spawn(
@@ -225,8 +248,8 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         let txn = self.schema.db.begin()?;
         for stat in self.tables.read().values() {
             let persisted = stat.to_persisted();
-            let key = DBIdType::Int(persisted.id.as_u64());
-            let bytes = to_allocvec(&persisted)?;
+            let key = DBIdType::Int(persisted.table.id.as_u64());
+            let bytes = crate::envelope::seal(STATS_ROW_VERSION, &to_allocvec(&persisted)?);
             let tuple = Tuple::new_with(key, &bytes, Some(txn.id()), None);
             match self.schema.db.update(stats_table_id, tuple.clone(), &txn) {
                 Ok(()) => {}
@@ -321,6 +344,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             name: table.name.clone(),
             row_count: 0,
             col_stats: RwLock::new(col_stats),
+            partition_rows: HashMap::new(),
         };
         Ok(tstat)
     }
@@ -331,10 +355,12 @@ impl<F: DBFile + 'static> SchemaStats<F> {
     // incremental, approximate stats fed by live traffic; wrong for
     // ANALYZE, which needs every row counted exactly once — see
     // `record_row_sync` for that path instead.
-    pub(crate) fn log_stat(&self, table: TableIdType, record: IndexKey) {
+    pub(crate) fn log_stat(&self, table: TableIdType, partition: u32, record: IndexKey) {
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let r = self.tx.try_send(StatMsg::InsertLogStat((table, record)));
+            let r = self
+                .tx
+                .try_send(StatMsg::InsertLogStat((table, partition, record)));
             match r {
                 Err(TrySendError::Full(_)) => {}
                 Err(_) => {}
@@ -352,7 +378,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         {
             let val = record.hash() as f64 / u64::MAX as f64;
             if val < self.sampling_rate {
-                update_table_stats(&self.tables, table, record);
+                update_table_stats(&self.tables, table, partition, record);
             }
         }
     }
@@ -365,8 +391,20 @@ impl<F: DBFile + 'static> SchemaStats<F> {
     // can enqueue far faster than one background thread can drain), which
     // is fine for sampled live traffic but defeats the entire point of an
     // exhaustive re-analysis.
-    pub(crate) fn record_row_sync(&self, table: TableIdType, record: IndexKey) {
-        update_table_stats(&self.tables, table, record);
+    pub(crate) fn record_row_sync(&self, table: TableIdType, partition: u32, record: IndexKey) {
+        update_table_stats(&self.tables, table, partition, record);
+    }
+
+    /// A partition and its rows are gone (ALTER TABLE ... DROP PARTITION):
+    /// so are its rows from the table's count. Its column values stay in
+    /// the column statistics until the next ANALYZE.
+    pub(crate) fn drop_partition(&self, table: TableIdType, partition: u32) {
+        self.flush();
+        if let Some(t) = self.tables.write().get_mut(&table)
+            && let Some(rows) = t.partition_rows.remove(&partition)
+        {
+            t.row_count = t.row_count.saturating_sub(rows);
+        }
     }
 
     // Waits until the collector has applied every row logged so far — what
@@ -412,10 +450,10 @@ fn stat_collector(
         let msg = rx.recv()?;
         match msg {
             StatMsg::Shutdown => break,
-            StatMsg::InsertLogStat((table, data)) => {
+            StatMsg::InsertLogStat((table, partition, data)) => {
                 let val = data.hash() as f64 / u64::MAX as f64;
                 if val < rate {
-                    update_table_stats(&stat, table, data);
+                    update_table_stats(&stat, table, partition, data);
                 }
             }
             StatMsg::Flush(done) => {
@@ -429,6 +467,7 @@ fn stat_collector(
 fn update_table_stats(
     stat: &Arc<RwLock<HashMap<TableIdType, TableStatStored>>>,
     table: TableIdType,
+    partition: u32,
     data: IndexKey,
 ) {
     let mut table_guard = stat.write();
@@ -443,6 +482,7 @@ fn update_table_stats(
         return;
     };
     table.row_count += 1;
+    *table.partition_rows.entry(partition).or_default() += 1;
     for (i, f) in table.col_stats.write().iter_mut() {
         // A row logged in a table's layout before an ALTER TABLE, applied
         // after it (see SchemaStats::reshape_table), can be short a column.
@@ -524,6 +564,11 @@ impl TableStatStored {
             id: self.id,
             name: self.name.clone(),
             row_count: self.row_count * mul,
+            partition_rows: self
+                .partition_rows
+                .iter()
+                .map(|(p, n)| (*p, n * mul))
+                .collect(),
             col_stats: self
                 .col_stats
                 .read()
@@ -553,6 +598,9 @@ struct PersistedColumnStat {
     max: Option<ValueItem>,
 }
 
+// Version 1: what every build before per-partition row counts wrote, as
+// bare postcard with no envelope (a table id is never 0, so such a row
+// never starts with the envelope's 0x00 — see crate::envelope). Frozen.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedTableStat {
     id: TableIdType,
@@ -560,6 +608,15 @@ struct PersistedTableStat {
     row_count: usize,
     col_stats: HashMap<usize, PersistedColumnStat>,
 }
+
+// Version 2: version 1 and the per-partition row counts, in the envelope.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedTableStatV2 {
+    table: PersistedTableStat,
+    partition_rows: HashMap<u32, usize>,
+}
+
+const STATS_ROW_VERSION: u16 = 2;
 
 impl ColumnStatStored {
     fn to_persisted(&self) -> PersistedColumnStat {
@@ -601,7 +658,14 @@ impl ColumnStatStored {
 }
 
 impl TableStatStored {
-    fn to_persisted(&self) -> PersistedTableStat {
+    fn to_persisted(&self) -> PersistedTableStatV2 {
+        PersistedTableStatV2 {
+            table: self.to_persisted_v1(),
+            partition_rows: self.partition_rows.clone(),
+        }
+    }
+
+    fn to_persisted_v1(&self) -> PersistedTableStat {
         PersistedTableStat {
             id: self.id,
             name: self.name.clone(),
@@ -615,7 +679,10 @@ impl TableStatStored {
         }
     }
 
-    fn from_persisted(p: PersistedTableStat) -> Result<Self, SchemaError> {
+    fn from_persisted(
+        p: PersistedTableStat,
+        partition_rows: HashMap<u32, usize>,
+    ) -> Result<Self, SchemaError> {
         let mut col_stats = HashMap::new();
         for (i, c) in p.col_stats {
             col_stats.insert(i, ColumnStatStored::from_persisted(c)?);
@@ -625,8 +692,34 @@ impl TableStatStored {
             name: p.name,
             row_count: p.row_count,
             col_stats: RwLock::new(col_stats),
+            partition_rows,
         })
     }
+}
+
+/// `stats` as for a read of only the partitions `parts` (positions in
+/// `table.partitions`): the rows they hold, by their own counts when the
+/// table has any, else an equal share each. Everything else as it is.
+pub(crate) fn for_partitions(
+    table: &SqlTable,
+    stats: &ComputedTableStat,
+    parts: &[usize],
+) -> ComputedTableStat {
+    let mut scoped = stats.clone();
+    let total = table.partitions.len();
+    if !table.is_partitioned() || parts.len() == total {
+        return scoped;
+    }
+    let counts = &stats.table_stat.partition_rows;
+    scoped.table_stat.row_count = if counts.is_empty() {
+        stats.table_stat.row_count * parts.len() / total.max(1)
+    } else {
+        parts
+            .iter()
+            .map(|p| counts.get(&table.partitions[*p].id).copied().unwrap_or(0))
+            .sum()
+    };
+    scoped
 }
 
 pub(crate) fn compute_table_stats<F: DBFile + 'static>(
@@ -744,12 +837,31 @@ mod tests {
             name: "orders".into(),
             row_count: 12345,
             col_stats: RwLock::new(col_stats),
+            partition_rows: HashMap::from([(0, 12000), (3, 345)]),
         };
 
-        let persisted = original.to_persisted();
-        let bytes = to_allocvec(&persisted).unwrap();
-        let decoded: PersistedTableStat = from_bytes(&bytes).unwrap();
-        let restored = TableStatStored::from_persisted(decoded).unwrap();
+        // As a stats row: sealed in the envelope, read back by the loader.
+        let key = DBIdType::Int(original.id.as_u64());
+        let row = crate::envelope::seal(
+            STATS_ROW_VERSION,
+            &to_allocvec(&original.to_persisted()).unwrap(),
+        );
+        let restored = SchemaStats::<store::memfile::MemFile>::decode_persisted_row(
+            &Tuple::new_with(key.clone(), &row, None, None),
+        )
+        .unwrap();
+        assert_eq!(restored.partition_rows, original.partition_rows);
+
+        // A row from before per-partition counts (version 1, bare postcard)
+        // still loads, with none known.
+        let legacy = to_allocvec(&original.to_persisted_v1()).unwrap();
+        assert_ne!(legacy[0], 0x00, "a table id is never 0");
+        let old = SchemaStats::<store::memfile::MemFile>::decode_persisted_row(&Tuple::new_with(
+            key, &legacy, None, None,
+        ))
+        .unwrap();
+        assert_eq!(old.row_count, original.row_count);
+        assert!(old.partition_rows.is_empty());
 
         assert_eq!(restored.id, original.id);
         assert_eq!(restored.name, original.name);

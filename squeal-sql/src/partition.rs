@@ -541,15 +541,27 @@ mod prune_tests {
         assert_eq!(kept(range(Excluded(int(9)), Excluded(int(10)))), [0]);
         assert_eq!(kept(range(Included(int(9)), Included(int(10)))), [0, 1]);
         assert_eq!(kept(range(Unbounded, Excluded(int(10)))), [0]);
-        assert_eq!(kept(range(Excluded(ValueItem::Null), Excluded(int(10)))), [0]);
+        assert_eq!(
+            kept(range(Excluded(ValueItem::Null), Excluded(int(10)))),
+            [0]
+        );
         assert_eq!(kept(range(Included(int(25)), Unbounded)), [2, 3]);
         assert_eq!(kept(range(Included(int(30)), Unbounded)), [3]);
-        assert_eq!(kept(ColumnSet::Points(vec![int(5), int(25), int(99)])), [0, 2, 3]);
+        assert_eq!(
+            kept(ColumnSet::Points(vec![int(5), int(25), int(99)])),
+            [0, 2, 3]
+        );
         assert_eq!(kept(ColumnSet::Points(vec![])), Vec::<usize>::new());
         // Without MAXVALUE, values above the last bound are nowhere.
         let three = &parts[..3];
-        assert_eq!(by.may_hold(three, &range(Included(int(30)), Unbounded)), Vec::<usize>::new());
-        assert_eq!(by.may_hold(three, &ColumnSet::Points(vec![int(40)])), Vec::<usize>::new());
+        assert_eq!(
+            by.may_hold(three, &range(Included(int(30)), Unbounded)),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            by.may_hold(three, &ColumnSet::Points(vec![int(40)])),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]
@@ -564,11 +576,23 @@ mod prune_tests {
             Partition::new(1, "b".into(), PartitionBound::In(vec![int(5)]), 0),
         ];
         assert_eq!(by.may_hold(&parts, &ColumnSet::Points(vec![int(5)])), [1]);
-        assert_eq!(by.may_hold(&parts, &ColumnSet::Points(vec![int(7)])), Vec::<usize>::new());
-        assert_eq!(by.may_hold(&parts, &range(Included(int(3)), Unbounded)), [1]);
+        assert_eq!(
+            by.may_hold(&parts, &ColumnSet::Points(vec![int(7)])),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            by.may_hold(&parts, &range(Included(int(3)), Unbounded)),
+            [1]
+        );
         parts.push(Partition::new(2, "rest".into(), PartitionBound::Default, 0));
         assert_eq!(by.may_hold(&parts, &ColumnSet::Points(vec![int(7)])), [2]);
-        assert_eq!(by.may_hold(&parts, &range(Included(int(3)), Unbounded)), [1, 2]);
-        assert_eq!(by.may_hold(&parts, &ColumnSet::Points(vec![int(1), int(2)])), [0]);
+        assert_eq!(
+            by.may_hold(&parts, &range(Included(int(3)), Unbounded)),
+            [1, 2]
+        );
+        assert_eq!(
+            by.may_hold(&parts, &ColumnSet::Points(vec![int(1), int(2)])),
+            [0]
+        );
     }
 }

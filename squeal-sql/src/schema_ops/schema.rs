@@ -688,7 +688,7 @@ where
         // worth threading commit/rollback awareness into an already-
         // lossy background collector for.
         if let Some(stats) = self.stats.lock().as_ref() {
-            stats.log_stat(table.id, row_data.values.clone());
+            stats.log_stat(table.id, part.id, row_data.values.clone());
         }
         Ok(())
     }
@@ -1367,7 +1367,7 @@ where
             let mut cursor = self.db.table_scan(part.rows())?;
             while let Some(tuple) = cursor.next()? {
                 let row = from_bytes::<VersionedRow>(tuple.data())?;
-                stats.record_row_sync(table.id, table.reproject(&row)?);
+                stats.record_row_sync(table.id, part.id, table.reproject(&row)?);
             }
         }
         Ok(())
@@ -1568,6 +1568,7 @@ where
         table_name: &str,
         partition: &str,
     ) -> Result<(), SchemaError> {
+        let mut dropped = None;
         self.alter_table(table_name, |t| {
             if !t.is_partitioned() {
                 return Err(SchemaError::UserError(format!(
@@ -1584,9 +1585,13 @@ where
                     "cannot drop {partition:?}: it is table {table_name:?}'s only partition"
                 )));
             }
-            t.partitions.remove(i);
+            dropped = Some((t.id, t.partitions.remove(i).id));
             Ok(())
-        })
+        })?;
+        if let (Some((table, id)), Some(stats)) = (dropped, self.stats.lock().as_ref()) {
+            stats.drop_partition(table, id);
+        }
+        Ok(())
     }
 
     fn alter_table(

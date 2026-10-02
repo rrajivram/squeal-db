@@ -85,16 +85,20 @@ Done: every table is a list of partitions with their own trees
 `ALTER TABLE ... ADD|DROP PARTITION`; INSERT/UPDATE/DELETE/COPY route rows by
 the partition column; queries read every partition (`source/append.rs`).
 
-- [ ] Pruning: skip partitions a WHERE rules out (`plan/sarg.rs` ranges
-  against partition bounds), and show how many were read in EXPLAIN.
-- [ ] Order across partitions: a partitioned table never reports its rows as
-  sorted, so ORDER BY / merge join / grouped-input always sort. RANGE
-  partitions read in bound order are sorted by the partition column.
-- [ ] Join seeks: a nested-loop join into a partitioned table is not planned
-  (hash join instead, which now gives the same answers); it needs a seek per
-  partition, or pruning to one.
-- [ ] Statistics are per table: tree shape is read off the first partition,
-  and DROP PARTITION leaves the row count stale until ANALYZE.
+- [x] Pruning: partitions a WHERE rules out are not read (SELECT, UPDATE,
+  DELETE); EXPLAIN shows `(k of n partitions)`.
+- [x] Order across partitions: per-partition ordered reads are merged
+  (`MergeAppend`), so ORDER BY / merge joins / GROUP BY need no sort.
+- [ ] RANGE partitions read in bound order are already sorted by the
+  partition column: plain concatenation would do instead of a merge.
+- [ ] Pruning from join keys at run time (a hash join's build side could
+  name the partitions the probe side needs); today only WHERE prunes.
+- [x] Join seeks into partitioned tables: each partition sought, or only the
+  one the key routes to when the key has the partition column.
+- [x] Row counts per partition (stats row format version 2); pruned reads are
+  estimated and costed by them; DROP PARTITION takes its rows off the count.
+- [ ] Column statistics (distinct counts, min/max) are still per table, and
+  tree shape is read off the first partition.
 - [ ] DROP PARTITION leaves the partition's trees in the store, unreferenced
   (their pages are not reused). Reclaiming them needs a `drop_table` in store
   that is safe against a scan still reading the tree. Store change.
