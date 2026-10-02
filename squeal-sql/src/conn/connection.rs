@@ -195,6 +195,11 @@ where
         }
     }
 
+    // Who this connection's table locks are held by (see conn::tablelock).
+    pub(crate) fn lock_owner(&self) -> crate::conn::tablelock::Owner {
+        self.id.as_u128()
+    }
+
     pub(crate) fn temp_tables(&self) -> &TempTables<F> {
         &self.temp_tables
     }

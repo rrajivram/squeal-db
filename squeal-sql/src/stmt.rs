@@ -441,6 +441,7 @@ where
             resume: vec![],
         };
         let in_txn = conn.with_current_txn(|t| t.is_some());
+        let owner = conn.lock_owner();
         // The lock of a real table; None for a temp table (one connection's
         // own) or a name that does not resolve (the statement will say so).
         let lock_of = |name: &sql_parser::ObjectName| match conn.resolve_object_name_ref(name) {
@@ -458,7 +459,7 @@ where
             if conn.txn_locks.release(&lock) {
                 locks.resume.push(lock.clone());
             }
-            locks.exclusive.push(lock.exclusive()?);
+            locks.exclusive.push(lock.exclusive(owner)?);
         }
         // Statements that depend on one staying as it is: those that write
         // rows, and everything inside an explicit transaction.
@@ -475,9 +476,9 @@ where
             wanted.dedup_by_key(|l| Arc::as_ptr(l) as usize);
             for lock in wanted {
                 if in_txn {
-                    conn.txn_locks.hold(&lock)?;
+                    conn.txn_locks.hold(&lock, owner)?;
                 } else {
-                    locks.shared.push(lock.shared()?);
+                    locks.shared.push(lock.shared(owner)?);
                 }
             }
         }
@@ -490,7 +491,7 @@ impl<F: DBFile + 'static> Drop for StatementLocks<F> {
         self.exclusive.clear();
         for lock in self.resume.drain(..) {
             // Best effort: another change to the table may be waiting.
-            let _ = self.conn.txn_locks.hold(&lock);
+            let _ = self.conn.txn_locks.hold(&lock, self.conn.lock_owner());
         }
     }
 }

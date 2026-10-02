@@ -463,3 +463,32 @@ fn test_a_transaction_reads_the_same_rows_before_and_after_a_concurrent_drop_par
     assert_eq!(before, 3);
     assert_eq!(after, before, "one transaction, one snapshot");
 }
+
+// Two transactions each hold a table the other's DDL wants: the second to
+// ask is refused at once with a deadlock error (not after the lock
+// timeout), and once it rolls back the first goes on.
+#[test]
+fn test_two_transactions_waiting_for_each_others_tables_is_a_deadlock_error() {
+    let (c, other) = two_conns();
+    run(&c, "create table dl_a (id integer)").unwrap();
+    run(&c, "create table dl_b (id integer)").unwrap();
+    run(&c, "begin").unwrap();
+    count(&c, "select count(*) from dl_a");
+    run(&other, "begin").unwrap();
+    count(&other, "select count(*) from dl_b");
+    std::thread::scope(|s| {
+        // c waits for other's hold on dl_b.
+        let first = s.spawn(|| run(&c, "alter table dl_b add column x integer"));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!first.is_finished(), "waits for the other transaction");
+        let start = Instant::now();
+        let err = run(&other, "alter table dl_a add column y integer").unwrap_err();
+        assert!(err.to_string().contains("deadlock"), "{err}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        run(&other, "rollback").unwrap();
+        first.join().unwrap().unwrap();
+    });
+    run(&c, "commit").unwrap();
+    let table = c.current_schema().unwrap().get_table("dl_b").unwrap();
+    assert!(table.fields().iter().any(|f| f.name == "x"));
+}

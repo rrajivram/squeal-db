@@ -21,11 +21,20 @@
 //! cannot hurt it.
 //!
 //! A waiting exclusive lock holds back new shared ones, so DDL is not
-//! starved. Every wait gives up after LOCK_TIMEOUT rather than hang: two
-//! transactions that each hold what the other's DDL wants would otherwise
-//! wait forever.
+//! starved.
+//!
+//! Locks are held by an owner — a connection — and every lock knows its
+//! holders and its waiters. A request that would have to wait for an owner
+//! who is, through a chain of such waits, waiting for the requester is a
+//! deadlock: it fails at once instead (see `deadlocked`). Two transactions
+//! that each hold what the other's DDL wants are the usual case. A wait
+//! still gives up after LOCK_TIMEOUT, as a backstop.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use parking_lot::{Condvar, Mutex};
 
@@ -33,12 +42,40 @@ use crate::error::SchemaError;
 
 pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
+// How often a waiting request looks for a deadlock again: one that formed
+// while two requests began waiting at the same moment is seen by neither
+// at first.
+const RECHECK: Duration = Duration::from_millis(50);
+
+/// Who holds a lock: a connection (see Connection::lock_owner).
+pub(crate) type Owner = u128;
+
 #[derive(Default)]
 struct State {
-    shared: usize,
-    exclusive: bool,
-    // Exclusive requests waiting: new shared ones queue behind them.
-    waiting: usize,
+    // Owners holding it shared, and how many times each.
+    shared: HashMap<Owner, usize>,
+    exclusive: Option<Owner>,
+    // Owners waiting for it exclusively: new shared requests queue behind
+    // them.
+    waiting: Vec<Owner>,
+}
+
+impl State {
+    // Who `owner` must wait for to get the lock: holders in a conflicting
+    // mode, and — for a shared request — exclusive requests queued first.
+    // Never `owner` itself: one connection's statements run one at a time.
+    fn blockers(&self, owner: Owner, exclusive: bool) -> Vec<Owner> {
+        let mut b: Vec<Owner> = self.exclusive.into_iter().collect();
+        if exclusive {
+            b.extend(self.shared.keys().copied());
+        } else {
+            b.extend(self.waiting.iter().copied());
+        }
+        b.retain(|o| *o != owner);
+        b.sort();
+        b.dedup();
+        b
+    }
 }
 
 pub(crate) struct TableLock {
@@ -48,10 +85,37 @@ pub(crate) struct TableLock {
 }
 
 /// Held: the table's definition does not change.
-pub(crate) struct SharedGuard(Arc<TableLock>);
+pub(crate) struct SharedGuard(Arc<TableLock>, Owner);
 
 /// Held: nothing else is using the table.
 pub(crate) struct ExclusiveGuard(Arc<TableLock>);
+
+// What each waiting owner waits for: the lock, and whether exclusively.
+fn waits() -> &'static Mutex<HashMap<Owner, (Arc<TableLock>, bool)>> {
+    static WAITS: OnceLock<Mutex<HashMap<Owner, (Arc<TableLock>, bool)>>> = OnceLock::new();
+    WAITS.get_or_init(Default::default)
+}
+
+// Whether `owner`, about to wait for `lock`, waits — through the owners
+// blocking it, what they wait for, and so on — for itself. Reads one lock's
+// state at a time, holding none while it reads another.
+fn deadlocked(owner: Owner, lock: &Arc<TableLock>, exclusive: bool) -> bool {
+    let mut seen = HashSet::new();
+    let mut todo = lock.state.lock().blockers(owner, exclusive);
+    while let Some(o) = todo.pop() {
+        if o == owner {
+            return true;
+        }
+        if !seen.insert(o) {
+            continue;
+        }
+        let waiting = waits().lock().get(&o).cloned();
+        if let Some((next, next_exclusive)) = waiting {
+            todo.extend(next.state.lock().blockers(o, next_exclusive));
+        }
+    }
+    false
+}
 
 impl TableLock {
     pub(crate) fn new(table: &str) -> Arc<Self> {
@@ -62,63 +126,92 @@ impl TableLock {
         })
     }
 
-    fn timed_out(&self, why: &str) -> SchemaError {
-        SchemaError::UserError(format!(
-            "timed out after {}s waiting for table {:?}: {why}",
-            LOCK_TIMEOUT.as_secs(),
-            self.table
-        ))
+    pub(crate) fn shared(self: &Arc<Self>, owner: Owner) -> Result<SharedGuard, SchemaError> {
+        self.acquire(owner, false, LOCK_TIMEOUT)?;
+        Ok(SharedGuard(self.clone(), owner))
     }
 
-    pub(crate) fn shared(self: &Arc<Self>) -> Result<SharedGuard, SchemaError> {
-        self.shared_within(LOCK_TIMEOUT)
-    }
-
-    pub(crate) fn exclusive(self: &Arc<Self>) -> Result<ExclusiveGuard, SchemaError> {
-        self.exclusive_within(LOCK_TIMEOUT)
-    }
-
-    fn shared_within(self: &Arc<Self>, timeout: Duration) -> Result<SharedGuard, SchemaError> {
-        let mut state = self.state.lock();
-        while state.exclusive || state.waiting > 0 {
-            if self.changed.wait_for(&mut state, timeout).timed_out() {
-                return Err(self.timed_out("its definition is being changed"));
-            }
-        }
-        state.shared += 1;
-        Ok(SharedGuard(self.clone()))
-    }
-
-    fn exclusive_within(
-        self: &Arc<Self>,
-        timeout: Duration,
-    ) -> Result<ExclusiveGuard, SchemaError> {
-        let mut state = self.state.lock();
-        state.waiting += 1;
-        while state.exclusive || state.shared > 0 {
-            if self.changed.wait_for(&mut state, timeout).timed_out() {
-                state.waiting -= 1;
-                // Shared requests queued behind this one can go on.
-                self.changed.notify_all();
-                return Err(self.timed_out("a statement or an open transaction is using it"));
-            }
-        }
-        state.waiting -= 1;
-        state.exclusive = true;
+    pub(crate) fn exclusive(self: &Arc<Self>, owner: Owner) -> Result<ExclusiveGuard, SchemaError> {
+        self.acquire(owner, true, LOCK_TIMEOUT)?;
         Ok(ExclusiveGuard(self.clone()))
+    }
+
+    fn acquire(
+        self: &Arc<Self>,
+        owner: Owner,
+        exclusive: bool,
+        timeout: Duration,
+    ) -> Result<(), SchemaError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock();
+        if exclusive {
+            state.waiting.push(owner);
+        }
+        let result = loop {
+            if state.blockers(owner, exclusive).is_empty() {
+                break Ok(());
+            }
+            // Look for a deadlock with no lock state held (it reads others').
+            waits().lock().insert(owner, (self.clone(), exclusive));
+            drop(state);
+            let dead = deadlocked(owner, self, exclusive);
+            state = self.state.lock();
+            if dead {
+                break Err(SchemaError::UserError(format!(
+                    "deadlock: waiting for table {:?} would wait forever — another \
+                     connection waits for a table this one holds; this statement is \
+                     refused, the other goes on once this transaction ends",
+                    self.table
+                )));
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break Err(SchemaError::UserError(format!(
+                    "timed out after {}s waiting for table {:?}: {}",
+                    timeout.as_secs(),
+                    self.table,
+                    if exclusive {
+                        "a statement or an open transaction is using it"
+                    } else {
+                        "its definition is being changed"
+                    }
+                )));
+            }
+            self.changed.wait_for(&mut state, left.min(RECHECK));
+        };
+        waits().lock().remove(&owner);
+        if exclusive && let Some(i) = state.waiting.iter().position(|o| *o == owner) {
+            state.waiting.remove(i);
+        }
+        match result {
+            Ok(()) if exclusive => state.exclusive = Some(owner),
+            Ok(()) => *state.shared.entry(owner).or_default() += 1,
+            // Shared requests queued behind this one can go on.
+            Err(_) => {
+                self.changed.notify_all();
+            }
+        }
+        result
     }
 }
 
 impl Drop for SharedGuard {
     fn drop(&mut self) {
-        self.0.state.lock().shared -= 1;
+        let mut state = self.0.state.lock();
+        if let Some(n) = state.shared.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                state.shared.remove(&self.1);
+            }
+        }
+        drop(state);
         self.0.changed.notify_all();
     }
 }
 
 impl Drop for ExclusiveGuard {
     fn drop(&mut self) {
-        self.0.state.lock().exclusive = false;
+        self.0.state.lock().exclusive = None;
         self.0.changed.notify_all();
     }
 }
@@ -153,13 +246,14 @@ impl HeldLocks {
         Arc::as_ptr(lock) as usize
     }
 
-    /// Takes `lock` shared unless this transaction already holds it.
-    pub(crate) fn hold(&self, lock: &Arc<TableLock>) -> Result<(), SchemaError> {
+    /// Takes `lock` shared for `owner` unless this transaction already
+    /// holds it.
+    pub(crate) fn hold(&self, lock: &Arc<TableLock>, owner: Owner) -> Result<(), SchemaError> {
         if self.held.lock().contains_key(&Self::key(lock)) {
             return Ok(());
         }
         // Not under `held`'s own lock: this may wait.
-        let guard = lock.shared()?;
+        let guard = lock.shared(owner)?;
         self.held
             .lock()
             .entry(Self::key(lock))
@@ -183,61 +277,133 @@ mod tests {
     use super::*;
 
     const SOON: Duration = Duration::from_millis(30);
+    // Owners no other test uses: what each waits for is process-wide.
+    fn owners() -> (Owner, Owner, Owner) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let base = NEXT.fetch_add(3, Ordering::SeqCst) as Owner;
+        (base, base + 1, base + 2)
+    }
+
+    fn try_shared(lock: &Arc<TableLock>, owner: Owner) -> Result<(), SchemaError> {
+        lock.acquire(owner, false, SOON)
+    }
+
+    fn try_exclusive(lock: &Arc<TableLock>, owner: Owner) -> Result<(), SchemaError> {
+        lock.acquire(owner, true, SOON)
+    }
+
+    fn release_exclusive(lock: &Arc<TableLock>) {
+        drop(ExclusiveGuard(lock.clone()));
+    }
 
     #[test]
     fn test_shared_locks_coexist_and_exclude_an_exclusive_one() {
+        #[allow(non_snake_case)]
+        let (A, B, C) = owners();
         let lock = TableLock::new("t");
-        let a = lock.shared().unwrap();
-        let b = lock.shared().unwrap();
-        assert!(lock.exclusive_within(SOON).is_err());
+        let a = lock.shared(A).unwrap();
+        let b = lock.shared(B).unwrap();
+        assert!(try_exclusive(&lock, C).is_err());
         drop(a);
-        assert!(lock.exclusive_within(SOON).is_err());
+        assert!(try_exclusive(&lock, C).is_err());
         drop(b);
-        let x = lock.exclusive().unwrap();
-        assert!(lock.shared_within(SOON).is_err());
-        assert!(lock.exclusive_within(SOON).is_err());
+        let x = lock.exclusive(C).unwrap();
+        assert!(try_shared(&lock, A).is_err());
+        assert!(try_exclusive(&lock, A).is_err());
         drop(x);
-        lock.shared().unwrap();
+        lock.shared(A).unwrap();
     }
 
     #[test]
     fn test_a_waiting_exclusive_lock_holds_back_new_shared_ones_then_gets_the_table() {
+        #[allow(non_snake_case)]
+        let (A, B, C) = owners();
         let lock = TableLock::new("t");
-        let reader = lock.shared().unwrap();
+        let reader = lock.shared(A).unwrap();
         std::thread::scope(|s| {
-            let writer = s.spawn(|| lock.exclusive().map(drop));
-            while lock.state.lock().waiting == 0 {
+            let writer = s.spawn(|| lock.exclusive(B).map(drop));
+            while lock.state.lock().waiting.is_empty() {
                 std::thread::yield_now();
             }
-            assert!(
-                lock.shared_within(SOON).is_err(),
-                "queued behind the writer"
-            );
+            assert!(try_shared(&lock, C).is_err(), "queued behind the writer");
             drop(reader);
             writer.join().unwrap().unwrap();
         });
         // A request that gave up no longer holds anyone back.
-        let reader = lock.shared().unwrap();
-        assert!(lock.exclusive_within(SOON).is_err());
-        lock.shared_within(SOON).unwrap();
+        let reader = lock.shared(A).unwrap();
+        assert!(try_exclusive(&lock, B).is_err());
+        try_shared(&lock, C).unwrap();
         drop(reader);
     }
 
     #[test]
     fn test_a_transaction_holds_each_lock_once_until_it_ends() {
+        #[allow(non_snake_case)]
+        let (A, B, _) = owners();
         let locks = TableLocks::default();
         let (t, u) = (locks.get("t"), locks.get("u"));
         assert!(Arc::ptr_eq(&t, &locks.get("t")));
         let held = HeldLocks::default();
-        held.hold(&t).unwrap();
-        held.hold(&t).unwrap();
-        held.hold(&u).unwrap();
-        assert_eq!(t.state.lock().shared, 1);
-        assert!(t.exclusive_within(SOON).is_err());
+        held.hold(&t, A).unwrap();
+        held.hold(&t, A).unwrap();
+        held.hold(&u, A).unwrap();
+        assert_eq!(t.state.lock().shared.get(&A), Some(&1));
+        assert!(try_exclusive(&t, B).is_err());
         assert!(held.release(&t));
         assert!(!held.release(&t));
-        t.exclusive_within(SOON).unwrap();
+        try_exclusive(&t, B).unwrap();
+        release_exclusive(&t);
         held.release_all();
-        u.exclusive_within(SOON).unwrap();
+        try_exclusive(&u, B).unwrap();
+    }
+
+    // A holds t, B holds u; A waits for u: no cycle yet. B asking for t
+    // closes one: refused at once, well before the timeout. A then gets u
+    // once B lets it go.
+    #[test]
+    fn test_a_request_closing_a_cycle_of_waits_is_refused_at_once() {
+        #[allow(non_snake_case)]
+        let (A, B, C) = owners();
+        let (t, u) = (TableLock::new("t"), TableLock::new("u"));
+        let a_holds = t.shared(A).unwrap();
+        let b_holds = u.shared(B).unwrap();
+        std::thread::scope(|s| {
+            let a_waits = s.spawn(|| u.exclusive(A).map(drop));
+            while waits().lock().get(&A).is_none() {
+                std::thread::yield_now();
+            }
+            let start = Instant::now();
+            let err = t.exclusive(B).map(drop).unwrap_err().to_string();
+            assert!(err.contains("deadlock"), "{err}");
+            assert!(start.elapsed() < Duration::from_secs(2));
+            drop(b_holds);
+            a_waits.join().unwrap().unwrap();
+        });
+        drop(a_holds);
+        // Three owners round a cycle, through a queued exclusive request:
+        // A holds t and waits for u (held by B); B waits, shared, for v,
+        // where C's exclusive request is queued; C holds t... C asks t.
+        let (t, u, v) = (
+            TableLock::new("t"),
+            TableLock::new("u"),
+            TableLock::new("v"),
+        );
+        let _a = t.shared(A).unwrap();
+        let _b = u.shared(B).unwrap();
+        let _c = v.shared(C).unwrap();
+        std::thread::scope(|s| {
+            let a = s.spawn(|| u.exclusive(A).map(drop));
+            let b = s.spawn(|| v.exclusive(B).map(drop));
+            while waits().lock().get(&A).is_none() || waits().lock().get(&B).is_none() {
+                std::thread::yield_now();
+            }
+            let err = t.exclusive(C).map(drop).unwrap_err().to_string();
+            assert!(err.contains("deadlock"), "{err}");
+            drop(_c);
+            b.join().unwrap().unwrap();
+            drop(_b);
+            a.join().unwrap().unwrap();
+        });
     }
 }
