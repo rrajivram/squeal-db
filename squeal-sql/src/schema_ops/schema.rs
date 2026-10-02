@@ -47,6 +47,9 @@ pub struct Schema<F: DBFile> {
     // else re-populates it — Schema itself is on its way out too).
     stats: Arc<Mutex<Option<SchemaStats<F>>>>,
     stats_table_id: TableIdType,
+    // See conn::tablelock: taken by statements (Statement::execute), not
+    // by the methods here.
+    pub(crate) locks: Arc<crate::conn::tablelock::TableLocks>,
 }
 
 #[cfg(test)]
@@ -84,6 +87,7 @@ where
             sys_table_id,
             stats: Arc::new(Mutex::new(None)),
             stats_table_id,
+            locks: Default::default(),
         });
         // SchemaStats::new needs the Arc<Schema<F>> this struct doesn't
         // exist as until the constructor above returns — a brand-new
@@ -114,6 +118,7 @@ where
             sys_table_id,
             stats: Arc::new(Mutex::new(None)),
             stats_table_id,
+            locks: Default::default(),
         };
         s.load_tables()?;
         let schema = Arc::new(s);

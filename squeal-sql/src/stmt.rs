@@ -388,6 +388,101 @@ where
     result
 }
 
+// The table locks one statement holds while it runs (see conn::tablelock
+// for the rules). Taken before the statement resolves any table, so the
+// definitions it then reads are the ones it runs against.
+struct StatementLocks<F: DBFile + 'static> {
+    conn: Arc<Connection<F>>,
+    // Outside a transaction: released when the statement is done. (Inside
+    // one, shared locks go to the connection, until the transaction ends.)
+    shared: Vec<crate::conn::tablelock::SharedGuard>,
+    exclusive: Vec<crate::conn::tablelock::ExclusiveGuard>,
+    // Locks this connection's transaction held shared and gave up for the
+    // statement's exclusive one: taken back when the statement is done.
+    resume: Vec<Arc<crate::conn::tablelock::TableLock>>,
+}
+
+// Every table a statement names.
+#[derive(Default)]
+struct Relations(Vec<sql_parser::ObjectName>);
+
+impl sql_parser::visitor::Visitor for Relations {
+    type Break = ();
+    fn pre_visit_relation(&mut self, name: &sql_parser::ObjectName) -> std::ops::ControlFlow<()> {
+        self.0.push(name.clone());
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
+impl<F> StatementLocks<F>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    fn take(conn: &Arc<Connection<F>>, stmt: &sql_parser::Statement) -> Result<Self, SchemaError> {
+        use sql_parser::Statement as S;
+        use sql_parser::visitor::Visit;
+        let mut locks = Self {
+            conn: conn.clone(),
+            shared: vec![],
+            exclusive: vec![],
+            resume: vec![],
+        };
+        let in_txn = conn.with_current_txn(|t| t.is_some());
+        // The lock of a real table; None for a temp table (one connection's
+        // own) or a name that does not resolve (the statement will say so).
+        let lock_of = |name: &sql_parser::ObjectName| match conn.resolve_object_name_ref(name) {
+            Ok((TableRef::Real(schema, table), _)) => Some(schema.locks.get(&table.name)),
+            _ => None,
+        };
+        // Statements that change a table's definition.
+        let targets: Vec<&sql_parser::ObjectName> = match stmt {
+            S::AlterTable(a) => vec![&a.name],
+            S::CreateIndex(c) => vec![&c.table],
+            S::DropTable(d) => d.names.items().collect(),
+            _ => vec![],
+        };
+        for lock in targets.into_iter().filter_map(lock_of) {
+            if conn.txn_locks.release(&lock) {
+                locks.resume.push(lock.clone());
+            }
+            locks.exclusive.push(lock.exclusive()?);
+        }
+        // Statements that depend on one staying as it is: those that write
+        // rows, and everything inside an explicit transaction.
+        let depends = match stmt {
+            S::Insert(_) | S::Update(_) | S::Delete(_) | S::CopyInto(_) | S::Truncate(_) => true,
+            S::Select(_) => in_txn,
+            _ => false,
+        };
+        if depends {
+            let mut relations = Relations::default();
+            let _ = stmt.visit(&mut relations);
+            let mut wanted: Vec<_> = relations.0.iter().filter_map(lock_of).collect();
+            wanted.sort_by_key(|l| Arc::as_ptr(l) as usize);
+            wanted.dedup_by_key(|l| Arc::as_ptr(l) as usize);
+            for lock in wanted {
+                if in_txn {
+                    conn.txn_locks.hold(&lock)?;
+                } else {
+                    locks.shared.push(lock.shared()?);
+                }
+            }
+        }
+        Ok(locks)
+    }
+}
+
+impl<F: DBFile + 'static> Drop for StatementLocks<F> {
+    fn drop(&mut self) {
+        self.exclusive.clear();
+        for lock in self.resume.drain(..) {
+            // Best effort: another change to the table may be waiting.
+            let _ = self.conn.txn_locks.hold(&lock);
+        }
+    }
+}
+
 impl<F> Statement<F>
 where
     F: DBFile + 'static,
@@ -447,6 +542,9 @@ where
 
     pub fn execute(&mut self) -> Result<(), SchemaError> {
         for stmt in self.stmts.iter() {
+            // Held until this statement is done (or, in an explicit
+            // transaction, until that ends): see conn::tablelock.
+            let _table_locks = StatementLocks::take(&self.conn, stmt)?;
             match stmt {
                 sql_parser::Statement::ShowSchemas(_) => {
                     let schemas = self

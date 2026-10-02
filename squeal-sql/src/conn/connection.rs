@@ -59,6 +59,9 @@ pub struct Connection<F: DBFile + 'static> {
     // their own transaction regardless of this — deliberately out of
     // scope for this first pass.
     pub(crate) current_txn: RwLock<Option<Transaction>>,
+    // The table locks the explicit transaction holds until it ends (see
+    // conn::tablelock).
+    pub(crate) txn_locks: crate::conn::tablelock::HeldLocks,
     // Connection-scoped temporary tables, addressed as `temp.<table>` —
     // see crate::temp's own doc comment for why this lives here rather
     // than as a real Schema. Cleared by use_database/create_database
@@ -187,6 +190,7 @@ where
             database: RwLock::new(database),
             current_schema: RwLock::new(None),
             current_txn: RwLock::new(None),
+            txn_locks: Default::default(),
             temp_tables: TempTables::new(),
         }
     }
@@ -449,7 +453,9 @@ where
             .write()
             .take()
             .ok_or(SchemaError::NoActiveTransaction)?;
-        self.database.read().commit(txn)
+        let result = self.database.read().commit(txn);
+        self.txn_locks.release_all();
+        result
     }
 
     pub(crate) fn rollback_transaction(self: &Arc<Self>) -> Result<(), SchemaError> {
@@ -458,7 +464,9 @@ where
             .write()
             .take()
             .ok_or(SchemaError::NoActiveTransaction)?;
-        self.database.read().rollback(txn)
+        let result = self.database.read().rollback(txn);
+        self.txn_locks.release_all();
+        result
     }
 
     // Runs `f` with a reference to the currently-open explicit

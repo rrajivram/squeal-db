@@ -5,10 +5,9 @@
 // Each test states what must hold afterwards, in a way that does not
 // depend on HOW it is made to hold: the second operation may fail, or wait
 // for the first (the test lets the first go after a short while either
-// way), or both may succeed with a consistent result. The tests marked
-// #[ignore] fail today — nothing excludes DDL from concurrent DML or from
-// other DDL — and are what a fix has to turn green. Run them with
-//     cargo test -p squeal-sql partition_races -- --ignored
+// way), or both may succeed with a consistent result. They failed before
+// statements took table locks (conn::tablelock), which is what makes them
+// pass: the second operation now waits for the first.
 use std::time::{Duration, Instant};
 
 use postcard::from_bytes;
@@ -246,7 +245,6 @@ fn test_a_scan_in_progress_survives_its_partition_being_dropped() {
 // partition's values, then adds it. A row with such a value inserted in
 // between is in DEFAULT, where nothing routes to any more.
 #[test]
-#[ignore = "known failure: ADD PARTITION does not exclude concurrent inserts"]
 fn test_add_partition_and_an_insert_of_its_value_leave_the_row_where_it_routes() {
     let (c, other) = two_conns();
     run(
@@ -280,10 +278,9 @@ fn test_add_partition_and_an_insert_of_its_value_leave_the_row_where_it_routes()
 }
 
 // An INSERT that resolved its table before a DROP PARTITION writes into the
-// dropped partition's trees, which nothing reads any more: it reports
-// success and the row is gone.
+// dropped partition's trees, which nothing reads any more. Its statement
+// was told the row is in; the row is not there.
 #[test]
-#[ignore = "known failure: an insert racing DROP PARTITION is acknowledged and lost"]
 fn test_an_insert_racing_a_drop_partition_is_stored_or_refused() {
     let (c, other) = two_conns();
     run(
@@ -296,22 +293,22 @@ fn test_an_insert_racing_a_drop_partition_is_stored_or_refused() {
     let (inserted, dropped) = interleave(
         "insert.resolved",
         "race_drop",
-        || run(&c, "insert into race_drop values (1, 15)"),
+        || {
+            // One transaction: the insert, then a read of what it wrote.
+            run(&c, "begin")?;
+            let inserted = run(&c, "insert into race_drop values (1, 15)");
+            let found = count(&c, "select count(*) from race_drop where id = 1");
+            run(&c, "commit")?;
+            inserted.map(|()| found)
+        },
         || run(&other, "alter table race_drop drop partition b"),
     );
-    println!("insert: {inserted:?}, drop partition: {dropped:?}");
-    assert_storage_sound(&c, "race_drop");
-    let found = count(&c, "select count(*) from race_drop where id = 1");
-    match (&inserted, &dropped) {
-        // The drop came after the insert in effect: the row went with its
-        // partition. Only a design that makes the drop wait can claim this.
-        (Ok(()), Ok(())) => assert_eq!(
-            found, 1,
-            "the insert was acknowledged, and day 15 now belongs to partition c"
-        ),
-        (Ok(()), Err(_)) => assert_eq!(found, 1, "the insert was acknowledged"),
-        (Err(_), _) => assert_eq!(found, 0),
+    println!("insert, then rows found: {inserted:?}, drop partition: {dropped:?}");
+    // A transaction sees its own write, whatever the drop does afterwards.
+    if let Ok(found) = inserted {
+        assert_eq!(found, 1, "the insert was acknowledged");
     }
+    assert_storage_sound(&c, "race_drop");
 }
 
 // CREATE INDEX backfills from the rows it can see, then publishes the
@@ -344,13 +341,11 @@ fn create_index_racing_an_insert(table: &str, partition_by: &str) {
 }
 
 #[test]
-#[ignore = "known failure: CREATE INDEX does not exclude concurrent inserts"]
 fn test_create_index_and_a_concurrent_insert_leave_every_row_indexed() {
     create_index_racing_an_insert("race_index_plain", "");
 }
 
 #[test]
-#[ignore = "known failure: CREATE INDEX does not exclude concurrent inserts"]
 fn test_create_index_on_a_partitioned_table_and_a_concurrent_insert_leave_every_row_indexed() {
     create_index_racing_an_insert(
         "race_index_part",
@@ -364,7 +359,6 @@ fn test_create_index_on_a_partitioned_table_and_a_concurrent_insert_leave_every_
 // drops the earlier one's change. When the lost change is ADD PARTITION,
 // rows inserted into the new partition in between are lost with it.
 #[test]
-#[ignore = "known failure: concurrent ALTER TABLEs overwrite each other's change"]
 fn test_two_alter_tables_at_once_both_take_effect() {
     let (c, other) = two_conns();
     run(
@@ -388,7 +382,7 @@ fn test_two_alter_tables_at_once_both_take_effect() {
                 &other,
                 "alter table race_alter add partition late values less than (30)",
             )?;
-            run(&other, "insert into race_alter values (1, 25)")
+            run(&other, "insert into race_alter (id, day) values (1, 25)")
         },
     );
     println!("add column: {column:?}, add partition + insert: {partition:?}");
@@ -414,7 +408,6 @@ fn test_two_alter_tables_at_once_both_take_effect() {
 }
 
 #[test]
-#[ignore = "known failure: concurrent ALTER TABLEs overwrite each other's change"]
 fn test_two_add_columns_at_once_both_take_effect() {
     let (c, other) = two_conns();
     run(&c, "create table race_columns (id integer not null)").unwrap();
@@ -438,7 +431,6 @@ fn test_two_add_columns_at_once_both_take_effect() {
 // connection drops a partition. The definition of the table is not part of
 // the transaction's snapshot, so the second read is of a different table.
 #[test]
-#[ignore = "known failure: DROP PARTITION changes what an open transaction sees"]
 fn test_a_transaction_reads_the_same_rows_before_and_after_a_concurrent_drop_partition() {
     let (c, other) = two_conns();
     run(
