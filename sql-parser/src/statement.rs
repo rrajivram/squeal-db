@@ -15,7 +15,7 @@ use crate::{
     ddl::{
         AlterTable, AnalyzeTable, AnalyzeTables, CopyInto, CreateDatabase, CreateIndex,
         CreateTable, CreateTableAsCopy, DescribeTable, DropDatabase, DropIndex, DropTable,
-        ShowSchemas, ShowTableIndex, ShowTables, Truncate, UseStatement,
+        ShowPartitions, ShowSchemas, ShowTableIndex, ShowTables, Truncate, UseStatement,
     },
     dml::{Delete, Insert, Update},
     expr::Expr,
@@ -60,6 +60,7 @@ pub enum Statement {
     ShowTables(ShowTables),
     ShowSchemas(ShowSchemas),
     ShowTableIndex(ShowTableIndex),
+    ShowPartitions(ShowPartitions),
     DescribeTable(DescribeTable),
     AnalyzeTable(AnalyzeTable),
     AnalyzeTables(AnalyzeTables),

@@ -128,6 +128,7 @@ fn stmt(s: &mut Statement, out: &mut Binder) {
         | Statement::ShowTables(_)
         | Statement::ShowSchemas(_)
         | Statement::ShowTableIndex(_)
+        | Statement::ShowPartitions(_)
         | Statement::DescribeTable(_)
         | Statement::AnalyzeTable(_)
         | Statement::AnalyzeTables(_) => {}

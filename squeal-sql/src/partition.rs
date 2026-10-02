@@ -144,20 +144,27 @@ impl Partition {
 
     /// What EXPLAIN and error messages call it.
     pub(crate) fn describe(&self) -> String {
+        match &self.bound {
+            PartitionBound::All => String::new(),
+            _ => format!("{} ({})", self.name, self.values()),
+        }
+    }
+
+    /// Which values it holds, as SHOW PARTITIONS and EXPLAIN say it.
+    pub(crate) fn values(&self) -> String {
         let show = |v: &ValueItem| match v {
             ValueItem::Str((s, _)) => format!("'{s}'"),
             other => other.to_string(),
         };
         match &self.bound {
-            PartitionBound::All => String::new(),
-            PartitionBound::LessThan(v) => format!("{} (< {})", self.name, show(v)),
-            PartitionBound::MaxValue => format!("{} (< MAXVALUE)", self.name),
+            PartitionBound::All => "all rows".into(),
+            PartitionBound::LessThan(v) => format!("< {}", show(v)),
+            PartitionBound::MaxValue => "< MAXVALUE".into(),
             PartitionBound::In(values) => format!(
-                "{} (in {})",
-                self.name,
+                "in {}",
                 values.iter().map(show).collect::<Vec<_>>().join(", ")
             ),
-            PartitionBound::Default => format!("{} (default)", self.name),
+            PartitionBound::Default => "default".into(),
         }
     }
 }

@@ -138,6 +138,7 @@ pub const SQL_HELP: &[HelpSection] = &[
             ("SHOW TABLES", "list tables in the current schema"),
             ("SHOW SCHEMAS", "list schemas"),
             ("SHOW TABLE INDEX t", "list indexes on a table"),
+            ("SHOW PARTITIONS [FROM] t", "list a table's partitions, their bounds and rows"),
             ("DESCRIBE TABLE t", "show a table's columns"),
             ("ANALYZE TABLE t | ANALYZE TABLES", "collect table statistics"),
             ("EXPLAIN <statement>", "show a statement's query plan"),

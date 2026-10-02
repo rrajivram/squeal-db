@@ -134,6 +134,15 @@ pub struct ShowTableIndex {
     pub name: ObjectName,
 }
 
+/// `SHOW PARTITIONS [FROM] <table>`
+#[derive(Debug, Clone, PartialEq, SQLParser)]
+pub struct ShowPartitions {
+    pub show: kw::Show,
+    pub partitions: kw::Partitions,
+    pub from: Option<kw::From>,
+    pub name: ObjectName,
+}
+
 /// `ANALYZE TABLE <name>` — collect stats for one table.
 #[derive(Debug, Clone, PartialEq, SQLParser)]
 pub struct AnalyzeTable {

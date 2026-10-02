@@ -1006,3 +1006,67 @@ fn test_a_pruned_read_is_estimated_by_the_rows_of_its_partitions() {
     assert_eq!(stat.partition_rows.get(&table.partitions[0].id), Some(&5));
     reloaded.persist_and_shutdown_stats().unwrap();
 }
+
+#[test]
+fn test_show_partitions_lists_each_partition_its_values_and_rows() {
+    let c = range_conn();
+    run(&c, "analyze table events").unwrap();
+    let mut stmt = c.clone().create_statement("show partitions from events").unwrap();
+    stmt.execute().unwrap();
+    let ResultType::Result(rs) = nth_result(&stmt, 0) else {
+        panic!("expected a result set");
+    };
+    let s = |v: &str| ValueItem::Str((v.into(), crate::constant::DEFAULT_VAR_SIZE as u32));
+    assert_eq!(rs.columns(), ["Partition", "Values", "Rows"]);
+    assert_eq!(
+        rs.rows(),
+        [
+            vec![s("early"), s("< 10"), Integer(2)],
+            vec![s("mid"), s("< 20"), Integer(2)],
+            vec![s("late"), s("< 30"), Integer(2)]
+        ]
+    );
+    let c = list_conn(true);
+    let mut stmt = c.clone().create_statement("show partitions regions").unwrap();
+    stmt.execute().unwrap();
+    let ResultType::Result(rs) = nth_result(&stmt, 0) else {
+        panic!("expected a result set");
+    };
+    assert_eq!(rs.rows()[0][1], s("in 'ca', 'or', 'wa'"));
+    assert_eq!(rs.rows()[2][1], s("default"));
+    run(&c, "create table plain (k integer)").unwrap();
+    let mut stmt = c.clone().create_statement("show partitions plain").unwrap();
+    stmt.execute().unwrap();
+    let ResultType::Result(rs) = nth_result(&stmt, 0) else {
+        panic!("expected a result set");
+    };
+    assert_eq!(rs.rows().len(), 1);
+    assert_eq!(rs.rows()[0][1], s("all rows"));
+}
+
+// Ordered by a RANGE table's partition column, the partitions in bound
+// order are the order: read one after the other, no merge.
+#[test]
+fn test_an_order_leading_with_the_range_column_reads_partitions_in_turn() {
+    let c = conn();
+    run(
+        &c,
+        "create table r (k integer not null, id integer not null, primary key(k, id)) \
+         partition by range (k) (partition a values less than (100), \
+         partition b values less than maxvalue)",
+    )
+    .unwrap();
+    let values: Vec<String> = (0..300).map(|i| format!("({}, {i})", (i * 37) % 200)).collect();
+    run(&c, &format!("insert into r values {}", values.join(", "))).unwrap();
+    run(&c, "analyze table r").unwrap();
+    let plan = explain(&c, "select k from r order by k limit 3");
+    assert!(plan.contains("Append r (2 partitions)"), "{plan}");
+    assert!(!plan.contains("MergeAppend") && !plan.contains("Sort"), "{plan}");
+    let mut stmt = c.clone().create_statement("select k, id from r order by k, id").unwrap();
+    stmt.execute().unwrap();
+    let got = take_streaming_result(&mut stmt, 0).1;
+    let mut want = got.clone();
+    want.sort();
+    assert_eq!(got, want);
+    assert_eq!(got.len(), 300);
+}

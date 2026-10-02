@@ -137,13 +137,32 @@ pub(crate) fn over_partitions(
         .iter()
         .map(|p| open(*p))
         .collect::<Result<Vec<_>, _>>()?;
+    let order = order.filter(|o| parts.len() > 1 && !in_bound_order(table, o));
     Ok(Box::new(AppendSource::new(
         table.clone(),
         parts.to_vec(),
         sources,
-        order.filter(|_| parts.len() > 1).map(|o| o.to_vec()),
+        order.map(|o| o.to_vec()),
         rows,
     )))
+}
+
+// Whether reading a RANGE table's partitions one after the other, each in
+// `order`, is already reading the table in `order`: the order leads with the
+// partition column, and every value of a partition is below the next one's.
+// NULLs, below every bound, are in the first partition, so they must come
+// first too (or there must be none).
+fn in_bound_order(table: &SqlTable, order: &[(usize, bool)]) -> bool {
+    let (Some(by), Some((column, field)), Some((first, nulls_first))) = (
+        &table.partitioning,
+        table.partition_column(),
+        order.first(),
+    ) else {
+        return false;
+    };
+    by.kind == crate::partition::PartitionKind::Range
+        && *first == column
+        && (*nulls_first || !field.nullable)
 }
 
 // Every partition of `table`.

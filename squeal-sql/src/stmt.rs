@@ -1014,6 +1014,38 @@ where
                         "".into(),
                     ))));
                 }
+                // One row per partition: its name, which values it holds,
+                // and its rows as the statistics count them (NULL when
+                // they have no count for it yet).
+                sql_parser::Statement::ShowPartitions(s) => {
+                    let (table_ref, field) = self.conn.resolve_object_name_ref(&s.name)?;
+                    reject_qualified_field("SHOW PARTITIONS", field)?;
+                    let (schema, table) = expect_real(table_ref, "SHOW PARTITIONS")?;
+                    let counts = schema
+                        .clone()
+                        .get_table_stats(table.id)?
+                        .map(|s| s.partition_rows)
+                        .unwrap_or_default();
+                    let sz = DEFAULT_VAR_SIZE as u32;
+                    let rows = table
+                        .partitions
+                        .iter()
+                        .map(|p| {
+                            vec![
+                                ValueItem::Str((p.name.clone(), sz)),
+                                ValueItem::Str((p.values(), sz)),
+                                counts
+                                    .get(&p.id)
+                                    .map_or(ValueItem::Null, |n| ValueItem::Integer(*n as i64)),
+                            ]
+                        })
+                        .collect();
+                    self.results.push(Some(ResultType::Result(ResultSet::new(
+                        vec!["Partition".into(), "Values".into(), "Rows".into()],
+                        rows,
+                        "".into(),
+                    ))));
+                }
                 // Entry point for optim::table_stats::SchemaStats —
                 // Schema::analyze_table (schema_ops/schema.rs) does a real,
                 // synchronous full-table scan and rebuilds that table's
