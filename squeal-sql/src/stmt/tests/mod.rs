@@ -2409,14 +2409,6 @@ mod join_tests {
         assert!(matches!(err, SchemaError::UserError(_)), "{err:?}");
     }
 
-    #[test]
-    fn test_using_clause_is_rejected_as_unsupported() {
-        let c = conn();
-        setup(&c);
-        let err = run(&c, "select * from t1 join t2 using (id)").unwrap_err();
-        assert!(matches!(err, SchemaError::UnsupportedFeature(_)), "{err:?}");
-    }
-
     // KNOWN BUG, not yet fixed: JoinSource::new calls equi_join_fields
     // on the ON expression unconditionally, before checking join_type —
     // but a CROSS JOIN's on_expr is EvalExpr::None (there is no ON

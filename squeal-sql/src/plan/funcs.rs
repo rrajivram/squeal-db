@@ -314,6 +314,8 @@ func_obj! {
     Upper(Upper),
     Lower(Lower),
     Concat(Concat),
+    IsNull(IsNull),
+    IsNotNull(IsNotNull),
 }
 
 impl<'a, F> TryFrom<&'a ExprWrapper<'a, F>> for FuncObj
@@ -607,6 +609,16 @@ scalar_fn!(Upper, "upper", |v: ValueItem| match v {
         format!("non-string operand {other:?}"),
     )),
 });
+
+// `x IS NULL` / `x IS NOT NULL` (see EvalExpr::from_expr): the two
+// expressions that are never NULL themselves. Not callable by name.
+scalar_fn!(IsNull, "is_null", |v: ValueItem| Ok(ValueItem::Boolean(
+    v == ValueItem::Null
+)));
+
+scalar_fn!(IsNotNull, "is_not_null", |v: ValueItem| Ok(
+    ValueItem::Boolean(v != ValueItem::Null)
+));
 
 scalar_fn!(Lower, "lower", |v: ValueItem| match v {
     ValueItem::Str((s, _)) => {

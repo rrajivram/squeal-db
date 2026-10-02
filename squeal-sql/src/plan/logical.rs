@@ -255,6 +255,12 @@ pub(crate) struct TableQuery<F: DBFile + 'static> {
     pub(crate) resolved: TableRef<F>,
     pub(crate) joins: Vec<JoinRelation<F>>,
     pub(crate) stats: Option<ComputedTableStat>,
+    // Columns of this table (positions in `fields`) that a JOIN ... USING
+    // merged into the same-named column of an earlier table: an
+    // unqualified reference to the name means that earlier column, and `*`
+    // shows it once. Only for INNER and LEFT joins, where the two are
+    // equal whenever this one is not NULL.
+    pub(crate) merged: Vec<usize>,
 }
 
 pub(crate) struct JoinRelation<F: DBFile + 'static> {
@@ -288,6 +294,9 @@ struct QueryVisitor<F: DBFile> {
     // long as the client holds the result; dropping it ends the
     // transaction.
     stmt_txn: Option<Transaction>,
+    // The WITH queries in scope, outermost first and in the order defined:
+    // a FROM item naming one reads that query (see get_table).
+    ctes: Vec<sql_parser::query::Cte>,
 }
 
 // The WHERE equalities that turn a comma join into a real join: each
@@ -636,6 +645,7 @@ where
             depth: 0,
             mem,
             stmt_txn,
+            ctes: vec![],
         })
     }
 
@@ -643,6 +653,21 @@ where
     // then ORDER BY / LIMIT. Used for the statement's own (outermost) query
     // and for every FROM subquery.
     fn plan_query(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
+        // This query's WITH queries are in scope for it (and for whatever
+        // it contains) and not after.
+        let outer_ctes = self.ctes.len();
+        if let Some(with) = &query.with {
+            if with.recursive.is_some() {
+                return Err(SchemaError::UnsupportedFeature("WITH RECURSIVE".into()));
+            }
+            self.ctes.extend(with.ctes.items().cloned());
+        }
+        let planned = self.plan_query_body(query);
+        self.ctes.truncate(outer_ctes);
+        planned
+    }
+
+    fn plan_query_body(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
         let SetOperand::Select(select) = &query.body else {
             return Err(SchemaError::UnsupportedFeature(
                 "a query body other than a plain SELECT".into(),
@@ -1257,6 +1282,11 @@ where
                 let mut v = vec![];
                 for (sid, t) in tables.iter().enumerate() {
                     for (fid, f) in t.fields.iter().enumerate() {
+                        // Shown once, as the earlier table's column (see
+                        // TableQuery::merged).
+                        if t.merged.contains(&fid) {
+                            continue;
+                        }
                         v.push(ProjectableField::new_with_field(
                             f.name.clone(),
                             f.clone(),
@@ -1888,7 +1918,7 @@ where
                     JoinOperator::Plain(_) => JoinType::Inner,
                     JoinOperator::RightOuter(_, _, _) => JoinType::Right,
                 };
-                let relation = self.get_table(&j.relation)?;
+                let mut relation = self.get_table(&j.relation)?;
                 let on_expr = if let Some(constraint) = &j.constraint {
                     match constraint {
                         JoinConstraint::On(_, expr) => {
@@ -1902,10 +1932,43 @@ where
                             let proj = self.handle_expr(expr, &None, &resolve_against)?;
                             proj.expr
                         }
-                        JoinConstraint::Using(_, _, _, _) => {
-                            return Err(SchemaError::UnsupportedFeature(
-                                "joins with USING. Use ON instead.".into(),
-                            ));
+                        // USING (a, b): `left.a = right.a AND left.b =
+                        // right.b`, each name a column of the joined table
+                        // and of exactly one table before it.
+                        JoinConstraint::Using(_, _, columns, _) => {
+                            if matches!(join_type, JoinType::Cross) {
+                                return Err(SchemaError::UserError(
+                                    "Cross joins cannot have USING".into(),
+                                ));
+                            }
+                            let width = joined_so_far.iter().map(|t| t.fields.len()).sum::<usize>();
+                            let mut on: Option<EvalExpr> = None;
+                            for column in columns.items() {
+                                let name = &column.value;
+                                let left = EvalExpr::validate_field(name, &joined_so_far)?;
+                                let right = relation
+                                    .fields
+                                    .iter()
+                                    .position(|f| f.name.eq_ignore_ascii_case(name))
+                                    .ok_or_else(|| SchemaError::FieldNotFound(name.clone()))?;
+                                let equal = EvalExpr::Binary {
+                                    lhs: Box::new(left),
+                                    op: BinaryOp::Eq,
+                                    rhs: Box::new(EvalExpr::Value(width + right)),
+                                };
+                                on = Some(match on {
+                                    Some(rest) => EvalExpr::Binary {
+                                        lhs: Box::new(rest),
+                                        op: BinaryOp::And,
+                                        rhs: Box::new(equal),
+                                    },
+                                    None => equal,
+                                });
+                                if matches!(join_type, JoinType::Inner | JoinType::Left) {
+                                    relation.merged.push(right);
+                                }
+                            }
+                            on.expect("USING lists at least one column")
                         }
                     }
                 } else {
@@ -1928,8 +1991,78 @@ where
         Ok(tables)
     }
 
+    // The WITH query `name` refers to, if any (the innermost, latest one of
+    // that name), and its position in `ctes`.
+    fn cte_named(&self, name: &sql_parser::ObjectName) -> Option<(usize, sql_parser::query::Cte)> {
+        let mut idents = name.idents();
+        let (Some(only), None) = (idents.next(), idents.next()) else {
+            return None;
+        };
+        self.ctes
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, c)| c.name.value.eq_ignore_ascii_case(&only.value))
+            .map(|(i, c)| (i, c.clone()))
+    }
+
+    // A query's output as a FROM item called `alias`, its columns renamed
+    // to `columns` when given (`WITH x (a, b) AS ...`).
+    fn derived(
+        alias: String,
+        inner: Box<dyn Source>,
+        columns: Option<Vec<String>>,
+    ) -> Result<TableQuery<F>, SchemaError> {
+        let mut fields: Vec<Arc<Field>> = inner.fields().iter().map(|f| f.field.clone()).collect();
+        if let Some(columns) = columns {
+            if columns.len() != fields.len() {
+                return Err(SchemaError::UserError(format!(
+                    "{alias} names {} column(s) but its query returns {}",
+                    columns.len(),
+                    fields.len()
+                )));
+            }
+            for (field, name) in fields.iter_mut().zip(columns) {
+                *field = Arc::new(Field {
+                    name,
+                    ..(**field).clone()
+                });
+            }
+        }
+        let stats = inner.table_stats();
+        Ok(TableQuery {
+            schema: String::new(),
+            table: alias.clone(),
+            alias: alias.clone(),
+            fields: fields.into(),
+            resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
+            joins: vec![],
+            stats,
+            merged: vec![],
+        })
+    }
+
     fn get_table(&mut self, factor: &TableFactor) -> Result<TableQuery<F>, SchemaError> {
-        let tq = if let TableFactor::Table { name, alias } = &factor {
+        let tq = if let TableFactor::Table { name, alias } = &factor
+            && let Some(cte) = self.cte_named(name)
+        {
+            // A WITH query's name: planned here like a FROM subquery, anew
+            // for each reference to it. Its own body sees only the WITH
+            // queries defined before it.
+            let (position, cte) = cte;
+            let later = self.ctes.split_off(position);
+            let inner = self.plan_query(&cte.query);
+            self.ctes.extend(later);
+            let alias = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| cte.name.value.to_lowercase());
+            let columns: Option<Vec<String>> = cte
+                .columns
+                .as_ref()
+                .map(|(_, names, _)| names.items().map(|n| n.value.to_lowercase()).collect());
+            Self::derived(alias, inner?, columns)?
+        } else if let TableFactor::Table { name, alias } = &factor {
             let (table, field) = self.conn.resolve_object_name_ref(name)?;
             crate::stmt::reject_qualified_field("a FROM target", field)?;
             if let TableRef::Real(schema, sqltable) = &table {
@@ -1944,6 +2077,7 @@ where
                     table: sqltable.name.clone(),
                     joins: vec![],
                     stats: compute_table_stats(&self.conn, &schema.name, sqltable)?,
+                    merged: vec![],
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
                 TableQuery {
@@ -1957,6 +2091,7 @@ where
                     resolved: table.clone(),
                     joins: vec![],
                     stats: None,
+                    merged: vec![],
                 }
             } else {
                 todo!()
@@ -1972,18 +2107,7 @@ where
                     SchemaError::UserError("every table in FROM needs an alias".into())
                 })?;
             let inner = self.plan_query(query)?;
-            let fields: Arc<[Arc<Field>]> =
-                inner.fields().iter().map(|f| f.field.clone()).collect();
-            let stats = inner.table_stats();
-            TableQuery {
-                schema: String::new(),
-                table: alias.clone(),
-                alias: alias.clone(),
-                fields,
-                resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
-                joins: vec![],
-                stats,
-            }
+            Self::derived(alias, inner, None)?
         } else {
             unreachable!("TableFactor is Table or Derived")
         };
@@ -2135,6 +2259,7 @@ impl<F: DBFile + 'static> Clone for TableQuery<F> {
             schema: self.schema.clone(),
             table: self.table.clone(),
             stats: self.stats.clone(),
+            merged: self.merged.clone(),
         }
     }
 }

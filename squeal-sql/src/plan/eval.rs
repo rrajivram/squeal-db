@@ -400,6 +400,18 @@ impl EvalExpr {
                 Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
             }
             Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables)?,
+            Expr::IsNull {
+                expr: inner,
+                negated,
+            } => {
+                use crate::plan::funcs::{IsNotNull, IsNull};
+                let arg = vec![FuncArgs::Field(Self::from_expr(inner, tables)?)];
+                Self::Function(if *negated {
+                    FuncObj::IsNotNull(IsNotNull::new(arg)?)
+                } else {
+                    FuncObj::IsNull(IsNull::new(arg)?)
+                })
+            }
             // `x IN (a, b)` is `x = a OR x = b`, and NOT IN its negation —
             // which, with AND/OR/NOT's three-valued logic (see
             // CrateValueItem::binary), gives SQL's NULL behaviour exactly:
@@ -447,7 +459,7 @@ impl EvalExpr {
         Ok(Box::new(eval_expr))
     }
 
-    fn validate_field<F: DBFile + 'static>(
+    pub(crate) fn validate_field<F: DBFile + 'static>(
         field: &str,
         tables: &[TableQuery<F>],
     ) -> Result<EvalExpr, SchemaError> {
@@ -458,7 +470,10 @@ impl EvalExpr {
             let f = t
                 .fields
                 .iter()
-                .position(|f| f.name.eq_ignore_ascii_case(field));
+                .position(|f| f.name.eq_ignore_ascii_case(field))
+                // A column that JOIN ... USING merged into an earlier
+                // table's is not a second column of that name.
+                .filter(|fd| !t.merged.contains(fd));
             if let Some(fd) = f {
                 if found {
                     return Err(SchemaError::AmbiguousFieldError(field.into()));

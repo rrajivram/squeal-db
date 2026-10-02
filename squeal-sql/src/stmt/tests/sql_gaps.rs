@@ -1,17 +1,21 @@
-// SQL that squeal-sql does not run yet, written down as tests of what it
-// should do. None of it is about partitions (see partition_diff.rs for
-// those): these fail on a plain table.
+// SQL that squeal-sql once did not run, each written down first as a
+// failing test of what it should do. None of it is about partitions (see
+// partition_diff.rs for those): these failed on a plain table.
 //
-// Where a query has an equivalent the engine does run, that is its expected
-// answer — no result is written out by hand. Every test here is #[ignore]d
-// as a known gap; test_every_known_gap_is_still_one fails the day one of
-// them starts working, so a fixed gap gets its test switched on.
-//     cargo test -p squeal-sql sql_gaps -- --ignored
+// Where a query has an equivalent the engine already ran, that is its
+// expected answer — no result is written out by hand.
+//
+// A new gap goes into GAPS with an #[ignore]d test;
+// test_every_known_gap_is_still_one fails the day it starts working, and
+// its entry then moves to CLOSED and its test joins the suite.
 use super::partition_diff::{outcome, twin_conn};
 use super::*;
 
 // (what is missing, the query, an equivalent that runs today)
-const GAPS: &[(&str, &str, &str)] = &[
+const GAPS: &[(&str, &str, &str)] = &[];
+
+// Gaps since closed: the same check, now part of the suite.
+const CLOSED: &[(&str, &str, &str)] = &[
     (
         "JOIN ... USING",
         "select e.id from plain_ev e join days d using (day)",
@@ -33,10 +37,6 @@ const GAPS: &[(&str, &str, &str)] = &[
         "select id from plain_ev where cat is not null",
         "select id from plain_ev where id % 7 <> 0",
     ),
-];
-
-// Gaps since closed: the same check, now part of the suite.
-const CLOSED: &[(&str, &str, &str)] = &[
     (
         "join ON with a term on one table (hash join)",
         "select e.id, d.label from plain_ev e join days d on e.day = d.day and d.day = 10",
@@ -72,10 +72,6 @@ const CLOSED: &[(&str, &str, &str)] = &[
     ),
 ];
 
-fn check(what: &str) {
-    check_in(GAPS, what)
-}
-
 fn check_in(list: &[(&str, &str, &str)], what: &str) {
     let c = twin_conn();
     let mut checked = 0;
@@ -105,22 +101,19 @@ fn test_a_join_on_condition_may_be_more_than_column_equalities() {
 }
 
 #[test]
-#[ignore = "known gap: JOIN ... USING is not supported"]
 fn test_join_using() {
-    check("JOIN ... USING");
+    check_in(CLOSED, "JOIN ... USING");
 }
 
 #[test]
-#[ignore = "known gap: WITH is not supported"]
 fn test_with_names_a_query() {
-    check("WITH (a common table expression)");
+    check_in(CLOSED, "WITH (a common table expression)");
 }
 
 #[test]
-#[ignore = "known gap: IS [NOT] NULL is not supported"]
 fn test_is_null_and_is_not_null() {
-    check("IS NULL");
-    check("IS NOT NULL");
+    check_in(CLOSED, "IS NULL");
+    check_in(CLOSED, "IS NOT NULL");
 }
 
 // DROP TABLE and TRUNCATE parse; neither does anything.
@@ -158,4 +151,182 @@ fn test_every_known_gap_is_still_one() {
             "{gap} now runs: {query}\nun-ignore its test and take it out of GAPS"
         );
     }
+}
+
+// ---- beyond the one query each gap was written down as ----
+
+fn rows(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<Vec<ValueItem>> {
+    outcome(c, sql).unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+fn ints(c: &Arc<Connection<MemFile>>, sql: &str) -> Vec<i64> {
+    rows(c, sql)
+        .into_iter()
+        .map(|r| match r[0] {
+            ValueItem::Integer(n) => n,
+            ref other => panic!("{sql}: expected an integer, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn test_is_null_finds_the_rows_an_outer_join_did_not_match() {
+    let c = twin_conn();
+    // days with no event: 25 and 60.
+    assert_eq!(
+        ints(
+            &c,
+            "select d.day from days d left join plain_ev e on e.day = d.day where e.id is null"
+        ),
+        [25, 60]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "select count(*) from days d left join plain_ev e on e.day = d.day \
+             where e.id is not null"
+        ),
+        [7]
+    );
+    // In an expression, in ON, and of an expression.
+    assert_eq!(
+        ints(&c, "select count(*) from plain_ev where not (cat is null) and day < 10"),
+        [8]
+    );
+    assert_eq!(ints(&c, "select count(*) from plain_ev where (cat + 1) is null"), [6]);
+    assert_eq!(
+        ints(
+            &c,
+            "select count(*) from days d join plain_ev e on e.day = d.day and e.cat is null"
+        ),
+        [1]
+    );
+    assert_eq!(
+        rows(&c, "select cat is null, count(*) from plain_ev group by cat is null"),
+        vec![
+            vec![ValueItem::Boolean(false), ValueItem::Integer(34)],
+            vec![ValueItem::Boolean(true), ValueItem::Integer(6)]
+        ]
+    );
+    // The partitioned twin agrees.
+    assert_eq!(ints(&c, "select count(*) from part_ev where cat is null"), [6]);
+}
+
+#[test]
+fn test_using_joins_on_the_named_columns_and_merges_them() {
+    let c = conn();
+    run(&c, "create table a (k integer not null, m integer, x varchar(4))").unwrap();
+    run(&c, "create table b (k integer not null, m integer, y varchar(4))").unwrap();
+    run(&c, "insert into a values (1, 10, 'a1'), (2, 20, 'a2'), (3, 30, 'a3')").unwrap();
+    run(&c, "insert into b values (1, 10, 'b1'), (2, 99, 'b2'), (4, 40, 'b4')").unwrap();
+    // The merged column is one column: named without a table, and once in *.
+    assert_eq!(ints(&c, "select k from a join b using (k)"), [1, 2]);
+    let mut stmt = c.clone().create_statement("select * from a join b using (k)").unwrap();
+    stmt.execute().unwrap();
+    let (columns, mut all) = take_streaming_result(&mut stmt, 0);
+    all.sort();
+    assert_eq!(columns, ["k", "m", "x", "m", "y"]);
+    assert_eq!(all.len(), 2);
+    // Several columns: all must be equal.
+    assert_eq!(
+        rows(&c, "select k, m, x, y from a join b using (k, m)"),
+        vec![vec![
+            ValueItem::Integer(1),
+            ValueItem::Integer(10),
+            ValueItem::Str(("a1".into(), 4)),
+            ValueItem::Str(("b1".into(), 4))
+        ]]
+    );
+    // LEFT JOIN: the merged column is the kept side's.
+    assert_eq!(ints(&c, "select k from a left join b using (k)"), [1, 2, 3]);
+    assert_eq!(ints(&c, "select k from a left join b using (k) where y is null"), [3]);
+    // Either table's own column can still be named.
+    assert_eq!(ints(&c, "select b.k from a join b using (k) where a.k = 2"), [2]);
+    // RIGHT and FULL joins keep both columns (neither side's alone is the
+    // merged value), so the bare name is ambiguous there.
+    assert_eq!(ints(&c, "select b.k from a right join b using (k)"), [1, 2, 4]);
+    assert_eq!(rows(&c, "select a.k, b.k from a full join b using (k)").len(), 4);
+    assert!(run(&c, "select k from a right join b using (k)").is_err());
+    // A name that is not a column of both sides.
+    assert!(run(&c, "select * from a join b using (x)").is_err());
+    assert!(run(&c, "select * from a join b using (nope)").is_err());
+    // A third table joins on the merged column.
+    run(&c, "create table d (k integer not null, z varchar(4))").unwrap();
+    run(&c, "insert into d values (2, 'd2'), (3, 'd3')").unwrap();
+    assert_eq!(ints(&c, "select k from a join b using (k) join d using (k)"), [2]);
+}
+
+#[test]
+fn test_with_queries_can_build_on_each_other_and_be_read_more_than_once() {
+    let c = twin_conn();
+    // A later WITH query reads an earlier one.
+    assert_eq!(
+        ints(
+            &c,
+            "with low as (select id, day from plain_ev where day < 10), \
+                  odd as (select id from low where id % 2 = 1) \
+             select count(*) from odd"
+        ),
+        [5]
+    );
+    // Read twice in one query: each reference reads it anew.
+    assert_eq!(
+        ints(
+            &c,
+            "with low as (select id from plain_ev where day < 3) \
+             select count(*) from low a, low b"
+        ),
+        [9]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "with low as (select id from plain_ev where day < 3) \
+             select a.id from low a join low b on a.id = b.id"
+        ),
+        [0, 1, 2]
+    );
+    // Its columns renamed.
+    assert_eq!(
+        ints(&c, "with x (n, d) as (select id, day from plain_ev) select n from x where d = 33"),
+        [23]
+    );
+    assert!(run(&c, "with x (n) as (select id, day from plain_ev) select n from x").is_err());
+    // Joined with a table, aggregated, aliased.
+    assert_eq!(
+        rows(
+            &c,
+            "with per_cat as (select cat, count(*) as n from plain_ev group by cat) \
+             select p.cat, p.n from per_cat p where p.cat is not null"
+        ),
+        vec![
+            vec![ValueItem::Integer(0), ValueItem::Integer(12)],
+            vec![ValueItem::Integer(1), ValueItem::Integer(11)],
+            vec![ValueItem::Integer(2), ValueItem::Integer(11)]
+        ]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "with ev as (select id, day from plain_ev where id > 35) \
+             select d.day from days d join ev on ev.day = d.day"
+        ),
+        [49]
+    );
+    // It shadows a table of the same name, inside its query only.
+    assert_eq!(ints(&c, "with days as (select id as day from plain_ev) select count(*) from days"), [40]);
+    assert_eq!(ints(&c, "select count(*) from days"), [9]);
+    // In a FROM subquery, with a WITH of its own.
+    assert_eq!(
+        ints(
+            &c,
+            "select s.id from (with t as (select id from plain_ev where id < 2) \
+             select id from t) s"
+        ),
+        [0, 1]
+    );
+    // A WITH query cannot read itself, or one defined after it.
+    assert!(run(&c, "with x as (select id from x) select id from x").is_err());
+    assert!(run(&c, "with x as (select id from y), y as (select id from plain_ev) select id from x").is_err());
+    assert!(run(&c, "with recursive x as (select id from plain_ev) select id from x").is_err());
 }
