@@ -170,13 +170,88 @@ fn test_explain_shows_each_partition_under_an_append() {
          TableScan events partition mid (< 20)\n    \
          TableScan events partition late (< 30)"
     );
-    let plan = explain(&c, "select note from events where id = 5 and day = 20");
-    assert!(plan.contains("Append events (3 partitions)"), "{plan}");
+    // A condition on the partition column reads only the partitions it
+    // leaves.
     assert_eq!(
-        plan.matches("TableSeek events partition").count(),
-        3,
-        "{plan}"
+        explain(&c, "select note from events where id = 5 and day = 20"),
+        "Projection note\n  Append events (1 of 3 partitions) (~1 rows)\n    \
+         TableSeek events partition late (< 30) (id = 5 AND day = 20)"
     );
+    let plan = explain(&c, "select id from events where day >= 15");
+    assert!(plan.contains("Append events (2 of 3 partitions)"), "{plan}");
+    assert!(!plan.contains("partition early"), "{plan}");
+    let plan = explain(&c, "select id from events where day in (1, 25)");
+    assert!(plan.contains("(2 of 3 partitions)"), "{plan}");
+    assert!(plan.contains("partition early") && plan.contains("partition late"), "{plan}");
+    // Nothing can match: no partition is read at all.
+    let plan = explain(&c, "select id from events where day > 100");
+    assert!(plan.contains("Append events (0 of 3 partitions)"), "{plan}");
+    // A condition pruning cannot use reads every partition.
+    let plan = explain(&c, "select id from events where note = 'n1' or day = 5");
+    assert!(plan.contains("Append events (3 partitions)"), "{plan}");
+}
+
+#[test]
+fn test_pruned_reads_return_exactly_the_matching_rows() {
+    let c = range_conn();
+    assert_eq!(ints(&c, "select id from events where day = 10"), [3]);
+    assert_eq!(ints(&c, "select id from events where day < 10"), [1, 2]);
+    assert_eq!(ints(&c, "select id from events where day > 9 and day < 20"), [3, 4]);
+    assert_eq!(ints(&c, "select id from events where day in (9, 20, 99)"), [2, 5]);
+    assert_eq!(ints(&c, "select id from events where day > 100"), Vec::<i64>::new());
+    assert_eq!(ints(&c, "select count(*) from events where day > 100"), [0]);
+    // The WHERE still applies within a kept partition.
+    assert_eq!(ints(&c, "select id from events where day >= 19 and id <> 5"), [4, 6]);
+    // UPDATE and DELETE prune too, and still change only matching rows.
+    run(&c, "update events set note = 'x' where day >= 20").unwrap();
+    assert_eq!(ints(&c, "select id from events where note = 'x'"), [5, 6]);
+    run(&c, "delete from events where day < 10").unwrap();
+    assert_eq!(counts(&c, "events"), [0, 2, 2]);
+    // LIST.
+    let c = list_conn(true);
+    run(
+        &c,
+        "insert into regions values (1, 'ca', 10), (2, 'ny', 20), (3, 'tx', 30), (4, null, 40)",
+    )
+    .unwrap();
+    assert_eq!(ints(&c, "select id from regions where region = 'ny'"), [2]);
+    assert_eq!(ints(&c, "select id from regions where region = 'zz'"), Vec::<i64>::new());
+    assert_eq!(ints(&c, "select id from regions where region in ('ca', 'tx')"), [1, 3]);
+    assert_eq!(ints(&c, "select id from regions where region > 'm'"), [2, 3]);
+    let plan = explain(&c, "select id from regions where region = 'ny'");
+    assert!(plan.contains("(1 of 3 partitions)") && plan.contains("partition east"), "{plan}");
+}
+
+// Each partition read in the order wanted, the reads are merged into that
+// order: no sort.
+#[test]
+fn test_an_ordered_read_of_several_partitions_merges_them_instead_of_sorting() {
+    let c = conn();
+    run(
+        &c,
+        "create table m (id integer not null, k integer not null, primary key(id, k)) \
+         partition by range (k) (partition a values less than (100), \
+         partition b values less than maxvalue)",
+    )
+    .unwrap();
+    // ids interleave across the partitions.
+    let values: Vec<String> = (0..300).map(|id| format!("({id}, {})", (id * 37) % 200)).collect();
+    run(&c, &format!("insert into m values {}", values.join(", "))).unwrap();
+    run(&c, "analyze table m").unwrap();
+    let plan = explain(&c, "select id from m order by id limit 5");
+    assert!(plan.contains("MergeAppend m (2 partitions)"), "{plan}");
+    assert!(!plan.contains("Sort") && !plan.contains("TopN"), "{plan}");
+    let mut stmt = c.clone().create_statement("select id from m order by id").unwrap();
+    stmt.execute().unwrap();
+    let got: Vec<i64> = take_streaming_result(&mut stmt, 0)
+        .1
+        .into_iter()
+        .map(|r| match r[0] {
+            Integer(n) => n,
+            ref o => panic!("{o:?}"),
+        })
+        .collect();
+    assert_eq!(got, (0..300).collect::<Vec<_>>());
 }
 
 #[test]

@@ -130,7 +130,7 @@ impl ColumnSet {
 }
 
 impl ColumnRange {
-    fn contains(&self, v: &ValueItem) -> bool {
+    pub(crate) fn contains(&self, v: &ValueItem) -> bool {
         let above = match &self.lower {
             Bound::Included(lo) => v >= lo,
             Bound::Excluded(lo) => v > lo,

@@ -319,7 +319,18 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    let mut source = crate::source::append::over_partitions(table, None, |part| {
+    // Only the partitions the WHERE leaves (see partition::
+    // partitions_to_read).
+    let parts = match &where_expr {
+        Some(w) => {
+            let mut terms = vec![];
+            crate::plan::logical::conjunct_terms(w, &mut terms);
+            let filters: Vec<_> = terms.into_iter().cloned().collect();
+            crate::partition::partitions_to_read(table, &filters)
+        }
+        None => crate::source::append::all_partitions(table),
+    };
+    let mut source = crate::source::append::over_partitions(table, &parts, None, None, |part| {
         Ok(Box::new(crate::source::table::TableSource::new(
             schema.db.clone(),
             table.clone(),

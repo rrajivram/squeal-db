@@ -36,7 +36,7 @@ use crate::{
     source::{
         ProjectableField, Source,
         aggr::AggregatingSource,
-        append::over_partitions,
+        append::{all_partitions, over_partitions},
         column_names,
         group::GroupSource,
         index::IndexSource,
@@ -157,7 +157,7 @@ where
     ) -> Result<Box<dyn Source>, SchemaError> {
         let db = conn.database.read().db.clone();
         let rows = stats.as_ref().map(|s| s.table_stat.row_count);
-        over_partitions(self, rows, |part| {
+        over_partitions(self, &all_partitions(self), None, rows, |part| {
             let ts = TableSource::new(db.clone(), self.clone(), part, txn, stats.clone())?;
             Ok(Box::new(ts) as Box<dyn Source>)
         })
@@ -558,7 +558,7 @@ impl MergeOrder {
 }
 
 // The AND-ed terms of a condition.
-fn conjunct_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
+pub(crate) fn conjunct_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
     match e {
         EvalExpr::Binary {
             lhs,
@@ -1818,31 +1818,33 @@ where
             return Ok((self.open(&item.resolved, item.stats.clone())?, None));
         };
         let db = self.conn.database.read().db.clone();
-        // Several partitions are read one after the other, each through
-        // the same path: whatever order a path gives holds within one
-        // partition only, so no order is asked for and none is promised.
-        let one_partition = table.partitions.len() == 1;
-        let mut access = pick_access(
+        // Only the partitions the WHERE leaves (see partition::
+        // partitions_to_read), each read through the same path. Several
+        // that are each read in the wanted order are merged into it (see
+        // AppendSource).
+        let parts = crate::partition::partitions_to_read(table, &needs.filters);
+        let access = pick_access(
             table,
             item.stats.as_ref(),
             needs,
             db.get_page_data_size(),
-            order.filter(|_| one_partition),
+            order,
         );
-        access.sorted &= one_partition;
+        let merge_order: Option<Vec<(usize, bool)>> = order
+            .filter(|_| access.sorted)
+            .map(|o| o.columns.clone());
         let stats = item.stats.clone();
         let chosen = access.clone();
         let source = self.conn.with_current_txn(|explicit| {
             let txn = explicit.or(self.stmt_txn.as_ref());
             let rows = access.rows;
             let path = &access.path;
-            if let AccessPath::TableScan = path {
-                return item.resolved.open_source(&self.conn, stats, txn);
-            }
-            over_partitions(table, rows, |part| {
+            over_partitions(table, &parts, merge_order.as_deref(), rows, |part| {
                 let stats = stats.clone();
                 let source: Box<dyn Source> = match path.clone() {
-                    AccessPath::TableScan => unreachable!("opened above"),
+                    AccessPath::TableScan => {
+                        Box::new(TableSource::new(db.clone(), table.clone(), part, txn, stats)?)
+                    }
                     AccessPath::TableSeek(range) => Box::new(TableSource::seek(
                         db.clone(),
                         table.clone(),
