@@ -17,3 +17,5 @@ pub mod source;
 pub mod stmt;
 pub mod table;
 pub(crate) mod temp;
+#[cfg(test)]
+pub(crate) mod testhook;

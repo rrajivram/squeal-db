@@ -2195,6 +2195,9 @@ mod merge_join;
 mod nested_loop;
 mod ordering;
 mod partition;
+mod partition_diff;
+mod partition_races;
+mod sql_gaps;
 
 #[cfg(test)]
 mod join_tests {

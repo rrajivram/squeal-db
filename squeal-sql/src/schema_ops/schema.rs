@@ -533,6 +533,8 @@ where
         let table = self.get_table(table_name).ok_or_else(|| {
             SchemaError::BadTableName(format!("Table {table_name:?} does not exist"))
         })?;
+        #[cfg(test)]
+        crate::testhook::pause("insert.resolved", &table.name);
 
         match txn {
             Some(txn) => self.insert_rows_in_txn(&table, rows, txn),
@@ -1157,6 +1159,8 @@ where
             return Err(e);
         }
 
+        #[cfg(test)]
+        crate::testhook::pause("create_index.backfilled", &table.name);
         let added = self.alter_table(table_name, |t| {
             // The partitions the trees were built for must still be the
             // table's.
@@ -1453,6 +1457,8 @@ where
             }
         }
 
+        #[cfg(test)]
+        crate::testhook::pause("add_partition.checked", &table.name);
         let names = self.tree_names(&table, &part);
         let mut created = vec![];
         let added = self
@@ -1529,6 +1535,8 @@ where
         // failure partway through (e.g. self.db.update erroring) still
         // never leaves it half-mutated.
         apply(Arc::make_mut(&mut table))?;
+        #[cfg(test)]
+        crate::testhook::pause("alter_table.applied", &name);
 
         let txn = self.db.begin()?;
         let ik = IndexKey::new_from(&[ValueItem::Str((name.clone(), MAX_TABLE_NAME_LEN as u32))])?;

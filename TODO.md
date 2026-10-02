@@ -47,6 +47,37 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   into a column the sort and grouping read; the SELECT list and HAVING may
   use the same expression).
 
+## Known-failure tests
+
+Tests of what should hold and does not yet, `#[ignore]`d with the reason.
+A fix is done when its tests pass with the `#[ignore]` taken off.
+
+    cargo test -p squeal-sql -- --ignored partition_races partition_diff sql_gaps
+
+- `stmt/tests/partition_races.rs` — DDL against concurrent DML/DDL, with the
+  interleaving forced through pause points (`src/testhook.rs`). 7 failing:
+  - [ ] ADD PARTITION vs an insert of its value (row left in DEFAULT).
+  - [ ] INSERT vs DROP PARTITION (insert acknowledged, row lost).
+  - [ ] CREATE INDEX vs INSERT, plain and partitioned (row not indexed).
+  - [ ] ALTER vs ALTER, two tests (the later write drops the earlier change;
+    with ADD PARTITION, its rows too).
+  - [ ] DROP PARTITION under an open transaction (its second read differs).
+  `storage_problems` there checks a table at rest: rows in the partition they
+  route to, index trees matching their partition's rows.
+- `stmt/tests/partition_diff.rs` — partitioned vs plain twins, same queries.
+  ~90 agree (kept as a regression test: pruning must pass it unchanged).
+  - [ ] 4 differ: a join into a partitioned table whose ON has more than
+    column equalities (no nested-loop seek, and the hash join refuses it).
+- `stmt/tests/sql_gaps.rs` — not about partitions; each checked against an
+  equivalent query that runs.
+  - [ ] Join ON with a term on one table; LEFT JOIN ON restricting the inner
+    table; join on an inequality; join on an expression (all: hash join).
+  - [ ] JOIN ... USING. WITH. IS [NOT] NULL. DROP TABLE. TRUNCATE.
+
+Not written yet: a seeded query generator for the twins, the concurrent
+soak with crash rounds, SQLite as a second oracle (`rusqlite` dev-dependency,
+approved).
+
 ## Partitions
 
 Done: every table is a list of partitions with their own trees
@@ -72,15 +103,6 @@ the partition column; queries read every partition (`source/append.rs`).
 - [ ] No way to list a table's partitions from SQL except EXPLAIN (a
   `SHOW PARTITIONS`, or DESCRIBE showing them).
 - [ ] External partitions (Parquet): a new `PartitionStorage` variant.
-
-## Gaps found on the way (not partition-specific)
-
-- [ ] `IS NULL` / `IS NOT NULL` are not supported by squeal-sql's evaluator
-  (`UnsupportedFeature("this kind of expression: IsNull")`).
-- [ ] A join's ON with a non-column term (`on a.x = b.x and b.y = 3`) fails
-  when it runs as a hash join ("hash join only supports equi-join conditions
-  between plain columns").
-- [ ] DROP TABLE and TRUNCATE parse but squeal-sql does not execute them.
 
 ## Flaky tests
 
