@@ -315,7 +315,10 @@ mod tests {
         let before = cache_stats().shape_hits;
         let t = "select * from shape_t where id = 'ORD0000042' and n > 7";
         assert_eq!(*parse_sql_cached(t).unwrap(), *parse_sql(t).unwrap());
-        assert!(cache_stats().shape_hits > before, "a new text of a known shape is bound, not parsed");
+        assert!(
+            cache_stats().shape_hits > before,
+            "a new text of a known shape is bound, not parsed"
+        );
     }
 
     #[test]
@@ -360,5 +363,59 @@ mod tests {
         // The oldest went first.
         let again = parse_sql_cached("select cache_test_bound_0 from t").unwrap();
         assert!(!Arc::ptr_eq(&first, &again));
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    // Where a shape-cache hit's time goes. By hand, in release:
+    //   cargo test --release -p sql-parser --lib cache::bench -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn shape_hit_parts() {
+        let texts: Vec<String> = (0..40_000)
+            .map(|i| format!("select * from orders where order_id = 'ORD{i:07}'"))
+            .collect();
+        parse_sql_cached(&texts[0]).unwrap();
+        parse_sql_cached(&texts[1]).unwrap();
+        let time = |what: &str, f: &mut dyn FnMut(&str)| {
+            let start = std::time::Instant::now();
+            for t in &texts[2..] {
+                f(t);
+            }
+            let us = start.elapsed().as_secs_f64() * 1e6 / (texts.len() - 2) as f64;
+            println!("{what:<30} {us:>7.2} us");
+        };
+        time("tokenize", &mut |t| {
+            tokenize(t).unwrap();
+        });
+        time("tokenize + shape_of", &mut |t| {
+            let tokens = tokenize(t).unwrap();
+            shape_of(t, &tokens).unwrap();
+        });
+        let key = {
+            let tokens = tokenize(&texts[0]).unwrap();
+            shape_of(&texts[0], &tokens).unwrap().0
+        };
+        let Some(Shape::Template(template)) = lock().shapes.get(&key) else {
+            panic!("no template");
+        };
+        time("template clone", &mut |_| {
+            let _ = template.to_vec();
+        });
+        time("clone + bind", &mut |t| {
+            let tokens = tokenize(t).unwrap();
+            let (_, _, literals) = shape_of(t, &tokens).unwrap();
+            let mut s = template.to_vec();
+            bind_literals(&mut s, literals);
+        });
+        time("parse_sql_cached (new text)", &mut |t| {
+            parse_sql_cached(t).unwrap();
+        });
+        time("parse_sql_cached (repeat)", &mut |t| {
+            parse_sql_cached(t).unwrap();
+        });
     }
 }

@@ -6,4 +6,5 @@ edition = "2024"
 [dependencies]
 chumsky = "0.13.0"
 either = "1.16.0"
+unicode-ident = "1.0.24"
 macros = { path="../macros"}
