@@ -2199,6 +2199,7 @@ mod partition_diff;
 mod partition_races;
 mod sql_gaps;
 mod oracle;
+mod soak;
 
 #[cfg(test)]
 mod join_tests {

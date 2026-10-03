@@ -155,7 +155,8 @@ where
         })
     }
 
-    // ORDER BY only ever supports a plain column reference (matching
+    // ORDER BY only ever supports a plain column reference, or a position
+    // in the select list (matching
     // the pre-existing limit here — a computed expression like `a+b`
     // already fell through to the same "non-value sort value" error via
     // EvalExpr::from_expr, since only EvalExpr::Value survived the match
@@ -168,6 +169,16 @@ where
         expr: &Expr,
         fields: &[ProjectableField],
     ) -> Result<usize, SchemaError> {
+        // `ORDER BY 2`: the select list's second column.
+        if let Expr::Literal(sql_parser::literal::Literal::Number(n)) = expr {
+            return match n.as_i64() {
+                Some(i) if i >= 1 && (i as usize) <= fields.len() => Ok(i as usize - 1),
+                _ => Err(SchemaError::UserError(format!(
+                    "ORDER BY position {} is not in the select list",
+                    n.raw
+                ))),
+            };
+        }
         let Expr::Column(c) = expr else {
             return Err(SchemaError::UnknownError(
                 "Do not know how to process non-value sort value".into(),
