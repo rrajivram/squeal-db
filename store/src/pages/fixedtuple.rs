@@ -76,6 +76,10 @@ impl PageTuple for FixedTuplePage {
         self.data.get(id)
     }
 
+    fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
+        self.data.get_hinted(id, hint)
+    }
+
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
         if tuple.size() > self.tuple_size as DBSizeType {
             return Err(StoreError::TupleTooLarge(tuple.size(), self.tuple_size));

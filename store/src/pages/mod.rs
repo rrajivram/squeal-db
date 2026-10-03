@@ -29,6 +29,18 @@ pub trait PageTuple {
 
     fn get(&self, id: &DBIdType) -> Result<Option<TupleType>, StoreError>;
 
+    /// `get`, told where the entry probably is — a caller reading a page's
+    /// entries in order passes one past the last position it was given —
+    /// and saying where it was found. A wrong hint costs nothing but the
+    /// one check; the default ignores it.
+    fn get_hinted(
+        &self,
+        id: &DBIdType,
+        _hint: usize,
+    ) -> Result<Option<(TupleType, usize)>, StoreError> {
+        Ok(self.get(id)?.map(|t| (t, 0)))
+    }
+
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError>;
 
     fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError>;
@@ -85,7 +97,7 @@ pub trait PageTuple {
     // until the first match. For an inner-routing page with N entries,
     // that's an O(N) clone plus up to O(N) `postcard` decodes for what is
     // structurally a single B-tree range query. `AnyTuplePage` backs this
-    // with `BTreeMap::range`, an O(log N) lookup with no clone of
-    // anything but the one matched entry.
+    // with a binary search, an O(log N) lookup with no clone of anything
+    // but the one matched entry.
     fn successor(&self, id: &DBIdType) -> Result<Option<TupleType>, StoreError>;
 }

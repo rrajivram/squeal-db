@@ -223,3 +223,72 @@ fn range_loop() {
     }
     per_op("range count", n, start);
 }
+
+// The same range, store alone (the row table), repeated, for a profiler.
+#[test]
+#[ignore]
+fn store_range_loop() {
+    let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
+    let c = ConnectionManager::<File>::get_manager()
+        .connect(&path)
+        .unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let db = c.database.read().db.clone();
+    let orders = db.table_id_by_name("default.orders").unwrap().unwrap();
+    let range = || KeyRange {
+        prefix: vec![],
+        lower: std::ops::Bound::Included(ValueItem::Str(("ORD0100000".into(), 12))),
+        upper: std::ops::Bound::Excluded(ValueItem::Str(("ORD0200000".into(), 12))),
+    };
+    let seconds: u64 = std::env::var("SQ_LOOP_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let start = Instant::now();
+    let mut n = 0usize;
+    while start.elapsed().as_secs() < seconds {
+        let txn = db.begin().unwrap();
+        let mut cur = db
+            .key_ranges_scan(orders, Some(txn.id()), vec![range()])
+            .unwrap();
+        while cur.next().unwrap().is_some() {}
+        drop(cur);
+        db.commit(txn).unwrap();
+        n += 1;
+    }
+    per_op("store range", n, start);
+}
+
+// Db::find on 200 keys, repeated, for a profiler.
+#[test]
+#[ignore]
+fn store_find_loop() {
+    let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
+    let c = ConnectionManager::<File>::get_manager()
+        .connect(&path)
+        .unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let db = c.database.read().db.clone();
+    let orders = db.table_id_by_name("default.orders").unwrap().unwrap();
+    let key = |id: &str| {
+        DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str((id.to_string(), 12))]).unwrap())
+    };
+    let keys: Vec<_> = (1..=200)
+        .map(|i| key(&format!("ORD{:07}", i * 1500)))
+        .collect();
+    let seconds: u64 = std::env::var("SQ_LOOP_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let start = Instant::now();
+    let mut n = 0usize;
+    let txn = db.begin().unwrap();
+    while start.elapsed().as_secs() < seconds {
+        for k in &keys {
+            db.find(orders, k.clone(), &txn).unwrap().unwrap();
+            n += 1;
+        }
+    }
+    db.rollback(txn).unwrap();
+    per_op("store find", n, start);
+}

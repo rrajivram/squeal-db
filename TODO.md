@@ -18,18 +18,29 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [x] **Read-only transaction commit (~9.5 us of the remaining 10).** Done:
   `Logger::sync_pending` skips the writer round trip when every queued record
   is synced (counted, not by LSN — records reach the writer out of LSN order).
-- [ ] **Store lookup itself is ~0.7 us** (`Db::find`): a copy-on-write page
-  iterator would not move SQL lookups noticeably.
+- [x] **Store lookup itself** (`Db::find`) 0.75 -> 0.54 us: pages' sorted
+  Vec with inline key prefixes (below).
 
-## Range scans (100k rows: SQL 46 ms, store 18 ms)
+## Range scans (100k rows: SQL 46 -> 21 ms, store 18 -> 9.3 ms)
 
 - [x] squeal-sql's per-row work: 100k-row count 46 -> 33 ms (store: 18 ms).
   Per-row clock reads now sampled; covering index scans fill only the
   columns read; aggregates build one output row per group. What is left is
   mostly store's cursor and the per-row Vec/Arc of a row.
-- [ ] Page iterator redesign (copy-on-write snapshot + `Arc<Tuple>` entries,
-  sorted Vec instead of BTreeMap) — worth it only after the above; store
-  change.
+- [x] Page redesign, part 1: profiled first — over half of store's scan was
+  the data-page lookup per row (a BTreeMap of IndexKeys, a memcmp per
+  comparison), a tenth SipHash of page ids; copying the leaf out was 7%.
+  Now `AnyTuplePage` is a sorted Vec (same bytes on disk) with each key's
+  leading bits inline (`order_prefix`), so most probes never follow the
+  key's pointers; a range cursor tells the page where it expects the next
+  row (`get_hinted`); page ids hash with a multiply. Store range 18 -> 9.3
+  ms, SQL count 32 -> 21 ms, `Db::find` 0.75 -> 0.54 us, SQL lookup 8.2 ->
+  7.3 us. Cost: a mid-page insert shifts the Vec (80-byte Tuples + 16-byte
+  prefixes) — random bulk inserts ~25% slower on the memory backend (2.2 ->
+  2.75 s for 500k); on the file backend it is lost in the noise.
+- [ ] Page redesign, part 2: `Arc<Tuple>` entries (an insert shifts 8 bytes
+  a row, not 80) and copy-on-write page snapshots (`Page::iter` without a
+  copy). Measured separately, to keep or drop.
 - [ ] `TableCursor::new` still copies a whole data page when a scan starts
   (`Page::iter`). Making it lazy changes what a scan sees when rows relocate
   mid-scan — needs its own look.

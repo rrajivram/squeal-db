@@ -178,6 +178,32 @@ enum InstallMode {
     ReuseIfPresent,
 }
 
+// The buffer's maps are keyed by page number, looked up on every page
+// access — a range scan does one per row. SipHash (HashMap's default) was
+// a tenth of such a scan; nothing here needs its resistance to chosen
+// keys, since page numbers are handed out by the database itself.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PageIdHasher(u64);
+
+impl std::hash::Hasher for PageIdHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        let h = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(b as u64);
+        }
+    }
+}
+
+type PageMap = HashMap<PageId, PageEntry, std::hash::BuildHasherDefault<PageIdHasher>>;
+
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // STORE_AUDIT.md P2 survey follow-up: sharded (Vec of independent
@@ -188,7 +214,7 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // comments for how eviction (a GLOBAL decision via access_map, which
     // stays unsharded-in-spirit — it already shards itself) stays correct
     // without ever needing to hold two shards' locks at once.
-    buffer: Vec<RwLock<HashMap<PageId, PageEntry>>>,
+    buffer: Vec<RwLock<PageMap>>,
     header: Arc<Header>,
     page_size: DBSizeType,
     // Persistence versioning Stage 3: denormalized off `header` the same
@@ -287,7 +313,7 @@ where
             max_entries,
             strong_count: AtomicUsize::new(0),
             buffer: (0..BUFFER_SHARD_COUNT)
-                .map(|_| RwLock::new(HashMap::new()))
+                .map(|_| RwLock::new(PageMap::default()))
                 .collect(),
             #[cfg(not(target_arch = "wasm32"))]
             write_tx,
@@ -324,11 +350,11 @@ where
         self.strong_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn shard_for(&self, page_num: &PageId) -> &RwLock<HashMap<PageId, PageEntry>> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        page_num.hash(&mut hasher);
-        &self.buffer[(hasher.finish() as usize) % self.buffer.len()]
+    fn shard_for(&self, page_num: &PageId) -> &RwLock<PageMap> {
+        // A different multiplier from PageIdHasher's: the pages of one
+        // shard must not all land in the same buckets of its map.
+        let h = page_num.0.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 32;
+        &self.buffer[h as usize % self.buffer.len()]
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {

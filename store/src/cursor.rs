@@ -205,6 +205,9 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // guarantees everything after that point is also >= end, so next()
     // can stop instead of walking the rest of the tree.
     done: bool,
+    // Where the last entry's row was (data page, position): the next row
+    // is usually just after it (see BPlusTree::resolve_index_entry).
+    last_row: Option<(PageId, usize)>,
 }
 
 impl<F: DBFile> TableCursor<F>
@@ -289,6 +292,7 @@ where
             ranges: None,
             range_idx: 0,
             done: false,
+            last_row: None,
         })
     }
 
@@ -329,6 +333,7 @@ where
             start,
             end: Bound::Unbounded,
             done: ranges.is_empty(),
+            last_row: None,
             ranges: Some(ranges),
             range_idx: 0,
         })
@@ -522,9 +527,12 @@ where
                     // new failure mode this cursor needs to invent
                     // handling for; skip and move on rather than erroring
                     // the whole scan over one stale entry.
-                    let Some(tuple) = table.resolve_index_entry(&entry)? else {
+                    let Some((tuple, page, at)) =
+                        table.resolve_index_entry(&entry, self.last_row)?
+                    else {
                         continue;
                     };
+                    self.last_row = Some((page, at));
                     match self.db.find_visible_to(&tuple, &reader)? {
                         Some(committed) if !committed.is_tombstoned() => {
                             return Ok(Some(committed.into_owned()));

@@ -2,7 +2,7 @@
 // `/P6_SLOTTED_PAGE_DESIGN.md` (repo root). Summary of what this buys over
 // `AnyTuplePage`: AnyTuplePage's `to_bytes()` postcard-re-encodes EVERY tuple
 // on the page on every flush, even for a one-row change, and its
-// `from_bytes()` decodes every tuple into a `BTreeMap` before any query can
+// `from_bytes()` decodes every tuple into a sorted `Vec` before any query can
 // run. A slotted page instead keeps one resident byte buffer that `add`/
 // `replace`/`remove` mutate in place (a slot-directory memmove plus a raw
 // byte write), so `to_bytes()` is a clone of already-correct bytes and
@@ -19,7 +19,7 @@
 // what P6 set out to do. Root cause, confirmed by a direct microbenchmark
 // (`bench_repeated_get_on_an_already_loaded_page`, this file and
 // `anytuple.rs`'s matching one): `AnyTuplePage` decodes every tuple once, on
-// `from_bytes` (page load), into a live `BTreeMap<DBIdType, Vec<Tuple>>` —
+// `from_bytes` (page load), into a live sorted `Vec<Tuple>` —
 // every subsequent `get`/`add`/`replace`/`successor` for as long as that page
 // stays cache-resident is then a free, no-decode in-memory comparison.
 // `SlottedPage` inverts that trade: `from_bytes` decodes nothing (just the
@@ -209,7 +209,7 @@ impl Clone for SlottedPage {
 // Structural equality would compare raw bytes, which differ across two
 // pages holding identical tuples but different insert/remove history
 // (fragmentation, heap packing order) — compare by decoded content instead,
-// the same semantic AnyTuplePage's PartialEq gets for free from BTreeMap.
+// the same semantic AnyTuplePage's PartialEq gets for free from its Vec.
 impl PartialEq for SlottedPage {
     fn eq(&self, other: &Self) -> bool {
         self.values().unwrap_or_default() == other.values().unwrap_or_default()

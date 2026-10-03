@@ -653,7 +653,7 @@ impl ValueItem {
     // pair — not "every same-type pair, plus a panic for anything else".
     // Null ranks lowest (unchanged from the old special-casing); the rest
     // is an arbitrary but fixed and documented order.
-    fn type_rank(&self) -> u8 {
+    pub(crate) fn type_rank(&self) -> u8 {
         match self {
             ValueItem::Null => 0,
             ValueItem::Boolean(_) => 1,

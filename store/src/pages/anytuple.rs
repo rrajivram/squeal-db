@@ -1,6 +1,7 @@
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::ops::Bound;
 
 use crate::{
     db::DBSizeType,
@@ -9,35 +10,37 @@ use crate::{
     tuple::{DBIdType, Tuple},
 };
 
-// No interior lock: the store is only mutated through `&mut self`, which is only
-// reachable after `Arc::make_mut(&mut Arc<Page>)` has made the owning Page
-// uniquely owned (see `PageTuple::deep_clone`). Concurrent readers only ever see
-// a different, immutable Page snapshot, so a lock here would guard nothing.
+// A page's tuples, sorted by id (DBIdType's own Ord), in one Vec: a lookup
+// is a binary search over contiguous entries, and a caller reading entries
+// in order can say where it expects the next one (`get_hinted`) and skip
+// the search. Was a BTreeMap<DBIdType, Vec<Tuple>>, whose lookups compared
+// about twice as many keys and chased a pointer per node — and for a row
+// table keyed by IndexKey, each comparison is a memcmp: that lookup was
+// over half of a range scan's time in store.
 //
-// Keyed by the id itself (via DBIdType's own Ord), not by `.hashed()` as a
-// separately-computed u64: this map's iteration order is what the B+ tree's
-// navigation/split logic treats as "sorted by DBIdType::cmp" (see
-// find_page/insert_recursive in bplustree.rs), so the two must always agree
-// by construction. Keying by a separately-derived u64 only guaranteed that
-// as long as every id type's Ord WAS `.hashed().cmp(...)` — which stopped
-// being true once DBIdType::Rec got a structural Ord (see tuple.rs) so that
-// range queries over multi-key ids mean something. Bucketing (the Vec) still
-// covers the same risk the old scheme had: DBIdType::cmp can say `Equal`
-// for ids that are `PartialEq`-distinct (hash collisions for Int;
-// IndexKey's own documented ties — same content, different reserved
-// capacity, or a strict field-wise prefix — for Rec), and `is_present`/
-// `extract`/etc. below still disambiguate within a bucket via `PartialEq`.
-#[derive(Debug, Serialize, Deserialize, Default)]
+// The order is what the B+ tree's navigation/split logic treats as "sorted
+// by DBIdType::cmp" (see find_page/insert_recursive in bplustree.rs), so
+// keying by the id itself, not a separately-derived hash, keeps the two in
+// agreement by construction. DBIdType::cmp can say `Equal` for ids that
+// are `PartialEq`-distinct (hash collisions for Int; IndexKey's own
+// documented ties — same content, different reserved capacity, or a
+// strict field-wise prefix — for Rec): such ties sit next to each other in
+// arrival order, and every lookup picks among them by `PartialEq`.
+//
+// A binary search jumps around the page, and comparing an IndexKey
+// follows two pointers (the key's fields, then a string's bytes) — a cache
+// miss or three per probe once the page isn't hot, which made it slower
+// than the BTreeMap's walk over neighbouring keys. So each entry also has
+// its key's leading bits inline (`prefixes`, see `order_prefix`): most
+// probes compare those and never touch the key itself.
+//
+// The wire form is the tuples in this order, exactly as the BTreeMap's
+// flattened values were, so pages already on disk read back unchanged.
+#[derive(Debug, Default, Clone)]
 pub struct AnyTuplePage {
-    data: BTreeMap<DBIdType, Vec<Tuple>>,
-}
-
-impl Clone for AnyTuplePage {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data.clone(),
-        }
-    }
+    data: Vec<Tuple>,
+    // order_prefix of each entry's id, in step with `data`.
+    prefixes: Vec<u128>,
 }
 
 impl PartialEq for AnyTuplePage {
@@ -46,24 +49,134 @@ impl PartialEq for AnyTuplePage {
     }
 }
 
+impl Serialize for AnyTuplePage {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.data.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AnyTuplePage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_sorted(Vec::<Tuple>::deserialize(deserializer)?))
+    }
+}
+
+// Leading bits of an id that order the same way it does, wherever they
+// differ: if two ids' prefixes are both known (non-zero tag), of the same
+// kind, and unequal, the ids compare the same way their prefixes do. Equal
+// prefixes say nothing — compare the ids. Bits 127..126 are the kind: 0 no
+// prefix (always compare the ids), 1 Int, 2 Rec; an Int and a Rec order by
+// hash (DBIdType::cmp), so they compare by id too.
+//
+// Int: its own value, which is what it orders by. Rec: its first field
+// only — IndexKey compares field by field, so a difference there decides
+// the order; later fields would not be safe (a shorter key ties with any
+// longer one it starts). The field is its type rank (3 bits), then the
+// value, left-aligned in the remaining 120 bits: an integer or timestamp
+// as an unsigned big-endian number (sign bit flipped), a double by
+// total_cmp's bit trick, a string or blob as its first 15 bytes, zero
+// padded — a shorter string padded with zeros is never above a longer one
+// it starts, so truncating and padding can only turn a difference into a
+// tie, never reverse it. A key with no fields ties with every key: no
+// prefix.
+pub(crate) fn order_prefix(id: &DBIdType) -> u128 {
+    use crate::valueitem::ValueItem;
+    const INT: u128 = 1 << 126;
+    const REC: u128 = 2 << 126;
+    let rec = match id {
+        DBIdType::Int(i) => return INT | *i as u128,
+        DBIdType::Rec(k) => k,
+    };
+    let Some(first) = rec.values().first() else {
+        return 0;
+    };
+    let ordered = |n: u64| (n as u128) << 56;
+    let bytes = |b: &[u8]| {
+        let mut out = [0u8; 16];
+        let n = b.len().min(15);
+        out[1..1 + n].copy_from_slice(&b[..n]);
+        u128::from_be_bytes(out)
+    };
+    let value = match first {
+        ValueItem::Null => 0,
+        ValueItem::Boolean(b) => ordered(*b as u64),
+        ValueItem::Integer(i) => ordered(*i as u64 ^ (1 << 63)),
+        ValueItem::Double(d) => {
+            let bits = d.to_bits() as i64;
+            let total = bits ^ (((bits >> 63) as u64) >> 1) as i64;
+            ordered(total as u64 ^ (1 << 63))
+        }
+        ValueItem::Datetime(t) => ordered(*t),
+        ValueItem::Str((s, _)) => bytes(s.as_bytes()),
+        ValueItem::Blob((b, _)) => bytes(b),
+    };
+    REC | (first.type_rank() as u128) << 123 | value
+}
+
 impl AnyTuplePage {
     pub(crate) fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
+        Self::default()
     }
 
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<AnyTuplePage, StoreError> {
-        let mut vec: Vec<Tuple> = from_bytes(bytes)?;
-        let data = vec.drain(..).map(|t| (t.id.clone(), t)).collect::<Vec<_>>();
-        let mut map: BTreeMap<DBIdType, Vec<Tuple>> = BTreeMap::new();
-        for (id, t) in data {
-            map.entry(id)
-                .and_modify(|f| f.push(t.clone()))
-                .or_insert(vec![t]);
-        }
+        Ok(Self::from_sorted(from_bytes(bytes)?))
+    }
 
-        Ok(Self { data: map })
+    fn from_sorted(mut data: Vec<Tuple>) -> Self {
+        // Written in key order; sorted anyway (stable, so ties keep their
+        // order) rather than trusting a page whose order is wrong, which a
+        // binary search would silently misread.
+        if !data.is_sorted_by(|a, b| a.id <= b.id) {
+            data.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        let prefixes = data.iter().map(|t| order_prefix(&t.id)).collect();
+        Self { data, prefixes }
+    }
+
+    // Entry `i` against `id`, whose order_prefix is `prefix`.
+    #[inline(always)]
+    fn cmp_at(&self, i: usize, id: &DBIdType, prefix: u128) -> Ordering {
+        let mine = self.prefixes[i];
+        if mine != prefix && mine >> 126 == prefix >> 126 && prefix >> 126 != 0 {
+            return mine.cmp(&prefix);
+        }
+        self.data[i].id.cmp(id)
+    }
+
+    // The first entry for which `past` holds; it holds for every one after.
+    #[inline(always)]
+    fn search(&self, id: &DBIdType, past: impl Fn(Ordering) -> bool) -> usize {
+        let prefix = order_prefix(id);
+        let (mut lo, mut hi) = (0, self.data.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if past(self.cmp_at(mid, id, prefix)) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+
+    // The first entry not below `id`.
+    fn lower_bound(&self, id: &DBIdType) -> usize {
+        self.search(id, |o| o != Ordering::Less)
+    }
+
+    // The first entry above `id`.
+    fn upper_bound(&self, id: &DBIdType) -> usize {
+        self.search(id, |o| o == Ordering::Greater)
+    }
+
+    // Where the entry with exactly this id is.
+    fn position(&self, id: &DBIdType) -> Option<usize> {
+        let from = self.lower_bound(id);
+        self.data[from..]
+            .iter()
+            .take_while(|t| t.id.cmp(id) == Ordering::Equal)
+            .position(|t| t.id == *id)
+            .map(|i| from + i)
     }
 }
 
@@ -77,44 +190,56 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
-        if self.contains(&tuple.id)? {
+        if self.position(&tuple.id).is_some() {
             return Err(StoreError::DuplicateKey(tuple.id));
         }
-        self.data
-            .entry(tuple.id.clone())
-            .and_modify(|v| v.push(tuple.clone()))
-            .or_insert(vec![tuple]);
+        // After any ties: they stay in arrival order.
+        let at = self.upper_bound(&tuple.id);
+        self.prefixes.insert(at, order_prefix(&tuple.id));
+        self.data.insert(at, tuple);
         Ok(())
     }
 
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
-        Ok(self
-            .data
-            .get(id)
-            .map(|v| is_present(v, id))
-            .unwrap_or_default())
+        Ok(self.position(id).is_some())
     }
 
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.data.get(id).and_then(|t| extract(t, id)))
+        Ok(self.position(id).map(|i| self.data[i].clone()))
+    }
+
+    fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
+        if let Some(t) = self.data.get(hint)
+            && t.id == *id
+        {
+            return Ok(Some((t.clone(), hint)));
+        }
+        Ok(self.position(id).map(|i| (self.data[i].clone(), i)))
     }
 
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
-        self.data
-            .get_mut(id)
-            .and_then(|v| replace(v, id, tuple))
-            .ok_or(StoreError::KeyNotFound(id.clone()))
+        // Same id (the callers' contract), so the order holds.
+        match self.position(id) {
+            Some(i) => {
+                self.prefixes[i] = order_prefix(&tuple.id);
+                Ok(std::mem::replace(&mut self.data[i], tuple))
+            }
+            None => Err(StoreError::KeyNotFound(id.clone())),
+        }
     }
 
     fn remove(&mut self, id: DBIdType) -> Result<Tuple, StoreError> {
-        self.data
-            .get_mut(&id)
-            .and_then(|t| remove(t, &id))
-            .ok_or(StoreError::KeyNotFound(id))
+        match self.position(&id) {
+            Some(i) => {
+                self.prefixes.remove(i);
+                Ok(self.data.remove(i))
+            }
+            None => Err(StoreError::KeyNotFound(id)),
+        }
     }
 
     fn values(&self) -> Result<Vec<Tuple>, StoreError> {
-        Ok(self.data.values().flatten().cloned().collect())
+        Ok(self.data.clone())
     }
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
@@ -122,99 +247,51 @@ impl PageTuple for AnyTuplePage {
         // this writing) — kept returning the hashed u64 rather than
         // widening the trait's signature to DBIdType for a method nothing
         // reads.
-        Ok(self.data.keys().map(|k| k.hashed()).collect())
+        Ok(self.data.iter().map(|t| t.id.hashed()).collect())
     }
 
     fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
-        // Serialize borrowed tuples: no clone / refcount bump of the payloads on
-        // the writer-thread path. `Vec<&Tuple>` serializes identically to
-        // `Vec<Tuple>` (serde forwards `&T` to `T`), so the wire format — and
-        // thus `from_bytes` — is unchanged.
-        let refs: Vec<&Tuple> = self.data.values().flatten().collect();
-        Ok(to_allocvec(&refs)?)
+        Ok(to_allocvec(&self.data)?)
     }
 
     fn clear(&mut self) -> Result<(), StoreError> {
         self.data.clear();
+        self.prefixes.clear();
         Ok(())
     }
 
     fn first(&self) -> Result<Option<Tuple>, StoreError> {
-        Ok(self
-            .data
-            .first_key_value()
-            .and_then(|(_k, v)| v.first())
-            .cloned())
+        Ok(self.data.first().cloned())
     }
 
     fn last(&self) -> Result<Option<Tuple>, StoreError> {
-        Ok(self
-            .data
-            .last_key_value()
-            .and_then(|(_k, v)| v.last())
-            .cloned())
+        Ok(self.data.last().cloned())
     }
 
-    // STORE_AUDIT.md P5: see PageTuple::successor's own comment. `range`
-    // takes `id` by reference directly (BTreeMap::range is generic over
-    // any borrowed form of the key), so this needs no clone of `id`
-    // itself — only the one matched entry (if any) gets cloned, via
-    // `Tuple`'s cheap Arc-backed `data` field.
-    fn values_in(
-        &self,
-        lower: std::ops::Bound<&DBIdType>,
-        max: usize,
-    ) -> Result<Vec<Tuple>, StoreError> {
-        let mut out = vec![];
-        for (_, bucket) in self.data.range((lower, std::ops::Bound::Unbounded)) {
-            if out.len() >= max {
-                break;
-            }
-            out.extend(bucket.iter().cloned());
+    fn values_in(&self, lower: Bound<&DBIdType>, max: usize) -> Result<Vec<Tuple>, StoreError> {
+        let from = match lower {
+            Bound::Included(k) => self.lower_bound(k),
+            Bound::Excluded(k) => self.upper_bound(k),
+            Bound::Unbounded => 0,
+        };
+        let rest = &self.data[from..];
+        // `max` of them, then the rest of the last one's ties: never part
+        // of a run of equal ids, which the next chunk (starting past that
+        // id) would skip.
+        let mut end = max.min(rest.len());
+        if let Some(last) = end.checked_sub(1).map(|i| &rest[i].id) {
+            end += rest[end..]
+                .iter()
+                .take_while(|t| t.id.cmp(last) == Ordering::Equal)
+                .count();
         }
-        Ok(out)
+        Ok(rest[..end].to_vec())
     }
 
+    // STORE_AUDIT.md P5: see PageTuple::successor's own comment.
     fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        Ok(self
-            .data
-            .range((Excluded(id), Unbounded))
-            .next()
-            .and_then(|(_k, v)| v.first())
-            .cloned())
+        Ok(self.data.get(self.upper_bound(id)).cloned())
     }
-}
-
-#[inline(always)]
-fn is_present(items: &[Tuple], id: &DBIdType) -> bool {
-    items.iter().any(|i| i.id == *id)
-}
-
-#[inline(always)]
-fn extract(items: &[Tuple], id: &DBIdType) -> Option<Tuple> {
-    items.iter().find(|i| i.id == *id).cloned()
-}
-
-#[inline(always)]
-fn remove(items: &mut Vec<Tuple>, id: &DBIdType) -> Option<Tuple> {
-    items.extract_if(.., |f| f.id == *id).next()
-}
-
-#[inline(always)]
-fn replace(items: &mut [Tuple], id: &DBIdType, tuple: Tuple) -> Option<Tuple> {
-    items
-        .iter_mut()
-        .try_for_each(|t| {
-            if t.id == *id {
-                let ret = t.clone();
-                *t = tuple.clone();
-                return std::ops::ControlFlow::Break(Some(ret));
-            }
-            std::ops::ControlFlow::Continue(())
-        })
-        .break_value()
-        .flatten()
 }
 
 #[cfg(test)]
@@ -252,6 +329,25 @@ mod tests {
         let twenty = DBIdType::Int(20);
         assert!(page.values_in(Excluded(&twenty), 4).unwrap().is_empty());
         assert_eq!(ids(page.values_in(Included(&twenty), 4).unwrap()), vec![20]);
+    }
+
+    // A hint is only a place to look first: right, wrong, or past the end,
+    // the answer (and where it was) is the same.
+    #[test]
+    fn test_get_hinted_finds_the_entry_whatever_the_hint() {
+        let mut page = make_page();
+        for i in 0u64..10 {
+            page.add(Tuple::new(i * 2, b"v")).unwrap();
+        }
+        let at = |id: u64, hint: usize| {
+            page.get_hinted(&DBIdType::Int(id), hint)
+                .unwrap()
+                .map(|(t, at)| (t.id, at))
+        };
+        for hint in [3, 0, 9, 10, usize::MAX] {
+            assert_eq!(at(6, hint), Some((DBIdType::Int(6), 3)), "hint {hint}");
+            assert_eq!(at(7, hint), None, "hint {hint}");
+        }
     }
 
     #[test]
@@ -295,7 +391,7 @@ mod tests {
     // STORE_AUDIT.md P5: successor() is the whole point of this fix —
     // route_to_leaf/remove_index_entry/update_index_entry/insert_recursive
     // all now depend on it returning exactly "the smallest key strictly
-    // greater than id" via BTreeMap::range, not a linear scan.
+    // greater than id" by a binary search, not a linear scan.
     #[test]
     fn test_successor_returns_first_key_greater_than_id() {
         let mut p = make_page();
@@ -457,9 +553,9 @@ mod tests {
 
     #[test]
     fn test_rec_id_iterates_in_structural_order() {
-        // The map is now keyed by DBIdType directly (see this file's own
-        // doc comment on `data`), so its natural BTreeMap key order IS
-        // DBIdType::cmp's order — for Rec, that's structural. Confirms
+        // Entries are sorted by DBIdType directly (see this file's own
+        // doc comment on `data`), so their order IS DBIdType::cmp's
+        // order — for Rec, that's structural. Confirms
         // values()/iteration produce ids in ascending field order, not
         // insertion order or hash order.
         let mut p = make_page();
@@ -478,8 +574,8 @@ mod tests {
             .into_iter()
             .map(|t| String::from_utf8(t.data.to_vec()).unwrap())
             .collect();
-        // values() flattens BTreeMap::values() in key order (ascending),
-        // so this should come out already sorted structurally.
+        // values() returns the entries in key order (ascending), so this
+        // should come out already sorted structurally.
         assert_eq!(vals, vec!["1-1", "1-2", "2-1", "3-1"]);
     }
 
@@ -513,11 +609,7 @@ mod tests {
         p.add(Tuple::new_with(long.clone(), b"long", None, None))
             .unwrap();
 
-        assert_eq!(
-            p.count().unwrap(),
-            1,
-            "both land in the same bucket (one map slot)"
-        );
+        assert_eq!(p.count().unwrap(), 2, "both are kept, side by side");
         assert_eq!(p.get(&short).unwrap().unwrap().data.to_vec(), b"short");
         assert_eq!(p.get(&long).unwrap().unwrap().data.to_vec(), b"long");
 
@@ -528,6 +620,83 @@ mod tests {
             p.contains(&long).unwrap(),
             "removing one tied id must not remove the other"
         );
+    }
+
+    // order_prefix's promise (see its own comment): where two ids'
+    // prefixes are both known, of one kind, and unequal, they order the
+    // ids. Checked over every pair of a mix of values of each type,
+    // including the edges: shared string prefixes past 15 bytes, embedded
+    // zeros, negative zero, NaN, the integer extremes, keys of different
+    // lengths, and Int ids next to Rec ones.
+    #[test]
+    fn test_order_prefix_never_contradicts_the_id_order() {
+        use super::order_prefix;
+        use crate::valueitem::{IndexKey, ValueItem};
+        use std::sync::Arc;
+
+        let s = |v: &str| ValueItem::Str((v.to_string(), 32));
+        let firsts = vec![
+            ValueItem::Null,
+            ValueItem::Boolean(false),
+            ValueItem::Boolean(true),
+            ValueItem::Integer(i64::MIN),
+            ValueItem::Integer(-1),
+            ValueItem::Integer(0),
+            ValueItem::Integer(1),
+            ValueItem::Integer(i64::MAX),
+            ValueItem::Double(f64::NEG_INFINITY),
+            ValueItem::Double(-1.5),
+            ValueItem::Double(-0.0),
+            ValueItem::Double(0.0),
+            ValueItem::Double(2.5),
+            ValueItem::Double(f64::NAN),
+            ValueItem::Datetime(0),
+            ValueItem::Datetime(u64::MAX),
+            s(""),
+            s("\0"),
+            s("a"),
+            s("a\0"),
+            s("a\0b"),
+            s("ab"),
+            s("ORD0100000"),
+            s("ORD0100001"),
+            s("abcdefghijklmno"),
+            s("abcdefghijklmnoA"),
+            s("abcdefghijklmnoB"),
+            s("abcdefghijklmn"),
+            s("\u{ff}"),
+            ValueItem::Blob((Arc::from(&b""[..]), 8)),
+            ValueItem::Blob((Arc::from(&b"\x00\x01"[..]), 8)),
+            ValueItem::Blob((Arc::from(&b"\x01"[..]), 8)),
+        ];
+        let mut ids: Vec<DBIdType> = vec![
+            DBIdType::Int(0),
+            DBIdType::Int(7),
+            DBIdType::Int(u64::MAX),
+            DBIdType::Rec(IndexKey::new_from(&[]).unwrap()),
+        ];
+        for f in &firsts {
+            ids.push(DBIdType::Rec(
+                IndexKey::new_from(std::slice::from_ref(f)).unwrap(),
+            ));
+            for second in [ValueItem::Integer(-3), s("z")] {
+                ids.push(DBIdType::Rec(
+                    IndexKey::new_from(&[f.clone(), second]).unwrap(),
+                ));
+            }
+        }
+        let mut checked = 0;
+        for a in &ids {
+            for b in &ids {
+                let (pa, pb) = (order_prefix(a), order_prefix(b));
+                if pa == pb || pa >> 126 != pb >> 126 || pa >> 126 == 0 {
+                    continue;
+                }
+                assert_eq!(pa.cmp(&pb), a.cmp(b), "{a:?} vs {b:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 1000, "{checked}");
     }
 
     // STORE_AUDIT.md P6 — see slotted.rs's matching bench and its own doc
@@ -558,5 +727,66 @@ mod tests {
              {elapsed:?} ({:.0} gets/s)",
             ITERS as f64 / elapsed.as_secs_f64()
         );
+    }
+
+    // Why a sorted Vec with inline key prefixes and not the BTreeMap it
+    // replaced: random gets of composite string keys over many pages (the
+    // working set out of cache, as a table's leaves are), against a
+    // BTreeMap<DBIdType, Vec<Tuple>> built the old way. Measured: 210 ns
+    // a get vs 440 (BTreeMap); with no prefixes, a plain binary search was
+    // 800-930 — two pointer chases per probe. Throwaway, #[ignore]d.
+    #[test]
+    #[ignore]
+    fn bench_get_over_many_pages_vs_btreemap() {
+        use crate::valueitem::{IndexKey, ValueItem};
+        use std::collections::BTreeMap;
+
+        let key = |i: usize| {
+            DBIdType::Rec(
+                IndexKey::new_from(&[ValueItem::Str((format!("ORD{i:07}"), 12))]).unwrap(),
+            )
+        };
+        for (pages, n) in [(1usize, 600usize), (400, 600), (400, 150)] {
+            let mut maps = vec![];
+            let mut vecs = vec![];
+            for p in 0..pages {
+                let ts: Vec<Tuple> = (0..n)
+                    .map(|i| Tuple::new_with(key(p * n + i), &7u64.to_le_bytes(), None, None))
+                    .collect();
+                let bytes = postcard::to_allocvec(&ts).unwrap();
+                let mut map: BTreeMap<DBIdType, Vec<Tuple>> = BTreeMap::new();
+                for t in postcard::from_bytes::<Vec<Tuple>>(&bytes).unwrap() {
+                    map.entry(t.id.clone()).or_default().push(t);
+                }
+                maps.push(map);
+                vecs.push(AnyTuplePage::from_bytes(&bytes).unwrap());
+            }
+            let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+            let probes: Vec<(usize, DBIdType)> = (0..200_000)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let i = (x % (pages * n) as u64) as usize;
+                    (i / n, key(i))
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            for (p, k) in &probes {
+                std::hint::black_box(
+                    maps[*p]
+                        .get(k)
+                        .and_then(|v| v.iter().find(|t| t.id == *k))
+                        .cloned(),
+                );
+            }
+            let map_ns = start.elapsed().as_nanos() as f64 / probes.len() as f64;
+            let start = std::time::Instant::now();
+            for (p, k) in &probes {
+                std::hint::black_box(vecs[*p].get(k).unwrap());
+            }
+            let vec_ns = start.elapsed().as_nanos() as f64 / probes.len() as f64;
+            eprintln!("{pages} pages of {n}: BTreeMap {map_ns:.0} ns, AnyTuplePage {vec_ns:.0} ns");
+        }
     }
 }

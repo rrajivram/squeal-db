@@ -253,8 +253,8 @@ impl Eq for PageId {}
 // match the data it just read (or vice versa). See Page's own doc comment
 // on why this is a lock, not an Arc<dyn PageTuple> mutated via
 // Arc::make_mut: a single-record insert/update/remove only ever touches one
-// key, so mutating in place under a write lock (what BTreeMap::insert/
-// remove already do internally, no cloning involved) is strictly cheaper
+// key, so mutating in place under a write lock (one Vec insert/remove,
+// no cloning involved) is strictly cheaper
 // than cloning the whole store first just to get unique ownership.
 //
 // has_overflow and next_page live here too, not in the `flags`/`next_page`
@@ -860,6 +860,15 @@ impl Page {
 
     pub(crate) fn get(&self, id: DBIdType) -> Result<Option<Tuple>, StoreError> {
         self.inner.read().data.get(&id)
+    }
+
+    // See PageTuple::get_hinted.
+    pub(crate) fn get_hinted(
+        &self,
+        id: &DBIdType,
+        hint: usize,
+    ) -> Result<Option<(Tuple, usize)>, StoreError> {
+        self.inner.read().data.get_hinted(id, hint)
     }
 
     // STORE_AUDIT.md P5: see PageTuple::successor's own comment — an O(log N)

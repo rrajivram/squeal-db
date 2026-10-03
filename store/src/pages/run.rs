@@ -8,7 +8,7 @@ use crate::{
     tuple::{DBIdType, Tuple},
 };
 
-// Insertion order, not id-sorted like AnyTuplePage's BTreeMap — a Run
+// Insertion order, not id-sorted like AnyTuplePage — a Run
 // (crate::run::Run) needs its tuples read back in exactly the order they
 // were appended (a sort run must stay sorted; nothing else here has any
 // other ordering to preserve), which a keyed/sorted map can't give:
