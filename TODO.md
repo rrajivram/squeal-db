@@ -78,9 +78,27 @@ Follow-ups from the fixes:
 - [x] UNION [ALL] / INTERSECT / EXCEPT (UNION ALL used to drop its second
   query's rows) and OFFSET (was ignored).
 
-Not written yet: a seeded query generator for the twins, the concurrent
-soak with crash rounds, SQLite as a second oracle (`rusqlite` dev-dependency,
-approved).
+Test tools (all in `squeal-sql/src/stmt/tests/`):
+
+- `oracle.rs` — seeded random queries answered by squeal on plain tables,
+  squeal on partitioned twins, and SQLite (`rusqlite`, dev-dependency); all
+  three must agree. 600 queries in the suite;
+  `SQ_ORACLE_QUERIES=20000 SQ_ORACLE_SEED=7 cargo test --release -p squeal-sql
+  --lib oracle::test_random -- --nocapture` for a long run.
+- `soak.rs` — concurrent transfers, partition moves, reads and DDL, with
+  crash rounds (snapshot, reopen, check totals / ledger / durability /
+  storage). 3 s in the suite; `SQ_SOAK_SECS=120 cargo test --release -p
+  squeal-sql --lib soak_long -- --ignored --nocapture` for a long run.
+- `partition_races.rs` (forced interleavings), `partition_diff.rs` (plain vs
+  partitioned, fixed queries), `sql_gaps.rs`.
+
+Found by the oracle and fixed: COUNT(x) counted NULLs; UNION ALL dropped its
+second query; OFFSET ignored; ORDER BY position, BETWEEN, LIKE, COALESCE,
+CASE, abs() missing.
+
+Still outside the oracle's grammar (squeal does not run them, so they would
+be findings): ORDER BY an expression; SUM/AVG(DISTINCT); scalar subqueries,
+IN (subquery), EXISTS; window functions; CAST.
 
 ## Partitions
 
