@@ -16,7 +16,6 @@ use sql_parser::expr::BinaryOp;
 
 use postcard::from_bytes;
 use store::{
-    clock::Instant,
     cursor::{Cursor, KeyRange, RangeCursor},
     db::{DBFile, Db},
     tuple::{DBIdType, Tuple},

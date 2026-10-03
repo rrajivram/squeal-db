@@ -8,11 +8,13 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [x] **Parse (~23 us of 33).** Done: texts differing only in literals share
   one parse (the shape cache in `sql_parser::parse_sql_cached`). Lookup now
   14.7 us with a new literal, 6.9 us repeated verbatim.
-- [ ] **Shape-cache hit costs ~7.7 us** (new literal vs repeated text): mostly
-  lexing (chumsky lexer), then cloning the template. A hand-written lexer, or
-  cloning only the statement being bound, would cut it.
-- [ ] **squeal-sql planning/execution ~5.6 us** of a repeated-text lookup
-  (store's part is 1.3 us).
+- [x] **Shape-cache hit** 6.1 -> 1.0 us: a hand-written lexer (lexing was
+  5.5 us of it), checked against the chumsky one by a fuzz test.
+- [x] **squeal-sql planning/execution** of a repeated-text lookup: 8.0 ->
+  5.2 us (store's part 1.3 us). Gone: a getentropy syscall per statement
+  (Uuid::new_v4), EXPLAIN text built on every seek, column statistics
+  rebuilt and copied on every plan. Lookup with a new literal: 16.7 -> 7.9
+  us. Measured on a scratch retail database in /tmp (1M details).
 - [x] **Read-only transaction commit (~9.5 us of the remaining 10).** Done:
   `Logger::sync_pending` skips the writer round trip when every queued record
   is synced (counted, not by LSN — records reach the writer out of LSN order).
@@ -21,9 +23,10 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 
 ## Range scans (100k rows: SQL 46 ms, store 18 ms)
 
-- [ ] squeal-sql's per-row work (~280 ns/row: decoding rows into ValueItems,
-  aggregation) is larger than store's. Profile before redesigning store's
-  page iterator.
+- [x] squeal-sql's per-row work: 100k-row count 46 -> 33 ms (store: 18 ms).
+  Per-row clock reads now sampled; covering index scans fill only the
+  columns read; aggregates build one output row per group. What is left is
+  mostly store's cursor and the per-row Vec/Arc of a row.
 - [ ] Page iterator redesign (copy-on-write snapshot + `Arc<Tuple>` entries,
   sorted Vec instead of BTreeMap) — worth it only after the above; store
   change.
@@ -62,17 +65,18 @@ A new known failure goes in the same files, `#[ignore]`d with its reason.
   expression joins, USING, WITH, IS [NOT] NULL, DROP TABLE, TRUNCATE.
 
 Follow-ups from the fixes:
-- [ ] Table locks are per process (`Schema::locks`): enough for one process
-  per database, which is all squeal supports today.
-- [ ] A lock wait gives up after 10 s instead of detecting a deadlock (two
-  transactions each holding a table the other's DDL wants).
+- [x] Table locks are per process (`Schema::locks`): by design — a database
+  is opened by one process at a time, which is all squeal supports.
+- [x] Lock waits detect deadlocks (wait-for graph; the latest waiter in a
+  cycle is refused); the 10 s timeout is only a backstop.
 - [ ] DROP TABLE, like DROP PARTITION, leaves its trees in the store
   unreferenced; a later table of the same name gets `name~N` trees. Reclaiming
   them needs a store change.
-- [ ] A join with no column equality runs every pair (INNER: a filtered cross
-  join; outer: a hash join with one bucket). Fine for small inputs only.
-- [ ] WITH queries are planned anew per reference (no materialization), and
-  WITH RECURSIVE is refused.
+- [x] An inequality join on a key or indexed column seeks a range per outer
+  row. Other joins with no column equality still try every pair.
+- [x] A WITH query read more than once runs once; WITH RECURSIVE works.
+- [x] UNION [ALL] / INTERSECT / EXCEPT (UNION ALL used to drop its second
+  query's rows) and OFFSET (was ignored).
 
 Not written yet: a seeded query generator for the twins, the concurrent
 soak with crash rounds, SQLite as a second oracle (`rusqlite` dev-dependency,
@@ -89,21 +93,20 @@ the partition column; queries read every partition (`source/append.rs`).
   DELETE); EXPLAIN shows `(k of n partitions)`.
 - [x] Order across partitions: per-partition ordered reads are merged
   (`MergeAppend`), so ORDER BY / merge joins / GROUP BY need no sort.
-- [ ] RANGE partitions read in bound order are already sorted by the
-  partition column: plain concatenation would do instead of a merge.
-- [ ] Pruning from join keys at run time (a hash join's build side could
-  name the partitions the probe side needs); today only WHERE prunes.
+- [x] RANGE partitions are read in turn (no merge) for an order leading with
+  the partition column.
+- [x] A hash join skips the probe side's partitions none of its build keys
+  route to.
 - [x] Join seeks into partitioned tables: each partition sought, or only the
   one the key routes to when the key has the partition column.
 - [x] Row counts per partition (stats row format version 2); pruned reads are
   estimated and costed by them; DROP PARTITION takes its rows off the count.
-- [ ] Column statistics (distinct counts, min/max) are still per table, and
-  tree shape is read off the first partition.
+- [x] Pruned reads get column statistics narrowed to their partitions; tree
+  shape is the deepest partition's.
 - [ ] DROP PARTITION leaves the partition's trees in the store, unreferenced
   (their pages are not reused). Reclaiming them needs a `drop_table` in store
   that is safe against a scan still reading the tree. Store change.
-- [ ] No way to list a table's partitions from SQL except EXPLAIN (a
-  `SHOW PARTITIONS`, or DESCRIBE showing them).
+- [x] `SHOW PARTITIONS [FROM] t`.
 - [ ] External partitions (Parquet): a new `PartitionStorage` variant.
 
 ## Flaky tests

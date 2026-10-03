@@ -243,7 +243,7 @@ fn lex_fast(src: &str) -> Option<Vec<TokenStruct<'_>>> {
         }
         if let Some((text, op)) = OPERATORS.iter().find(|(t, _)| rest.starts_with(t)) {
             tokens.push(TokenStruct {
-                token: Token::Operator(op.clone()),
+                token: Token::Operator(*op),
                 span: span(at, at + text.len()),
             });
             at += text.len();

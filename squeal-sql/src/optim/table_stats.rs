@@ -746,8 +746,8 @@ pub(crate) fn for_partitions(
     };
     let (rows, kept) = (stats.table_stat.row_count, scoped.table_stat.row_count);
     for c in Arc::make_mut(&mut scoped.table_stat.col_stats).values_mut() {
-        if rows > 0 {
-            c.null = c.null * kept / rows;
+        if let Some(share) = (c.null * kept).checked_div(rows) {
+            c.null = share;
         }
         c.unique = c.unique.min(kept);
     }
