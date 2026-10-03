@@ -2,6 +2,7 @@ use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Bound;
+use std::sync::Arc;
 
 use crate::{
     db::DBSizeType,
@@ -38,7 +39,11 @@ use crate::{
 // flattened values were, so pages already on disk read back unchanged.
 #[derive(Debug, Default, Clone)]
 pub struct AnyTuplePage {
-    data: Vec<Tuple>,
+    // Each tuple behind its own Arc: an insert or remove mid-page shifts 8
+    // bytes an entry instead of a whole Tuple, and copying the content for
+    // a write under a reader's snapshot (Page's data_mut) bumps counts
+    // instead of copying tuples.
+    data: Vec<Arc<Tuple>>,
     // order_prefix of each entry's id, in step with `data`.
     prefixes: Vec<u128>,
 }
@@ -59,6 +64,11 @@ impl<'de> Deserialize<'de> for AnyTuplePage {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         Ok(Self::from_sorted(Vec::<Tuple>::deserialize(deserializer)?))
     }
+}
+
+// A tuple taken out of the page: moved out if no snapshot shares it.
+fn unwrap(t: Arc<Tuple>) -> Tuple {
+    Arc::try_unwrap(t).unwrap_or_else(|t| Tuple::clone(&t))
 }
 
 // Leading bits of an id that order the same way it does, wherever they
@@ -130,6 +140,7 @@ impl AnyTuplePage {
             data.sort_by(|a, b| a.id.cmp(&b.id));
         }
         let prefixes = data.iter().map(|t| order_prefix(&t.id)).collect();
+        let data = data.into_iter().map(Arc::new).collect();
         Self { data, prefixes }
     }
 
@@ -190,7 +201,7 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn at(&self, i: usize) -> Option<Tuple> {
-        self.data.get(i).cloned()
+        self.data.get(i).map(|t| Tuple::clone(t))
     }
 
     fn seek(&self, lower: Bound<&DBIdType>) -> Result<usize, StoreError> {
@@ -208,7 +219,7 @@ impl PageTuple for AnyTuplePage {
         // After any ties: they stay in arrival order.
         let at = self.upper_bound(&tuple.id);
         self.prefixes.insert(at, order_prefix(&tuple.id));
-        self.data.insert(at, tuple);
+        self.data.insert(at, Arc::new(tuple));
         Ok(())
     }
 
@@ -217,16 +228,16 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.position(id).map(|i| self.data[i].clone()))
+        Ok(self.position(id).map(|i| Tuple::clone(&self.data[i])))
     }
 
     fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
         if let Some(t) = self.data.get(hint)
             && t.id == *id
         {
-            return Ok(Some((t.clone(), hint)));
+            return Ok(Some((Tuple::clone(t), hint)));
         }
-        Ok(self.position(id).map(|i| (self.data[i].clone(), i)))
+        Ok(self.position(id).map(|i| (Tuple::clone(&self.data[i]), i)))
     }
 
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
@@ -234,7 +245,10 @@ impl PageTuple for AnyTuplePage {
         match self.position(id) {
             Some(i) => {
                 self.prefixes[i] = order_prefix(&tuple.id);
-                Ok(std::mem::replace(&mut self.data[i], tuple))
+                Ok(unwrap(std::mem::replace(
+                    &mut self.data[i],
+                    Arc::new(tuple),
+                )))
             }
             None => Err(StoreError::KeyNotFound(id.clone())),
         }
@@ -244,14 +258,14 @@ impl PageTuple for AnyTuplePage {
         match self.position(&id) {
             Some(i) => {
                 self.prefixes.remove(i);
-                Ok(self.data.remove(i))
+                Ok(unwrap(self.data.remove(i)))
             }
             None => Err(StoreError::KeyNotFound(id)),
         }
     }
 
     fn values(&self) -> Result<Vec<Tuple>, StoreError> {
-        Ok(self.data.clone())
+        Ok(self.data.iter().map(|t| Tuple::clone(t)).collect())
     }
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
@@ -273,16 +287,16 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn first(&self) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.data.first().cloned())
+        Ok(self.data.first().map(|t| Tuple::clone(t)))
     }
 
     fn last(&self) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.data.last().cloned())
+        Ok(self.data.last().map(|t| Tuple::clone(t)))
     }
 
     // STORE_AUDIT.md P5: see PageTuple::successor's own comment.
     fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
-        Ok(self.data.get(self.upper_bound(id)).cloned())
+        Ok(self.data.get(self.upper_bound(id)).map(|t| Tuple::clone(t)))
     }
 }
 
