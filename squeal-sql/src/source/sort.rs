@@ -761,11 +761,17 @@ pub(crate) fn cmp_by_fields(lhs_key: &IndexKey, rhs_key: &IndexKey, order: &[Sor
                 }
             }
             _ => {
-                if field.asc {
-                    lhs.cmp(rhs)
-                } else {
-                    rhs.cmp(lhs)
-                }
+                // An integer and a double (one column can hold both: a
+                // UNION of an integer column and an average) compare by
+                // value, as WHERE and joins compare them — not by type. A
+                // NaN goes after every number.
+                let by_value = match crate::numeric::cmp_mixed(lhs, rhs) {
+                    Some(Some(ord)) => ord,
+                    Some(None) if matches!(lhs, ValueItem::Double(_)) => Ordering::Greater,
+                    Some(None) => Ordering::Less,
+                    None => lhs.cmp(rhs),
+                };
+                if field.asc { by_value } else { by_value.reverse() }
             }
         };
         if ord != Ordering::Equal {
@@ -773,6 +779,20 @@ pub(crate) fn cmp_by_fields(lhs_key: &IndexKey, rhs_key: &IndexKey, order: &[Sor
         }
     }
     Ordering::Equal
+}
+
+/// Whether two rows are the same row to DISTINCT and the set operations:
+/// equal column by column, NULL equal to NULL, an integer equal to the
+/// double of its value.
+pub(crate) fn same_row(a: &IndexKey, b: &IndexKey) -> bool {
+    let all: Vec<SortField> = (0..a.values().len().max(b.values().len()))
+        .map(|index| SortField {
+            asc: true,
+            null_first: true,
+            index,
+        })
+        .collect();
+    a.values().len() == b.values().len() && cmp_by_fields(a, b, &all) == Ordering::Equal
 }
 
 impl<'a> Ord for CrateItem<'a> {

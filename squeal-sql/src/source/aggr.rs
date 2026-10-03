@@ -49,7 +49,7 @@ impl Source for AggregatingSource {
         if let Some(this) = next_emit {
             loop {
                 if let Some(next) = self.source.next()? {
-                    if this != next {
+                    if !crate::source::sort::same_row(&this, &next) {
                         self.next_emit = Some(next);
                         crate::source::timing::add(&mut self.time_spent, start);
                         return Ok(Some(this));

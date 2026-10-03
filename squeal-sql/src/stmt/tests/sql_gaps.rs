@@ -873,3 +873,33 @@ fn test_between_like_coalesce_case_and_abs() {
         [1, 5, 10, 29, 40]
     );
 }
+
+// Found by the oracle (seed 21): an integer and a double in one column —
+// a UNION of an integer column and an average — were ordered by type, all
+// integers first, and 1 and 1.0 kept as two rows.
+#[test]
+fn test_integers_and_doubles_in_one_column_compare_by_value() {
+    let c = conn();
+    run(&c, "create table n (i integer, d double)").unwrap();
+    run(&c, "insert into n values (1, 1.0), (3, 2.5), (10, 0.5)").unwrap();
+    let sql = "select i from n union all select d from n order by 1";
+    let mut stmt = c.clone().create_statement(sql).unwrap();
+    stmt.execute().unwrap();
+    let got: Vec<f64> = take_streaming_result(&mut stmt, 0)
+        .1
+        .iter()
+        .map(|r| match r[0] {
+            ValueItem::Integer(i) => i as f64,
+            ValueItem::Double(d) => d,
+            ref o => panic!("{o:?}"),
+        })
+        .collect();
+    assert_eq!(got, [0.5, 1.0, 1.0, 2.5, 3.0, 10.0]);
+    // 1 and 1.0 are one value to UNION, INTERSECT and EXCEPT.
+    assert_eq!(rows(&c, "select i from n union select d from n").len(), 5);
+    assert_eq!(
+        rows(&c, "select i from n intersect select d from n").len(),
+        1
+    );
+    assert_eq!(rows(&c, "select i from n except select d from n").len(), 2);
+}

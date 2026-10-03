@@ -19,7 +19,6 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum V {
     Null,
-    Int(i64),
     Real(i64),
     Text(String),
 }
@@ -28,13 +27,20 @@ fn real(d: f64) -> V {
     V::Real((d * 1e9).round() as i64)
 }
 
+// An integer, as the number it is: when a column holds integers and
+// doubles (a UNION of the two), which of `1` and `1.0` survives DISTINCT is
+// either engine's choice.
+fn int(i: i64) -> V {
+    real(i as f64)
+}
+
 fn from_squeal(v: &ValueItem) -> V {
     match v {
         ValueItem::Null => V::Null,
-        ValueItem::Integer(i) => V::Int(*i),
+        ValueItem::Integer(i) => int(*i),
         ValueItem::Double(d) => real(*d),
         ValueItem::Str((s, _)) => V::Text(s.clone()),
-        ValueItem::Boolean(b) => V::Int(*b as i64),
+        ValueItem::Boolean(b) => int(*b as i64),
         other => V::Text(format!("{other:?}")),
     }
 }
@@ -57,7 +63,7 @@ fn sqlite(db: &rusqlite::Connection, sql: &str) -> Answer {
             .map(|i| {
                 Ok(match r.get_ref(i)? {
                     rusqlite::types::ValueRef::Null => V::Null,
-                    rusqlite::types::ValueRef::Integer(i) => V::Int(i),
+                    rusqlite::types::ValueRef::Integer(i) => int(i),
                     rusqlite::types::ValueRef::Real(d) => real(d),
                     rusqlite::types::ValueRef::Text(t) => {
                         V::Text(String::from_utf8_lossy(t).into_owned())
