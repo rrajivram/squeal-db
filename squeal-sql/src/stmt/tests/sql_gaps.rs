@@ -498,12 +498,13 @@ fn test_with_queries_can_build_on_each_other_and_be_read_more_than_once() {
         )
         .is_err()
     );
-    assert!(
-        run(
+    // RECURSIVE, with a query that does not read itself: an ordinary one.
+    assert_eq!(
+        ints(
             &c,
-            "with recursive x as (select id from plain_ev) select id from x"
-        )
-        .is_err()
+            "with recursive x as (select id from plain_ev where id < 2) select id from x"
+        ),
+        [0, 1]
     );
 }
 
@@ -635,4 +636,75 @@ fn test_offset_skips_rows() {
         ordered("select count(*) from (select day from days limit 100 offset 4) d"),
         [5]
     );
+}
+
+#[test]
+fn test_with_recursive_repeats_its_step_until_it_adds_nothing() {
+    let c = conn();
+    // Counting.
+    assert_eq!(
+        ints(
+            &c,
+            "with recursive n (i) as (select 1 union all select i + 1 from n where i < 5) \
+             select i from n"
+        ),
+        [1, 2, 3, 4, 5]
+    );
+    // Walking a graph that has a cycle: UNION adds only rows not seen, so
+    // it stops; from 1 every node but 9 is reached.
+    run(
+        &c,
+        "create table edge (a integer not null, b integer not null)",
+    )
+    .unwrap();
+    run(
+        &c,
+        "insert into edge values (1, 2), (2, 3), (3, 1), (3, 4), (4, 5), (9, 1)",
+    )
+    .unwrap();
+    let reach = "with recursive r (node) as (select 1 union \
+                 select e.b from r join edge e on e.a = r.node) select node from r";
+    assert_eq!(ints(&c, reach), [1, 2, 3, 4, 5]);
+    // Paths from 1 by length, while short.
+    assert_eq!(
+        rows(
+            &c,
+            "with recursive p (node, len) as (select 1, 0 union all \
+             select e.b, p.len + 1 from p join edge e on e.a = p.node where p.len < 3) \
+             select len, count(*) from p group by len"
+        ),
+        vec![
+            vec![ValueItem::Integer(0), ValueItem::Integer(1)],
+            vec![ValueItem::Integer(1), ValueItem::Integer(1)],
+            vec![ValueItem::Integer(2), ValueItem::Integer(1)],
+            vec![ValueItem::Integer(3), ValueItem::Integer(2)]
+        ]
+    );
+    // Read twice.
+    assert_eq!(
+        ints(
+            &c,
+            "with recursive r (node) as (select 1 union \
+             select e.b from r join edge e on e.a = r.node) select count(*) from r a, r b"
+        ),
+        [25]
+    );
+    // UNION ALL around a cycle never adds nothing: an error, not a hang.
+    let e = run(
+        &c,
+        "with recursive r (node) as (select 1 union all \
+         select e.b from r join edge e on e.a = r.node) select node from r",
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(e.contains("did not finish"), "{e}");
+    // Shapes it does not take.
+    for sql in [
+        "with recursive r (n) as (select 1 intersect select n from r) select n from r",
+        "with recursive r (n) as (select n from r union select 1) select n from r",
+        "with recursive r (n) as (select 1 union select n + 1, 2 from r) select n from r",
+        "with recursive r (n, m) as (select 1 union select n + 1 from r) select n from r",
+    ] {
+        assert!(run(&c, sql).is_err(), "{sql}");
+    }
 }

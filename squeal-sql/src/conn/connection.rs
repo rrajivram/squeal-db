@@ -610,6 +610,52 @@ impl DerivedSource {
         }
     }
 
+    // Rows already saved in `run`: every take() opens a fresh scan.
+    pub(crate) fn replay<F>(fields: Arc<[ProjectableField]>, run: Arc<store::run::Run<F>>) -> Self
+    where
+        F: DBFile + 'static,
+        F: DBFile<Item = F>,
+    {
+        let shown = fields.clone();
+        Self {
+            fields,
+            backing: Arc::new(parking_lot::Mutex::new(DerivedBacking::Replayable(Box::new(
+                move || Ok(Box::new(RunSource::new(run.cursor()?, &shown)) as Box<dyn Source>),
+            )))),
+        }
+    }
+
+    // `source`, readable any number of times: the first take() runs it,
+    // saving its rows in a temp Run; every take() reads them from there.
+    // Nothing runs until something reads.
+    pub(crate) fn shared<F>(source: Box<dyn Source>, db: Arc<store::db::Db<F>>) -> Self
+    where
+        F: DBFile + 'static,
+        F: DBFile<Item = F>,
+    {
+        let fields = source.fields();
+        let shown = fields.clone();
+        let pending = parking_lot::Mutex::new((Some(source), None::<Arc<store::run::Run<F>>>));
+        Self {
+            fields,
+            backing: Arc::new(parking_lot::Mutex::new(DerivedBacking::Replayable(Box::new(
+                move || {
+                    let mut pending = pending.lock();
+                    if pending.1.is_none() {
+                        let mut source = pending.0.take().expect("run once");
+                        let mut run = db.create_run()?;
+                        while let Some(row) = source.next()? {
+                            run.append(&row.to_bytes())?;
+                        }
+                        pending.1 = Some(Arc::new(run));
+                    }
+                    let run = pending.1.as_ref().expect("saved above");
+                    Ok(Box::new(RunSource::new(run.cursor()?, &shown)) as Box<dyn Source>)
+                },
+            )))),
+        }
+    }
+
     // Drains the stream into a temp Run so it can be opened any number of
     // times (by every clone of this handle). A no-op if already
     // materialized; an error if the stream was already handed out.

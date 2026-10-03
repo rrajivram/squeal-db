@@ -296,8 +296,44 @@ struct QueryVisitor<F: DBFile> {
     stmt_txn: Option<Transaction>,
     // The WITH queries in scope, outermost first and in the order defined:
     // a FROM item naming one reads that query (see get_table).
-    ctes: Vec<sql_parser::query::Cte>,
+    ctes: Vec<CteScope>,
 }
+
+// One WITH query in scope.
+struct CteScope {
+    cte: sql_parser::query::Cte,
+    // How many FROM items of its query name it: more than one, and its rows
+    // are computed once and shared (see DerivedSource::shared).
+    refs: usize,
+    // WITH RECURSIVE, and its own query names it.
+    recursive: bool,
+    // Its rows, once computed — or, while a recursive one is being
+    // computed, the rows its last round added (what its query then reads).
+    shared: Option<DerivedSource>,
+}
+
+// How many FROM items of `query` name `name` (a bare, one-part name).
+fn references(query: &Query, name: &str) -> usize {
+    struct Count<'a>(&'a str, usize);
+    impl Visitor for Count<'_> {
+        type Break = ();
+        fn pre_visit_relation(&mut self, n: &sql_parser::ObjectName) -> std::ops::ControlFlow<()> {
+            let mut idents = n.idents();
+            if let (Some(only), None) = (idents.next(), idents.next())
+                && only.value.eq_ignore_ascii_case(self.0)
+            {
+                self.1 += 1;
+            }
+            std::ops::ControlFlow::Continue(())
+        }
+    }
+    let mut count = Count(name, 0);
+    let _ = query.visit(&mut count);
+    count.1
+}
+
+// Rounds a WITH RECURSIVE query may take before it is called endless.
+const MAX_RECURSION_ROUNDS: usize = 10_000;
 
 // The WHERE equalities that turn a comma join into a real join: each
 // conjunct of the form `col = col` whose two columns live in DIFFERENT
@@ -657,10 +693,16 @@ where
         // it contains) and not after.
         let outer_ctes = self.ctes.len();
         if let Some(with) = &query.with {
-            if with.recursive.is_some() {
-                return Err(SchemaError::UnsupportedFeature("WITH RECURSIVE".into()));
+            let recursive = with.recursive.is_some();
+            for cte in with.ctes.items() {
+                let name = &cte.name.value;
+                self.ctes.push(CteScope {
+                    cte: cte.clone(),
+                    refs: references(query, name),
+                    recursive: recursive && references(&cte.query, name) > 0,
+                    shared: None,
+                });
             }
-            self.ctes.extend(with.ctes.items().cloned());
         }
         let planned = self.plan_query_body(query);
         self.ctes.truncate(outer_ctes);
@@ -2113,8 +2155,137 @@ where
             .iter()
             .enumerate()
             .rev()
-            .find(|(_, c)| c.name.value.eq_ignore_ascii_case(&only.value))
-            .map(|(i, c)| (i, c.clone()))
+            .find(|(_, c)| c.cte.name.value.eq_ignore_ascii_case(&only.value))
+            .map(|(i, c)| (i, c.cte.clone()))
+    }
+
+    // The rows of the WITH query at `position` in `ctes`: computed now and
+    // kept when they are read more than once (or recursive), else a stream
+    // planned for this one reference. Its query sees the WITH queries
+    // defined before it — and, recursive, itself.
+    fn cte_rows(&mut self, position: usize) -> Result<(DerivedSource, Option<ComputedTableStat>), SchemaError> {
+        if let Some(shared) = &self.ctes[position].shared {
+            return Ok((shared.clone(), None));
+        }
+        if self.ctes[position].recursive {
+            let rows = self.recursive_cte(position)?;
+            self.ctes[position].shared = Some(rows.clone());
+            return Ok((rows, None));
+        }
+        let query = self.ctes[position].cte.query.clone();
+        let later = self.ctes.split_off(position);
+        let inner = self.plan_query(&query);
+        self.ctes.extend(later);
+        let inner = inner?;
+        let stats = inner.table_stats();
+        if self.ctes[position].refs > 1 {
+            let db = self.conn.database.read().db.clone();
+            let rows = DerivedSource::shared(inner, db);
+            self.ctes[position].shared = Some(rows.clone());
+            Ok((rows, stats))
+        } else {
+            Ok((DerivedSource::new(inner), stats))
+        }
+    }
+
+    // WITH RECURSIVE x AS (anchor UNION [ALL] step): the anchor's rows,
+    // then round after round the step's, reading as `x` only the rows the
+    // round before added — until a round adds none. UNION (not ALL) adds
+    // only rows not seen yet, which is also what makes a query over a
+    // cycle finish. Computed here, while planning.
+    fn recursive_cte(&mut self, position: usize) -> Result<DerivedSource, SchemaError> {
+        use sql_parser::query::SetOperator;
+        let cte = self.ctes[position].cte.clone();
+        let name = cte.name.value.to_lowercase();
+        let query = &cte.query;
+        let unsupported = |what: &str| {
+            Err(SchemaError::UnsupportedFeature(format!(
+                "WITH RECURSIVE {name}: {what} — write it as `anchor UNION [ALL] step`"
+            )))
+        };
+        let [step] = query.compounds.as_slice() else {
+            return unsupported("its query is not one UNION of two parts");
+        };
+        let SetOperator::Union(_, all) = &step.op else {
+            return unsupported("its two parts are not joined by UNION");
+        };
+        if query.order_by.is_some() || query.limit.is_some() || query.offset.is_some() {
+            return unsupported("ORDER BY / LIMIT / OFFSET on it");
+        }
+        if references(&query_of(&query.body), &name) > 0 {
+            return unsupported("its first part (the anchor) reads it");
+        }
+        let distinct = !matches!(all, Some(either::Either::Left(_)));
+        let db = self.conn.database.read().db.clone();
+
+        // The anchor sees the WITH queries before this one.
+        let later = self.ctes.split_off(position);
+        let anchor = self.plan_operand(&query.body);
+        self.ctes.extend(later);
+        let mut anchor = anchor?;
+        let width = anchor.fields().len();
+        // Named as the WITH query's columns, when it names them.
+        let mut fields: Vec<ProjectableField> = anchor.fields().to_vec();
+        if let Some((_, names, _)) = &cte.columns {
+            if names.len() != width {
+                return Err(SchemaError::UserError(format!(
+                    "{name} names {} column(s) but its query returns {width}",
+                    names.len()
+                )));
+            }
+            for (f, n) in fields.iter_mut().zip(names.items()) {
+                f.display_name = n.value.to_lowercase();
+            }
+        }
+        let fields: Arc<[ProjectableField]> = fields.into();
+
+        let mut seen: std::collections::HashSet<store::valueitem::IndexKey> = Default::default();
+        let mut all_rows = db.create_run()?;
+        let mut added = db.create_run()?;
+        let mut added_any = false;
+        while let Some(row) = anchor.next()? {
+            if distinct && !seen.insert(row.clone()) {
+                continue;
+            }
+            all_rows.append(&row.to_bytes())?;
+            added.append(&row.to_bytes())?;
+            added_any = true;
+        }
+        let mut rounds = 0;
+        while added_any {
+            rounds += 1;
+            if rounds > MAX_RECURSION_ROUNDS {
+                self.ctes[position].shared = None;
+                return Err(SchemaError::UserError(format!(
+                    "WITH RECURSIVE {name} did not finish after {MAX_RECURSION_ROUNDS} rounds"
+                )));
+            }
+            // The step reads, as this query, the rows the last round added.
+            self.ctes[position].shared = Some(DerivedSource::replay(fields.clone(), Arc::new(added)));
+            let later = self.ctes.split_off(position + 1);
+            let step_rows = self.plan_operand(&step.operand);
+            self.ctes.extend(later);
+            let mut step_rows = step_rows?;
+            if step_rows.fields().len() != width {
+                self.ctes[position].shared = None;
+                return Err(SchemaError::UserError(format!(
+                    "WITH RECURSIVE {name}: its two parts return {width} and {} column(s)",
+                    step_rows.fields().len()
+                )));
+            }
+            added = db.create_run()?;
+            added_any = false;
+            while let Some(row) = step_rows.next()? {
+                if distinct && !seen.insert(row.clone()) {
+                    continue;
+                }
+                all_rows.append(&row.to_bytes())?;
+                added.append(&row.to_bytes())?;
+                added_any = true;
+            }
+        }
+        self.ctes[position].shared = None;
+        Ok(DerivedSource::replay(fields, Arc::new(all_rows)))
     }
 
     // A query's output as a FROM item called `alias`, its columns renamed
@@ -2124,7 +2295,17 @@ where
         inner: Box<dyn Source>,
         columns: Option<Vec<String>>,
     ) -> Result<TableQuery<F>, SchemaError> {
-        let mut fields: Vec<Arc<Field>> = inner.fields().iter().map(|f| f.field.clone()).collect();
+        let stats = inner.table_stats();
+        Self::derived_from(alias, DerivedSource::new(inner), stats, columns)
+    }
+
+    fn derived_from(
+        alias: String,
+        rows: DerivedSource,
+        stats: Option<ComputedTableStat>,
+        columns: Option<Vec<String>>,
+    ) -> Result<TableQuery<F>, SchemaError> {
+        let mut fields: Vec<Arc<Field>> = rows.fields().iter().map(|f| f.field.clone()).collect();
         if let Some(columns) = columns {
             if columns.len() != fields.len() {
                 return Err(SchemaError::UserError(format!(
@@ -2140,13 +2321,12 @@ where
                 });
             }
         }
-        let stats = inner.table_stats();
         Ok(TableQuery {
             schema: String::new(),
             table: alias.clone(),
             alias: alias.clone(),
             fields: fields.into(),
-            resolved: TableRef::Derived(alias, DerivedSource::new(inner)),
+            resolved: TableRef::Derived(alias, rows),
             joins: vec![],
             stats,
             merged: vec![],
@@ -2157,13 +2337,9 @@ where
         let tq = if let TableFactor::Table { name, alias } = &factor
             && let Some(cte) = self.cte_named(name)
         {
-            // A WITH query's name: planned here like a FROM subquery, anew
-            // for each reference to it. Its own body sees only the WITH
-            // queries defined before it.
+            // A WITH query's name: read like a FROM subquery (see cte_rows).
             let (position, cte) = cte;
-            let later = self.ctes.split_off(position);
-            let inner = self.plan_query(&cte.query);
-            self.ctes.extend(later);
+            let (rows, stats) = self.cte_rows(position)?;
             let alias = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -2172,7 +2348,7 @@ where
                 .columns
                 .as_ref()
                 .map(|(_, names, _)| names.items().map(|n| n.value.to_lowercase()).collect());
-            Self::derived(alias, inner?, columns)?
+            Self::derived_from(alias, rows, stats, columns)?
         } else if let TableFactor::Table { name, alias } = &factor {
             let (table, field) = self.conn.resolve_object_name_ref(name)?;
             crate::stmt::reject_qualified_field("a FROM target", field)?;
@@ -2382,5 +2558,20 @@ impl<F: DBFile + 'static> Clone for JoinRelation<F> {
             on_expr: self.on_expr.clone(),
             relation: self.relation.clone(),
         }
+    }
+}
+
+// A set operation's operand as a query of its own, for walking it.
+fn query_of(operand: &SetOperand) -> Query {
+    match operand {
+        SetOperand::Paren(_, q, _) => (**q).clone(),
+        SetOperand::Select(_) => Query {
+            with: None,
+            body: operand.clone(),
+            compounds: vec![],
+            order_by: None,
+            limit: None,
+            offset: None,
+        },
     }
 }
