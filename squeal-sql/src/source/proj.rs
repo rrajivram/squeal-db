@@ -16,6 +16,8 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct Projection {
+    timer: crate::source::timing::RowTimer,
+    timer_eval_start: crate::source::timing::RowTimer,
     source: Box<dyn Source>,
     fields: Vec<ProjectableField>,
     time_spent: u128,
@@ -25,6 +27,8 @@ pub(crate) struct Projection {
 impl Projection {
     pub(crate) fn new(source: Box<dyn Source>, fields: Vec<ProjectableField>) -> Self {
         Self {
+            timer: Default::default(),
+            timer_eval_start: Default::default(),
             source,
             fields,
             time_spent: 0,
@@ -52,19 +56,19 @@ impl Source for Projection {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         if let Some(res) = self.source.next()? {
-            self.time_spent += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.time_spent, start);
             let mut out = vec![];
             let res = &[res];
-            let eval_start = Instant::now();
+            let eval_start = self.timer_eval_start.start();
             for (i, f) in self.fields.iter_mut().enumerate() {
                 out.push(f.expr.eval(res, i)?);
             }
-            self.eval_time += eval_start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.eval_time, eval_start);
             return Ok(Some(IndexKey::new_from_owned(out)?));
         }
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         Ok(None)
     }
 

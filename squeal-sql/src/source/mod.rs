@@ -21,6 +21,7 @@ pub(crate) mod setop;
 pub(crate) mod run;
 pub mod sort;
 pub(crate) mod sortjoin;
+pub(crate) mod timing;
 pub mod table;
 #[cfg(test)]
 mod tests;

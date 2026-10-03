@@ -6,6 +6,7 @@ use crate::source::{QueryStats, Source, merge_stats};
 
 #[derive(Debug)]
 pub(crate) struct Limit {
+    timer: crate::source::timing::RowTimer,
     source: Box<dyn Source>,
     limit: usize,
     // OFFSET: rows read and dropped before the first one yielded.
@@ -18,6 +19,7 @@ pub(crate) struct Limit {
 impl Limit {
     pub(crate) fn new(source: Box<dyn Source>, limit: usize) -> Self {
         Self {
+            timer: Default::default(),
             source,
             limit,
             offset: 0,
@@ -52,11 +54,11 @@ impl Source for Limit {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         while self.skipped < self.offset {
             self.skipped += 1;
             if self.source.next()?.is_none() {
-                self.time_spent += start.elapsed().as_nanos();
+                crate::source::timing::add(&mut self.time_spent, start);
                 return Ok(None);
             }
         }
@@ -66,7 +68,7 @@ impl Source for Limit {
         } else {
             Ok(None)
         };
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         result
     }
 

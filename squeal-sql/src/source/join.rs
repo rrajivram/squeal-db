@@ -31,6 +31,7 @@ pub(crate) enum JoinType {
 /// exactly once.
 #[derive(Debug)]
 pub(crate) struct UnionJoin {
+    timer: crate::source::timing::RowTimer,
     sources: Vec<Box<dyn Source>>,
     fields: Arc<[ProjectableField]>,
     // The row currently held by each source — the "digits" of a
@@ -223,6 +224,7 @@ impl UnionJoin {
             }
         }
         Ok(Self {
+            timer: Default::default(),
             sources,
             fields: Arc::from(fields.as_slice()),
             current: None,
@@ -249,7 +251,7 @@ impl Source for UnionJoin {
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         if self.current.is_none() {
             // First call: seed one row from every source. A source with
             // no rows at all makes the whole cross product empty — a
@@ -260,7 +262,7 @@ impl Source for UnionJoin {
                 match s.next()? {
                     Some(row) => rows.push(row),
                     None => {
-                        self.time_spent += start.elapsed().as_nanos();
+                        crate::source::timing::add(&mut self.time_spent, start);
                         return Ok(None);
                     }
                 }
@@ -272,7 +274,7 @@ impl Source for UnionJoin {
             // produce exactly one output row.
             let combined = Self::combine(&rows)?;
             self.current = Some(rows);
-            self.time_spent += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.time_spent, start);
             return Ok(Some(combined));
         }
 
@@ -284,7 +286,7 @@ impl Source for UnionJoin {
         loop {
             if i == 0 {
                 self.current = None;
-                self.time_spent += start.elapsed().as_nanos();
+                crate::source::timing::add(&mut self.time_spent, start);
                 return Ok(None);
             }
             i -= 1;
@@ -307,7 +309,7 @@ impl Source for UnionJoin {
             }
         }
         let out = Self::combine(self.current.as_ref().unwrap())?;
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         Ok(Some(out))
     }
 

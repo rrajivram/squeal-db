@@ -11,6 +11,7 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct AggregatingSource {
+    timer: crate::source::timing::RowTimer,
     source: Box<dyn Source>,
     next_emit: Option<IndexKey>,
     time_spent: u128,
@@ -19,6 +20,7 @@ pub(crate) struct AggregatingSource {
 impl AggregatingSource {
     pub(crate) fn new(source: Box<dyn Source>) -> Result<Self, SchemaError> {
         Ok(Self {
+            timer: Default::default(),
             source,
             next_emit: None,
             time_spent: 0,
@@ -36,7 +38,7 @@ impl Source for AggregatingSource {
         self.source.fields()
     }
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         //if next emit is some, continue till next() is not = to next_emit
 
         let next_emit = if let Some(s) = self.next_emit.take() {
@@ -49,16 +51,16 @@ impl Source for AggregatingSource {
                 if let Some(next) = self.source.next()? {
                     if this != next {
                         self.next_emit = Some(next);
-                        self.time_spent += start.elapsed().as_nanos();
+                        crate::source::timing::add(&mut self.time_spent, start);
                         return Ok(Some(this));
                     }
                 } else {
-                    self.time_spent += start.elapsed().as_nanos();
+                    crate::source::timing::add(&mut self.time_spent, start);
                     return Ok(Some(this));
                 }
             }
         }
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         Ok(None)
     }
     // Was a no-op: DISTINCT (this wraps a sort so equal rows are adjacent,

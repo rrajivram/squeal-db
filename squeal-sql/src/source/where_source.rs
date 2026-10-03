@@ -12,6 +12,7 @@ use crate::{
 
 #[derive(Debug)]
 pub(crate) struct WhereSource {
+    timer: crate::source::timing::RowTimer,
     source: Box<dyn Source>,
     expr: EvalExpr,
     time_spent: u128,
@@ -20,6 +21,7 @@ pub(crate) struct WhereSource {
 impl WhereSource {
     pub(crate) fn new(source: Box<dyn Source>, expr: EvalExpr) -> Result<Self, SchemaError> {
         Ok(Self {
+            timer: Default::default(),
             source,
             expr,
             time_spent: 0,
@@ -50,14 +52,14 @@ impl Source for WhereSource {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         while let Some(res) = self.source.next()? {
             let mut slice = vec![res];
             let should_output = self.expr.eval(&slice, 0)?;
             match should_output {
                 ValueItem::Boolean(b) => {
                     if b {
-                        self.time_spent += start.elapsed().as_nanos();
+                        crate::source::timing::add(&mut self.time_spent, start);
                         return Ok(Some(slice.remove(0)));
                     } else {
                         continue;
@@ -73,7 +75,7 @@ impl Source for WhereSource {
                 }
             }
         }
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         Ok(None)
     }
 

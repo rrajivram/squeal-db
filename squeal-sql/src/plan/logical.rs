@@ -2035,12 +2035,17 @@ where
                         range,
                         rows,
                     )?),
-                    AccessPath::IndexScan(i) => {
-                        Box::new(IndexSource::new(&self.conn, table, part, i, txn, stats)?)
-                    }
-                    AccessPath::IndexSeek(i, range) => Box::new(IndexSource::seek(
-                        &self.conn, table, part, i, txn, stats, range, false, rows,
-                    )?),
+                    // A covering index: only the columns the query reads.
+                    AccessPath::IndexScan(i) => Box::new(
+                        IndexSource::new(&self.conn, table, part, i, txn, stats)?
+                            .reading(&needs.columns),
+                    ),
+                    AccessPath::IndexSeek(i, range) => Box::new(
+                        IndexSource::seek(
+                            &self.conn, table, part, i, txn, stats, range, false, rows,
+                        )?
+                        .reading(&needs.columns),
+                    ),
                     AccessPath::IndexLookup(i, range) => Box::new(IndexSource::seek(
                         &self.conn, table, part, i, txn, stats, range, true, rows,
                     )?),

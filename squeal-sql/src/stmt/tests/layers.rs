@@ -202,3 +202,24 @@ fn lookup_loop() {
     }
     per_op("lookup, repeated texts", n, start);
 }
+
+// The 100k-row range count, repeated, for a profiler (by hand, as above).
+#[test]
+#[ignore]
+fn range_loop() {
+    let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
+    let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let sql =
+        "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'";
+    let seconds: u64 = std::env::var("SQ_LOOP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let start = Instant::now();
+    let mut n = 0usize;
+    while start.elapsed().as_secs() < seconds {
+        let mut stmt = c.clone().create_statement(sql).unwrap();
+        stmt.execute().unwrap();
+        drain(&mut stmt);
+        n += 1;
+    }
+    per_op("range count", n, start);
+}

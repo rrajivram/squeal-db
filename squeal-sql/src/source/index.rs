@@ -33,6 +33,7 @@ use crate::{
 // a PRIMARY KEY table, the key columns' values, which fill those columns
 // too (see Schema's index maintenance).
 pub struct IndexSource<F: DBFile + 'static> {
+    timer: crate::source::timing::RowTimer,
     table: Arc<SqlTable>,
     // Which of the table's partitions this reads the index of.
     part: usize,
@@ -50,6 +51,10 @@ pub struct IndexSource<F: DBFile + 'static> {
     seek: Option<(Vec<KeyRange>, Option<usize>)>,
     // Some: fetch each entry's row from the table (IndexLookup).
     lookup: Option<Arc<Db<F>>>,
+    // Per table column, whether the query reads it (see reading): the
+    // others are left NULL, and an entry's row identity is not decoded
+    // unless a column it fills is read.
+    wanted: Option<Vec<bool>>,
     last_id: Option<DBIdType>,
     stats: Option<ComputedTableStat>,
     next_time: u128,
@@ -147,6 +152,7 @@ where
             .map(|(i, f)| ProjectableField::from_field(f.clone(), 0, i))
             .collect::<Vec<_>>();
         Ok(Self {
+            timer: Default::default(),
             table: table.clone(),
             part,
             index,
@@ -156,10 +162,22 @@ where
             pk_positions,
             seek: None,
             lookup: None,
+            wanted: None,
             last_id: None,
             stats,
             next_time: 0,
         })
+    }
+
+    /// Fills only `columns` (positions in the table's row) — the ones the
+    /// query reads; every other column comes out NULL.
+    pub(crate) fn reading(mut self, columns: &std::collections::BTreeSet<usize>) -> Self {
+        self.wanted = Some(
+            (0..self.fields.len())
+                .map(|c| columns.contains(&c))
+                .collect(),
+        );
+        self
     }
 
     // The table row an entry points to, at the scan's snapshot. None if it
@@ -220,10 +238,12 @@ where
             .iter()
             .map(|f| f.name.clone())
             .collect();
-        let seek = self
-            .seek
-            .as_ref()
-            .map(|(ranges, rows)| (crate::plan::sarg::describe_key_ranges(ranges, &key_names), *rows));
+        let seek = self.seek.as_ref().map(|(ranges, rows)| {
+            (
+                crate::plan::sarg::describe_key_ranges(ranges, &key_names),
+                *rows,
+            )
+        });
         match &seek {
             Some((seek, rows)) => PlanNode::new(if self.lookup.is_some() {
                 "IndexLookup"
@@ -252,22 +272,22 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         if let Some(db) = self.lookup.clone() {
             loop {
                 let Some(entry) = self.cursor.next()? else {
                     self.last_id = None;
-                    self.next_time += start.elapsed().as_nanos();
+                    crate::source::timing::add(&mut self.next_time, start);
                     return Ok(None);
                 };
                 if let Some(row) = self.fetch_row(&db, &entry)? {
-                    self.next_time += start.elapsed().as_nanos();
+                    crate::source::timing::add(&mut self.next_time, start);
                     return Ok(Some(row));
                 }
             }
         }
         let Some(entry) = self.cursor.next()? else {
-            self.next_time += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.next_time, start);
             return Ok(None);
         };
         let DBIdType::Rec(key) = entry.id() else {
@@ -276,19 +296,28 @@ where
                 self.index_name()
             )));
         };
+        let wanted = |pos: usize| self.wanted.as_ref().is_none_or(|w| w[pos]);
         let mut row = vec![ValueItem::Null; self.fields.len()];
         // zip stops at the indexed columns: a non-unique index's key goes
         // on to carry the row identity, which the data holds as well.
         for (value, &pos) in key.values().iter().zip(&self.key_positions) {
-            row[pos] = value.clone();
-        }
-        if let Some(pk) = &self.pk_positions {
-            let identity = from_bytes::<IndexKey>(entry.data())?;
-            for (value, &pos) in identity.values().iter().zip(pk) {
+            if wanted(pos) {
                 row[pos] = value.clone();
             }
         }
-        self.next_time += start.elapsed().as_nanos();
+        if let Some(pk) = &self.pk_positions
+            && pk
+                .iter()
+                .any(|p| wanted(*p) && !self.key_positions.contains(p))
+        {
+            let identity = from_bytes::<IndexKey>(entry.data())?;
+            for (value, &pos) in identity.values().iter().zip(pk) {
+                if wanted(pos) {
+                    row[pos] = value.clone();
+                }
+            }
+        }
+        crate::source::timing::add(&mut self.next_time, start);
         Ok(Some(IndexKey::new_from_owned(row)?))
     }
 

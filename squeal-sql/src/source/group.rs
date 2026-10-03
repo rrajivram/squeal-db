@@ -34,12 +34,17 @@ use crate::{
 // handling of an empty first pull.
 #[derive(Debug)]
 pub(crate) struct GroupSource {
+    timer: crate::source::timing::RowTimer,
+    timer_eval: crate::source::timing::RowTimer,
     source: Box<dyn Source>,
     fields: Vec<ProjectableField>,
     key_positions: Vec<usize>,
     // HAVING: read over the raw rows like the SELECT list (its aggregates
     // accumulate alongside), and a group is output only when it is true.
     having: Option<EvalExpr>,
+    // The SELECT list's values as of the latest row evaluated: reused row
+    // after row, an output row made of it once per group.
+    values: Vec<ValueItem>,
     // The next raw row to start a new group with, and its own group key
     // — already pulled from `source` while scanning ahead to find the
     // end of the *previous* group, so it can't be pulled again.
@@ -57,10 +62,13 @@ impl GroupSource {
         key_positions: Vec<usize>,
     ) -> Self {
         Self {
+            timer: Default::default(),
+            timer_eval: Default::default(),
             source,
             fields,
             key_positions,
             having: None,
+            values: vec![],
             pending: None,
             started: false,
             done: false,
@@ -102,19 +110,22 @@ impl GroupSource {
     //
     // HAVING is evaluated the same way; the second value is whether the
     // group passes it, as of this row.
-    fn eval_row(&mut self, row: &IndexKey) -> Result<(IndexKey, bool), SchemaError> {
-        let start = Instant::now();
+    //
+    // The values go to `self.values`; next_group makes the output row of
+    // the group's last.
+    fn eval_row(&mut self, row: &IndexKey) -> Result<bool, SchemaError> {
+        let start = self.timer_eval.start();
         let data = [row.clone()];
-        let mut out = vec![];
+        self.values.clear();
         for (i, f) in self.fields.iter_mut().enumerate() {
-            out.push(f.expr.eval(&data, i)?);
+            self.values.push(f.expr.eval(&data, i)?);
         }
         let keep = match &mut self.having {
             Some(having) => Self::is_true(having.eval(&data, 0)?)?,
             None => true,
         };
-        self.eval_time += start.elapsed().as_nanos();
-        Ok((IndexKey::new_from_owned(out)?, keep))
+        crate::source::timing::add(&mut self.eval_time, start);
+        Ok(keep)
     }
 
     // A NULL HAVING is "not true", as in WHERE: the group is left out.
@@ -140,7 +151,7 @@ impl GroupSource {
     //
     // None when HAVING rejects that group (`HAVING count(*) > 0`).
     fn empty_group_row(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer_eval.start();
         let mut out = vec![];
         for f in &self.fields {
             out.push(f.expr.eval_empty_group()?);
@@ -149,7 +160,7 @@ impl GroupSource {
             Some(having) => Self::is_true(having.eval_empty_group()?)?,
             None => true,
         };
-        self.eval_time += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.eval_time, start);
         Ok(if keep {
             Some(IndexKey::new_from_owned(out)?)
         } else {
@@ -179,25 +190,26 @@ impl GroupSource {
         let current_key = self.key_of(&current);
         self.reset_aggregates()?;
 
-        let mut last_evaluated = self.eval_row(&current)?;
+        let mut keep = self.eval_row(&current)?;
         loop {
             match self.source.next()? {
                 Some(next_row) => {
                     let next_key = self.key_of(&next_row);
                     if next_key == current_key {
                         current = next_row;
-                        last_evaluated = self.eval_row(&current)?;
+                        keep = self.eval_row(&current)?;
                     } else {
                         self.pending = Some((next_row, next_key));
-                        return Ok(Some(last_evaluated));
+                        break;
                     }
                 }
                 None => {
                     self.done = true;
-                    return Ok(Some(last_evaluated));
+                    break;
                 }
             }
         }
+        Ok(Some((IndexKey::new_from(&self.values)?, keep)))
     }
 }
 
@@ -236,7 +248,7 @@ impl Source for GroupSource {
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         let mut out = None;
         while !self.done {
             match self.next_group()? {
@@ -249,7 +261,7 @@ impl Source for GroupSource {
                 None => break,
             }
         }
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         Ok(out)
     }
 

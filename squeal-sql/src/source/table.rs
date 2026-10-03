@@ -21,6 +21,7 @@ use crate::{
 // table's tree is keyed by (TableSeek). Either way rows come out whole, in
 // the table's own layout.
 pub struct TableSource<F: DBFile> {
+    timer: crate::source::timing::RowTimer,
     cursor: RowCursor<F>,
     // The seek's ranges, described for EXPLAIN only when asked (see
     // plan::sarg::describe_key_range), and its estimated row count; None
@@ -154,6 +155,7 @@ where
             .collect::<Vec<_>>();
         let fields = Arc::from(fields);
         Self {
+            timer: Default::default(),
             cursor,
             seek: None,
             table,
@@ -209,16 +211,16 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         if let Some(tuple) = self.cursor.next()? {
             let row = from_bytes::<VersionedRow>(tuple.data())?;
             let out = self.table.reproject(&row)?;
             self.last_id = Some(tuple.id().clone());
-            self.next_time += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.next_time, start);
             Ok(Some(out))
         } else {
             self.last_id = None;
-            self.next_time += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.next_time, start);
             Ok(None)
         }
     }

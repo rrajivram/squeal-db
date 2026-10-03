@@ -53,6 +53,7 @@ pub(crate) struct JoinSeek {
 }
 
 pub(crate) struct NestedLoopJoin<F: DBFile + 'static> {
+    timer: crate::source::timing::RowTimer,
     outer: Box<dyn Source>,
     db: Arc<Db<F>>,
     reader: TransactionId,
@@ -132,6 +133,7 @@ where
             )
             .collect();
         Ok(Self {
+            timer: Default::default(),
             outer,
             db,
             reader,
@@ -438,9 +440,9 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         let row = self.step();
-        self.time_spent += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.time_spent, start);
         row
     }
 

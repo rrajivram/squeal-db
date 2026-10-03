@@ -12,6 +12,7 @@ use crate::{
 // (see crate::temp::TempTable). Like TableSource, always a leaf: nothing
 // upstream of a bare table/temp-table scan to chain from.
 pub(crate) struct RunSource<F: DBFile + 'static> {
+    timer: crate::source::timing::RowTimer,
     cursor: RunCursor<F>,
     fields: Arc<[ProjectableField]>,
     next_time: u128,
@@ -24,6 +25,7 @@ where
 {
     pub(crate) fn new(cursor: RunCursor<F>, fields: &[ProjectableField]) -> Self {
         Self {
+            timer: Default::default(),
             cursor,
             fields: Arc::from(fields),
             next_time: 0,
@@ -47,13 +49,13 @@ where
         // like TableSource's real-table case, since a temp table has no
         // ALTER TABLE, so there's only ever one schema version to decode
         // against.
-        let start = Instant::now();
+        let start = self.timer.start();
         let out = self
             .cursor
             .next()?
             .map(|tuple| Ok(IndexKey::from_bytes(tuple.data())?))
             .transpose();
-        self.next_time += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.next_time, start);
         out
     }
 
