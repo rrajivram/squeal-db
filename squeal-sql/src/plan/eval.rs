@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CrateValueItem(ValueItem);
+pub(crate) struct CrateValueItem(ValueItem);
 
 pub(crate) struct ExprWrapper<'a, F: DBFile + 'static> {
     pub(crate) expr: &'a Expr,
@@ -400,6 +400,80 @@ impl EvalExpr {
                 Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
             }
             Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables)?,
+            // `x BETWEEN low AND high` is `x >= low AND x <= high`.
+            Expr::Between {
+                expr: x,
+                negated,
+                low,
+                high,
+            } => {
+                let x = Self::from_expr(x, tables)?;
+                let both = EvalExpr::Binary {
+                    lhs: Box::new(EvalExpr::Binary {
+                        lhs: x.clone(),
+                        op: BinaryOp::GtEq,
+                        rhs: Self::from_expr(low, tables)?,
+                    }),
+                    op: BinaryOp::And,
+                    rhs: Box::new(EvalExpr::Binary {
+                        lhs: x,
+                        op: BinaryOp::LtEq,
+                        rhs: Self::from_expr(high, tables)?,
+                    }),
+                };
+                if *negated {
+                    EvalExpr::Unary {
+                        op: sql_parser::expr::UnaryOp::Not,
+                        field: Box::new(both),
+                    }
+                } else {
+                    both
+                }
+            }
+            Expr::Like {
+                expr: x,
+                negated,
+                case_insensitive,
+                pattern,
+            } => {
+                use crate::plan::funcs::{Scalar, ScalarKind};
+                Self::Function(FuncObj::Scalar(Scalar::new(
+                    ScalarKind::Like {
+                        negated: *negated,
+                        insensitive: *case_insensitive,
+                    },
+                    vec![
+                        FuncArgs::Field(Self::from_expr(x, tables)?),
+                        FuncArgs::Field(Self::from_expr(pattern, tables)?),
+                    ],
+                )?))
+            }
+            Expr::Case {
+                operand,
+                when_then,
+                else_expr,
+            } => {
+                use crate::plan::funcs::{Scalar, ScalarKind};
+                let field = |e: &Expr| Self::from_expr(e, tables).map(FuncArgs::Field);
+                let mut args = vec![];
+                if let Some(o) = operand {
+                    args.push(field(o)?);
+                }
+                for (when, then) in when_then {
+                    args.push(field(when)?);
+                    args.push(field(then)?);
+                }
+                if let Some(e) = else_expr {
+                    args.push(field(e)?);
+                }
+                Self::Function(FuncObj::Scalar(Scalar::new(
+                    ScalarKind::Case {
+                        operand: operand.is_some(),
+                        otherwise: else_expr.is_some(),
+                    },
+                    args,
+                )?))
+            }
             Expr::IsNull {
                 expr: inner,
                 negated,
@@ -546,7 +620,11 @@ impl CrateValueItem {
         Ok(v)
     }
 
-    fn binary(lhs: &ValueItem, rhs: &ValueItem, op: &BinaryOp) -> Result<ValueItem, SchemaError> {
+    pub(crate) fn binary(
+        lhs: &ValueItem,
+        rhs: &ValueItem,
+        op: &BinaryOp,
+    ) -> Result<ValueItem, SchemaError> {
         // AND/OR use SQL's three-valued logic: a known operand can decide
         // the answer on its own — `NULL OR TRUE` is TRUE, `NULL AND FALSE`
         // is FALSE — and only otherwise is a NULL operand the answer.

@@ -20,3 +20,6 @@ bloomfilter = "3.0.1"
 crossbeam = "0.8.5"
 crossbeam-skiplist = "0.1.3"
 rand = {version="0.10.2",features=["thread_rng"]}
+
+[dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }

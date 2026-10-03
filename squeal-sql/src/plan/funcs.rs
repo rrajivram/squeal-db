@@ -314,6 +314,8 @@ func_obj! {
     Upper(Upper),
     Lower(Lower),
     Concat(Concat),
+    Scalar(Scalar),
+    Abs(Abs),
     IsNull(IsNull),
     IsNotNull(IsNotNull),
 }
@@ -394,6 +396,14 @@ impl FuncObj {
                 reject_distinct("concat — concat is a scalar function")?;
                 Ok(FuncObj::Concat(Concat::new(args)?))
             }
+            "coalesce" => {
+                reject_distinct("coalesce — coalesce is a scalar function")?;
+                Ok(FuncObj::Scalar(Scalar::new(ScalarKind::Coalesce, args)?))
+            }
+            "abs" => {
+                reject_distinct("abs — abs is a scalar function")?;
+                Ok(FuncObj::Abs(Abs::new(args)?))
+            }
             _ => Err(SchemaError::UnknownFunction(name.value.clone())),
         }
     }
@@ -438,18 +448,20 @@ impl Count {
 
 impl FuncTrait for Count {
     fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
-        let res = if self.distinct {
-            let item = match &mut self.args {
-                FuncArgs::Field(exp) => exp.eval(args, 0)?,
-                FuncArgs::Wildcard => ValueItem::Integer(1),
-            };
-            self.values.insert(item);
-            self.values.len()
-        } else {
-            self.count += 1;
-            self.count
+        // COUNT(*) counts rows; COUNT(x) and COUNT(DISTINCT x) the rows
+        // where x is not NULL.
+        let item = match &mut self.args {
+            FuncArgs::Field(exp) => exp.eval(args, 0)?,
+            FuncArgs::Wildcard => ValueItem::Integer(1),
         };
-        Ok(ValueItem::Integer(res as i64))
+        if item != ValueItem::Null {
+            if self.distinct {
+                self.values.insert(item);
+            } else {
+                self.count += 1;
+            }
+        }
+        Ok(self.current())
     }
 
     fn is_aggregate(&self) -> bool {
@@ -831,12 +843,210 @@ impl FuncTrait for Concat {
     }
 }
 
+scalar_fn!(Abs, "abs", |v: ValueItem| match v {
+    ValueItem::Integer(i) => i.checked_abs().map(ValueItem::Integer).ok_or_else(|| {
+        SchemaError::InvalidOperationOnOperand("abs".into(), format!("{i} (out of range)"))
+    }),
+    ValueItem::Double(d) => Ok(ValueItem::Double(d.abs())),
+    ValueItem::Null => Ok(ValueItem::Null),
+    other => Err(SchemaError::InvalidOperationOnOperand(
+        "abs".into(),
+        format!("{other:?}")
+    )),
+});
+
+/// Scalar expressions built from SQL syntax rather than called by name
+/// (but COALESCE, which is called by name and has their shape): every
+/// argument is evaluated on every row — an aggregate inside a CASE branch
+/// must see every row of its group, whichever branch a row takes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ScalarKind {
+    /// The first argument that is not NULL.
+    Coalesce,
+    /// `x [NOT] [I]LIKE pattern`: `%` any run of characters, `_` one.
+    Like { negated: bool, insensitive: bool },
+    /// `CASE [operand] WHEN w THEN t ... [ELSE e] END`, its arguments in
+    /// that order: the first THEN whose WHEN is true (equals the operand,
+    /// when there is one), else ELSE, else NULL.
+    Case { operand: bool, otherwise: bool },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Scalar {
+    kind: ScalarKind,
+    args: Vec<FuncArgs>,
+}
+
+impl Scalar {
+    pub(crate) fn new(kind: ScalarKind, args: Vec<FuncArgs>) -> Result<Self, SchemaError> {
+        let name = Self::name_of(kind);
+        if args.iter().any(|a| matches!(a, FuncArgs::Wildcard)) {
+            return Err(SchemaError::UnsupportedFeature(format!(
+                "{name}(*) is not valid"
+            )));
+        }
+        let ok = match kind {
+            ScalarKind::Coalesce => !args.is_empty(),
+            ScalarKind::Like { .. } => args.len() == 2,
+            ScalarKind::Case { operand, otherwise } => {
+                let pairs = args.len() - operand as usize - otherwise as usize;
+                pairs >= 2 && pairs.is_multiple_of(2)
+            }
+        };
+        if !ok {
+            return Err(SchemaError::UnknownFunction(format!(
+                "{name} taking {} arguments",
+                args.len()
+            )));
+        }
+        Ok(Self { kind, args })
+    }
+
+    fn name_of(kind: ScalarKind) -> &'static str {
+        match kind {
+            ScalarKind::Coalesce => "coalesce",
+            ScalarKind::Like { negated: false, insensitive: false } => "like",
+            ScalarKind::Like { negated: true, insensitive: false } => "not like",
+            ScalarKind::Like { negated: false, insensitive: true } => "ilike",
+            ScalarKind::Like { negated: true, insensitive: true } => "not ilike",
+            ScalarKind::Case { .. } => "case",
+        }
+    }
+}
+
+// Whether `text` matches the LIKE `pattern`: `%` any run of characters
+// (none included), `_` exactly one.
+pub(crate) fn like_matches(text: &str, pattern: &str) -> bool {
+    let (t, p): (Vec<char>, Vec<char>) = (text.chars().collect(), pattern.chars().collect());
+    // The classic two-pointer match, backtracking to the last `%`.
+    let (mut ti, mut pi) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || (p[pi] != '%' && p[pi] == t[ti])) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '%')
+}
+
+impl FuncTrait for Scalar {
+    fn name(&self) -> String {
+        Self::name_of(self.kind).into()
+    }
+
+    fn eval(&mut self, rows: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+        let mut values = Vec::with_capacity(self.args.len());
+        for a in &mut self.args {
+            let FuncArgs::Field(e) = a else {
+                unreachable!("rejected in Scalar::new")
+            };
+            values.push(e.eval(rows, 0)?);
+        }
+        match self.kind {
+            ScalarKind::Coalesce => Ok(values
+                .into_iter()
+                .find(|v| *v != ValueItem::Null)
+                .unwrap_or(ValueItem::Null)),
+            ScalarKind::Like {
+                negated,
+                insensitive,
+            } => match (&values[0], &values[1]) {
+                (ValueItem::Null, _) | (_, ValueItem::Null) => Ok(ValueItem::Null),
+                (ValueItem::Str((t, _)), ValueItem::Str((p, _))) => {
+                    let hit = if insensitive {
+                        like_matches(&t.to_lowercase(), &p.to_lowercase())
+                    } else {
+                        like_matches(t, p)
+                    };
+                    Ok(ValueItem::Boolean(hit != negated))
+                }
+                (t, p) => Err(SchemaError::InvalidOperationOnOperand(
+                    "like".into(),
+                    format!("{t:?} and {p:?}: LIKE compares strings"),
+                )),
+            },
+            ScalarKind::Case { operand, otherwise } => {
+                let mut values = values.into_iter();
+                let subject = if operand { values.next() } else { None };
+                let else_value = if otherwise { values.next_back() } else { None };
+                let rest: Vec<ValueItem> = values.collect();
+                for pair in rest.chunks(2) {
+                    let hit = match &subject {
+                        Some(s) => crate::plan::eval::CrateValueItem::binary(
+                            s,
+                            &pair[0],
+                            &sql_parser::expr::BinaryOp::Eq,
+                        )?,
+                        None => pair[0].clone(),
+                    };
+                    if hit == ValueItem::Boolean(true) {
+                        return Ok(pair[1].clone());
+                    }
+                }
+                Ok(else_value.unwrap_or(ValueItem::Null))
+            }
+        }
+    }
+
+    fn is_aggregate(&self) -> bool {
+        false
+    }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        unreachable!("a scalar function — see Concat::reset")
+    }
+
+    fn args(&self) -> Vec<&FuncArgs> {
+        self.args.iter().collect()
+    }
+
+    fn args_mut(&mut self) -> Vec<&mut FuncArgs> {
+        self.args.iter_mut().collect()
+    }
+
+    fn current(&self) -> ValueItem {
+        unreachable!("a scalar function — see Concat::current")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn literal_arg(v: ValueItem) -> FuncArgs {
         FuncArgs::Field(Box::new(EvalExpr::Literal(v)))
+    }
+
+    #[test]
+    fn test_like_patterns() {
+        for (t, p, want) in [
+            ("abc", "abc", true),
+            ("abc", "a%", true),
+            ("abc", "%c", true),
+            ("abc", "%b%", true),
+            ("abc", "a_c", true),
+            ("abc", "a_", false),
+            ("abc", "%", true),
+            ("", "%", true),
+            ("", "_", false),
+            ("aXbXc", "a%b%c", true),
+            ("abcbc", "a%bc", true),
+            ("ab", "a%b%c", false),
+            ("é", "_", true),
+            ("100%", "100%", true),
+        ] {
+            assert_eq!(like_matches(t, p), want, "{t:?} like {p:?}");
+        }
     }
 
     #[test]

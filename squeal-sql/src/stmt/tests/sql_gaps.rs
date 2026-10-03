@@ -732,12 +732,144 @@ fn test_an_inequality_join_seeks_a_range_per_outer_row() {
     ] {
         assert_eq!(outcome(&c, sql), outcome(&c, cross), "{sql}");
     }
-    let plan = explain(&c, "select d.day, b.id from days d join plain_big b on b.id < d.day");
+    let plan = explain(
+        &c,
+        "select d.day, b.id from days d join plain_big b on b.id < d.day",
+    );
     assert!(plan.contains("NestedLoopJoin"), "{plan}");
     assert!(plan.contains("inner(id) < outer(day)"), "{plan}");
     // Partitioned: the same, partition by partition.
     assert_eq!(
-        outcome(&c, "select d.day, b.id from days d join part_big b on b.id < d.day"),
-        outcome(&c, "select d.day, b.id from days d join plain_big b on b.id < d.day"),
+        outcome(
+            &c,
+            "select d.day, b.id from days d join part_big b on b.id < d.day"
+        ),
+        outcome(
+            &c,
+            "select d.day, b.id from days d join plain_big b on b.id < d.day"
+        ),
+    );
+}
+
+// Found by the SQLite oracle: COUNT(x) counted the rows where x is NULL.
+#[test]
+fn test_aggregates_skip_nulls() {
+    let c = conn();
+    run(&c, "create table agg (g integer, x integer)").unwrap();
+    run(
+        &c,
+        "insert into agg values (1, 4), (1, null), (1, 4), (2, null), (2, null), (3, 6)",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &c,
+            "select g, count(*), count(x), count(distinct x), sum(x), avg(x), min(x), max(x) \
+             from agg group by g"
+        ),
+        vec![
+            vec![
+                ValueItem::Integer(1),
+                ValueItem::Integer(3),
+                ValueItem::Integer(2),
+                ValueItem::Integer(1),
+                ValueItem::Integer(8),
+                ValueItem::Double(4.0),
+                ValueItem::Integer(4),
+                ValueItem::Integer(4)
+            ],
+            vec![
+                ValueItem::Integer(2),
+                ValueItem::Integer(2),
+                ValueItem::Integer(0),
+                ValueItem::Integer(0),
+                ValueItem::Null,
+                ValueItem::Null,
+                ValueItem::Null,
+                ValueItem::Null
+            ],
+            vec![
+                ValueItem::Integer(3),
+                ValueItem::Integer(1),
+                ValueItem::Integer(1),
+                ValueItem::Integer(1),
+                ValueItem::Integer(6),
+                ValueItem::Double(6.0),
+                ValueItem::Integer(6),
+                ValueItem::Integer(6)
+            ],
+        ]
+    );
+}
+
+// Found missing by the SQLite oracle's first probe.
+#[test]
+fn test_between_like_coalesce_case_and_abs() {
+    let c = twin_conn();
+    assert_eq!(
+        ints(&c, "select day from days where day between 9 and 19"),
+        [9, 10, 19]
+    );
+    assert_eq!(
+        ints(&c, "select day from days where day not between 5 and 49"),
+        [0, 60]
+    );
+    assert_eq!(
+        ints(&c, "select day from days where label like 'd1%'"),
+        [10, 19]
+    );
+    assert_eq!(
+        ints(&c, "select day from days where label like 'd_'"),
+        [0, 5, 9]
+    );
+    assert_eq!(
+        ints(&c, "select day from days where label not like '%0'"),
+        [5, 9, 19, 25, 49]
+    );
+    assert_eq!(
+        ints(&c, "select day from days where label ilike 'D6%'"),
+        [60]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "select coalesce(cat, -1) from plain_ev where id in (0, 1, 2)"
+        ),
+        [-1, 1, 2]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            "select case when day < 10 then 0 when day < 30 then 1 else 2 end from days"
+        ),
+        [0, 0, 0, 1, 1, 1, 2, 2, 2]
+    );
+    // No WHEN matches day 0 and there is no ELSE: NULL.
+    assert_eq!(
+        rows(
+            &c,
+            "select case day when 5 then 50 when 9 then 90 end from days where day < 10"
+        ),
+        vec![
+            vec![ValueItem::Null],
+            vec![ValueItem::Integer(50)],
+            vec![ValueItem::Integer(90)]
+        ]
+    );
+    // An aggregate inside a branch, and a branch inside an aggregate.
+    assert_eq!(
+        rows(
+            &c,
+            "select sum(case when cat = 1 then amount else 0 end), \
+             case when count(*) > 30 then 'many' else 'few' end from plain_ev"
+        ),
+        vec![vec![
+            ValueItem::Integer(2120),
+            ValueItem::Str(("many".into(), 4))
+        ]]
+    );
+    assert_eq!(
+        ints(&c, "select abs(day - 20) from days where day > 15"),
+        [1, 5, 10, 29, 40]
     );
 }
