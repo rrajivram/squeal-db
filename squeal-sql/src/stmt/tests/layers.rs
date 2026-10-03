@@ -36,10 +36,15 @@ fn drain(stmt: &mut Statement<File>) -> usize {
 #[ignore]
 fn layers() {
     let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
-    let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
+    let c = ConnectionManager::<File>::get_manager()
+        .connect(&path)
+        .unwrap();
     c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
     let db = c.database.read().db.clone();
-    let orders = db.table_id_by_name("default.orders").unwrap().expect("an orders table");
+    let orders = db
+        .table_id_by_name("default.orders")
+        .unwrap()
+        .expect("an orders table");
 
     // 200 keys, each read 200 times (warm; within the parse cache); and
     // 40000 keys read once.
@@ -73,7 +78,11 @@ fn layers() {
     for id in &repeated {
         sql_parser::parse_sql_cached(&sql(id)).unwrap();
     }
-    per_op("parse, cached (200 texts, 200 times each)", repeated.len(), start);
+    per_op(
+        "parse, cached (200 texts, 200 times each)",
+        repeated.len(),
+        start,
+    );
 
     let start = Instant::now();
     let mut rows = 0;
@@ -82,7 +91,11 @@ fn layers() {
         stmt.execute().unwrap();
         rows += drain(&mut stmt);
     }
-    per_op("SQL, every text new (parse + plan + execute)", many.len(), start);
+    per_op(
+        "SQL, every text new (parse + plan + execute)",
+        many.len(),
+        start,
+    );
     assert_eq!(rows, many.len());
     let start = Instant::now();
     for id in &repeated {
@@ -95,7 +108,9 @@ fn layers() {
     let start = Instant::now();
     let txn = db.begin().unwrap();
     for id in &repeated {
-        db.find(orders, DBIdType::Rec(key(id)), &txn).unwrap().unwrap();
+        db.find(orders, DBIdType::Rec(key(id)), &txn)
+            .unwrap()
+            .unwrap();
     }
     db.rollback(txn).unwrap();
     per_op("store: Db::find, one transaction", repeated.len(), start);
@@ -103,16 +118,25 @@ fn layers() {
     for id in &repeated {
         let txn = db.begin().unwrap();
         let mut cur = db
-            .key_ranges_scan(orders, Some(txn.id()), vec![KeyRange::prefix(vec![ValueItem::Str(((*id).clone(), 12))])])
+            .key_ranges_scan(
+                orders,
+                Some(txn.id()),
+                vec![KeyRange::prefix(vec![ValueItem::Str(((*id).clone(), 12))])],
+            )
             .unwrap();
         assert!(cur.next().unwrap().is_some());
         drop(cur);
         db.commit(txn).unwrap();
     }
-    per_op("store: key range seek, a transaction each (as SQL)", repeated.len(), start);
+    per_op(
+        "store: key range seek, a transaction each (as SQL)",
+        repeated.len(),
+        start,
+    );
 
     println!("\n-- 100k-row primary key range (warm), 10 times --");
-    let range_sql = "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'";
+    let range_sql =
+        "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'";
     let start = Instant::now();
     for _ in 0..10 {
         let mut stmt = c.clone().create_statement(range_sql).unwrap();
@@ -127,12 +151,17 @@ fn layers() {
         lower: std::ops::Bound::Included(ValueItem::Str(("ORD0100000".into(), 12))),
         upper: std::ops::Bound::Excluded(ValueItem::Str(("ORD0200000".into(), 12))),
     };
-    for (what, tid) in [("store: same range of the primary key index", pk_index), ("store: same range of the row table (rows)", orders)] {
+    for (what, tid) in [
+        ("store: same range of the primary key index", pk_index),
+        ("store: same range of the row table (rows)", orders),
+    ] {
         let start = Instant::now();
         let mut n = 0;
         for _ in 0..10 {
             let txn = db.begin().unwrap();
-            let mut cur = db.key_ranges_scan(tid, Some(txn.id()), vec![range()]).unwrap();
+            let mut cur = db
+                .key_ranges_scan(tid, Some(txn.id()), vec![range()])
+                .unwrap();
             while cur.next().unwrap().is_some() {
                 n += 1;
             }
@@ -143,4 +172,33 @@ fn layers() {
         assert_eq!(n % 10, 0);
     }
     println!();
+}
+
+// A primary key lookup, repeated, for a profiler to watch (by hand):
+//   SQ_LAYERS_DB=... cargo test --release -p squeal-sql --lib lookup_loop -- --ignored
+#[test]
+#[ignore]
+fn lookup_loop() {
+    let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
+    let c = ConnectionManager::<File>::get_manager()
+        .connect(&path)
+        .unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let ids: Vec<String> = (1..=200).map(|i| format!("ORD{:07}", i * 1000)).collect();
+    let seconds: u64 = std::env::var("SQ_LOOP_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
+    let start = Instant::now();
+    let mut n = 0usize;
+    while start.elapsed().as_secs() < seconds {
+        for id in &ids {
+            let sql = format!("select * from orders where order_id = '{id}'");
+            let mut stmt = c.clone().create_statement(&sql).unwrap();
+            stmt.execute().unwrap();
+            drain(&mut stmt);
+            n += 1;
+        }
+    }
+    per_op("lookup, repeated texts", n, start);
 }

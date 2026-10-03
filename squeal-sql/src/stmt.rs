@@ -505,7 +505,9 @@ where
         let stmts = sql_parser::parse_sql_cached(sql)?;
         Self::semantic_validate(&stmts)?;
         Ok(Self {
-            id: Uuid::new_v4(),
+            // From the thread's own generator: Uuid::new_v4 asks the OS
+            // for randomness, a system call on every statement.
+            id: Uuid::from_u128(rand::random()),
             sql: sql.to_string(),
             conn,
             stmts,

@@ -45,6 +45,10 @@ pub(crate) struct TableStatStored {
     // Of row_count, how many each partition holds, by Partition::id: what
     // a read of some of a partitioned table's partitions is estimated by.
     partition_rows: HashMap<u32, usize>,
+    // col_stats as planning reads them, built at the first read after a
+    // change and shared until the next: planning asks for them on every
+    // statement, and building them is a map and a string per column.
+    snapshot: parking_lot::Mutex<Option<Arc<HashMap<usize, ColumnStat>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,8 +93,9 @@ pub struct TableStat {
     // Keyed by field index (matching SqlTable::fields()'s own order) —
     // pub(crate), not private, so a caller outside this module (e.g.
     // Schema, for the `!show table stats` CLI command) can render it
-    // without a bespoke accessor per field.
-    pub(crate) col_stats: HashMap<usize, ColumnStat>,
+    // without a bespoke accessor per field. Shared: a plan clones its
+    // statistics freely.
+    pub(crate) col_stats: Arc<HashMap<usize, ColumnStat>>,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +303,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             })
             .collect();
         *stored.col_stats.write() = reshaped;
+        *stored.snapshot.lock() = None;
         stored.name = table.name.clone();
         Ok(())
     }
@@ -344,6 +350,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             name: table.name.clone(),
             row_count: 0,
             col_stats: RwLock::new(col_stats),
+            snapshot: Default::default(),
             partition_rows: HashMap::new(),
         };
         Ok(tstat)
@@ -483,6 +490,7 @@ fn update_table_stats(
     };
     table.row_count += 1;
     *table.partition_rows.entry(partition).or_default() += 1;
+    *table.snapshot.get_mut() = None;
     for (i, f) in table.col_stats.write().iter_mut() {
         // A row logged in a table's layout before an ALTER TABLE, applied
         // after it (see SchemaStats::reshape_table), can be short a column.
@@ -569,12 +577,25 @@ impl TableStatStored {
                 .iter()
                 .map(|(p, n)| (*p, n * mul))
                 .collect(),
-            col_stats: self
-                .col_stats
-                .read()
-                .iter()
-                .map(|(i, c)| (*i, c.with_mutiplier(mul)))
-                .collect(),
+            col_stats: {
+                let mut snapshot = self.snapshot.lock();
+                match &*snapshot {
+                    Some(cols) if mul == 1 => cols.clone(),
+                    _ => {
+                        let cols: Arc<HashMap<usize, ColumnStat>> = Arc::new(
+                            self.col_stats
+                                .read()
+                                .iter()
+                                .map(|(i, c)| (*i, c.with_mutiplier(mul)))
+                                .collect(),
+                        );
+                        if mul == 1 {
+                            *snapshot = Some(cols.clone());
+                        }
+                        cols
+                    }
+                }
+            },
         }
     }
 }
@@ -692,6 +713,7 @@ impl TableStatStored {
             name: p.name,
             row_count: p.row_count,
             col_stats: RwLock::new(col_stats),
+            snapshot: Default::default(),
             partition_rows,
         })
     }
@@ -723,7 +745,7 @@ pub(crate) fn for_partitions(
             .sum()
     };
     let (rows, kept) = (stats.table_stat.row_count, scoped.table_stat.row_count);
-    for c in scoped.table_stat.col_stats.values_mut() {
+    for c in Arc::make_mut(&mut scoped.table_stat.col_stats).values_mut() {
         if rows > 0 {
             c.null = c.null * kept / rows;
         }
@@ -732,7 +754,7 @@ pub(crate) fn for_partitions(
     if let Some((column, _)) = table.partition_column()
         && let Some(by) = &table.partitioning
         && by.kind == crate::partition::PartitionKind::Range
-        && let Some(c) = scoped.table_stat.col_stats.get_mut(&column)
+        && let Some(c) = Arc::make_mut(&mut scoped.table_stat.col_stats).get_mut(&column)
         && let (Some(first), Some(last)) = (parts.iter().min(), parts.iter().max())
     {
         use crate::partition::PartitionBound;
@@ -877,6 +899,7 @@ mod tests {
             name: "orders".into(),
             row_count: 12345,
             col_stats: RwLock::new(col_stats),
+            snapshot: Default::default(),
             partition_rows: HashMap::from([(0, 12000), (3, 345)]),
         };
 

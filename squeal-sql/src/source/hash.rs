@@ -1031,7 +1031,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
     fn table_stats(&self) -> Option<ComputedTableStat> {
         Some(ComputedTableStat {
             table_stat: TableStat {
-                col_stats: HashMap::new(),
+                col_stats: Default::default(),
                 id: TableIdType::none(),
                 name: "".into(),
                 row_count: self.count,
@@ -1816,7 +1816,7 @@ mod tests {
                     name: "t".into(),
                     row_count: self.1,
                     partition_rows: Default::default(),
-                    col_stats: HashMap::new(),
+                    col_stats: Default::default(),
                 },
                 indices: None,
                 self_index: None,

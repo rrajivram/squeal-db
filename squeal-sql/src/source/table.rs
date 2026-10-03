@@ -22,9 +22,10 @@ use crate::{
 // the table's own layout.
 pub struct TableSource<F: DBFile> {
     cursor: RowCursor<F>,
-    // The seek's condition for EXPLAIN (see plan::sarg::describe_key_range)
-    // and its estimated row count; None for a full scan.
-    seek: Option<(String, Option<usize>)>,
+    // The seek's ranges, described for EXPLAIN only when asked (see
+    // plan::sarg::describe_key_range), and its estimated row count; None
+    // for a full scan.
+    seek: Option<(Vec<KeyRange>, Option<usize>)>,
     table: Arc<SqlTable>,
     // Which of the table's partitions this reads.
     part: usize,
@@ -79,11 +80,7 @@ where
         ranges: Vec<KeyRange>,
         rows: Option<usize>,
     ) -> Result<Self, SchemaError> {
-        let key_names: Vec<String> = table
-            .primary_key()
-            .map(|pk| pk.fields.iter().map(|f| f.name.clone()).collect())
-            .unwrap_or_default();
-        let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
+        let seek = ranges.clone();
         let cursor =
             db.key_ranges_scan(table.partitions[part].rows(), txn.map(|t| t.id()), ranges)?;
         // Built around the seek's own cursor: opening a scan only to replace
@@ -188,14 +185,23 @@ where
     F: DBFile<Item = F>,
 {
     fn plan(&self) -> PlanNode {
-        match &self.seek {
+        let key_names: Vec<String> = self
+            .table
+            .primary_key()
+            .map(|pk| pk.fields.iter().map(|f| f.name.clone()).collect())
+            .unwrap_or_default();
+        let seek = self
+            .seek
+            .as_ref()
+            .map(|(ranges, rows)| (crate::plan::sarg::describe_key_ranges(ranges, &key_names), rows));
+        match &seek {
             // All of it, read through its key for the order.
             Some((seek, rows)) if seek.is_empty() => PlanNode::new("TableScan")
                 .detail(format!("{} (in {} order)", self.label(), self.key_names()))
-                .rows(self.shown_rows(*rows)),
+                .rows(self.shown_rows(**rows)),
             Some((seek, rows)) => PlanNode::new("TableSeek")
                 .detail(format!("{} ({seek})", self.label()))
-                .rows(self.shown_rows(*rows)),
+                .rows(self.shown_rows(**rows)),
             None => PlanNode::new("TableScan")
                 .detail(self.label())
                 .rows(self.shown_rows(self.stats.as_ref().map(|s| s.table_stat.row_count))),

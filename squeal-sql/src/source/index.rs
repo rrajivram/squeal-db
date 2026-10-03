@@ -47,7 +47,7 @@ pub struct IndexSource<F: DBFile + 'static> {
     pk_positions: Option<Vec<usize>>,
     // The seek's condition for EXPLAIN and its estimated row count; None
     // for a full scan.
-    seek: Option<(String, Option<usize>)>,
+    seek: Option<(Vec<KeyRange>, Option<usize>)>,
     // Some: fetch each entry's row from the table (IndexLookup).
     lookup: Option<Arc<Db<F>>>,
     last_id: Option<DBIdType>,
@@ -75,12 +75,7 @@ where
         rows: Option<usize>,
     ) -> Result<Self, SchemaError> {
         let db = conn.database.read().db.clone();
-        let key_names: Vec<String> = table.indices[index]
-            .fields
-            .iter()
-            .map(|f| f.name.clone())
-            .collect();
-        let seek = crate::plan::sarg::describe_key_ranges(&ranges, &key_names);
+        let seek = ranges.clone();
         let cursor = db.key_ranges_scan(
             table.partitions[part].index(index),
             txn.map(|t| t.id()),
@@ -220,7 +215,16 @@ where
         // Row estimates are for the whole table: shown on the step reading
         // all of its partitions (AppendSource), not on each partition's.
         let shown = |rows: Option<usize>| rows.filter(|_| !self.table.is_partitioned());
-        match &self.seek {
+        let key_names: Vec<String> = self.table.indices[self.index]
+            .fields
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        let seek = self
+            .seek
+            .as_ref()
+            .map(|(ranges, rows)| (crate::plan::sarg::describe_key_ranges(ranges, &key_names), *rows));
+        match &seek {
             Some((seek, rows)) => PlanNode::new(if self.lookup.is_some() {
                 "IndexLookup"
             } else {
