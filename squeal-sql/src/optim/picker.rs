@@ -741,6 +741,10 @@ pub(crate) fn pick_join_seek(
     table: &SqlTable,
     stats: Option<&ComputedTableStat>,
     pairs: &[(usize, usize, DataType)],
+    // ON comparisons of an outer column with an inner one: (outer
+    // position, inner column, the op as `inner op outer`, outer type). One
+    // may bound a range on the key column after the equalities.
+    ranges: &[(usize, usize, BinaryOp, DataType)],
     outer_rows: Option<usize>,
     // Trees each outer row descends: one per partition sought. The rows
     // that match are in one of them or another, so they are fetched once.
@@ -808,10 +812,20 @@ pub(crate) fn pick_join_seek(
     let mut consider =
         |index: Option<usize>, key: Vec<usize>, unique: bool, entry: usize, row: usize| {
             let used = keys_for(&key);
-            if used.is_empty() {
+            let range = key.get(used.len()).and_then(|col| {
+                ranges
+                    .iter()
+                    .find(|(_, c, _, t)| c == col && same_type(*t, fields[*col].datatype))
+                    .map(|(o, _, op, _)| (*o, *op))
+            });
+            if used.is_empty() && range.is_none() {
                 return;
             }
-            let rows_per_key = per_key(&key, &used, unique);
+            let mut rows_per_key = per_key(&key, &used, unique && range.is_none());
+            // A range keeps a third, as filtered_rows guesses for one.
+            if range.is_some() {
+                rows_per_key = rows_per_key.div_ceil(3).max(1);
+            }
             let descent = page_size.min(rows * entry);
             let cost = outer_rows * (trees * descent + rows_per_key * (row + TREE_ROW_BYTES));
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {
@@ -821,6 +835,7 @@ pub(crate) fn pick_join_seek(
                         index,
                         keys: used,
                         rows_per_key,
+                        range,
                     },
                 ));
             }
@@ -848,6 +863,11 @@ pub(crate) fn pick_join_seek(
         );
     }
     let (cost, seek) = best?;
+    // With no equality, the other way is no hash join but every pair of
+    // rows: the seek wins.
+    if pairs.is_empty() {
+        return Some(seek);
+    }
     ((cost as f64) < (hash_rows * table_row) as f64 + hash_extra).then_some(seek)
 }
 

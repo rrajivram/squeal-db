@@ -1891,6 +1891,35 @@ where
                 _ => None,
             })
             .collect();
+        // The ON comparisons between an outer and an inner column, as
+        // `inner op outer`.
+        let ranges: Vec<(usize, usize, BinaryOp, DataType)> = terms
+            .iter()
+            .filter_map(|t| {
+                let EvalExpr::Binary { lhs, op, rhs } = t else {
+                    return None;
+                };
+                let flip = |op: &BinaryOp| match op {
+                    BinaryOp::Lt => Some(BinaryOp::Gt),
+                    BinaryOp::LtEq => Some(BinaryOp::GtEq),
+                    BinaryOp::Gt => Some(BinaryOp::Lt),
+                    BinaryOp::GtEq => Some(BinaryOp::LtEq),
+                    _ => None,
+                };
+                match (lhs.as_ref(), rhs.as_ref()) {
+                    // inner op outer
+                    (EvalExpr::Value(i), EvalExpr::Value(o)) if *o < left_width && *i >= left_width => {
+                        flip(op)?;
+                        Some((*o, *i - left_width, *op, left_types[*o]))
+                    }
+                    // outer op inner
+                    (EvalExpr::Value(o), EvalExpr::Value(i)) if *o < left_width && *i >= left_width => {
+                        Some((*o, *i - left_width, flip(op)?, left_types[*o]))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
         let db = self.conn.database.read().db.clone();
         let page_size = db.get_page_data_size();
         // What a hash join would read of this table: however it would be
@@ -1926,6 +1955,7 @@ where
             table,
             relation.stats.as_ref(),
             &pairs,
+            &ranges,
             outer_rows,
             fanout,
             hash_rows,

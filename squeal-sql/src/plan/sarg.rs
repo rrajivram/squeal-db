@@ -462,7 +462,11 @@ fn empty() -> ColumnRange {
 
 // The range `column op value` allows, in the column's stored type; None
 // when the condition can't be used for a seek (see the module comment).
-fn condition_range(datatype: DataType, op: BinaryOp, value: &ValueItem) -> Option<ColumnRange> {
+pub(crate) fn condition_range(
+    datatype: DataType,
+    op: BinaryOp,
+    value: &ValueItem,
+) -> Option<ColumnRange> {
     if !matches!(
         op,
         BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq

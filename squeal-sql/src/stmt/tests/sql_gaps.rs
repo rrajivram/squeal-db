@@ -708,3 +708,36 @@ fn test_with_recursive_repeats_its_step_until_it_adds_nothing() {
         assert!(run(&c, sql).is_err(), "{sql}");
     }
 }
+
+// A join on an inequality with the inner table's key: each outer row seeks
+// the range, rather than every pair of rows being tried.
+#[test]
+fn test_an_inequality_join_seeks_a_range_per_outer_row() {
+    let c = twin_conn();
+    for (sql, cross) in [
+        (
+            "select d.day, b.id from days d join plain_big b on b.id < d.day",
+            "select d.day, b.id from days d cross join plain_big b where b.id < d.day",
+        ),
+        (
+            "select d.day, b.id from days d join plain_big b on b.id >= d.day + 0 and b.id <= 3",
+            "select d.day, b.id from days d cross join plain_big b \
+             where b.id >= d.day and b.id <= 3",
+        ),
+        (
+            "select d.day, b.id from days d left join plain_big b on d.day > b.id and b.id > 40",
+            "select d.day, b.id from days d left join \
+             (select id from plain_big where id > 40) b on d.day > b.id",
+        ),
+    ] {
+        assert_eq!(outcome(&c, sql), outcome(&c, cross), "{sql}");
+    }
+    let plan = explain(&c, "select d.day, b.id from days d join plain_big b on b.id < d.day");
+    assert!(plan.contains("NestedLoopJoin"), "{plan}");
+    assert!(plan.contains("inner(id) < outer(day)"), "{plan}");
+    // Partitioned: the same, partition by partition.
+    assert_eq!(
+        outcome(&c, "select d.day, b.id from days d join part_big b on b.id < d.day"),
+        outcome(&c, "select d.day, b.id from days d join plain_big b on b.id < d.day"),
+    );
+}

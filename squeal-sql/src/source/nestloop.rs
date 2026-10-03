@@ -12,6 +12,8 @@
 
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
+use sql_parser::expr::BinaryOp;
+
 use postcard::from_bytes;
 use store::{
     clock::Instant,
@@ -25,7 +27,10 @@ use store::{
 use crate::{
     datatype::DataType,
     error::SchemaError,
-    plan::{eval::EvalExpr, sarg::equal_points},
+    plan::{
+        eval::EvalExpr,
+        sarg::{condition_range, equal_points},
+    },
     source::{
         ProjectableField, QueryStats, Source, column_names, join::JoinType, planinfo::PlanNode,
     },
@@ -42,6 +47,9 @@ pub(crate) struct JoinSeek {
     pub keys: Vec<(usize, usize)>,
     /// Expected inner rows per outer row.
     pub rows_per_key: usize,
+    /// A range on the key column after `keys`: (outer position, op), the
+    /// inner column `op` the outer value (`inner > outer.x`).
+    pub range: Option<(usize, BinaryOp)>,
 }
 
 pub(crate) struct NestedLoopJoin<F: DBFile + 'static> {
@@ -148,6 +156,11 @@ where
     // any is NULL.
     fn ranges_for(&self, outer: &IndexKey) -> Vec<KeyRange> {
         let mut prefixes: Vec<Vec<ValueItem>> = vec![vec![]];
+        let range = self.seek.range.and_then(|(pos, op)| {
+            let column = self.key_column(self.seek.keys.len())?;
+            let datatype = self.table.fields()[column].datatype;
+            condition_range(datatype, op, &outer[pos])
+        });
         for ((pos, _), datatype) in self.seek.keys.iter().zip(&self.key_types) {
             let points = equal_points(*datatype, &outer[*pos]).unwrap_or_default();
             prefixes = prefixes
@@ -161,7 +174,30 @@ where
                 })
                 .collect();
         }
-        prefixes.into_iter().map(KeyRange::prefix).collect()
+        match range {
+            None if self.seek.range.is_some() => vec![],
+            None => prefixes.into_iter().map(KeyRange::prefix).collect(),
+            Some(r) => prefixes
+                .into_iter()
+                .map(|prefix| KeyRange {
+                    prefix,
+                    lower: r.lower.clone(),
+                    upper: r.upper.clone(),
+                })
+                .filter(|k| !crate::plan::sarg::is_empty(k))
+                .collect(),
+        }
+    }
+
+    // The inner table column at position `n` of the sought key.
+    fn key_column(&self, n: usize) -> Option<usize> {
+        let fields = self.table.fields();
+        let key = match self.seek.index {
+            None => self.table.primary_key()?,
+            Some(i) => &self.table.indices[i],
+        };
+        let name = &key.fields.get(n)?.name;
+        fields.iter().position(|f| &f.name == name)
     }
 
     // The tree sought in partition `part`.
@@ -333,12 +369,36 @@ where
             .map(|(o, i)| format!("outer({o}) = inner({i})"))
             .collect::<Vec<_>>()
             .join(" AND ");
-        let condition = inner
+        let mut condition: Vec<String> = inner
             .iter()
             .zip(&outer)
             .map(|(i, o)| format!("{i} = outer {o}"))
-            .collect::<Vec<_>>()
-            .join(" AND ");
+            .collect();
+        let mut keys = keys;
+        if let Some((pos, op)) = self.seek.range
+            && let Some(column) = self.key_column(self.seek.keys.len())
+        {
+            let sym = match op {
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                _ => "?",
+            };
+            let o = column_names(&self.outer.fields())
+                .get(pos)
+                .cloned()
+                .unwrap_or_else(|| format!("#{pos}"));
+            let i = self.table.fields()[column].name.clone();
+            condition.push(format!("{i} {sym} outer {o}"));
+            let range = format!("inner({i}) {sym} outer({o})");
+            keys = if keys.is_empty() {
+                range
+            } else {
+                format!("{keys} AND {range}")
+            };
+        }
+        let condition = condition.join(" AND ");
         // Which of a partitioned table's partitions each outer row seeks.
         let table = if !self.table.is_partitioned() {
             self.table.name.clone()
