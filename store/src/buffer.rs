@@ -2339,6 +2339,10 @@ mod tests {
             Ok(self.tuples.len())
         }
 
+        fn at(&self, i: usize) -> Option<Tuple> {
+            self.tuples.get(i).cloned()
+        }
+
         fn deep_clone(&self) -> Box<dyn crate::pages::PageTuple> {
             Box::new(self.clone())
         }

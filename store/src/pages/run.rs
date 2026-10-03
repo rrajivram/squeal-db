@@ -42,6 +42,10 @@ impl PageTuple for RunPage {
         Ok(self.data.len())
     }
 
+    fn at(&self, i: usize) -> Option<Tuple> {
+        self.data.get(i).cloned()
+    }
+
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         self.data.push(tuple);
         Ok(())

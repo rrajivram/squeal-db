@@ -529,6 +529,19 @@ impl PageTuple for SlottedPage {
         Ok(self.slot_count())
     }
 
+    fn at(&self, i: usize) -> Option<Tuple> {
+        (i < self.slot_count()).then(|| self.decode_at(i).ok()).flatten()
+    }
+
+    fn seek(&self, lower: std::ops::Bound<&DBIdType>) -> Result<usize, StoreError> {
+        use std::ops::Bound::*;
+        match lower {
+            Included(k) => self.lower_bound(k),
+            Excluded(k) => self.upper_bound(k),
+            Unbounded => Ok(0),
+        }
+    }
+
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         let lo = self.lower_bound(&tuple.id)?;
         let hi = self.upper_bound(&tuple.id)?;

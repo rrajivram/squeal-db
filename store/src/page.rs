@@ -2,6 +2,7 @@
  * Page is a logical construct. It does nbot care about actual disk page size ,  though it is bound by it. i.e. capacity =0
  * if HAS_Overflow is set, next_page will point to continuation. This contunation logic is fully handled by PageBuffer
  */
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64};
 
 use parking_lot::RwLock;
@@ -250,12 +251,11 @@ impl Eq for PageId {}
 
 // The tuple store and its byte-accounting must change together — locking
 // them separately would let a reader observe a page_used_size that doesn't
-// match the data it just read (or vice versa). See Page's own doc comment
-// on why this is a lock, not an Arc<dyn PageTuple> mutated via
-// Arc::make_mut: a single-record insert/update/remove only ever touches one
-// key, so mutating in place under a write lock (one Vec insert/remove,
-// no cloning involved) is strictly cheaper
-// than cloning the whole store first just to get unique ownership.
+// match the data it just read (or vice versa). A write changes the store
+// in place under this lock: a single-record insert/update/remove touches
+// one key, so that is cheaper than cloning the whole store first. The
+// store is cloned only while a reader holds a snapshot of it (see `data`
+// below).
 //
 // has_overflow and next_page live here too, not in the `flags`/`next_page`
 // atomics alongside the other independent bits (PINNED, LEAF/INNER_NODE,
@@ -292,9 +292,15 @@ impl Eq for PageId {}
 // reader combining a stale high_key with a fresher next_page (or vice
 // versa) would misnavigate exactly the way the has_overflow/next_page pair
 // used to.
+//
+// `data` is shared with readers, not owned outright: Page::iter hands out
+// the content itself (an Arc clone) instead of copying every tuple out,
+// and a write copies it first only while such a snapshot is still held
+// (data_mut). A reader walking a page sees it as it was when it started,
+// as it did when iter() copied it.
 #[derive(Debug)]
 struct PageInner {
-    data: Box<dyn PageTuple>,
+    data: Arc<dyn PageTuple>,
     page_used_size: DBSizeType,
     has_overflow: bool,
     next_page: DBSizeType,
@@ -314,6 +320,17 @@ struct PageInner {
     // exact same reason has_overflow/next_page do (see this struct's own
     // comment): it's meaningless read torn against either of them.
     overflow_page_count: DBSizeType,
+}
+
+impl PageInner {
+    // The content, to change in place: copied first if a reader still
+    // holds a snapshot of it (see Page::iter).
+    fn data_mut(&mut self) -> &mut dyn PageTuple {
+        if Arc::get_mut(&mut self.data).is_none() {
+            self.data = Arc::from(self.data.deep_clone());
+        }
+        Arc::get_mut(&mut self.data).expect("content just copied is unshared")
+    }
 }
 
 ///Page Invariants
@@ -370,9 +387,11 @@ pub(crate) struct Page {
     referenced: AtomicBool,
 }
 
+// A page's tuples, read from a snapshot of its content (see PageInner).
 #[derive(Clone)]
 pub(crate) struct PageTupleIterator {
-    data: std::vec::IntoIter<Tuple>,
+    content: Arc<dyn PageTuple>,
+    next: usize,
 }
 
 impl Page {
@@ -462,7 +481,7 @@ impl Page {
         let ds = size - page_overhead as DBSizeType;
         Self {
             inner: RwLock::new(PageInner {
-                data: content,
+                data: Arc::from(content),
                 page_used_size: 0,
                 has_overflow: false,
                 next_page: 0,
@@ -694,7 +713,7 @@ impl Page {
     pub(crate) fn clear(&self) -> Result<(), StoreError> {
         {
             let mut inner = self.inner.write();
-            inner.data.clear()?;
+            inner.data_mut().clear()?;
             inner.page_used_size = 0;
         }
         self.set_dirty(true)?;
@@ -703,14 +722,19 @@ impl Page {
 
     pub(crate) fn iter(&self) -> PageTupleIterator {
         PageTupleIterator {
-            data: self
-                .inner
-                .read()
-                .data
-                .values()
-                .unwrap_or_default()
-                .into_iter(),
+            content: Arc::clone(&self.inner.read().data),
+            next: 0,
         }
+    }
+
+    // iter(), from the first tuple at or after `lower`.
+    pub(crate) fn iter_from(
+        &self,
+        lower: std::ops::Bound<&DBIdType>,
+    ) -> Result<PageTupleIterator, StoreError> {
+        let content = Arc::clone(&self.inner.read().data);
+        let next = content.seek(lower)?;
+        Ok(PageTupleIterator { content, next })
     }
 
     // Threshold used for the fullness decision — strictly less than the true
@@ -776,7 +800,7 @@ impl Page {
         let sz = tuple.size();
         {
             let mut inner = self.inner.write();
-            inner.data.add(tuple)?;
+            inner.data_mut().add(tuple)?;
             inner.page_used_size += sz;
         }
         self.set_dirty(true)?;
@@ -786,7 +810,7 @@ impl Page {
     pub(crate) fn remove_tuple(&self, id: DBIdType) -> Result<Tuple, StoreError> {
         let old = {
             let mut inner = self.inner.write();
-            let old = inner.data.remove(id)?;
+            let old = inner.data_mut().remove(id)?;
             // checked_sub: an underflow here would wrap page_used_size to
             // ~u64::MAX, which then drives handle_large_page_size to allocate
             // a giant overflow chain (observed: 21 GB file / OOM). Surface it
@@ -812,7 +836,7 @@ impl Page {
         let new_size = tuple.size();
         let old = {
             let mut inner = self.inner.write();
-            let old = inner.data.replace(id, tuple)?;
+            let old = inner.data_mut().replace(id, tuple)?;
             let old_size = old.size();
             inner.page_used_size = inner.page_used_size.checked_sub(old_size).ok_or_else(|| {
                 StoreError::UnknownError(format!(
@@ -872,7 +896,7 @@ impl Page {
     }
 
     // STORE_AUDIT.md P5: see PageTuple::successor's own comment — an O(log N)
-    // B-tree range lookup instead of iter()'s O(N) clone-everything-then-scan.
+    // search instead of a scan of every entry.
     pub(crate) fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         self.inner.read().data.successor(id)
     }
@@ -883,16 +907,6 @@ impl Page {
 
     pub(crate) fn first(&self) -> Result<Option<Tuple>, StoreError> {
         self.inner.read().data.first()
-    }
-
-    // See PageTuple::values_in: a chunk of the page from `lower` on, not a
-    // copy of all of it as iter() makes.
-    pub(crate) fn values_in(
-        &self,
-        lower: std::ops::Bound<&DBIdType>,
-        max: usize,
-    ) -> Result<Vec<Tuple>, StoreError> {
-        self.inner.read().data.values_in(lower, max)
     }
 
     // The one atomic read anything that needs *both* a header and the raw
@@ -985,7 +999,7 @@ impl Page {
         let has_overflow = header.flags & HAS_OVERFLOW != 0;
         Ok(Self {
             inner: RwLock::new(PageInner {
-                data: pt,
+                data: Arc::from(pt),
                 page_used_size: header.page_used_size,
                 has_overflow,
                 next_page: header.next_page,
@@ -1075,7 +1089,9 @@ impl PageHeader {
 impl Iterator for PageTupleIterator {
     type Item = Tuple;
     fn next(&mut self) -> Option<Self::Item> {
-        self.data.next()
+        let t = self.content.at(self.next)?;
+        self.next += 1;
+        Some(t)
     }
 }
 
@@ -1106,7 +1122,7 @@ impl From<PageDto> for Page {
         let has_overflow = value.flags & HAS_OVERFLOW != 0;
         Self {
             inner: RwLock::new(PageInner {
-                data: pt,
+                data: Arc::from(pt),
                 page_used_size: value.page_used_size,
                 has_overflow,
                 next_page: value.next_page,
@@ -1178,7 +1194,7 @@ impl Clone for Page {
         let inner = self.inner.read();
         Self {
             inner: RwLock::new(PageInner {
-                data: inner.data.deep_clone(),
+                data: Arc::from(inner.data.deep_clone()),
                 page_used_size: inner.page_used_size,
                 has_overflow: inner.has_overflow,
                 next_page: inner.next_page,
@@ -1256,15 +1272,12 @@ impl PageId {
     }
 }
 
-// SAFETY: needed only because `data: Box<dyn PageTuple>` (inside PageInner)
-// is a trait object without Send+Sync bounds. The concrete stores
-// (AnyTuplePage/FixedTuplePage) are Send+Sync plain data. Sharing `&Page`
-// across threads is sound: every mutating method (add_tuple/remove_tuple/
-// replace_tuple/clear) takes `&self` and mutates through `inner`'s own
-// RwLock, and the other genuinely-shared mutable fields are atomics / a
-// lock — there is no field left that's mutated without synchronization.
-unsafe impl Sync for Page {}
-unsafe impl Send for Page {}
+// Page is Send + Sync by its fields: PageTuple requires both of its
+// content, the rest are locks and atomics.
+const _: fn() = || {
+    fn shared<T: Send + Sync>() {}
+    shared::<Page>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -1384,6 +1397,37 @@ mod tests {
         }
         let count = p.iter().count();
         assert_eq!(count, 5);
+    }
+
+    // iter() reads a snapshot: writes after it (each kind of write) leave
+    // it as it was, and a later iter() sees them.
+    #[test]
+    fn page_test_iter_reads_the_page_as_it_was_when_taken() {
+        let p = Page::new_data(4000, TEST_OVERHEAD);
+        for i in 0..5u64 {
+            p.add_tuple(Tuple::new(i, b"old")).unwrap();
+        }
+        let ids = |it: super::PageTupleIterator| {
+            let mut v: Vec<_> = it.map(|t| (t.id, t.data.to_vec())).collect();
+            v.sort_by(|a, b| a.0.cmp(&b.0));
+            v
+        };
+        let before = ids(p.iter());
+        let snapshot = p.iter();
+        let mut part_read = p.iter();
+        part_read.next();
+        p.add_tuple(Tuple::new(9, b"new")).unwrap();
+        p.remove_tuple(DBIdType::Int(0)).unwrap();
+        p.replace_tuple(&DBIdType::Int(1), Tuple::new(1, b"new")).unwrap();
+        assert_eq!(ids(snapshot), before);
+        assert_eq!(part_read.count(), 4);
+        let after = ids(p.iter());
+        assert_eq!(after.len(), 5);
+        assert!(after.contains(&(DBIdType::Int(9), b"new".to_vec())));
+        assert!(after.contains(&(DBIdType::Int(1), b"new".to_vec())));
+        assert!(!after.iter().any(|(id, _)| *id == DBIdType::Int(0)));
+        p.clear().unwrap();
+        assert_eq!(p.iter().count(), 0);
     }
 
     #[test]

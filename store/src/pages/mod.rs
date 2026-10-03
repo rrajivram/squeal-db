@@ -12,15 +12,34 @@ pub mod slotted;
 
 pub type TupleType = Tuple;
 
-pub trait PageTuple {
+// Send + Sync: a page's content is shared, read-only, with the readers
+// holding a snapshot of it (see Page::iter), on whatever thread they run.
+pub trait PageTuple: Send + Sync {
     fn count(&self) -> Result<usize, StoreError>;
 
-    /// Deep-copy into a fresh allocation. `Page::clone` must use this (not a
-    /// shared pointer) so a cloned Page owns an independent tuple store —
-    /// `Page` guards its own copy behind a lock (see `PageInner`), so
-    /// ordinary mutation (`add`/`remove`/`replace`/`clear`) happens in place
-    /// under that lock rather than via this method; `deep_clone` exists for
-    /// the rarer case of needing a genuinely separate copy (`Page::clone`).
+    /// The `i`th tuple in the page's own order, if there are that many.
+    fn at(&self, i: usize) -> Option<TupleType>;
+
+    /// Where the first tuple at or after `lower` is, in the page's own
+    /// order (`at`) — `count` if none.
+    fn seek(&self, lower: std::ops::Bound<&DBIdType>) -> Result<usize, StoreError> {
+        use std::ops::Bound::*;
+        let values = self.values()?;
+        Ok(values
+            .iter()
+            .position(|t| match lower {
+                Included(k) => t.id >= *k,
+                Excluded(k) => t.id > *k,
+                Unbounded => true,
+            })
+            .unwrap_or(values.len()))
+    }
+
+    /// Deep-copy into a fresh allocation: for `Page::clone`, which must own
+    /// an independent tuple store, and for a change to content a reader
+    /// still holds a snapshot of (see `PageInner::data_mut`). Otherwise
+    /// mutation (`add`/`remove`/`replace`/`clear`) happens in place under
+    /// `Page`'s lock.
     fn deep_clone(&self) -> Box<dyn PageTuple>;
 
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError>;
@@ -56,34 +75,6 @@ pub trait PageTuple {
     //fn from_bytes(bytes: &[u8]) -> Result<Self::Item, StoreError>;
 
     fn first(&self) -> Result<Option<TupleType>, StoreError>;
-
-    /// Tuples at or after `lower`, in key order: about `max` of them —
-    /// whole buckets of ids that compare equal, never part of one — so a
-    /// caller can walk a page a chunk at a time instead of copying all of
-    /// it (`values`) to read a few entries.
-    fn values_in(
-        &self,
-        lower: std::ops::Bound<&DBIdType>,
-        max: usize,
-    ) -> Result<Vec<TupleType>, StoreError> {
-        use std::ops::Bound::*;
-        let mut out: Vec<TupleType> = vec![];
-        for t in self.values()? {
-            let wanted = match lower {
-                Included(k) => t.id >= *k,
-                Excluded(k) => t.id > *k,
-                Unbounded => true,
-            };
-            if !wanted {
-                continue;
-            }
-            if out.len() >= max && out.last().is_some_and(|l| l.id < t.id) {
-                break;
-            }
-            out.push(t);
-        }
-        Ok(out)
-    }
 
     fn last(&self) -> Result<Option<TupleType>, StoreError>;
 

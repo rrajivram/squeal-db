@@ -189,6 +189,18 @@ impl PageTuple for AnyTuplePage {
         Ok(self.data.len())
     }
 
+    fn at(&self, i: usize) -> Option<Tuple> {
+        self.data.get(i).cloned()
+    }
+
+    fn seek(&self, lower: Bound<&DBIdType>) -> Result<usize, StoreError> {
+        Ok(match lower {
+            Bound::Included(k) => self.lower_bound(k),
+            Bound::Excluded(k) => self.upper_bound(k),
+            Bound::Unbounded => 0,
+        })
+    }
+
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         if self.position(&tuple.id).is_some() {
             return Err(StoreError::DuplicateKey(tuple.id));
@@ -268,26 +280,6 @@ impl PageTuple for AnyTuplePage {
         Ok(self.data.last().cloned())
     }
 
-    fn values_in(&self, lower: Bound<&DBIdType>, max: usize) -> Result<Vec<Tuple>, StoreError> {
-        let from = match lower {
-            Bound::Included(k) => self.lower_bound(k),
-            Bound::Excluded(k) => self.upper_bound(k),
-            Bound::Unbounded => 0,
-        };
-        let rest = &self.data[from..];
-        // `max` of them, then the rest of the last one's ties: never part
-        // of a run of equal ids, which the next chunk (starting past that
-        // id) would skip.
-        let mut end = max.min(rest.len());
-        if let Some(last) = end.checked_sub(1).map(|i| &rest[i].id) {
-            end += rest[end..]
-                .iter()
-                .take_while(|t| t.id.cmp(last) == Ordering::Equal)
-                .count();
-        }
-        Ok(rest[..end].to_vec())
-    }
-
     // STORE_AUDIT.md P5: see PageTuple::successor's own comment.
     fn successor(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         Ok(self.data.get(self.upper_bound(id)).cloned())
@@ -306,48 +298,25 @@ mod tests {
         AnyTuplePage::default()
     }
 
-    // values_in reads a chunk from a bound on, in key order.
+    // seek finds where a bound starts, in key order; at reads from there.
     #[test]
-    fn test_values_in_reads_a_chunk_from_a_bound() {
+    fn test_seek_finds_the_first_entry_within_a_bound() {
         use std::ops::Bound::*;
         let mut page = make_page();
         for i in (1u64..=20).rev() {
             page.add(Tuple::new(i, b"v")).unwrap();
         }
-        let ids = |ts: Vec<Tuple>| {
-            ts.into_iter()
-                .map(|t| match t.id {
-                    DBIdType::Int(i) => i,
-                    other => panic!("{other:?}"),
-                })
-                .collect::<Vec<_>>()
+        let from = |lower: std::ops::Bound<&DBIdType>| {
+            let at = page.seek(lower).unwrap();
+            page.at(at).map(|t| t.id)
         };
-        let five = DBIdType::Int(5);
-        assert_eq!(ids(page.values_in(Unbounded, 3).unwrap()), vec![1, 2, 3]);
-        assert_eq!(ids(page.values_in(Included(&five), 3).unwrap()), vec![5, 6, 7]);
-        assert_eq!(ids(page.values_in(Excluded(&five), 2).unwrap()), vec![6, 7]);
-        let twenty = DBIdType::Int(20);
-        assert!(page.values_in(Excluded(&twenty), 4).unwrap().is_empty());
-        assert_eq!(ids(page.values_in(Included(&twenty), 4).unwrap()), vec![20]);
-    }
-
-    // A hint is only a place to look first: right, wrong, or past the end,
-    // the answer (and where it was) is the same.
-    #[test]
-    fn test_get_hinted_finds_the_entry_whatever_the_hint() {
-        let mut page = make_page();
-        for i in 0u64..10 {
-            page.add(Tuple::new(i * 2, b"v")).unwrap();
-        }
-        let at = |id: u64, hint: usize| {
-            page.get_hinted(&DBIdType::Int(id), hint)
-                .unwrap()
-                .map(|(t, at)| (t.id, at))
-        };
-        for hint in [3, 0, 9, 10, usize::MAX] {
-            assert_eq!(at(6, hint), Some((DBIdType::Int(6), 3)), "hint {hint}");
-            assert_eq!(at(7, hint), None, "hint {hint}");
-        }
+        let (five, twenty) = (DBIdType::Int(5), DBIdType::Int(20));
+        assert_eq!(from(Unbounded), Some(DBIdType::Int(1)));
+        assert_eq!(from(Included(&five)), Some(DBIdType::Int(5)));
+        assert_eq!(from(Excluded(&five)), Some(DBIdType::Int(6)));
+        assert_eq!(from(Included(&twenty)), Some(DBIdType::Int(20)));
+        assert_eq!(from(Excluded(&twenty)), None);
+        assert_eq!(page.seek(Excluded(&twenty)).unwrap(), 20);
     }
 
     #[test]

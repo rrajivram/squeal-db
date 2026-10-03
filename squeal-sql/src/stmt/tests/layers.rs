@@ -171,6 +171,24 @@ fn layers() {
         per_op(what, 10, start);
         assert_eq!(n % 10, 0);
     }
+
+    println!("\n-- whole orders table (warm), 5 times --");
+    let start = Instant::now();
+    for _ in 0..5 {
+        let mut stmt = c
+            .clone()
+            .create_statement("select count(*) from orders")
+            .unwrap();
+        stmt.execute().unwrap();
+        drain(&mut stmt);
+    }
+    per_op("SQL count(*)", 5, start);
+    let start = Instant::now();
+    for _ in 0..5 {
+        let mut cur = db.table_scan(orders).unwrap();
+        while cur.next().unwrap().is_some() {}
+    }
+    per_op("store: table scan of the row table", 5, start);
     println!();
 }
 
@@ -291,4 +309,32 @@ fn store_find_loop() {
     }
     db.rollback(txn).unwrap();
     per_op("store find", n, start);
+}
+
+// First-touch random lookups in a fresh process: every page a cache miss.
+#[test]
+#[ignore]
+fn store_cold_find() {
+    let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
+    let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let db = c.database.read().db.clone();
+    let orders = db.table_id_by_name("default.orders").unwrap().unwrap();
+    let key = |id: &str| DBIdType::Rec(IndexKey::new_from(&[ValueItem::Str((id.to_string(), 12))]).unwrap());
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let keys: Vec<_> = (0..20_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            key(&format!("ORD{:07}", x % 330_000 + 1))
+        })
+        .collect();
+    let txn = db.begin().unwrap();
+    let start = Instant::now();
+    for k in &keys {
+        db.find(orders, k.clone(), &txn).unwrap();
+    }
+    per_op("store find, cold", keys.len(), start);
+    db.rollback(txn).unwrap();
 }

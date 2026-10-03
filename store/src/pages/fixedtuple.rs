@@ -61,6 +61,14 @@ impl PageTuple for FixedTuplePage {
         self.data.count()
     }
 
+    fn at(&self, i: usize) -> Option<Tuple> {
+        self.data.at(i)
+    }
+
+    fn seek(&self, lower: std::ops::Bound<&DBIdType>) -> Result<usize, StoreError> {
+        self.data.seek(lower)
+    }
+
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
         if tuple.size() > self.tuple_size as DBSizeType {
             return Err(StoreError::TupleTooLarge(tuple.size(), self.tuple_size));
@@ -123,13 +131,6 @@ impl PageTuple for FixedTuplePage {
         self.data.successor(id)
     }
 
-    fn values_in(
-        &self,
-        lower: std::ops::Bound<&DBIdType>,
-        max: usize,
-    ) -> Result<Vec<Tuple>, StoreError> {
-        self.data.values_in(lower, max)
-    }
 }
 
 #[cfg(test)]

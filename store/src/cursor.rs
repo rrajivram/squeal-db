@@ -138,47 +138,30 @@ pub struct TableCursor<F: DBFile + 'static> {
     transaction: ScanTxn,
 }
 
-// One index leaf's entries from a starting key on, copied out a chunk at a
-// time: a point lookup reads a handful, a long scan doubles its chunk.
-// Page::iter() copies the whole page up front, which costs a lookup the
-// page's full size — and leaves split by bytes hold hundreds of entries.
+// One index leaf's entries from a starting key on, read in place from a
+// snapshot of the leaf's content (see Page::iter) taken at the first read —
+// nothing is copied out, so a point lookup costs no more on a leaf of
+// hundreds of entries than on one of ten. A leaf is read as it was when
+// the scan reached it: the same view copying its entries out gave.
 struct LeafEntries {
-    buffered: std::collections::VecDeque<Tuple>,
-    // Where the next chunk starts: the starting key, then past the last
-    // entry read.
-    lower: Bound<DBIdType>,
-    chunk: usize,
-    exhausted: bool,
+    start: Bound<DBIdType>,
+    entries: Option<PageTupleIterator>,
 }
 
 impl LeafEntries {
-    const FIRST_CHUNK: usize = 8;
-
     fn from(start: &Bound<DBIdType>) -> Self {
         LeafEntries {
-            buffered: Default::default(),
-            lower: start.clone(),
-            // A leaf entered at its left edge (the next one along a scan) is
-            // read whole; only where a seek lands starts small.
-            chunk: match start {
-                Bound::Unbounded => usize::MAX,
-                _ => Self::FIRST_CHUNK,
-            },
-            exhausted: false,
+            start: start.clone(),
+            entries: None,
         }
     }
 
     fn next(&mut self, leaf: &Page) -> Result<Option<Tuple>, StoreError> {
-        if self.buffered.is_empty() && !self.exhausted {
-            let chunk = leaf.values_in(self.lower.as_ref(), self.chunk)?;
-            match chunk.last() {
-                Some(last) => self.lower = Bound::Excluded(last.id.clone()),
-                None => self.exhausted = true,
-            }
-            self.chunk = self.chunk.saturating_mul(2).max(Self::FIRST_CHUNK);
-            self.buffered.extend(chunk);
-        }
-        Ok(self.buffered.pop_front())
+        let entries = match &mut self.entries {
+            Some(entries) => entries,
+            None => self.entries.insert(leaf.iter_from(self.start.as_ref())?),
+        };
+        Ok(entries.next())
     }
 }
 

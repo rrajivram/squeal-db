@@ -38,12 +38,28 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   7.3 us. Cost: a mid-page insert shifts the Vec (80-byte Tuples + 16-byte
   prefixes) — random bulk inserts ~25% slower on the memory backend (2.2 ->
   2.75 s for 500k); on the file backend it is lost in the noise.
-- [ ] Page redesign, part 2: `Arc<Tuple>` entries (an insert shifts 8 bytes
-  a row, not 80) and copy-on-write page snapshots (`Page::iter` without a
-  copy). Measured separately, to keep or drop.
-- [ ] `TableCursor::new` still copies a whole data page when a scan starts
-  (`Page::iter`). Making it lazy changes what a scan sees when rows relocate
-  mid-scan — needs its own look.
+- [x] Page redesign, part 2: copy-on-write content. A page's content is an
+  Arc shared with readers; `Page::iter` hands out that snapshot instead of
+  copying every tuple, and a write copies the content only while a reader
+  still holds one. Table scans and index leaves read in place (index
+  leaves used to be copied out in chunks). A scan sees each page as it was
+  when it got there, as before; the one difference is the leaf a seek
+  lands in, which used to be re-read chunk by chunk. Store table scan 10.3
+  -> 9.5 ms, key seek 1.01 -> 0.95 us; ranges flat.
+- [ ] `Arc<Tuple>` entries in `AnyTuplePage` (branch `arc-tuple-entries`,
+  on top of part 2): undoes part 1's random-insert cost (500k on the
+  memory backend 2.77 -> 2.21 s, the BTreeMap's figure) but reads pay a
+  pointer more — table scan 9.5 -> 10.4 ms, ranges ~+4%, cold first-touch
+  lookups 7.6 -> 8.4 us (a page decode allocates per tuple). Not merged;
+  your call.
+- [ ] A scan reads each page (TableCursor) and index leaf (RangeCursor) as
+  it was when it got there. Whether a row relocated mid-scan can be missed
+  or read twice that way (its old page behind the scan, or a leaf snapshot
+  pointing at its old page) is unverified — the old TODO flagged the same
+  question for TableCursor. Not changed by part 2: copying gave the same
+  view.
+- [ ] `RangeCursor::next` looks its table up by id every row
+  (`Db::table_by_id`, a SipHash map): ~8% of a store range scan.
 
 ## Cold reads
 
