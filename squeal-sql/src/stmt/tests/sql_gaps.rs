@@ -506,3 +506,133 @@ fn test_with_queries_can_build_on_each_other_and_be_read_more_than_once() {
         .is_err()
     );
 }
+
+// UNION ALL returned its first query's rows only, and OFFSET was ignored:
+// both silently wrong answers.
+#[test]
+fn test_set_operations_combine_their_queries() {
+    let c = twin_conn();
+    let days = "select day from days";
+    // days: 0, 5, 9, 10, 19, 25, 30, 49, 60.
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day < 6 union all {days} where day > 40")
+        ),
+        [0, 5, 49, 60]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day < 10 union all {days} where day < 6")
+        ),
+        [0, 0, 5, 5, 9]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day < 10 union {days} where day < 6")
+        ),
+        [0, 5, 9]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day < 20 intersect {days} where day > 8")
+        ),
+        [9, 10, 19]
+    );
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day < 20 except {days} where day > 8")
+        ),
+        [0, 5]
+    );
+    // INTERSECT binds tighter: a UNION (b INTERSECT c).
+    assert_eq!(
+        ints(
+            &c,
+            &format!(
+                "{days} where day = 0 union {days} where day < 20 intersect {days} where day > 15"
+            )
+        ),
+        [0, 19]
+    );
+    // Left to right otherwise: (a UNION b) EXCEPT c.
+    assert_eq!(
+        ints(
+            &c,
+            &format!("{days} where day = 0 union {days} where day = 5 except {days} where day = 0")
+        ),
+        [5]
+    );
+    // Across tables, NULLs counted equal, parentheses, ORDER BY and LIMIT
+    // on the whole.
+    assert_eq!(
+        rows(
+            &c,
+            "select cat from plain_ev where id < 3 union select cat from part_ev where id = 0"
+        ),
+        vec![
+            vec![ValueItem::Null],
+            vec![ValueItem::Integer(1)],
+            vec![ValueItem::Integer(2)]
+        ]
+    );
+    let mut stmt = c
+        .clone()
+        .create_statement(&format!(
+            "({days} where day < 10) union all ({days} where day > 40) order by day desc limit 3"
+        ))
+        .unwrap();
+    stmt.execute().unwrap();
+    let (columns, got) = take_streaming_result(&mut stmt, 0);
+    assert_eq!(columns, ["day"]);
+    assert_eq!(
+        got,
+        vec![
+            vec![ValueItem::Integer(60)],
+            vec![ValueItem::Integer(49)],
+            vec![ValueItem::Integer(9)]
+        ]
+    );
+    assert!(run(&c, &format!("{days} union select day, label from days")).is_err());
+}
+
+#[test]
+fn test_offset_skips_rows() {
+    let c = twin_conn();
+    let ordered = |sql: &str| -> Vec<i64> {
+        let mut stmt = c.clone().create_statement(sql).unwrap();
+        stmt.execute().unwrap();
+        take_streaming_result(&mut stmt, 0)
+            .1
+            .into_iter()
+            .map(|r| match r[0] {
+                ValueItem::Integer(n) => n,
+                ref o => panic!("{o:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(
+        ordered("select day from days order by day limit 3 offset 2"),
+        [9, 10, 19]
+    );
+    assert_eq!(
+        ordered("select day from days order by day desc offset 7"),
+        [5, 0]
+    );
+    assert_eq!(
+        ordered("select day from days order by day limit 2 offset 100"),
+        Vec::<i64>::new()
+    );
+    assert_eq!(
+        ordered("select id from plain_big order by id limit 2 offset 10"),
+        [10, 11]
+    );
+    assert_eq!(
+        ordered("select count(*) from (select day from days limit 100 offset 4) d"),
+        [5]
+    );
+}

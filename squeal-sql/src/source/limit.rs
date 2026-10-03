@@ -8,6 +8,9 @@ use crate::source::{QueryStats, Source, merge_stats};
 pub(crate) struct Limit {
     source: Box<dyn Source>,
     limit: usize,
+    // OFFSET: rows read and dropped before the first one yielded.
+    offset: usize,
+    skipped: usize,
     yielded: usize,
     time_spent: u128,
 }
@@ -17,17 +20,30 @@ impl Limit {
         Self {
             source,
             limit,
+            offset: 0,
+            skipped: 0,
             yielded: 0,
             time_spent: 0,
+        }
+    }
+
+    // LIMIT `limit` (None: no limit) OFFSET `offset`.
+    pub(crate) fn paged(source: Box<dyn Source>, offset: usize, limit: Option<usize>) -> Self {
+        Self {
+            offset,
+            ..Self::new(source, limit.unwrap_or(usize::MAX))
         }
     }
 }
 
 impl Source for Limit {
     fn plan(&self) -> PlanNode {
-        PlanNode::new("Limit")
-            .detail(self.limit.to_string())
-            .child(self.source.plan())
+        let detail = match (self.limit, self.offset) {
+            (usize::MAX, o) => format!("offset {o}"),
+            (l, 0) => l.to_string(),
+            (l, o) => format!("{l} offset {o}"),
+        };
+        PlanNode::new("Limit").detail(detail).child(self.source.plan())
     }
 
 
@@ -37,6 +53,13 @@ impl Source for Limit {
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
         let start = Instant::now();
+        while self.skipped < self.offset {
+            self.skipped += 1;
+            if self.source.next()?.is_none() {
+                self.time_spent += start.elapsed().as_nanos();
+                return Ok(None);
+            }
+        }
         let result = if self.yielded < self.limit {
             self.yielded += 1;
             self.source.as_mut().next()
@@ -50,6 +73,7 @@ impl Source for Limit {
     fn reset(&mut self) -> Result<(), crate::error::SchemaError> {
         self.source.reset()?;
         self.yielded = 0;
+        self.skipped = 0;
         Ok(())
     }
 

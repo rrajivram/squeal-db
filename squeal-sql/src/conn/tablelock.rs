@@ -90,28 +90,66 @@ pub(crate) struct SharedGuard(Arc<TableLock>, Owner);
 /// Held: nothing else is using the table.
 pub(crate) struct ExclusiveGuard(Arc<TableLock>);
 
-// What each waiting owner waits for: the lock, and whether exclusively.
-fn waits() -> &'static Mutex<HashMap<Owner, (Arc<TableLock>, bool)>> {
-    static WAITS: OnceLock<Mutex<HashMap<Owner, (Arc<TableLock>, bool)>>> = OnceLock::new();
+// What a waiting owner waits for.
+#[derive(Clone)]
+struct Wait {
+    lock: Arc<TableLock>,
+    exclusive: bool,
+    // When it began waiting: in a cycle, the latest to begin is the one
+    // that closed it, and the one refused (see deadlocked).
+    since: Instant,
+}
+
+fn waits() -> &'static Mutex<HashMap<Owner, Wait>> {
+    static WAITS: OnceLock<Mutex<HashMap<Owner, Wait>>> = OnceLock::new();
     WAITS.get_or_init(Default::default)
 }
 
-// Whether `owner`, about to wait for `lock`, waits — through the owners
-// blocking it, what they wait for, and so on — for itself. Reads one lock's
-// state at a time, holding none while it reads another.
+// Whether `owner`, waiting for `lock`, must give up: it waits — through
+// the owners blocking it, what they wait for, and so on — for itself, and
+// of the owners in that cycle it began waiting last. Every owner in the
+// cycle reaches the same verdict, so exactly one gives up and the rest go
+// on once it does. Reads one lock's state at a time, holding none while it
+// reads another.
 fn deadlocked(owner: Owner, lock: &Arc<TableLock>, exclusive: bool) -> bool {
+    // Breadth first, remembering how each owner was reached, to name the
+    // cycle's members once it closes.
+    let mut via: HashMap<Owner, Owner> = HashMap::new();
+    let mut todo: std::collections::VecDeque<Owner> = std::collections::VecDeque::new();
+    for b in lock.state.lock().blockers(owner, exclusive) {
+        via.insert(b, owner);
+        todo.push_back(b);
+    }
     let mut seen = HashSet::new();
-    let mut todo = lock.state.lock().blockers(owner, exclusive);
-    while let Some(o) = todo.pop() {
+    while let Some(o) = todo.pop_front() {
         if o == owner {
-            return true;
+            let mut members = vec![owner];
+            let mut at = via[&owner];
+            while at != owner && members.len() <= via.len() {
+                members.push(at);
+                at = via[&at];
+            }
+            // Read while walking, the cycle may already be broken: a member
+            // no longer waiting (it gave up, or got its lock) means it is.
+            let waits = waits().lock();
+            let Some(sinces) = members
+                .iter()
+                .map(|m| waits.get(m).map(|w| (w.since, *m)))
+                .collect::<Option<Vec<_>>>()
+            else {
+                return false;
+            };
+            return sinces.iter().max().map(|(_, m)| *m) == Some(owner);
         }
         if !seen.insert(o) {
             continue;
         }
         let waiting = waits().lock().get(&o).cloned();
-        if let Some((next, next_exclusive)) = waiting {
-            todo.extend(next.state.lock().blockers(o, next_exclusive));
+        if let Some(w) = waiting {
+            for b in w.lock.state.lock().blockers(o, w.exclusive) {
+                via.entry(b).or_insert(o);
+                todo.push_back(b);
+            }
         }
     }
     false
@@ -142,7 +180,8 @@ impl TableLock {
         exclusive: bool,
         timeout: Duration,
     ) -> Result<(), SchemaError> {
-        let deadline = Instant::now() + timeout;
+        let since = Instant::now();
+        let deadline = since + timeout;
         let mut state = self.state.lock();
         if exclusive {
             state.waiting.push(owner);
@@ -152,7 +191,14 @@ impl TableLock {
                 break Ok(());
             }
             // Look for a deadlock with no lock state held (it reads others').
-            waits().lock().insert(owner, (self.clone(), exclusive));
+            waits().lock().insert(
+                owner,
+                Wait {
+                    lock: self.clone(),
+                    exclusive,
+                    since,
+                },
+            );
             drop(state);
             let dead = deadlocked(owner, self, exclusive);
             state = self.state.lock();
@@ -370,7 +416,7 @@ mod tests {
         let b_holds = u.shared(B).unwrap();
         std::thread::scope(|s| {
             let a_waits = s.spawn(|| u.exclusive(A).map(drop));
-            while waits().lock().get(&A).is_none() {
+            while !waits().lock().contains_key(&A) {
                 std::thread::yield_now();
             }
             let start = Instant::now();
@@ -395,7 +441,7 @@ mod tests {
         std::thread::scope(|s| {
             let a = s.spawn(|| u.exclusive(A).map(drop));
             let b = s.spawn(|| v.exclusive(B).map(drop));
-            while waits().lock().get(&A).is_none() || waits().lock().get(&B).is_none() {
+            while !waits().lock().contains_key(&A) || !waits().lock().contains_key(&B) {
                 std::thread::yield_now();
             }
             let err = t.exclusive(C).map(drop).unwrap_err().to_string();

@@ -704,7 +704,7 @@ impl<'a> CrateHeap<'a> {
 // investigation). A free function, not just CrateItem::cmp's body, so
 // sort_rows can sort a plain `Vec<IndexKey>` directly (sort_unstable_by)
 // without wrapping every row in a CrateItem first.
-fn cmp_by_fields(lhs_key: &IndexKey, rhs_key: &IndexKey, order: &[SortField]) -> Ordering {
+pub(crate) fn cmp_by_fields(lhs_key: &IndexKey, rhs_key: &IndexKey, order: &[SortField]) -> Ordering {
     // Iterate the ORDER BY clauses themselves, in their own order — not
     // lhs_key.values() — and use each one's own `index` (its flat position
     // in the row, resolved back in create_from) to pull its value out of

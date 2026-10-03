@@ -668,43 +668,43 @@ where
     }
 
     fn plan_query_body(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
-        let SetOperand::Select(select) = &query.body else {
-            return Err(SchemaError::UnsupportedFeature(
-                "a query body other than a plain SELECT".into(),
-            ));
-        };
         // Resolved once, up front, and used by BOTH the ORDER BY and
         // no-ORDER-BY paths below — previously this was only ever
         // computed (and therefore ORDER BY only ever applied) inside
         // the `if let Some(limit) = ...` branch, so a bare `ORDER BY`
         // with no `LIMIT` at all silently did nothing: the query
         // still succeeded, just returned rows in scan order.
-        let limit_count = match &query.limit {
-            Some(limit) => match limit.count_i64() {
-                Some(n) if n < 0 => return Err(SchemaError::InvalidLimitValue(n)),
-                Some(n) => Some(n as usize),
-                // A LIMIT that isn't a literal count (e.g. a bound
-                // parameter) can't be resolved here — pre-existing
-                // behavior, unchanged: treated as no limit rather
-                // than erroring.
-                None => None,
-            },
-            None => None,
+        let count = |e: Option<i64>| match e {
+            Some(n) if n < 0 => Err(SchemaError::InvalidLimitValue(n)),
+            Some(n) => Ok(Some(n as usize)),
+            // A count that isn't a literal (e.g. a bound parameter) can't
+            // be resolved here — pre-existing behavior, unchanged: treated
+            // as absent rather than erroring.
+            None => Ok(None),
         };
-        let SourceHolder {
-            source,
-            hidden,
-            sorted,
-        } = self.handle_select(select, query.order_by.as_ref(), limit_count)?;
-        let mut step = source;
+        let limit = count(query.limit.as_ref().and_then(|l| l.count_i64()))?;
+        let offset = count(query.offset.as_ref().and_then(|o| o.count_i64()))?.unwrap_or(0);
+        // The rows ORDER BY ... LIMIT must keep: those OFFSET skips too.
+        let limit_count = limit.map(|l| l.saturating_add(offset));
+        let (mut step, hidden, sorted) = match (&query.body, query.compounds.is_empty()) {
+            (SetOperand::Select(select), true) => {
+                let SourceHolder {
+                    source,
+                    hidden,
+                    sorted,
+                } = self.handle_select(select, query.order_by.as_ref(), limit_count)?;
+                (source, hidden, sorted)
+            }
+            // `(query)`, or set operations: ORDER BY and LIMIT apply to the
+            // whole result, and name its columns.
+            _ => (self.plan_set_operations(query)?, 0, false),
+        };
 
         // Already in ORDER BY's order (read through a key that gives it —
         // see optim::picker::OrderWanted): no sort, just the LIMIT.
-        if sorted {
-            if let Some(limit_count) = limit_count {
-                step = Box::new(Limit::new(step, limit_count));
-            }
-        } else if let Some(order) = &query.order_by {
+        // A sort with a LIMIT keeps only that many rows itself (TopN).
+        let mut limited = false;
+        if !sorted && let Some(order) = &query.order_by {
             step = Box::new(SortSource::create_from(
                 step,
                 order,
@@ -712,8 +712,10 @@ where
                 self.conn.database.read().db.clone(),
                 self.mem.clone(),
             )?);
-        } else if let Some(limit_count) = limit_count {
-            step = Box::new(Limit::new(step, limit_count));
+            limited = true;
+        }
+        if offset > 0 || (limit.is_some() && !limited) {
+            step = Box::new(Limit::paged(step, offset, limit));
         }
         if hidden > 0 {
             // Keep only the SELECT-list columns: each passes through by
@@ -730,6 +732,76 @@ where
             step = Box::new(Projection::new(step, visible));
         }
         Ok(step)
+    }
+
+    // One operand of a set operation: a SELECT block, or a parenthesized
+    // query (with its own ORDER BY / LIMIT).
+    fn plan_operand(&mut self, operand: &SetOperand) -> Result<Box<dyn Source>, SchemaError> {
+        match operand {
+            SetOperand::Select(select) => Ok(self.handle_select(select, None, None)?.source),
+            SetOperand::Paren(_, query, _) => self.plan_query(query),
+        }
+    }
+
+    // `a UNION b INTERSECT c EXCEPT d ...`: INTERSECT first, then UNION and
+    // EXCEPT left to right — SQL's precedence. Each operand must have as
+    // many columns as the first; the result has the first's column names.
+    fn plan_set_operations(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
+        use sql_parser::query::SetOperator;
+        use crate::source::setop::{ConcatSource, MergeSetOp, SetOp};
+        let first = self.plan_operand(&query.body)?;
+        let width = first.fields().len();
+        // (operator joining it to what came before, operand), INTERSECTs
+        // already folded in.
+        let mut terms: Vec<(Option<SetOperator>, Box<dyn Source>)> = vec![(None, first)];
+        for compound in &query.compounds {
+            let operand = self.plan_operand(&compound.operand)?;
+            if operand.fields().len() != width {
+                return Err(SchemaError::UserError(format!(
+                    "each query of a set operation must have the same number of columns: \
+                     {width} and {}",
+                    operand.fields().len()
+                )));
+            }
+            if let SetOperator::Intersect(_) = compound.op {
+                let (op, last) = terms.pop().expect("never empty");
+                let both = MergeSetOp::new(SetOp::Intersect, self.distinct(last)?, self.distinct(operand)?);
+                terms.push((op, Box::new(both)));
+            } else {
+                terms.push((Some(compound.op.clone()), operand));
+            }
+        }
+        let mut terms = terms.into_iter();
+        let (_, mut result) = terms.next().expect("never empty");
+        for (op, operand) in terms {
+            result = match op.expect("every term after the first has its operator") {
+                SetOperator::Union(_, Some(either::Either::Left(_))) => {
+                    Box::new(ConcatSource::new(vec![result, operand]))
+                }
+                SetOperator::Union(..) => {
+                    self.distinct(Box::new(ConcatSource::new(vec![result, operand])))?
+                }
+                SetOperator::Except(_) => Box::new(MergeSetOp::new(
+                    SetOp::Except,
+                    self.distinct(result)?,
+                    self.distinct(operand)?,
+                )),
+                SetOperator::Intersect(_) => unreachable!("folded above"),
+            };
+        }
+        Ok(result)
+    }
+
+    // `source`'s rows sorted on every column, each once.
+    fn distinct(&self, source: Box<dyn Source>) -> Result<Box<dyn Source>, SchemaError> {
+        let all: Vec<usize> = (0..source.fields().len()).collect();
+        let sorted = SortSource::with_fields(
+            source,
+            self.conn.database.read().db.clone(),
+            self.mem.clone(),
+            &all,
+        )?;
+        Ok(Box::new(AggregatingSource::new(Box::new(sorted))?))
     }
 
     /// Opens a FROM item under the statement's transaction: the explicit

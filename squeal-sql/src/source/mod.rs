@@ -17,6 +17,7 @@ pub(crate) mod nestloop;
 pub mod limit;
 pub mod planinfo;
 pub mod proj;
+pub(crate) mod setop;
 pub(crate) mod run;
 pub mod sort;
 pub(crate) mod sortjoin;
