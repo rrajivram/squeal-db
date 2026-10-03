@@ -400,8 +400,18 @@ where
         // past one page (invisible in prior tests, which always forced
         // a one-page-per-run budget).
         let mut current_run: Vec<IndexKey> = vec![];
-        let mem = self.mem.try_reserve(run.data_size() as usize)?;
-        mems.push(mem);
+        // The first page's worth of memory. With none to be had — another
+        // operator holds the budget (the sort join sorts both its sides at
+        // once against one) — sort out of memory, a page per run, from the
+        // start, rather than fail.
+        match self.mem.try_reserve(run.data_size() as usize) {
+            Ok(mem) => mems.push(mem),
+            Err(SchemaError::QueryMemoryExceeded { .. }) => {
+                mem_filled = true;
+                pages_per_run = 1;
+            }
+            Err(e) => return Err(e),
+        }
         while let Some(r) = self.source.next()? {
             total_count += 1;
             current_run.push(r);
@@ -1419,5 +1429,46 @@ mod tests {
         assert_eq!(first.len(), 3);
         sort.reset().unwrap();
         assert_eq!(drain(&mut sort), first);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use store::{db::Db, memfile::MemFile, valueitem::ValueItem};
+
+    use super::*;
+    use crate::{
+        plan::memory::QueryMemory,
+        source::test_support::{VecSource, drain},
+    };
+
+    // The sort join sorts its two sides on two threads against one budget
+    // (see SortJoinSource::prime): one sort may find the other has taken
+    // all of it. It must still sort — out of memory, through runs — not
+    // fail. It used to fail at its first page's reservation, which is
+    // what made the sort join's spill tests fail now and then under load.
+    #[test]
+    fn test_a_sort_whose_budget_another_operator_holds_still_sorts() {
+        let rows: Vec<Vec<ValueItem>> = (0..5000)
+            .map(|i| vec![ValueItem::Integer((i * 7919) % 5000)])
+            .collect();
+        let mem = QueryMemory::new(48 * 1024);
+        let _other = mem.try_reserve(48 * 1024).unwrap();
+        let db = Db::<MemFile>::create("sort_budget_test.db").unwrap();
+        let mut sort = SortSource::with_fields(
+            Box::new(VecSource::new(&["n"], rows)),
+            db,
+            mem.clone(),
+            &[0],
+        )
+        .unwrap();
+        let got: Vec<i64> = drain(&mut sort)
+            .into_iter()
+            .map(|r| match r[0] {
+                ValueItem::Integer(n) => n,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(got, (0..5000).collect::<Vec<_>>());
     }
 }

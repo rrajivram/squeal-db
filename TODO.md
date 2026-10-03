@@ -108,12 +108,12 @@ the partition column; queries read every partition (`source/append.rs`).
 
 ## Flaky tests
 
-- [ ] `squeal-sql` `source::sortjoin` spill tests
-  (`test_a_group_over_the_memory_budget_spills_and_stays_correct`,
-  `test_reset_after_a_spilling_join_replays_it_and_releases_the_budget`):
-  `QueryMemoryExceeded` / no spill, 2 in 40 full-suite runs at 9b53136, 0 in
-  25 at 9aff786; never alone (0 in 30). Code unchanged between them; cause
-  not found.
+- [x] `squeal-sql` `source::sortjoin` spill tests (`QueryMemoryExceeded`, 2 in
+  40 full-suite runs). Cause: the sort join sorts both sides on two threads
+  against one memory budget, and a sort failed outright when the other had
+  taken all of it (its first page's reservation used `?`). Fixed: the sort
+  then starts out of memory; pinned by
+  `sort::budget_tests::test_a_sort_whose_budget_another_operator_holds_still_sorts`.
 - [x] `store` crash harness: two bugs, both fixed. Reproduce with the soak
   under contention (24 `examples/crash` processes at once, debug build):
   it failed 4-5 of 48 processes before, 0 of 144 since.
