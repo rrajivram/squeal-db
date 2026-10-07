@@ -222,27 +222,43 @@ fn lookup_loop() {
 }
 
 // The 100k-row range count, repeated, for a profiler (by hand, as above).
-// SQ_LOOP_SQL runs another query instead.
+// SQ_LOOP_SQL runs another query instead; SQ_LOOP_THREADS runs it on that
+// many threads at once, each with its own connection (us/op is then wall
+// time over every thread's queries).
 #[test]
 #[ignore]
 fn range_loop() {
     let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
-    let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
-    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
     let sql = std::env::var("SQ_LOOP_SQL").unwrap_or_else(|_| {
         "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'"
             .into()
     });
-    let sql = sql.as_str();
     let seconds: u64 = std::env::var("SQ_LOOP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let threads: usize =
+        std::env::var("SQ_LOOP_THREADS").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+    // Opened here first: the threads' connections then share it, where
+    // opening it from several threads at once races for the file's lock.
+    let _open = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
     let start = Instant::now();
-    let mut n = 0usize;
-    while start.elapsed().as_secs() < seconds {
-        let mut stmt = c.clone().create_statement(sql).unwrap();
-        stmt.execute().unwrap();
-        drain(&mut stmt);
-        n += 1;
-    }
+    let n: usize = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
+                    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+                    let mut n = 0usize;
+                    while start.elapsed().as_secs() < seconds {
+                        let mut stmt = c.clone().create_statement(&sql).unwrap();
+                        stmt.execute().unwrap();
+                        drain(&mut stmt);
+                        n += 1;
+                    }
+                    n
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).sum()
+    });
     per_op("range count", n, start);
 }
 

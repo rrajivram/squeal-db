@@ -122,8 +122,7 @@ pub enum LockAttempt<T: Sized + Clone + Debug> {
     TimedOut(String),
 }
 
-// STORE_AUDIT.md P2 follow-up: sharded the same way `buffer.rs`'s
-// `ShardedPQ` shards its eviction heap, for the same reason — a single
+// STORE_AUDIT.md P2 follow-up: sharded, because a single
 // `RwLock`, even taken only on its *read* side by every caller (see
 // `get_or_create`), still has one shared reader-count atomic that every
 // thread's read()/drop bounces across cores. `disjoint_keys_concurrent`
@@ -134,9 +133,7 @@ pub enum LockAttempt<T: Sized + Clone + Debug> {
 // contention over the map's *contents*. `SHARD_COUNT` shards means threads
 // hashing to different shards (the common case once there are more shards
 // than threads) touch entirely different cache lines. Hashed by `T`'s own
-// `Hash` impl (not `ShardedPQ`'s `Rem<usize> + From<usize>` scheme, which
-// only works because its key is numeric) — more general, and `ArcLock<T>`
-// already requires `Hash` for the map itself.
+// `Hash` impl — `ArcLock<T>` already requires `Hash` for the map itself.
 //
 // This does NOT help genuinely hot-key contention (`same_key_contended` in
 // the same bench file): every thread locking the SAME key hashes to the

@@ -3,8 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use parking_lot::RwLock;
 
-// STORE_AUDIT.md P2 follow-up: the same pattern ArcLock and ShardedPQ already
-// use — a single RwLock<HashMap<K, V>> serializes every reader on that one
+// STORE_AUDIT.md P2 follow-up: the same pattern ArcLock already uses — a
+// single RwLock<HashMap<K, V>> serializes every reader on that one
 // lock's own internal state (a shared reader-count atomic bounces across
 // cores under concurrent access, even though a read() is nominally
 // non-exclusive), regardless of whether the keys involved are related at
@@ -13,10 +13,8 @@ use parking_lot::RwLock;
 // shared state at all — see benches/arclock.rs / BASELINE.md's P2 section
 // for the measured effect on ArcLock, which this generalizes.
 //
-// Hashed by `K`'s own `Hash` impl (unlike ShardedPQ, which requires
-// `Rem<usize> + From<usize>` and only works for numeric-like keys) — this
-// works for any key already required to be Hash + Eq for HashMap itself, at
-// the cost of one DefaultHasher computation per call. Not a drop-in
+// Hashed by `K`'s own `Hash` impl — this works for any key already required
+// to be Hash + Eq for HashMap itself, at the cost of one DefaultHasher computation per call. Not a drop-in
 // replacement for every `RwLock<HashMap<..>>` in this crate: it only helps
 // when the keys involved are genuinely independent of each other (no
 // operation needs to touch two different keys atomically) — see

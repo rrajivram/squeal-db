@@ -137,12 +137,45 @@ pub struct Tuple {
     // is an O(1) refcount bump instead of copying the whole payload. Serializes
     // identically to `Vec<u8>` in postcard (a seq of u8), so on-disk format is
     // unchanged. Mutation replaces the whole Arc (see `set_data`).
+    #[serde(deserialize_with = "arc_bytes")]
     pub(crate) data: Arc<[u8]>,
     flags: u8,
     // Cached serialized size — not persisted. Zero means not yet computed (e.g. after serde
     // deserialization, which skips this field); size() computes it on demand in that case.
     #[serde(skip)]
     serialized_size: DBSizeType,
+}
+
+// Tuple::data, decoded as bytes: postcard lays a seq of u8 out exactly as
+// it does bytes (a length, then the bytes), and reading it as bytes is one
+// copy into the Arc. Read as a seq — serde's own way for Arc<[u8]> — it was
+// visited a byte at a time into a Box, then copied again into the Arc:
+// about half of decoding a page.
+fn arc_bytes<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<[u8]>, D::Error> {
+    struct ArcBytes;
+
+    impl<'de> Visitor<'de> for ArcBytes {
+        type Value = Arc<[u8]>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a tuple's bytes")
+        }
+
+        fn visit_bytes<E: DeError>(self, v: &[u8]) -> Result<Arc<[u8]>, E> {
+            Ok(Arc::from(v))
+        }
+
+        // A format that writes bytes as a seq and reads them back that way.
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Arc<[u8]>, A::Error> {
+            let mut v = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(b) = seq.next_element()? {
+                v.push(b);
+            }
+            Ok(Arc::from(v))
+        }
+    }
+
+    deserializer.deserialize_bytes(ArcBytes)
 }
 
 impl Tuple {

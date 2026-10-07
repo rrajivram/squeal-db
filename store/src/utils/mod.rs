@@ -1,2 +1,2 @@
 pub(crate) mod shardedmap;
-pub(crate) mod shardedpq;
+pub(crate) mod fifo;

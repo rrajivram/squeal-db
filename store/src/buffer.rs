@@ -18,7 +18,7 @@ use crate::{
     logger::{LsnClock, LsnId},
     page::{CURRENT_PAGE_FORMAT_VERSION, PAGE_MAGIC, Page, PageHeader, PageId},
     pages::content::PageContentRegistry,
-    utils::shardedpq::ShardedPQ,
+    utils::fifo::Fifo,
 };
 
 // Phase 6/7: modified pages reach disk only through a checkpoint capture
@@ -254,13 +254,10 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // captures them, and not worth re-scanning until then. Re-enqueued as
     // eviction candidates by capture_dirty_pages.
     parked_dirty: parking_lot::Mutex<Vec<PageId>>,
-    // STORE_AUDIT.md P3: still a ShardedPQ (its own sharded locking already
-    // handles concurrent eviction-candidate tracking fine) but priorities
-    // are now insertion-sequence numbers (next_seq()), not timestamps —
-    // see evict_lru_locked's own comment for the full CLOCK/second-chance
-    // scheme this backs.
-    access_map: ShardedPQ<PageId, u64>,
-    insertion_seq: AtomicU64,
+    // STORE_AUDIT.md P3: the pages eviction considers, in the order they
+    // were cached or last given a second chance — see evict_one for the
+    // CLOCK/second-chance scheme this backs.
+    access_map: Fifo<PageId, std::hash::BuildHasherDefault<PageIdHasher>>,
     locks: Arc<ArcLock<PageId>>,
     free_pages: RwLock<Vec<PageId>>,
     // This database's WAL clock, shared with its Logger. Read to stamp a page's
@@ -324,8 +321,7 @@ where
             parked_dirty: parking_lot::Mutex::new(Vec::new()),
             #[cfg(not(target_arch = "wasm32"))]
             write_handle: Some(write_handle),
-            access_map: ShardedPQ::new(max_entries / 10),
-            insertion_seq: AtomicU64::new(0),
+            access_map: Fifo::new(),
             page_count: page_counter,
             header,
             locks: ArcLock::new(),
@@ -832,7 +828,7 @@ where
         // Clean again: back on the eviction candidate list.
         let parked: Vec<PageId> = std::mem::take(&mut *self.parked_dirty.lock());
         for page_num in parked {
-            self.access_map.push(page_num, self.next_seq());
+            self.access_map.push(page_num);
         }
         Ok(out)
     }
@@ -1250,7 +1246,7 @@ where
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.access_map.push(page_num, self.next_seq());
+            self.access_map.push(page_num);
             page.mark_referenced();
             guard.insert(page_num, PageEntry::Strong(page.clone()));
             return page;
@@ -1266,14 +1262,12 @@ where
     // evicted some other way) and past referenced victims (given a second
     // chance instead of evicted — see below).
     //
-    // STORE_AUDIT.md P3: CLOCK / second-chance eviction. access_map still
-    // gives the same thing it always did — the oldest-tracked candidate,
-    // across its own shards — but candidates are ordered by insertion
-    // sequence (next_seq(), a plain AtomicU64 fetch_add), not wall-clock
-    // time, and a candidate found to have been accessed since it was last
-    // considered (Page::take_referenced()) isn't evicted: it's cleared and
-    // re-pushed with a fresh sequence number (a "second chance"), moving
-    // it to the back of the queue, and the sweep continues. This is what
+    // STORE_AUDIT.md P3: CLOCK / second-chance eviction. access_map
+    // gives the oldest-tracked candidate — ordered by when it was cached,
+    // not wall-clock time — and a candidate found to have been accessed
+    // since it was last considered (Page::take_referenced()) isn't
+    // evicted: it's cleared and re-pushed (a "second chance"), moving it
+    // to the back of the queue, and the sweep continues. This is what
     // makes the hot path (PageBuffer::get_page's Strong-hit branch) able
     // to skip touching access_map at all — only eviction, not every
     // access, ever reorders anything.
@@ -1291,7 +1285,7 @@ where
                     // decide how to tolerate it.
                     return Evicted::Exhausted;
                 }
-                Some((victim, _)) => {
+                Some(victim) => {
                     let mut guard = self.shard_for(&victim).write();
                     if let Some(PageEntry::Strong(arc)) = guard.get(&victim) {
                         if arc.take_referenced() {
@@ -1299,7 +1293,7 @@ where
                             // swept (or since insertion) — give it another
                             // lap instead of evicting it now.
                             drop(guard);
-                            self.access_map.push(victim, self.next_seq());
+                            self.access_map.push(victim);
                             continue;
                         }
                         if arc.is_dirty() {
@@ -1320,20 +1314,6 @@ where
                 }
             }
         }
-    }
-
-    // Monotonic insertion-order counter backing access_map's priority —
-    // inverted (u64::MAX - seq) so the OLDEST sequence number, i.e. the
-    // earliest-inserted-or-last-given-a-second-chance page, is the largest
-    // priority and pop()s first (ShardedPQ::pop is max-first). Plain
-    // fetch_add, no timestamp: this only needs a total order among pages
-    // this PageBuffer has itself ever tracked, never anything comparable
-    // across a reopen or another Db instance.
-    fn next_seq(&self) -> u64 {
-        u64::MAX
-            - self
-                .insertion_seq
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn init_page(&self, page_num: PageId, should_pin: bool) -> Result<(), StoreError> {
@@ -2260,8 +2240,8 @@ mod tests {
             .insert(id_b, PageEntry::Strong(page_b.clone()));
         // A inserted (logically) before B, so a plain FIFO/LRU-by-age
         // policy with no referenced check would target A first.
-        buf.access_map.push(id_a, buf.next_seq());
-        buf.access_map.push(id_b, buf.next_seq());
+        buf.access_map.push(id_a);
+        buf.access_map.push(id_b);
 
         match buf.evict_one() {
             Evicted::Yes => {}

@@ -89,9 +89,25 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   `count(*) where quantity > 3` 0.71 -> 0.53 s, `sum, max` 0.79 -> 0.60 s;
   cold first-touch `Db::find` (`store_cold_find`) 7.2 -> 5.35 us. Skipping
   verification entirely measured 0.515 s, so little is left there.
-- [ ] Still on that scan: `Page::from_bytes` (postcard, every Tuple) ~24%,
-  `install` 13%, `ShardedPQ::pop` eviction 9% — pages readable without a
-  decode (above) is the bigger part.
+- [x] Two more on that scan (branch `page-decode`). A tuple's payload was
+  deserialized as a seq — a byte at a time into a Box, then copied into
+  its Arc — half of `Page::from_bytes`; now read as bytes, one copy, same
+  bytes on disk. And the eviction queue (`ShardedPQ`, 819 shards at the
+  default cache) read-locked every shard on each pop to find the oldest:
+  13% of the scan; now a FIFO (`utils::fifo`), O(1) under one lock, same
+  order and the same move-to-back on a re-push. Against main: order_details
+  `count(*) where quantity > 3` 0.52 -> 0.375 s, `sum, max` 0.60 -> 0.45 s,
+  cold `Db::find` 5.4 -> 4.2 us; 4 and 8 threads scanning at once ~20%
+  faster too (the one lock doesn't cost them).
+- [ ] What's left on that scan's page loads is building each tuple's key
+  (an IndexKey: a String and an Arc per tuple, ~22%) and freeing them on
+  eviction (~8%) — pages readable without a decode (above).
+- [ ] Concurrent scans don't scale: 4 threads scanning order_details finish
+  no more queries than 1 (8 do worse), on main as on this branch. Not
+  locks — the threads are in malloc/free (system allocator) for those keys
+  and for rows (`new_from_owned`). Fewer allocations (above) is the real
+  fix; a faster allocator in the binaries (mimalloc) would be a stopgap.
+  `SQ_LOOP_THREADS` in `layers::range_loop` measures it.
 - [ ] WAL records are checksummed with FNV-1a too (`logger.rs`), on every
   commit's write path. Same fix would need a WAL format version.
 
