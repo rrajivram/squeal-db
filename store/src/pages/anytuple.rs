@@ -10,6 +10,11 @@ use crate::{
     tuple::{DBIdType, IdRef, Tuple, TupleRef},
 };
 
+// What a page written before every page became a SlottedPage reads as
+// (content kind ANY_TUPLE; see Page::new) — no new page is one, and one
+// that is rewritten stays what it is. order_prefix, shared with
+// SlottedPage, lives here.
+//
 // A page's tuples, sorted by id (DBIdType's own Ord), in one Vec: a lookup
 // is a binary search over contiguous entries, and a caller reading entries
 // in order can say where it expects the next one (`get_hinted`) and skip

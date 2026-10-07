@@ -145,10 +145,15 @@ impl<'a> ValueRef<'a> {
     // per S8, would poison the page lock this runs under on the hot read
     // path).
     pub fn decode(bytes: &'a [u8]) -> Result<(ValueRef<'a>, usize), StoreError> {
-        let vtype = *bytes
-            .first()
-            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
-        Ok(match vtype {
+        Self::try_decode(bytes).ok_or_else(|| truncated(bytes))
+    }
+
+    // `decode`, saying None for a buffer cut short: an Option is a
+    // register or two where a Result of StoreError goes through memory,
+    // and this runs for every column of every row read.
+    #[inline(always)]
+    fn try_decode(bytes: &'a [u8]) -> Option<(ValueRef<'a>, usize)> {
+        Some(match *bytes.first()? {
             0 => (ValueRef::Null, 1),
             5 => (ValueRef::Integer(i64::from_le_bytes(word(bytes, 1)?)), 9),
             10 => (ValueRef::Double(f64::from_le_bytes(word(bytes, 1)?)), 9),
@@ -161,7 +166,7 @@ impl<'a> ValueRef<'a> {
                 let (cap, content, end) = sized(bytes)?;
                 (ValueRef::Blob(content, cap), end)
             }
-            30 => (ValueRef::Boolean(take(bytes, 1, 1)?[0] != 0), 2),
+            30 => (ValueRef::Boolean(*bytes.get(1)? != 0), 2),
             i => {
                 error!("Unknown value item : {i}");
                 (ValueRef::Null, 1)
@@ -172,43 +177,42 @@ impl<'a> ValueRef<'a> {
     // How many bytes `decode` would take, without decoding: a string's
     // content isn't checked for UTF-8. Errs where `decode` would.
     pub fn width(bytes: &[u8]) -> Result<usize, StoreError> {
-        let vtype = *bytes
-            .first()
-            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
-        Ok(match vtype {
-            5 | 10 | 15 => take(bytes, 1, 8).map(|_| 9)?,
+        Self::try_width(bytes).ok_or_else(|| truncated(bytes))
+    }
+
+    #[inline(always)]
+    fn try_width(bytes: &[u8]) -> Option<usize> {
+        Some(match *bytes.first()? {
+            5 | 10 | 15 => bytes.get(1..9).map(|_| 9)?,
             20 | 25 => sized(bytes)?.2,
-            30 => take(bytes, 1, 1).map(|_| 2)?,
+            30 => bytes.get(1).map(|_| 2)?,
             _ => 1,
         })
     }
 }
 
-fn take(bytes: &[u8], index: usize, len: usize) -> Result<&[u8], StoreError> {
-    let end = index.checked_add(len).ok_or_else(|| {
-        StoreError::TruncatedValueItem(format!("offset {index} + {len} overflows"))
-    })?;
-    bytes.get(index..end).ok_or_else(|| {
-        StoreError::TruncatedValueItem(format!(
-            "need {len} byte(s) at offset {index}, buffer is {} byte(s)",
-            bytes.len()
-        ))
-    })
+fn truncated(bytes: &[u8]) -> StoreError {
+    StoreError::TruncatedValueItem(format!(
+        "a value doesn't fit the {} byte(s) left of its buffer",
+        bytes.len()
+    ))
 }
 
-fn word<const N: usize>(bytes: &[u8], index: usize) -> Result<[u8; N], StoreError> {
-    Ok(take(bytes, index, N)?.try_into().unwrap())
+#[inline(always)]
+fn word<const N: usize>(bytes: &[u8], index: usize) -> Option<[u8; N]> {
+    bytes.get(index..index.checked_add(N)?)?.try_into().ok()
 }
 
 // A Str's or Blob's capacity, its content, and where the value ends:
 // to_bytes pads the content out to the capacity when it is shorter, and
 // that padding is skipped too, or the next value in the buffer is misread
 // starting mid-padding.
-fn sized(bytes: &[u8]) -> Result<(u32, &[u8], usize), StoreError> {
+#[inline(always)]
+fn sized(bytes: &[u8]) -> Option<(u32, &[u8], usize)> {
     let cap = u32::from_le_bytes(word(bytes, 1)?);
     let len = u32::from_le_bytes(word(bytes, 5)?) as usize;
-    let content = take(bytes, 9, len)?;
-    Ok((cap, content, 9usize.saturating_add(len.max(cap as usize))))
+    let content = bytes.get(9..9usize.checked_add(len)?)?;
+    Some((cap, content, 9usize.saturating_add(len.max(cap as usize))))
 }
 
 // Hand-written, not derived, for exactly one reason: Double. `impl Hash

@@ -9,30 +9,33 @@
 // `from_bytes()` only ever parses the (small, fixed-size) slot directory —
 // tuple bytes stay raw/undecoded until actually requested.
 //
-// ## The data page (Page::new's, for a table's rows)
+// ## The page (Page::new's: every page a tree writes)
 //
-// It wasn't, at first: every binary-search step decoded a whole Tuple (then,
-// later, its id) — allocating — where AnyTuplePage, having decoded every
-// tuple once at load, compared in memory. ~22x slower on repeated gets of a
-// resident page, and ~45-50% slower end to end on the stress harness when
-// it was briefly the default.
+// A table's data pages, its index's inner nodes and leaves, and the pinned
+// system pages are all this. It wasn't, at first: every binary-search step
+// decoded a whole Tuple (then, later, its id) — allocating — where
+// AnyTuplePage, having decoded every tuple once at load, compared in
+// memory. ~22x slower on repeated gets of a resident page, and ~45-50%
+// slower end to end on the stress harness when it was briefly the default.
 //
 // Now nothing on this page is decoded to be read. Each slot's id is read in
 // place from its bytes (wire::tuple_id_ending: a key's values as ValueRefs,
-// compared, equalled and hashed as DBIdType does), most probes don't read
-// it at all (an in-memory order_prefix per slot, as AnyTuplePage keeps),
-// and a tuple is lent as a view of its bytes (at_ref, TupleRef) — where it
-// ends and the rest begins kept per slot (id_ends), so lending one is a few
-// varints. Page load is one pass over the slots, allocating nothing per
-// tuple; flushing is a copy of the buffer.
+// compared, equalled and hashed as DBIdType does; two keys that are the
+// same bytes are equal with no value read — an index entry and its row),
+// most probes don't read it at all (an in-memory order_prefix per slot, as
+// AnyTuplePage kept), and a tuple is lent as a view of its bytes (at_ref,
+// TupleRef) — where its id ends kept per slot (id_ends), so lending one is
+// a few varints, about 5 ns. The tree's descent reads an entry's child
+// pointer the same way (Page::with_entry). Page load is one pass over the
+// slots, allocating nothing per tuple; flushing is a copy of the buffer.
 //
-// What that measured, against AnyTuplePage (1M-row retail data): scans
-// bigger than the cache 6-18% faster on one thread and 30-38% on four (the
-// allocator no longer serializes them); cold first-touch lookups -12%; bulk
-// load -23%. A page already resident is read a little slower — its tuples
-// are parsed where AnyTuplePage's are in memory: warm table scans +20%,
-// warm range scans through an index +50%, point lookups +30% in store
-// (flat through SQL). See TODO.md.
+// Against AnyTuplePage/FixedTuplePage (1M-row retail data, with rows
+// fixed-width — see squeal-sql's RowLayout): warm table scans 12-15%
+// faster, scans bigger than the cache 30-34% (40% on four threads — the
+// allocator no longer serializes them), cold first-touch lookups 37%; SQL
+// point lookups and index range scans within 1-7%. What still costs is an
+// OWNED tuple (get, Cursor::next, Db::find): built from bytes, where
+// AnyTuplePage bumped two refcounts — Db::find +35%. See TODO.md.
 //
 // ## On-disk layout (the buffer this struct owns and returns verbatim from
 // `to_bytes()`)
@@ -329,6 +332,7 @@ impl SlottedPage {
     // (a whole Tuple at first, then the id alone) at every binary-search
     // step is what made this page ~22x slower than AnyTuplePage on
     // repeated gets (see this file's top comment).
+    #[inline(always)]
     fn id_at(&self, idx: usize) -> Result<IdRef<'_>, StoreError> {
         let id = tuple_id_ending(self.record(idx), self.id_ends[idx] as usize)?;
         // SAFETY: every key on this page is UTF-8 (see SlottedPage).
@@ -351,9 +355,9 @@ impl SlottedPage {
 
     fn bound(&self, id: &DBIdType, strict_greater: bool) -> Result<usize, StoreError> {
         if strict_greater {
-            self.search(id, |o| o.is_gt())
+            self.search(IdRef::of(id), |o| o.is_gt())
         } else {
-            self.search(id, |o| o.is_ge())
+            self.search(IdRef::of(id), |o| o.is_ge())
         }
     }
 
@@ -363,17 +367,17 @@ impl SlottedPage {
     #[inline(always)]
     fn search(
         &self,
-        id: &DBIdType,
+        id: IdRef<'_>,
         past: impl Fn(std::cmp::Ordering) -> bool,
     ) -> Result<usize, StoreError> {
-        let prefix = order_prefix(id);
+        let prefix = order_prefix_of(id);
         let prefixes = &self.prefixes[..];
         let (mut lo, mut hi) = (0, prefixes.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let ord = match prefix_order(prefixes[mid], prefix) {
                 Some(ord) => ord,
-                None => self.id_at(mid)?.cmp_owned(id),
+                None => self.id_at(mid)?.cmp(&id),
             };
             if past(ord) {
                 hi = mid;
@@ -401,19 +405,48 @@ impl SlottedPage {
     // One binary search, then along the run of ids tied with `id` — most
     // often none — rather than a second search for the run's end.
     fn find_exact(&self, id: &DBIdType) -> Result<Option<usize>, StoreError> {
-        let prefix = order_prefix(id);
-        for idx in self.lower_bound(id)?..self.slot_count() {
-            match prefix_order(self.prefixes[idx], prefix) {
+        self.find_exact_ref(IdRef::of(id))
+    }
+
+    // The slot holding exactly `id`. A binary search like `search`'s, but
+    // one that stops at a slot that is `id` — a page holds an id once — so
+    // the slot whose key ties the probe's prefix is read once: equal (the
+    // same bytes, often, for an index entry and its row), or else ordered.
+    // What it leaves is a run of slots that compare Equal to `id` without
+    // being it (see this file's top comment, deviation #2), walked.
+    fn find_exact_ref(&self, id: IdRef<'_>) -> Result<Option<usize>, StoreError> {
+        let prefix = order_prefix_of(id);
+        let prefixes = &self.prefixes[..];
+        let (mut lo, mut hi) = (0, prefixes.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let ord = match prefix_order(prefixes[mid], prefix) {
                 // Only row ids' prefixes say Equal, and theirs say all.
-                Some(std::cmp::Ordering::Equal) => return Ok(Some(idx)),
-                Some(_) => break,
-                None => {}
+                Some(std::cmp::Ordering::Equal) => return Ok(Some(mid)),
+                Some(ord) => ord,
+                None => {
+                    let cand = self.id_at(mid)?;
+                    if cand.eq(&id) {
+                        return Ok(Some(mid));
+                    }
+                    cand.cmp(&id)
+                }
+            };
+            if ord.is_ge() {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        for (idx, slot_prefix) in prefixes.iter().enumerate().skip(lo) {
+            if prefix_order(*slot_prefix, prefix).is_some() {
+                break;
             }
             let cand = self.id_at(idx)?;
-            if cand.eq_owned(id) {
+            if cand.eq(&id) {
                 return Ok(Some(idx));
             }
-            if cand.cmp_owned(id).is_ne() {
+            if cand.cmp(&id).is_ne() {
                 break;
             }
         }
@@ -577,11 +610,11 @@ impl PageTuple for SlottedPage {
     }
 
     fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
-        (i < self.slot_count())
-            .then(|| WireTuple::read_after(self.record(i), self.id_ends[i] as usize).ok())
-            .flatten()
-            // SAFETY: every key on this page is UTF-8 (see SlottedPage).
-            .map(|t| TupleRef::wire(unsafe { t.assume_checked() }))
+        // id_ends is as long as the directory: one lookup bounds `i`.
+        let id_end = *self.id_ends.get(i)? as usize;
+        let t = WireTuple::read_fields(self.record(i), id_end)?;
+        // SAFETY: every key on this page is UTF-8 (see SlottedPage).
+        Some(TupleRef::wire(unsafe { t.assume_checked() }))
     }
 
     fn entry_overhead(&self) -> DBSizeType {
@@ -618,10 +651,14 @@ impl PageTuple for SlottedPage {
     }
 
     fn find_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<usize>, StoreError> {
-        if hint < self.slot_count() && self.id_at(hint)?.eq_owned(id) {
+        self.find_hinted_ref(IdRef::of(id), hint)
+    }
+
+    fn find_hinted_ref(&self, id: IdRef<'_>, hint: usize) -> Result<Option<usize>, StoreError> {
+        if hint < self.slot_count() && self.id_at(hint)?.eq(&id) {
             return Ok(Some(hint));
         }
-        self.find_exact(id)
+        self.find_exact_ref(id)
     }
 
     fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
@@ -1260,6 +1297,38 @@ mod tests {
     // committed criterion bench), #[ignore]d — compare against
     // anytuple.rs's identically-shaped bench_repeated_get_on_an_already_
     // loaded_page.
+    // What lending one tuple costs (at_ref), by key shape. Throwaway,
+    // #[ignore]d.
+    #[test]
+    #[ignore]
+    fn bench_at_ref() {
+        use crate::valueitem::{IndexKey, ValueItem};
+        let key = |i: u64| {
+            DBIdType::Rec(
+                IndexKey::new_from(&[ValueItem::Str((format!("ORD{i:07}"), 12))]).unwrap(),
+            )
+        };
+        for (what, id) in [("int id", None), ("string key", Some(key as fn(u64) -> DBIdType))] {
+            let mut p = SlottedPage::new(64 * 1024);
+            for i in 0..300u64 {
+                let id = id.map_or(DBIdType::Int(i), |k| k(i));
+                let mut t = Tuple::new_with(id, &[7u8; 60], None, None);
+                t.set_txn_id(crate::txn::TransactionId(123_456));
+                p.add(t).unwrap();
+            }
+            const ROUNDS: usize = 20_000;
+            let start = crate::clock::Instant::now();
+            let mut sum = 0usize;
+            for _ in 0..ROUNDS {
+                for i in 0..300 {
+                    sum += std::hint::black_box(p.at_ref(i).unwrap()).data().len();
+                }
+            }
+            let ns = start.elapsed().as_nanos() as f64 / (ROUNDS * 300) as f64;
+            eprintln!("at_ref, {what}: {ns:.1} ns ({sum})");
+        }
+    }
+
     #[test]
     #[ignore]
     fn bench_repeated_get_on_an_already_loaded_page() {

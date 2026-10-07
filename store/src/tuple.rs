@@ -506,16 +506,24 @@ impl<'a> IdRef<'a> {
     // DBIdType's `==` (exact: the same kind, and for column keys the same
     // number of fields, each equal) against an owned id.
     pub(crate) fn eq_owned(&self, other: &DBIdType) -> bool {
-        match self.0 {
-            Id::Owned(id) => id == other,
-            Id::Wire(WireId::Int(i)) => *other == DBIdType::Int(i),
-            Id::Wire(WireId::Rec(k)) => match other {
-                DBIdType::Rec(o) => {
-                    k.len() == o.values().len()
-                        && k.values().zip(o.values()).all(|(a, b)| a == b.as_ref())
-                }
-                DBIdType::Int(_) => false,
-            },
+        self.eq(&IdRef::of(other))
+    }
+
+    // DBIdType's `==` between two lent ids. Two keys read from bytes that
+    // are the same bytes are equal without a value being read — an index
+    // entry and the row it points to, as a range scan checks them.
+    pub(crate) fn eq(&self, other: &IdRef) -> bool {
+        match (self.0, other.0) {
+            (Id::Owned(a), Id::Owned(b)) => return a == b,
+            (Id::Wire(WireId::Rec(a)), Id::Wire(WireId::Rec(b))) if a.same_bytes(&b) => {
+                return true;
+            }
+            _ => {}
+        }
+        match (self.key_values(), other.key_values()) {
+            (Some(a), Some(b)) => a.len() == b.len() && a.zip(b).all(|(a, b)| a == b),
+            (None, None) => self.as_int() == other.as_int(),
+            _ => false,
         }
     }
 
@@ -758,6 +766,8 @@ mod tests {
                 assert_eq!(wa.cmp(&wb), a.cmp(b), "{a:?} vs {b:?}, both read");
                 assert_eq!(IdRef::of(a).cmp(&wb), a.cmp(b), "{a:?} vs read {b:?}");
                 assert_eq!(wa.eq_owned(b), a == b, "{a:?} == {b:?}");
+                assert_eq!(wa.eq(&wb), a == b, "{a:?} == {b:?}, both read");
+                assert_eq!(IdRef::of(a).eq(&wb), a == b, "{a:?} == read {b:?}");
             }
         }
     }

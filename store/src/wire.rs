@@ -13,10 +13,14 @@
 
 use crate::{error::StoreError, logger::LsnId, txn::TransactionId, valueitem::ValueRef};
 
-fn malformed(what: &str) -> StoreError {
-    StoreError::UnknownError(format!("malformed tuple bytes: {what}"))
+fn malformed() -> StoreError {
+    StoreError::UnknownError("malformed tuple bytes".into())
 }
 
+// Its methods say None for bytes that aren't what they should be: an
+// Option is a register or two where a Result of StoreError is returned
+// through memory, and these are a few instructions each, called for every
+// tuple read. The functions below turn None into the error.
 struct Reader<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -27,52 +31,65 @@ impl<'a> Reader<'a> {
         Self { bytes, pos: 0 }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], StoreError> {
-        let end = self.pos.checked_add(n).ok_or_else(|| malformed("length overflows"))?;
-        let out = self.bytes.get(self.pos..end).ok_or_else(|| malformed("truncated"))?;
+    #[inline(always)]
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(n)?;
+        let out = self.bytes.get(self.pos..end)?;
         self.pos = end;
-        Ok(out)
+        Some(out)
     }
 
-    fn byte(&mut self) -> Result<u8, StoreError> {
-        Ok(self.take(1)?[0])
+    #[inline(always)]
+    fn byte(&mut self) -> Option<u8> {
+        let b = *self.bytes.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
     }
 
-    fn varint(&mut self) -> Result<u64, StoreError> {
-        let mut out = 0u64;
-        for shift in (0..64).step_by(7) {
+    #[inline(always)]
+    fn varint(&mut self) -> Option<u64> {
+        // Most are one byte: a count, a short length, an option's tag.
+        let first = self.byte()?;
+        if first < 0x80 {
+            return Some(first as u64);
+        }
+        let mut out = (first & 0x7F) as u64;
+        for shift in (7..64).step_by(7) {
             let b = self.byte()?;
             out |= ((b & 0x7F) as u64) << shift;
             if b & 0x80 == 0 {
-                return Ok(out);
+                return Some(out);
             }
         }
-        Err(malformed("varint too long"))
+        None
     }
 
-    fn signed(&mut self) -> Result<i64, StoreError> {
+    #[inline(always)]
+    fn signed(&mut self) -> Option<i64> {
         let n = self.varint()?;
-        Ok((n >> 1) as i64 ^ -((n & 1) as i64))
+        Some((n >> 1) as i64 ^ -((n & 1) as i64))
     }
 
-    fn sized(&mut self) -> Result<&'a [u8], StoreError> {
+    #[inline(always)]
+    fn sized(&mut self) -> Option<&'a [u8]> {
         let n = self.varint()? as usize;
         self.take(n)
     }
 
-    fn option(&mut self) -> Result<Option<u64>, StoreError> {
+    #[inline(always)]
+    fn option(&mut self) -> Option<Option<u64>> {
         match self.byte()? {
-            0 => Ok(None),
-            1 => Ok(Some(self.varint()?)),
-            _ => Err(malformed("option tag")),
+            0 => Some(None),
+            1 => Some(Some(self.varint()?)),
+            _ => None,
         }
     }
 
     // One ValueItem (see its Serialize: a tag, then the value). `checked`:
     // its strings are known to be UTF-8 (see WireKey::checked), so aren't
     // checked again.
-    fn value(&mut self, checked: bool) -> Result<ValueRef<'a>, StoreError> {
-        Ok(match self.byte()? {
+    fn value(&mut self, checked: bool) -> Option<ValueRef<'a>> {
+        Some(match self.byte()? {
             0 => ValueRef::Null,
             1 => ValueRef::Integer(self.signed()?),
             2 => ValueRef::Double(f64::from_le_bytes(self.take(8)?.try_into().unwrap())),
@@ -83,7 +100,7 @@ impl<'a> Reader<'a> {
                     // SAFETY: see WireKey::assume_checked.
                     unsafe { std::str::from_utf8_unchecked(bytes) }
                 } else {
-                    std::str::from_utf8(bytes).map_err(|_| malformed("string"))?
+                    std::str::from_utf8(bytes).ok()?
                 };
                 ValueRef::Str(s, self.varint()? as u32)
             }
@@ -94,15 +111,15 @@ impl<'a> Reader<'a> {
             6 => match self.byte()? {
                 0 => ValueRef::Boolean(false),
                 1 => ValueRef::Boolean(true),
-                _ => return Err(malformed("bool")),
+                _ => return None,
             },
-            _ => return Err(malformed("value tag")),
+            _ => return None,
         })
     }
 
     // Steps over one ValueItem as `value` reads it, without checking a
     // string is UTF-8 (see WireKey::check).
-    fn skip_value(&mut self) -> Result<(), StoreError> {
+    fn skip_value(&mut self) -> Option<()> {
         match self.byte()? {
             0 => {}
             1 | 3 => {
@@ -117,33 +134,33 @@ impl<'a> Reader<'a> {
             }
             6 => {
                 if self.byte()? > 1 {
-                    return Err(malformed("bool"));
+                    return None;
                 }
             }
-            _ => return Err(malformed("value tag")),
+            _ => return None,
         }
-        Ok(())
+        Some(())
     }
 
     // A DBIdType (see its Serialize): tag 0 and a number, or tag 1 and an
     // IndexKey — a count, then that many values, stepped over (see
     // skip_value): a tuple's key is located without being read.
-    fn id(&mut self) -> Result<WireId<'a>, StoreError> {
+    fn id(&mut self) -> Option<WireId<'a>> {
         match self.byte()? {
-            0 => Ok(WireId::Int(self.varint()?)),
+            0 => Some(WireId::Int(self.varint()?)),
             1 => {
                 let count = self.varint()? as usize;
                 let start = self.pos;
                 for _ in 0..count {
                     self.skip_value()?;
                 }
-                Ok(WireId::Rec(WireKey {
+                Some(WireId::Rec(WireKey {
                     count,
                     bytes: &self.bytes[start..self.pos],
                     checked: false,
                 }))
             }
-            _ => Err(malformed("id tag")),
+            _ => None,
         }
     }
 }
@@ -183,12 +200,19 @@ impl<'a> WireKey<'a> {
         self.count
     }
 
+    /// Whether the two keys are the same bytes: equal, then, with no
+    /// value read. (Keys that differ in bytes can still be equal — a
+    /// string's capacity isn't part of its value.)
+    pub(crate) fn same_bytes(&self, other: &WireKey) -> bool {
+        self.count == other.count && self.bytes == other.bytes
+    }
+
     /// Whether every value reads (`values` assumes so): the strings are
     /// UTF-8. Locating a key (see Reader::id) doesn't check that.
     pub(crate) fn check(&self) -> Result<(), StoreError> {
         let mut r = Reader::new(self.bytes);
         for _ in 0..self.count {
-            r.value(false)?;
+            r.value(false).ok_or_else(malformed)?;
         }
         Ok(())
     }
@@ -234,13 +258,11 @@ impl<'a> Iterator for WireValues<'a> {
         self.left -= 1;
         // A page checks its keys when it reads them in (WireKey::check),
         // so this can't fail there; if it somehow did, the key just ends.
-        match self.reader.value(self.checked) {
-            Ok(v) => Some(v),
-            Err(_) => {
-                self.left = 0;
-                None
-            }
+        let value = self.reader.value(self.checked);
+        if value.is_none() {
+            self.left = 0;
         }
+        value
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -280,10 +302,19 @@ impl<'a> WireTuple<'a> {
     /// `read`, told where the id ends (see id_end) — it then doesn't step
     /// over the id's key to find the rest.
     pub(crate) fn read_after(bytes: &'a [u8], id_end: usize) -> Result<Self, StoreError> {
-        let id = tuple_id_ending(bytes, id_end)?;
+        Self::read_fields(bytes, id_end).ok_or_else(malformed)
+    }
+}
+
+impl<'a> WireTuple<'a> {
+    /// read_after, saying None for bytes that aren't a tuple's: for what
+    /// reads a tuple on every row (see Reader).
+    #[inline(always)]
+    pub(crate) fn read_fields(bytes: &'a [u8], id_end: usize) -> Option<Self> {
+        let id = id_ending(bytes, id_end)?;
         let mut r = Reader::new(bytes);
         r.pos = id_end;
-        Ok(Self {
+        Some(Self {
             id,
             txn_id: r.option()?.map(TransactionId),
             pre_lsn: r.option()?.map(LsnId),
@@ -295,33 +326,38 @@ impl<'a> WireTuple<'a> {
 
 /// Just the id of an encoded tuple — its first field.
 pub(crate) fn tuple_id(bytes: &[u8]) -> Result<WireId<'_>, StoreError> {
-    Reader::new(bytes).id()
+    Reader::new(bytes).id().ok_or_else(malformed)
 }
 
 /// Where an encoded tuple's id ends: what a reader that keeps it can
 /// hand tuple_id_ending / WireTuple::read_after.
 pub(crate) fn id_end(bytes: &[u8]) -> Result<usize, StoreError> {
     let mut r = Reader::new(bytes);
-    r.id()?;
+    r.id().ok_or_else(malformed)?;
     Ok(r.pos)
 }
 
 /// tuple_id, told where the id ends (see id_end): a key's values are
 /// then not stepped over.
 pub(crate) fn tuple_id_ending(bytes: &[u8], id_end: usize) -> Result<WireId<'_>, StoreError> {
+    id_ending(bytes, id_end).ok_or_else(malformed)
+}
+
+#[inline(always)]
+fn id_ending(bytes: &[u8], id_end: usize) -> Option<WireId<'_>> {
     let mut r = Reader::new(bytes);
     match r.byte()? {
-        0 => Ok(WireId::Int(r.varint()?)),
+        0 => Some(WireId::Int(r.varint()?)),
         1 => {
             let count = r.varint()? as usize;
-            let bytes = bytes.get(r.pos..id_end).ok_or_else(|| malformed("id end"))?;
-            Ok(WireId::Rec(WireKey {
+            let bytes = bytes.get(r.pos..id_end)?;
+            Some(WireId::Rec(WireKey {
                 count,
                 bytes,
                 checked: false,
             }))
         }
-        _ => Err(malformed("id tag")),
+        _ => None,
     }
 }
 

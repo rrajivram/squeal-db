@@ -150,6 +150,9 @@ pub struct TableCursor<F: DBFile + 'static> {
 struct LeafEntries {
     start: Bound<DBIdType>,
     entries: Option<PageTupleIterator>,
+    // No entry read from here has been checked against `start` yet (see
+    // RangeCursor::next_ref): the first is, and those after follow it.
+    unchecked: bool,
 }
 
 impl LeafEntries {
@@ -157,6 +160,7 @@ impl LeafEntries {
         LeafEntries {
             start: start.clone(),
             entries: None,
+            unchecked: !matches!(start, Bound::Unbounded),
         }
     }
 
@@ -452,15 +456,9 @@ where
     ) -> Result<Bound<DBIdType>, StoreError> {
         // Any entry shows the length (all keys of a tree share it). An
         // empty tree has no entries to scan: start at the beginning.
-        let Some(sample) = tree.first_leaf_page()?.first()? else {
+        let Some(len) = tree.key_fields()? else {
             return Ok(Bound::Unbounded);
         };
-        let DBIdType::Rec(sample) = sample.id else {
-            return Err(StoreError::UnknownError(
-                "a key-range scan needs a table keyed by IndexKey".into(),
-            ));
-        };
-        let len = sample.values().len();
         let mut full = range.prefix.clone();
         if let Bound::Included(v) | Bound::Excluded(v) = &range.lower {
             full.push(v.clone());
@@ -544,16 +542,29 @@ where
                 }
                 return Ok(None);
             };
-            let entry = self.entry(i)?;
-            // The leaf containing `start` generally holds entries both
-            // below and at/above it — skip the ones below.
-            let before_start = match &self.start {
-                Bound::Included(k) => entry.id().cmp_owned(k).is_lt(),
-                Bound::Excluded(k) => entry.id().cmp_owned(k).is_le(),
-                Bound::Unbounded => false,
-            };
-            if before_start {
-                continue;
+            // SAFETY: as in TableCursor::next_ref — `entry` borrows the
+            // leaf snapshot current_iter holds, and is done with before
+            // current_iter changes: next_range, the one thing below that
+            // replaces it, is followed by `continue` when it does. A plain
+            // borrow means reading the entry again to find its row.
+            let leaf: *const LeafEntries = &self.current_iter;
+            let entry = unsafe { &*leaf }.get(i).ok_or_else(|| {
+                StoreError::UnknownError(format!("no entry at position {i} of its index leaf"))
+            })?;
+            // A leaf is read from `start` on (LeafEntries seeks there), so
+            // only the first entry after positioning can be before it —
+            // checked, in case the leaf changed between the tree's descent
+            // to it and its snapshot; the entries after follow in order.
+            if self.current_iter.unchecked {
+                let before_start = match &self.start {
+                    Bound::Included(k) => entry.id().cmp_owned(k).is_lt(),
+                    Bound::Excluded(k) => entry.id().cmp_owned(k).is_le(),
+                    Bound::Unbounded => false,
+                };
+                if before_start {
+                    continue;
+                }
+                self.current_iter.unchecked = false;
             }
             // Ascending leaf-chain order guarantees everything from here
             // on is also >= end, so this is a real early-termination, not
@@ -594,7 +605,6 @@ where
             // to close, not a new failure mode this cursor needs to invent
             // handling for; skip and move on rather than erroring the
             // whole scan over one stale entry.
-            let entry = self.entry(i)?;
             let Some((content, page, at)) = table.locate_index_entry(&entry, self.last_row)?
             else {
                 continue;
@@ -615,13 +625,6 @@ where
             }
         };
         Ok(self.lent.get())
-    }
-
-    // The index entry at position `i` of the leaf being read.
-    fn entry(&self, i: usize) -> Result<TupleRef<'_>, StoreError> {
-        self.current_iter.get(i).ok_or_else(|| {
-            StoreError::UnknownError(format!("no entry at position {i} of its index leaf"))
-        })
     }
 }
 

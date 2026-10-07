@@ -8,6 +8,10 @@ use crate::{
     tuple::{DBIdType, Tuple, TupleRef},
 };
 
+// An index page written before every page became a SlottedPage (content
+// kind FIXED_TUPLE; see Page::new): an AnyTuplePage with a per-entry size
+// limit. No new page is one — Page itself holds an index page's limit
+// (record_size) now.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct FixedTuplePage {
     tuple_size: usize,

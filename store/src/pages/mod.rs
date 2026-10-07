@@ -1,7 +1,7 @@
 use crate::{
     db::DBSizeType,
     error::StoreError,
-    tuple::{DBIdType, Tuple, TupleRef},
+    tuple::{DBIdType, IdRef, Tuple, TupleRef},
 };
 
 pub mod anytuple;
@@ -24,6 +24,12 @@ pub trait PageTuple: Send + Sync {
     /// tuples it can lend; the default copies.
     fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
         self.at(i).map(TupleRef::owned)
+    }
+
+    /// `find_hinted`, by a lent id (see IdRef): an index entry's, say,
+    /// looked up on the data page it points to. The default copies it out.
+    fn find_hinted_ref(&self, id: IdRef<'_>, hint: usize) -> Result<Option<usize>, StoreError> {
+        id.with_owned(|id| self.find_hinted(id, hint))
     }
 
     /// Bytes the page takes for each tuple beyond the tuple's own size()

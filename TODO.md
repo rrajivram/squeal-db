@@ -147,10 +147,36 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   37 / 65 / 352). The retail data stores no NULLs (sentinels instead), so
   its file is the same size; a table with NULLs in wide columns grows by
   their width.
-- [ ] Next: a fixed record header and a key layout the table declares
-  (squeal-sql's PRIMARY KEY columns), in a new page content kind — a
-  key's fields at known offsets, lending a row with no parsing. Then
-  WHERE on a fixed row before the row is built.
+- [x] One page format (branch `one-page-format`, on `fixed-rows`, not
+  merged). Index pages — inner nodes and leaves — and pinned system pages
+  are SlottedPages too: every page a tree writes. AnyTuplePage and
+  FixedTuplePage only read what was written before. The tree's descent
+  reads an entry's child pointer in place (`Page::with_entry`); a range
+  scan checks an index entry against its row by comparing their key bytes
+  (`IdRef::eq`, `find_hinted_ref`) and reads each leaf entry once; a tree
+  remembers how many fields its keys have. The reader's helpers return
+  Option, not Result<_, StoreError> (returned through memory, and not
+  inlined): lending a tuple went from 23 ns to 5. Against main, each on
+  its own load of the 1M-row retail data:
+    SQL count(*) of orders                 36.8 -> 31.8 ms
+    filtered count of orders               65.8 -> 56.0 ms
+    select * from orders                   73.6 -> 64.7 ms
+    order_details count (> cache)          359 -> 235 ms; 4 threads 454 -> 268
+    order_details sum/max                  434 -> 306 ms
+    cold first-touch Db::find              4.11 -> 2.57 us
+    SQL point lookup                       4.62 -> 4.67 us
+    100k-row PK range count                17.1 -> 18.3 ms
+    Db::find (owned tuple)                 0.51 -> 0.69 us
+    bulk load                              about even; file +12%
+- [ ] Owned tuples are what still cost on byte pages: `Db::find`, the
+  nested-loop join's inner rows, store's `Cursor::next` (2-3x on a warm
+  scan) build a Tuple from bytes. A lent `Db::find` (a closure over a
+  TupleRef) would cover the index-lookup and nested-loop paths.
+- [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
+  index pages too. u16 offsets/lengths would halve that for pages under
+  64 KiB — a change to SlottedPage's layout, so a page format version.
+- [ ] WHERE on a fixed-width row before the row is built (read the
+  filtered column at its offset; skip the row if it fails).
 - [ ] If kept: step 3 is done by this (the default switched; old
   AnyTuplePage data pages still read). Still owned on the way: the
   nested-loop join's inner rows, Db::find.

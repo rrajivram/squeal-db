@@ -420,6 +420,17 @@ pub(crate) struct Page {
 
 // A page's tuples, read from a snapshot of its content (see PageInner).
 #[derive(Clone)]
+// Which of a page's tuples Page::with_entry reads.
+pub(crate) enum Entry<'a> {
+    // The first, in the page's own order.
+    First,
+    // The one with this id.
+    Exact(&'a DBIdType),
+    // The first whose id is above this one (PageTuple::successor), or the
+    // last if none is: where an inner node routes a key.
+    SuccessorOrLast(&'a DBIdType),
+}
+
 pub(crate) struct PageTupleIterator {
     content: Arc<dyn PageTuple>,
     next: usize,
@@ -482,24 +493,21 @@ impl Page {
     }
 
     fn new(size: DBSizeType, flags: u16, record_size: Option<usize>, page_overhead: usize) -> Self {
-        let (pt, content_kind): (Box<dyn PageTuple>, PageContentKind) =
-            if let Some(record_size) = record_size {
-                (
-                    Box::new(FixedTuplePage::new(record_size)),
-                    PageContentKind::FIXED_TUPLE,
-                )
-            } else if flags & PINNED == 0 {
-                // A table's data page: its tuples kept as their bytes, read
-                // and lent in place (see pages::slotted).
-                let capacity = (size - page_overhead as DBSizeType) as usize;
-                (
-                    Box::new(crate::pages::slotted::SlottedPage::new(capacity)),
-                    PageContentKind::SLOTTED_TUPLE,
-                )
-            } else {
-                (Box::new(AnyTuplePage::new()), PageContentKind::ANY_TUPLE)
-            };
-        Self::new_with_content(size, flags, record_size, pt, content_kind, page_overhead)
+        // Every page of a tree — a table's data pages, its index's inner
+        // nodes and leaves, the pinned system pages — keeps its tuples as
+        // their bytes, read and lent in place (see pages::slotted). An
+        // index page's per-entry budget (record_size) is this Page's to
+        // enforce (add_tuple, replace_tuple). AnyTuplePage and
+        // FixedTuplePage are only what pages written before this read as.
+        let capacity = (size - page_overhead as DBSizeType) as usize;
+        Self::new_with_content(
+            size,
+            flags,
+            record_size,
+            Box::new(crate::pages::slotted::SlottedPage::new(capacity)),
+            PageContentKind::SLOTTED_TUPLE,
+            page_overhead,
+        )
     }
 
     // Lets a caller supply its own PageTuple implementor for a registered
@@ -766,6 +774,29 @@ impl Page {
         }
     }
 
+    // `f` of one of the page's tuples, lent (see TupleRef) under the page's
+    // lock: what the tree's descent reads of an index page — an entry's
+    // child pointer — without the entry being copied out. None if there is
+    // no such tuple.
+    pub(crate) fn with_entry<R>(
+        &self,
+        which: Entry<'_>,
+        f: impl FnOnce(TupleRef<'_>) -> R,
+    ) -> Result<Option<R>, StoreError> {
+        use std::ops::Bound::Excluded;
+        let inner = self.inner.read();
+        let data = &inner.data;
+        let pos = match which {
+            Entry::First => Some(0),
+            Entry::Exact(id) => data.find_hinted(id, usize::MAX)?,
+            Entry::SuccessorOrLast(id) => {
+                let count = data.count()?;
+                Some(data.seek(Excluded(id))?.min(count.saturating_sub(1)))
+            }
+        };
+        Ok(pos.and_then(|pos| data.at_ref(pos)).map(f))
+    }
+
     // A snapshot of the page's content, as iter() reads it: what a reader
     // lends tuples from once the page's lock is let go.
     pub(crate) fn content(&self) -> Arc<dyn PageTuple> {
@@ -788,6 +819,12 @@ impl Page {
     // individual tuple's size() accounts for. See USABLE_DATA_MARGIN.
     pub(crate) fn usable_data_size(&self) -> DBSizeType {
         self.page_data_size.saturating_sub(USABLE_DATA_MARGIN)
+    }
+
+    /// Bytes the page takes per tuple beyond the tuple's own size() (see
+    /// PageTuple::entry_overhead).
+    pub(crate) fn entry_overhead(&self) -> DBSizeType {
+        self.inner.read().data.entry_overhead()
     }
 
     /// Bytes the page's tuples take, as can_store counts them.
@@ -887,6 +924,12 @@ impl Page {
     }
 
     pub(crate) fn replace_tuple(&self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {
+        // See add_tuple: an index page's per-entry budget.
+        if let Some(max) = self.record_size
+            && tuple.size() as usize > max
+        {
+            return Err(StoreError::TupleTooLarge(tuple.size(), max));
+        }
         let new_size = tuple.size();
         let old = {
             let mut inner = self.inner.write();

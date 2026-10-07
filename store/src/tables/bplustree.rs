@@ -9,7 +9,7 @@ use crate::{
     db::{DBFile, DBSizeType},
     error::StoreError,
     logger::{Logger, LsnId},
-    page::{Page, PageId, USABLE_DATA_MARGIN},
+    page::{Entry, Page, PageId, USABLE_DATA_MARGIN},
     pages::PageTuple,
     table::{Table, TableIdType, TableType},
     tuple::{DBIdType, Tuple, TupleRef},
@@ -118,6 +118,10 @@ const LEAF_NODE: usize = 5;
 //   passes all of them with real margin to spare.
 pub(crate) const MAX_ENTRY_BYTES: u64 = 48;
 
+// Where a row is (BPlusTree::locate_index_entry): a snapshot of its data
+// page's content, the page, and its position there.
+pub(crate) type LocatedRow = (Arc<dyn PageTuple>, PageId, usize);
+
 // A node is full — splits before taking another entry — when it has less
 // free space than one entry of the table's largest size plus this slack:
 // a child split rewrites one routing entry (its page id may grow by a few
@@ -167,6 +171,9 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // why a plain Relaxed store (not a CAS/fetch_max) is fine even though
     // concurrent writers can race to extend the chain — see write_data.
     last_data_page: AtomicU64,
+    // How many fields this tree's keys have (see key_fields), plus one;
+    // zero until an entry has shown it. All of a tree's keys share it.
+    key_fields: AtomicU64,
     // Whether `last_data_page` is trustworthy yet. False right after a
     // reopen (see from_table): the real tail is found lazily, by the first
     // write that needs it (ensure_tail_known), so a session that only reads
@@ -277,6 +284,7 @@ where
             txn_mgr,
             logger,
             last_data_page: AtomicU64::new(first_data_page.into()),
+            key_fields: AtomicU64::new(0),
             tail_known: std::sync::atomic::AtomicBool::new(true),
             relocation_lock: std::sync::RwLock::new(()),
         })
@@ -308,6 +316,7 @@ where
         // is always a valid, if far-behind, place to start.
         Ok(Self {
             last_data_page: AtomicU64::new(t.first_data_page.into()),
+            key_fields: AtomicU64::new(0),
             tail_known: std::sync::atomic::AtomicBool::new(false),
             count_cap: count_cap(&t, &buffer),
             table: t,
@@ -316,6 +325,31 @@ where
             logger,
             relocation_lock: std::sync::RwLock::new(()),
         })
+    }
+
+    /// How many fields this tree's keys have — all share it. None for an
+    /// empty tree, which has no entry to show it; an error for a tree
+    /// keyed by row ids. Read off an entry once, then remembered: a key-
+    /// range scan asks every time it is positioned (RangeCursor::
+    /// range_start), and the answer took a walk down to the first leaf.
+    pub(crate) fn key_fields(&self) -> Result<Option<usize>, StoreError> {
+        match self.key_fields.load(Ordering::Relaxed) {
+            0 => {}
+            n => return Ok(Some(n as usize - 1)),
+        }
+        let sample = self
+            .first_leaf_page()?
+            .with_entry(Entry::First, |e| e.id().key_values().map(|k| k.len()))?;
+        let Some(sample) = sample else {
+            return Ok(None);
+        };
+        let Some(len) = sample else {
+            return Err(StoreError::UnknownError(
+                "a key-range scan needs a table keyed by IndexKey".into(),
+            ));
+        };
+        self.key_fields.store(len as u64 + 1, Ordering::Relaxed);
+        Ok(Some(len))
     }
 
     pub fn table_btree_params(&self) -> Result<(usize, usize, usize), StoreError> {
@@ -329,21 +363,22 @@ where
                     start.record_size().unwrap(),
                 ));
             } else {
-                if let Some(tuple) = start.first()? {
-                    level += 1;
-                    let page = from_bytes::<Node>(&tuple.data)?;
-                    match page {
-                        Node::Inner(p) => start = self.buffer.get_page(p)?,
-                        Node::Leaf(_) => {
-                            return Ok((
-                                level,
-                                self.table.nodes_per_page,
-                                start.record_size().unwrap(),
-                            ));
-                        }
+                let first = start
+                    .with_entry(Entry::First, |e| from_bytes::<Node>(e.data()))?
+                    .transpose()?
+                    .ok_or_else(|| {
+                        StoreError::Corruption("an inner node with no entries".into())
+                    })?;
+                level += 1;
+                match first {
+                    Node::Inner(p) => start = self.buffer.get_page(p)?,
+                    Node::Leaf(_) => {
+                        return Ok((
+                            level,
+                            self.table.nodes_per_page,
+                            start.record_size().unwrap(),
+                        ));
                     }
-                } else {
-                    panic!("Should not come here!");
                 }
             }
         }
@@ -459,17 +494,18 @@ where
             None,
         );
         let leaf = self.leaf_for_write(&probe, lsn)?;
-        let entry = leaf.page.get(id.clone())?;
+        let entry = leaf
+            .page
+            .with_entry(Entry::Exact(&id), |e| from_bytes::<Node>(e.data()))?
+            .transpose()?;
         let data_page = match &entry {
-            Some(e) => match from_bytes::<Node>(&e.data)? {
-                Node::Leaf(p) => Some(p),
-                Node::Inner(_) => {
-                    return Err(StoreError::Corruption(format!(
-                        "expected a leaf entry, found an inner routing entry at {:?}",
-                        id
-                    )));
-                }
-            },
+            Some(Node::Leaf(p)) => Some(*p),
+            Some(Node::Inner(_)) => {
+                return Err(StoreError::Corruption(format!(
+                    "expected a leaf entry, found an inner routing entry at {:?}",
+                    id
+                )));
+            }
             None => None,
         };
         let current = match data_page {
@@ -940,18 +976,18 @@ where
             // last_child fallthrough: non-root inner nodes have no
             // u64::MAX sentinel, so the last child covers everything from
             // its own separator up to the parent's upper bound.
-            let entry = match page.successor(id)? {
-                Some(entry) => entry,
-                None => match page.last()? {
-                    Some(entry) => entry,
-                    // An INNER_NODE page always has at least one Node::Inner
-                    // entry (routing pages are never created empty) — this
-                    // is here so the match is exhaustive, not because it's
-                    // expected to happen.
-                    None => return Ok((current, page)),
-                },
+            // Read in place (Page::with_entry): only the entry's child
+            // pointer is wanted, not the entry.
+            let child = page
+                .with_entry(Entry::SuccessorOrLast(id), |e| from_bytes::<Node>(e.data()))?
+                .transpose()?;
+            // An INNER_NODE page always has at least one Node::Inner entry
+            // (routing pages are never created empty) — this is here so
+            // the match is exhaustive, not because it's expected to happen.
+            let Some(child) = child else {
+                return Ok((current, page));
             };
-            current = match from_bytes::<Node>(&entry.data)? {
+            current = match child {
                 Node::Inner(page_num) => page_num,
                 // STORE_AUDIT.md S8: this page's own INNER_NODE flag
                 // disagrees with this entry's actual content — every real
@@ -961,8 +997,8 @@ where
                 // typed error.
                 Node::Leaf(_) => {
                     return Err(StoreError::Corruption(format!(
-                        "expected an inner routing entry, found a leaf entry at {:?}",
-                        entry.id
+                        "expected an inner routing entry, found a leaf entry for {:?} in {:?}",
+                        id, current
                     )));
                 }
             };
@@ -984,16 +1020,20 @@ where
     pub(crate) fn first_leaf_page(&self) -> Result<Arc<Page>, StoreError> {
         let mut page = self.buffer.get_page(self.table.first_index_page)?;
         while page.is_flag_set(INNER_NODE) {
-            let Some(entry) = page.first()? else {
+            let first = page
+                .with_entry(Entry::First, |e| from_bytes::<Node>(e.data()))?
+                .transpose()?;
+            let Some(first) = first else {
                 return Ok(page);
             };
-            page = match from_bytes::<Node>(&entry.data)? {
+            page = match first {
                 Node::Inner(page_num) => self.buffer.get_page(page_num)?,
                 Node::Leaf(_) => {
-                    return Err(StoreError::Corruption(format!(
-                        "expected an inner routing entry, found a leaf entry at {:?}",
-                        entry.id
-                    )));
+                    return Err(StoreError::Corruption(
+                        "expected an inner routing entry, found a leaf entry first in an inner \
+                         node"
+                            .into(),
+                    ));
                 }
             };
         }
@@ -1177,7 +1217,7 @@ where
         &self,
         entry: &TupleRef,
         last: Option<(PageId, usize)>,
-    ) -> Result<Option<(Arc<dyn PageTuple>, PageId, usize)>, StoreError> {
+    ) -> Result<Option<LocatedRow>, StoreError> {
         match from_bytes::<Node>(entry.data())? {
             Node::Leaf(data_page_id) => {
                 let hint = match last {
@@ -1185,7 +1225,7 @@ where
                     _ => usize::MAX,
                 };
                 let content = self.buffer.get_page(data_page_id)?.content();
-                let at = entry.id().with_owned(|id| content.find_hinted(id, hint))?;
+                let at = content.find_hinted_ref(entry.id(), hint)?;
                 Ok(at.map(|at| (content, data_page_id, at)))
             }
             // STORE_AUDIT.md S8: see route_to_leaf's identical comment —
@@ -1199,25 +1239,22 @@ where
         }
     }
 
-    #[allow(clippy::bind_instead_of_map)]
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
         let page = self.route_to_leaf(&id, start)?;
-        page.get(id)?
-            .and_then(|t| {
-                let id = from_bytes::<Node>(&t.data);
-                match id {
-                    Ok(Node::Leaf(page_id)) => Some(Ok(page_id)),
-                    // STORE_AUDIT.md S8: see route_to_leaf's identical
-                    // comment on why this is corrupted data, not a
-                    // reachable outcome of any real write path.
-                    Ok(Node::Inner(_)) => Some(Err(StoreError::Corruption(format!(
-                        "expected a leaf entry, found an inner routing entry at {:?}",
-                        t.id
-                    )))),
-                    Err(e) => Some(Err(StoreError::from(e))),
-                }
-            })
-            .transpose()
+        let entry = page
+            .with_entry(Entry::Exact(&id), |e| from_bytes::<Node>(e.data()))?
+            .transpose()?;
+        match entry {
+            Some(Node::Leaf(page_id)) => Ok(Some(page_id)),
+            // STORE_AUDIT.md S8: see route_to_leaf's identical comment on
+            // why this is corrupted data, not a reachable outcome of any
+            // real write path.
+            Some(Node::Inner(_)) => Err(StoreError::Corruption(format!(
+                "expected a leaf entry, found an inner routing entry at {:?}",
+                id
+            ))),
+            None => Ok(None),
+        }
     }
 
     // TXN_SIMPLIFICATION_PLAN.md phase 4: the top-down, hand-over-hand
@@ -1281,14 +1318,14 @@ where
         }
         // STORE_AUDIT.md P5: successor(id), falling back to last() when the
         // key is >= every separator (non-root inner nodes have no sentinel).
-        let row_id = match handle.page.successor(&probe.id)? {
-            Some(row) => row,
-            None => handle
-                .page
-                .last()?
-                .expect("INNER_NODE page must have at least one entry"),
-        };
-        let Node::Inner(p) = from_bytes::<Node>(&row_id.data)? else {
+        let child = handle
+            .page
+            .with_entry(Entry::SuccessorOrLast(&probe.id), |e| from_bytes::<Node>(e.data()))?
+            .transpose()?
+            .ok_or_else(|| {
+                StoreError::Corruption(format!("inner node {start:?} has no entries"))
+            })?;
+        let Node::Inner(p) = child else {
             return Err(StoreError::Corruption(format!(
                 "expected an inner routing entry, found a leaf entry at {:?}",
                 start
@@ -1296,13 +1333,21 @@ where
         };
         match self.split_if_needed(p, probe, lsn)? {
             SplitOutcome::Split(separator, sibling) => {
+                // The entry that routed here (this node is locked: the same
+                // one), by its id now that it is to be rewritten.
+                let routed = handle
+                    .page
+                    .with_entry(Entry::SuccessorOrLast(&probe.id), |e| e.id().to_owned())?
+                    .ok_or_else(|| {
+                        StoreError::Corruption(format!("inner node {start:?} has no entries"))
+                    })?;
                 let page = Arc::make_mut(&mut handle.page);
                 // `p` kept the smaller half; the larger half moved to
                 // `sibling`, which the existing entry must now route to.
                 page.replace_tuple(
-                    &row_id.id,
+                    &routed,
                     Tuple::new_with(
-                        row_id.id.clone(),
+                        routed.clone(),
                         &to_allocvec(&Node::Inner(sibling))?,
                         None,
                         None,
@@ -1395,7 +1440,7 @@ where
             Some(n) => n as DBSizeType,
             None => usable / self.table.nodes_per_page.max(1) as DBSizeType,
         };
-        Ok(page.used_data_size() + max + FULL_SLACK > usable)
+        Ok(page.used_data_size() + max + page.entry_overhead() + FULL_SLACK > usable)
     }
 
     fn is_root_page(&self, page_id: PageId) -> bool {

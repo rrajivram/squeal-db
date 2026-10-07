@@ -178,6 +178,16 @@ committing (each stage is its own commit).
       a format-1 page reads through the buffer and rewrites as format 2
       (`test_a_format_1_page_verifies_with_fnv_and_is_rewritten_with_crc`).
       The file header and WAL records keep FNV-1a.
+      **One page content kind** (later, no format version): every page a
+      tree writes — data pages, index nodes and leaves, pinned system pages
+      — is a `SlottedPage` (content kind 4, a layout builds since Stage 5
+      already read: a slot directory, then each tuple's own postcard bytes).
+      `ANY_TUPLE` and `FIXED_TUPLE` pages are still read, and stay what they
+      are when rewritten; nothing writes a new one. Checked by writing into
+      a database of the old kinds (inserts, updates, deletes, CREATE INDEX)
+      and reopening it. A table row's values gained a fixed-width layout the
+      same way — marked in the row itself (squeal-sql's `RowLayout`,
+      `FIXED_ROW`), old rows read as before.
 - [x] **Stage 6 — store-level system pages — DONE. Committed: `7a081fe`.** The table catalog (page 0), sequence state (page 1)
       and free-page list (page 2) were each exactly ONE pinned page with
       unversioned payloads; a catalog or free list that outgrew a page could
