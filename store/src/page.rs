@@ -57,7 +57,8 @@ pub(crate) struct PageHeader {
     // decoded fine but the data attached to it didn't.
     #[serde(with = "postcard::fixint::le")]
     pub(crate) magic: u32,
-    // FNV-1a (see fnv1a_32) over exactly this page's own on-disk data
+    // A checksum (see checksum_of: which one is the format version's
+    // choice) over exactly this page's own on-disk data
     // slice — not, for an overflow chain, the whole reassembled logical
     // object. Set once the data bytes for *this* physical page are known
     // (see Page::to_bytes_snapshot for the ordinary case, and
@@ -91,9 +92,21 @@ impl PageHeader {
     /// version-0/1 shape drifts without that.
     pub(crate) fn check_format_version(&self) -> Result<(), StoreError> {
         match self.format_version {
-            LEGACY_PAGE_FORMAT_VERSION | CURRENT_PAGE_FORMAT_VERSION => Ok(()),
+            LEGACY_PAGE_FORMAT_VERSION | FNV_PAGE_FORMAT_VERSION | CURRENT_PAGE_FORMAT_VERSION => {
+                Ok(())
+            }
             other => Err(crate::versioned::unsupported_version("page", other)),
         }
+    }
+
+    /// The checksum of `data` this header's format version stores: FNV-1a
+    /// up to version 1, CRC-32 from version 2. FNV-1a takes one dependent
+    /// multiply per byte — it was over a quarter of a scan bigger than the
+    /// cache — where CRC-32 runs on the CPU's own instructions. A page
+    /// keeps the version it was written with until it is written again, so
+    /// a write stamps the version before computing this.
+    pub(crate) fn checksum_of(&self, data: &[u8]) -> u32 {
+        page_checksum(self.format_version, data)
     }
 
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>, StoreError> {
@@ -144,16 +157,34 @@ pub(crate) const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"SQDB");
 /// decodes its tuples with one bulk `Vec<Tuple>` call that has no per-element
 /// hook (see PERSISTENCE_VERSIONING_PROGRESS.md, Stage 2). It also means
 /// `SlottedPage::decode_id_at`'s "`id` is `Tuple`'s first field" fast path is
-/// a promise made by page format versions 0 and 1; a version that moves it
+/// a promise made by page format versions 0 to 2; a version that moves it
 /// must change that function in the same commit.
-pub(crate) const CURRENT_PAGE_FORMAT_VERSION: u16 = 1;
+///
+/// Version 2 changed only the data checksum, FNV-1a to CRC-32 (see
+/// `PageHeader::checksum_of`); the layout is version 1's.
+pub(crate) const CURRENT_PAGE_FORMAT_VERSION: u16 = 2;
+
+/// The last page format whose data checksum is FNV-1a.
+pub(crate) const FNV_PAGE_FORMAT_VERSION: u16 = 1;
 
 /// A page written before `format_version` existed: its header's trailing
 /// bytes are zero padding, which decodes as this. Same layout as the current
 /// version.
 pub(crate) const LEGACY_PAGE_FORMAT_VERSION: u16 = 0;
 
-// The standard FNV-1a 32-bit hash (basis 0x811c9dc5, prime 0x01000193 —
+// A page's data checksum, by its format version (see
+// PageHeader::checksum_of).
+pub(crate) fn page_checksum(format_version: u16, data: &[u8]) -> u32 {
+    if format_version <= FNV_PAGE_FORMAT_VERSION {
+        fnv1a_32(data)
+    } else {
+        crc32fast::hash(data)
+    }
+}
+
+// Page formats 0 and 1's data checksum, and the file header's (see
+// db.rs's checksum_input). The standard FNV-1a 32-bit hash (basis
+// 0x811c9dc5, prime 0x01000193 —
 // the same constants IndexKey::hash/ValueItem::hash already use, applied
 // here to raw bytes instead of structured values) — not cryptographic,
 // but cheap and good enough to catch accidental corruption (truncation,
@@ -931,7 +962,7 @@ impl Page {
         // write_page recomputes and overwrites this per physical page (its
         // own on-disk slice only) once it knows how the split lands; see its
         // own comment.
-        header.checksum = fnv1a_32(&data);
+        header.checksum = header.checksum_of(&data);
         (header, data)
     }
 
@@ -1176,7 +1207,7 @@ impl From<Page> for PageDto {
             high_key: inner.high_key,
             content_kind: value.content_kind,
             magic: PAGE_MAGIC,
-            checksum: fnv1a_32(&data),
+            checksum: page_checksum(CURRENT_PAGE_FORMAT_VERSION, &data),
             format_version: CURRENT_PAGE_FORMAT_VERSION,
             data,
         }
@@ -1872,6 +1903,19 @@ mod tests {
             "a variable-length high_key must survive ahead of the trailing version field"
         );
         assert_eq!(page.iter().count(), 2);
+    }
+
+    // The checksums those builds wrote are FNV-1a, which is what a page of
+    // their version still verifies with (see PageHeader::checksum_of).
+    #[test]
+    fn test_pre_format_version_page_fixtures_verify_their_checksums() {
+        for fixture in [LEGACY_DATA_PAGE, LEGACY_INDEX_PAGE] {
+            let bytes = legacy_page_bytes(fixture, 1024);
+            let header = header_of(&bytes);
+            let data = &bytes[TEST_OVERHEAD..];
+            assert_eq!(header.checksum, header.checksum_of(data));
+            assert_eq!(header.checksum, super::fnv1a_32(data));
+        }
     }
 
     #[test]

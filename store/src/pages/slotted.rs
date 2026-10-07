@@ -299,7 +299,7 @@ impl SlottedPage {
     }
 
     // Persistence versioning Stage 5: `id` being `Tuple`'s first field is a
-    // promise of page format versions 0 and 1 (page::CURRENT_PAGE_FORMAT_VERSION);
+    // promise of page format versions 0 to 2 (page::CURRENT_PAGE_FORMAT_VERSION);
     // a page format version that moves it must change this function in the
     // same commit.
     //

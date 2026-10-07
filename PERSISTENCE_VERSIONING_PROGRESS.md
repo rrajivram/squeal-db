@@ -168,6 +168,16 @@ committing (each stage is its own commit).
       cross-referenced both ways; nothing needed to change since no `Tuple`
       shape changed. `cargo test --workspace` green (402 squeal-sql + 538
       store), clippy clean on the touched files.
+      **Page format 2** (later): the data checksum went from FNV-1a to
+      CRC-32 (`crc32fast`); nothing else changed. `PageHeader::checksum_of`
+      picks the checksum by the header's version, so pages of version 0/1
+      verify as before and are CRC-32 once rewritten (an overflow chain's
+      pages are restamped one by one as `write_page` rewrites them). Pinned:
+      the legacy fixtures' own checksums verify
+      (`test_pre_format_version_page_fixtures_verify_their_checksums`), and
+      a format-1 page reads through the buffer and rewrites as format 2
+      (`test_a_format_1_page_verifies_with_fnv_and_is_rewritten_with_crc`).
+      The file header and WAL records keep FNV-1a.
 - [x] **Stage 6 — store-level system pages — DONE. Committed: `7a081fe`.** The table catalog (page 0), sequence state (page 1)
       and free-page list (page 2) were each exactly ONE pinned page with
       unversioned payloads; a catalog or free list that outgrew a page could

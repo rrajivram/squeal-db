@@ -81,10 +81,19 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   entries, so first-touch random lookups are ~15-20% slower in a fresh
   process (warm ones are faster). Fix: pages readable without a full decode
   (slotted layout / lazy decode). Store change.
-- [ ] Same cost on a scan bigger than the cache: a scan of order_details
-  (1M rows, doesn't fit) spends 70% in `get_page` — 24% `Page::from_bytes`
-  (postcard, every Tuple), 13% `install`, 9% `ShardedPQ::pop` eviction, and
-  28% in `get_page` itself (not yet broken down).
+- [x] Page checksum. A scan of order_details (1M rows, bigger than the
+  cache) spent 28% in the page checksum, FNV-1a: a dependent multiply per
+  byte, inlined into `get_page`. Page format 2 checksums with CRC-32
+  (`crc32fast`, the CPU's own instructions); older pages verify with FNV-1a
+  until rewritten. Same binary, format-1 vs format-2 database: order_details
+  `count(*) where quantity > 3` 0.71 -> 0.53 s, `sum, max` 0.79 -> 0.60 s;
+  cold first-touch `Db::find` (`store_cold_find`) 7.2 -> 5.35 us. Skipping
+  verification entirely measured 0.515 s, so little is left there.
+- [ ] Still on that scan: `Page::from_bytes` (postcard, every Tuple) ~24%,
+  `install` 13%, `ShardedPQ::pop` eviction 9% — pages readable without a
+  decode (above) is the bigger part.
+- [ ] WAL records are checksummed with FNV-1a too (`logger.rs`), on every
+  commit's write path. Same fix would need a WAL format version.
 
 ## Bugs
 

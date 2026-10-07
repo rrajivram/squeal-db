@@ -16,7 +16,7 @@ use crate::{
     db::{DBFile, DBSizeType, Header},
     error::StoreError,
     logger::{LsnClock, LsnId},
-    page::{PAGE_MAGIC, Page, PageHeader, PageId, fnv1a_32},
+    page::{CURRENT_PAGE_FORMAT_VERSION, PAGE_MAGIC, Page, PageHeader, PageId},
     pages::content::PageContentRegistry,
     utils::shardedpq::ShardedPQ,
 };
@@ -636,7 +636,7 @@ where
             // overwrites this again with the true data checksum once it
             // runs — this is only about the header being honest about
             // disk contents in the meantime.
-            let zero_checksum = fnv1a_32(&vec![0u8; header.page_data_size as usize]);
+            let zero_checksum = header.checksum_of(&vec![0u8; header.page_data_size as usize]);
             header.set_has_overflow();
             header.set_next_page(first_page);
             self.write_page_header(page_id, &header)?;
@@ -1585,7 +1585,7 @@ fn write_page(
         let first_len = (header.page_data_size as usize).min(data.len());
         let mut first_chunk = vec![0u8; header.page_data_size as usize];
         first_chunk[..first_len].copy_from_slice(&data[..first_len]);
-        header.checksum = fnv1a_32(&first_chunk);
+        header.checksum = header.checksum_of(&first_chunk);
         let mut header_bytes = to_allocvec(&header).unwrap_or_default();
         if header_bytes.len() < page_overhead {
             header_bytes.append(&mut vec![0u8; page_overhead - header_bytes.len()]);
@@ -1604,7 +1604,10 @@ fn write_page(
             if chunk_len > 0 {
                 chunk[..chunk_len].copy_from_slice(&data[start..start + chunk_len]);
             }
-            cur_header.checksum = fnv1a_32(&chunk);
+            // Read back off disk, so in whatever format it was last written
+            // in: rewritten, it is the current one.
+            cur_header.format_version = CURRENT_PAGE_FORMAT_VERSION;
+            cur_header.checksum = cur_header.checksum_of(&chunk);
             let mut cur_header_bytes = to_allocvec(&cur_header)?;
             if cur_header_bytes.len() < page_overhead {
                 cur_header_bytes.append(&mut vec![0u8; page_overhead - cur_header_bytes.len()]);
@@ -1687,7 +1690,7 @@ fn read_page(
             &mut all_data,
             page_offset(page_id, page_size, first_offset) + page_overhead as u64,
         )?;
-        if header.checksum != fnv1a_32(&all_data) {
+        if header.checksum != header.checksum_of(&all_data) {
             return Err(StoreError::PageChecksumMismatch(page_id));
         }
         let primary_header = header;
@@ -1720,7 +1723,7 @@ fn read_page(
             // Verified per physical page, against its own header — not
             // against some checksum over the whole reassembled object — the
             // same granularity write_page computed it at.
-            if cur_header.checksum != fnv1a_32(&chunk) {
+            if cur_header.checksum != cur_header.checksum_of(&chunk) {
                 return Err(StoreError::PageChecksumMismatch(cur_page_id));
             }
             all_data.extend_from_slice(&chunk);
@@ -1745,7 +1748,7 @@ fn read_page(
         // zero-initialized buffer acts as padding.
         let mut bytes = vec![0u8; page_size as usize];
         file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
-        if header.checksum != fnv1a_32(&bytes[page_overhead..]) {
+        if header.checksum != header.checksum_of(&bytes[page_overhead..]) {
             return Err(StoreError::PageChecksumMismatch(page_id));
         }
         Ok(Page::from_bytes(&bytes, content_registry, page_overhead)?)
@@ -2593,7 +2596,7 @@ mod tests {
                 0,
                 page_count,
                 PAGE_SIZE,
-                TEST_MAX_INDEX_KEY_SIZE,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
             ))
             .unwrap(),
         );
@@ -2611,6 +2614,64 @@ mod tests {
         let err = buf2.get_page(page_id).unwrap_err();
         assert!(matches!(err, StoreError::PageChecksumMismatch(id) if id == page_id));
         let _ = buf2.shutdown();
+    }
+
+    // A page written in format 1 carries an FNV-1a checksum; it reads back
+    // as it always did, and is CRC-32 once written again.
+    #[test]
+    fn test_a_format_1_page_verifies_with_fnv_and_is_rewritten_with_crc() {
+        use crate::page::{CURRENT_PAGE_FORMAT_VERSION, FNV_PAGE_FORMAT_VERSION, fnv1a_32};
+        let (buf, page_counter, file) = make_buffer_ps(PAGE_SIZE, 0, 10);
+        let page_id = buf.alloc_page(false).unwrap();
+        let page = Page::new_data(PAGE_SIZE, TEST_MIN_OVERHEAD);
+        page.add_tuple(Tuple::new(1, b"hello")).unwrap();
+        buf.write_page(page_id, &page).unwrap();
+        buf.shutdown().unwrap();
+
+        let at = super::page_offset(page_id, PAGE_SIZE, 0);
+        let mut data = vec![0u8; PAGE_SIZE as usize - TEST_MIN_OVERHEAD];
+        file.pread(&mut data, at + TEST_MIN_OVERHEAD as u64).unwrap();
+        let header_at = |file: &MemFile| {
+            super::read_page_header(page_id, file, PAGE_SIZE, 0, TEST_MIN_OVERHEAD).unwrap()
+        };
+        let mut header = header_at(&file);
+        assert_eq!(header.format_version, CURRENT_PAGE_FORMAT_VERSION);
+        assert_eq!(header.checksum, crc32fast::hash(&data));
+        // What a build before format 2 wrote.
+        header.format_version = FNV_PAGE_FORMAT_VERSION;
+        header.checksum = fnv1a_32(&data);
+        file.pwrite(&postcard::to_allocvec(&header).unwrap(), at).unwrap();
+
+        let reopen = |file: MemFile| {
+            let page_count = page_counter.load(Ordering::Relaxed);
+            let header = from_bytes::<Header>(&make_header_bytes(
+                0,
+                page_count,
+                PAGE_SIZE,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
+            ))
+            .unwrap();
+            PageBuffer::new(
+                PAGE_SIZE,
+                Arc::new(AtomicU64::new(page_count)),
+                file,
+                Arc::new(header),
+                10,
+                Arc::new(crate::logger::LsnClock::default()),
+                Arc::new(crate::pages::content::PageContentRegistry::builtin()),
+            )
+            .unwrap()
+        };
+        let buf2 = reopen(file.clone());
+        let page = buf2.get_page(page_id).unwrap();
+        assert!(page.get(1.into()).unwrap().is_some());
+        buf2.write_page(page_id, &page).unwrap();
+        buf2.shutdown().unwrap();
+        let header = header_at(&file);
+        assert_eq!(header.format_version, CURRENT_PAGE_FORMAT_VERSION);
+        file.pread(&mut data, at + TEST_MIN_OVERHEAD as u64).unwrap();
+        assert_eq!(header.checksum, crc32fast::hash(&data));
+        assert!(reopen(file).get_page(page_id).is_ok());
     }
 
     #[test]
@@ -2633,7 +2694,7 @@ mod tests {
                 0,
                 page_count,
                 PAGE_SIZE,
-                TEST_MAX_INDEX_KEY_SIZE,
+                TEST_MIN_MAX_INDEX_KEY_SIZE,
             ))
             .unwrap(),
         );
