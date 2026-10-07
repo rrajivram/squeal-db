@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -12,7 +13,7 @@ use crate::{
     error::StoreError,
     logger::LsnId,
     txn::TransactionId,
-    valueitem::{IndexKey, ValueItem},
+    valueitem::{IndexKey, ValueItem, ValueRef},
 };
 
 const NONE: u8 = 0;
@@ -287,6 +288,105 @@ impl Tuple {
 
     pub fn to(&self) -> Vec<u8> {
         to_allocvec(&self).unwrap()
+    }
+}
+
+// A tuple a reader is handed without it being copied out: what a page or
+// cursor lends (see PageTuple::at_ref, TableCursor::next_ref). Opaque on
+// purpose — a page that keeps its tuples as bytes will lend views into
+// those bytes behind this same surface. Today it is a borrowed Tuple, or,
+// from a page that decodes on demand or a version walked back to, an
+// owned one.
+#[derive(Debug, Clone)]
+pub struct TupleRef<'a>(Cow<'a, Tuple>);
+
+impl<'a> TupleRef<'a> {
+    pub(crate) fn borrowed(tuple: &'a Tuple) -> Self {
+        Self(Cow::Borrowed(tuple))
+    }
+
+    pub(crate) fn owned(tuple: Tuple) -> Self {
+        Self(Cow::Owned(tuple))
+    }
+
+    pub fn id(&self) -> IdRef<'_> {
+        IdRef(&self.0.id)
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.0.data
+    }
+
+    pub fn is_index(&self) -> bool {
+        self.0.is_index()
+    }
+
+    pub fn is_tombstoned(&self) -> bool {
+        self.0.is_tombstoned()
+    }
+
+    pub(crate) fn txn_id(&self) -> Option<TransactionId> {
+        self.0.txn_id
+    }
+
+    pub(crate) fn pre_lsn(&self) -> Option<LsnId> {
+        self.0.pre_lsn
+    }
+
+    pub fn to_owned(&self) -> Tuple {
+        self.0.clone().into_owned()
+    }
+
+    pub fn into_owned(self) -> Tuple {
+        self.0.into_owned()
+    }
+}
+
+// A tuple's id, lent with it (see TupleRef).
+#[derive(Debug, Clone, Copy)]
+pub struct IdRef<'a>(&'a DBIdType);
+
+impl<'a> IdRef<'a> {
+    /// A row-id key's number; None for a column key.
+    pub fn as_int(&self) -> Option<u64> {
+        match self.0 {
+            DBIdType::Int(i) => Some(*i),
+            DBIdType::Rec(_) => None,
+        }
+    }
+
+    /// A column key's fields, in order; None for a row-id key.
+    pub fn key_values(&self) -> Option<impl ExactSizeIterator<Item = ValueRef<'a>> + 'a> {
+        match self.0 {
+            DBIdType::Int(_) => None,
+            DBIdType::Rec(k) => Some(k.values().iter().map(ValueItem::as_ref)),
+        }
+    }
+
+    pub fn to_owned(&self) -> DBIdType {
+        self.0.clone()
+    }
+
+    // `f` of this id as a DBIdType, for what looks ids up by one.
+    pub(crate) fn with_owned<R>(&self, f: impl FnOnce(&DBIdType) -> R) -> R {
+        f(self.0)
+    }
+
+    // DBIdType's own order (see its Ord) against an owned id.
+    pub(crate) fn cmp_owned(&self, other: &DBIdType) -> std::cmp::Ordering {
+        self.0.cmp(other)
+    }
+
+    // Where this id lies against `range` (see KeyRange::position); None
+    // for a row-id key, which no key range applies to.
+    pub(crate) fn range_position(
+        &self,
+        range: &crate::cursor::KeyRange,
+    ) -> Option<std::cmp::Ordering> {
+        match self.0 {
+            DBIdType::Rec(k) => Some(range.position(k)),
+            DBIdType::Int(_) => None,
+        }
     }
 }
 

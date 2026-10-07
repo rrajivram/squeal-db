@@ -1,7 +1,7 @@
 use crate::{
     db::DBSizeType,
     error::StoreError,
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
 };
 
 pub mod anytuple;
@@ -19,6 +19,18 @@ pub trait PageTuple: Send + Sync {
 
     /// The `i`th tuple in the page's own order, if there are that many.
     fn at(&self, i: usize) -> Option<TupleType>;
+
+    /// `at`, lent rather than copied (see TupleRef) where the page holds
+    /// tuples it can lend; the default copies.
+    fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
+        self.at(i).map(TupleRef::owned)
+    }
+
+    /// Where `id` is in the page's own order (`at`), told where it probably
+    /// is as `get_hinted` is. The default looks at every tuple.
+    fn find_hinted(&self, id: &DBIdType, _hint: usize) -> Result<Option<usize>, StoreError> {
+        Ok((0..self.count()?).find(|&i| self.at(i).is_some_and(|t| t.id == *id)))
+    }
 
     /// Where the first tuple at or after `lower` is, in the page's own
     /// order (`at`) — `count` if none.

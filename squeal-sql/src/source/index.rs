@@ -6,7 +6,7 @@ use store::{
     cursor::KeyRange,
     cursor::{Cursor, RangeCursor},
     db::{DBFile, Db},
-    tuple::{DBIdType, Tuple},
+    tuple::DBIdType,
     txn::Transaction,
     valueitem::{IndexKey, ValueItem},
 };
@@ -179,27 +179,10 @@ where
         self
     }
 
-    // The table row an entry points to, at the scan's snapshot. None if it
-    // isn't visible there, which the entry being visible should rule out.
-    fn fetch_row(
-        &mut self,
-        db: &Arc<Db<F>>,
-        entry: &Tuple,
-    ) -> Result<Option<IndexKey>, SchemaError> {
-        let identity = from_bytes::<IndexKey>(entry.data())?;
-        let id = if self.pk_positions.is_some() {
-            DBIdType::Rec(identity)
-        } else {
-            match identity.values() {
-                [ValueItem::Integer(n)] => DBIdType::Int(*n as u64),
-                other => {
-                    return Err(SchemaError::InternalSchemaError(format!(
-                        "index {} points to a row id that isn't one integer: {other:?}",
-                        self.index_name()
-                    )));
-                }
-            }
-        };
+    // The table row an entry points to (its `id`, see row_id), at the
+    // scan's snapshot. None if it isn't visible there, which the entry
+    // being visible should rule out.
+    fn fetch_row(&mut self, db: &Arc<Db<F>>, id: DBIdType) -> Result<Option<IndexKey>, SchemaError> {
         let rows = self.table.partitions[self.part].rows();
         let Some(tuple) = db.find_as(rows, id.clone(), self.cursor.reader())? else {
             return Ok(None);
@@ -207,6 +190,20 @@ where
         let row = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
         self.last_id = Some(id);
         Ok(Some(row))
+    }
+
+    // The table row id an index entry's data holds: the PRIMARY KEY's
+    // values, or (`keyed` false: no PRIMARY KEY) a row id. Err(the
+    // identity) for a row id that isn't one integer.
+    fn row_id(data: &[u8], keyed: bool) -> Result<Result<DBIdType, IndexKey>, SchemaError> {
+        let identity = from_bytes::<IndexKey>(data)?;
+        if keyed {
+            return Ok(Ok(DBIdType::Rec(identity)));
+        }
+        Ok(match identity.values() {
+            [ValueItem::Integer(n)] => Ok(DBIdType::Int(*n as u64)),
+            _ => Err(identity),
+        })
     }
 
     fn index_name(&self) -> String {
@@ -274,22 +271,32 @@ where
         let start = self.timer.start();
         if let Some(db) = self.lookup.clone() {
             loop {
-                let Some(entry) = self.cursor.next()? else {
+                let Some(entry) = self.cursor.next_ref()? else {
                     self.last_id = None;
                     crate::source::timing::add(&mut self.next_time, start);
                     return Ok(None);
                 };
-                if let Some(row) = self.fetch_row(&db, &entry)? {
+                let id = match Self::row_id(entry.data(), self.pk_positions.is_some())? {
+                    Ok(id) => id,
+                    Err(other) => {
+                        return Err(SchemaError::InternalSchemaError(format!(
+                            "index {} points to a row id that isn't one integer: {:?}",
+                            self.index_name(),
+                            other.values()
+                        )));
+                    }
+                };
+                if let Some(row) = self.fetch_row(&db, id)? {
                     crate::source::timing::add(&mut self.next_time, start);
                     return Ok(Some(row));
                 }
             }
         }
-        let Some(entry) = self.cursor.next()? else {
+        let Some(entry) = self.cursor.next_ref()? else {
             crate::source::timing::add(&mut self.next_time, start);
             return Ok(None);
         };
-        let DBIdType::Rec(key) = entry.id() else {
+        let Some(key) = entry.id().key_values() else {
             return Err(SchemaError::InternalSchemaError(format!(
                 "index {} has an entry without a column key",
                 self.index_name()
@@ -299,9 +306,9 @@ where
         let mut row = vec![ValueItem::Null; self.fields.len()];
         // zip stops at the indexed columns: a non-unique index's key goes
         // on to carry the row identity, which the data holds as well.
-        for (value, &pos) in key.values().iter().zip(&self.key_positions) {
+        for (value, &pos) in key.zip(&self.key_positions) {
             if wanted(pos) {
-                row[pos] = value.clone();
+                row[pos] = value.to_owned();
             }
         }
         if let Some(pk) = &self.pk_positions

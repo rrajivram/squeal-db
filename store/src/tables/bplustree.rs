@@ -10,8 +10,9 @@ use crate::{
     error::StoreError,
     logger::{Logger, LsnId},
     page::{Page, PageId, USABLE_DATA_MARGIN},
+    pages::PageTuple,
     table::{Table, TableIdType, TableType},
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
     txn::{TransactionId, TransactionManager},
 };
 
@@ -1165,28 +1166,27 @@ where
         Ok(out)
     }
 
-    // Resolves an index leaf entry (a Tuple whose `.data` is a serialized
-    // Node::Leaf pointer, not real row content — see insert_index) to the
-    // actual row it points to, and where it was: its data page and position
-    // there. `last`, where the previous entry's row was, is where a scan
-    // in key order finds this one too, more often than not — one past it
-    // on the same page (see PageTuple::get_hinted).
-    pub(crate) fn resolve_index_entry(
+    // Where the row an index leaf entry points to is (the entry's `.data`
+    // is a serialized Node::Leaf pointer, not real row content — see
+    // insert_index): a snapshot of its data page's content to read it
+    // from, the page, and its position there. `last`, where the previous
+    // entry's row was, is where a scan in key order finds this one too,
+    // more often than not — one past it on the same page (see
+    // PageTuple::find_hinted).
+    pub(crate) fn locate_index_entry(
         &self,
-        entry: &Tuple,
+        entry: &TupleRef,
         last: Option<(PageId, usize)>,
-    ) -> Result<Option<(Tuple, PageId, usize)>, StoreError> {
-        match from_bytes::<Node>(&entry.data)? {
+    ) -> Result<Option<(Arc<dyn PageTuple>, PageId, usize)>, StoreError> {
+        match from_bytes::<Node>(entry.data())? {
             Node::Leaf(data_page_id) => {
                 let hint = match last {
                     Some((page, at)) if page == data_page_id => at + 1,
                     _ => usize::MAX,
                 };
-                Ok(self
-                    .buffer
-                    .get_page(data_page_id)?
-                    .get_hinted(&entry.id, hint)?
-                    .map(|(t, at)| (t, data_page_id, at)))
+                let content = self.buffer.get_page(data_page_id)?.content();
+                let at = entry.id().with_owned(|id| content.find_hinted(id, hint))?;
+                Ok(at.map(|at| (content, data_page_id, at)))
             }
             // STORE_AUDIT.md S8: see route_to_leaf's identical comment —
             // a leaf page holding an inner routing entry instead of a
@@ -1194,7 +1194,7 @@ where
             // reachable outcome of any real write path.
             Node::Inner(_) => Err(StoreError::Corruption(format!(
                 "expected a leaf entry, found an inner routing entry at {:?}",
-                entry.id
+                entry.id()
             ))),
         }
     }

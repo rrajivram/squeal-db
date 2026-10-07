@@ -1,12 +1,13 @@
 use std::{ops::Bound, sync::Arc};
 
 use crate::{
-    db::{DBFile, Db},
+    db::{DBFile, Db, Visible},
     error::StoreError,
     page::{Page, PageId, PageTupleIterator},
+    pages::PageTuple,
     table::TableIdType,
     tables::bplustree::BPlusTree,
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
     txn::{Transaction, TransactionId},
     valueitem::{IndexKey, ValueItem},
 };
@@ -39,7 +40,7 @@ impl KeyRange {
     // Where `key` lies relative to the range: Less (before it), Equal
     // (inside), Greater (after it). Keys come in ascending order, so the
     // first Greater ends a scan.
-    fn position(&self, key: &IndexKey) -> std::cmp::Ordering {
+    pub(crate) fn position(&self, key: &IndexKey) -> std::cmp::Ordering {
         use std::cmp::Ordering::*;
         let values = key.values();
         for (i, p) in self.prefix.iter().enumerate() {
@@ -136,6 +137,7 @@ pub struct TableCursor<F: DBFile + 'static> {
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: ScanTxn,
+    lent: Lent,
 }
 
 // One index leaf's entries from a starting key on, read in place from a
@@ -156,12 +158,41 @@ impl LeafEntries {
         }
     }
 
-    fn next(&mut self, leaf: &Page) -> Result<Option<Tuple>, StoreError> {
+    // The next entry's position (see PageTupleIterator::advance).
+    fn advance(&mut self, leaf: &Page) -> Result<Option<usize>, StoreError> {
         let entries = match &mut self.entries {
             Some(entries) => entries,
             None => self.entries.insert(leaf.iter_from(self.start.as_ref())?),
         };
-        Ok(entries.next())
+        Ok(entries.advance())
+    }
+
+    fn get(&self, i: usize) -> Option<TupleRef<'_>> {
+        self.entries.as_ref()?.get(i)
+    }
+}
+
+// What a cursor's next_ref last lent, kept where the TupleRef it hands out
+// borrows from: a position in the page snapshot the cursor is reading (a
+// TableCursor's), a position in a data page's snapshot (the row a
+// RangeCursor's index entry points to), or a version walked back to (see
+// Db::visible_version), which no page holds.
+enum Lent {
+    Nothing,
+    At(usize),
+    Row(Arc<dyn PageTuple>, usize),
+    Owned(Tuple),
+}
+
+impl Lent {
+    // `page` is the snapshot an At position is in.
+    fn get<'a>(&'a self, page: Option<&'a PageTupleIterator>) -> Option<TupleRef<'a>> {
+        match self {
+            Lent::Nothing => None,
+            Lent::At(i) => page?.get(*i),
+            Lent::Row(content, i) => content.at_ref(*i),
+            Lent::Owned(t) => Some(TupleRef::borrowed(t)),
+        }
     }
 }
 
@@ -189,8 +220,9 @@ pub struct RangeCursor<F: DBFile + 'static> {
     // can stop instead of walking the rest of the tree.
     done: bool,
     // Where the last entry's row was (data page, position): the next row
-    // is usually just after it (see BPlusTree::resolve_index_entry).
+    // is usually just after it (see BPlusTree::locate_index_entry).
     last_row: Option<(PageId, usize)>,
+    lent: Lent,
 }
 
 impl<F: DBFile> TableCursor<F>
@@ -215,10 +247,46 @@ where
             current_page_id,
             current_page,
             transaction,
+            lent: Lent::Nothing,
         })
     }
 
-    fn next_tuple(&mut self) -> Result<Option<Tuple>, StoreError> {
+    /// The next row this cursor's transaction sees, lent (see TupleRef):
+    /// what `next` yields, without the copy. Valid until the next call.
+    pub fn next_ref(&mut self) -> Result<Option<TupleRef<'_>>, StoreError> {
+        let reader = self.transaction.id();
+        // See Db::find: a finished reader may not keep scanning.
+        self.db.require_active(&reader)?;
+        // Loops rather than resolving just one raw row per call: a single
+        // physical row can be invisible for two different reasons, and
+        // either one must make the cursor move on to the next row instead
+        // of stopping or surfacing something the caller shouldn't see.
+        //   - an in-flight insert with nothing before it: no version this
+        //     reader sees, which a concurrent writer racing the scan makes
+        //     entirely reachable, not just theoretical.
+        //   - a tombstone: the key was removed (a committed remove's
+        //     tombstone, matching Db::find's own check) — it must be
+        //     treated as absent, the same way Db::find does.
+        self.lent = loop {
+            let Some(i) = self.next_position()? else {
+                self.lent = Lent::Nothing;
+                return Ok(None);
+            };
+            let tuple = self.current_iter.get(i).ok_or_else(|| {
+                StoreError::UnknownError(format!("no tuple at position {i} of its page"))
+            })?;
+            match self.db.visible_version(&tuple, &reader)? {
+                Visible::Itself => break Lent::At(i),
+                Visible::Ancestor(t) => break Lent::Owned(t),
+                Visible::Not => continue,
+            }
+        };
+        Ok(self.lent.get(Some(&self.current_iter)))
+    }
+
+    // The position of the next row on the page being read, moving on to
+    // the next page when this one is done.
+    fn next_position(&mut self) -> Result<Option<usize>, StoreError> {
         // Loop, not a single step: a data page can be EMPTY (every row on it
         // removed and reclaimed, or relocated away to the tail) while still
         // sitting in the chain. Advancing exactly one page and returning
@@ -227,8 +295,8 @@ where
         // hundreds, found by the crash harness's scan check
         // (TXN_SIMPLIFICATION_PLAN.md phase 0).
         loop {
-            if let Some(t) = self.current_iter.next() {
-                return Ok(Some(t));
+            if let Some(i) = self.current_iter.advance() {
+                return Ok(Some(i));
             }
             let new_page = self
                 .db
@@ -276,6 +344,7 @@ where
             range_idx: 0,
             done: false,
             last_row: None,
+            lent: Lent::Nothing,
         })
     }
 
@@ -319,6 +388,7 @@ where
             last_row: None,
             ranges: Some(ranges),
             range_idx: 0,
+            lent: Lent::Nothing,
         })
     }
 
@@ -413,13 +483,13 @@ where
     // leaf-to-leaf via the leaf sibling chain once the current leaf is
     // exhausted. Mirrors TableCursor::next_tuple's pattern, but over index
     // leaves instead of data pages.
-    fn next_index_entry(&mut self, table: &BPlusTree<F>) -> Result<Option<Tuple>, StoreError> {
-        // Same loop as TableCursor::next_tuple, for the same reason: an
+    fn next_index_entry(&mut self, table: &BPlusTree<F>) -> Result<Option<usize>, StoreError> {
+        // Same loop as TableCursor::next_position, for the same reason: an
         // index leaf whose every entry was removed is still in the leaf
         // chain, and must be skipped rather than end the scan.
         loop {
-            if let Some(t) = self.current_iter.next(&self.current_leaf)? {
-                return Ok(Some(t));
+            if let Some(i) = self.current_iter.advance(&self.current_leaf)? {
+                return Ok(Some(i));
             }
             match table.next_leaf_page(&self.current_leaf)? {
                 Some(next_leaf) => {
@@ -432,24 +502,25 @@ where
     }
 }
 
-impl<F: DBFile> Cursor for RangeCursor<F>
+impl<F: DBFile> RangeCursor<F>
 where
     F: DBFile<Item = F> + 'static,
 {
-    type Item = Tuple;
+    /// The next row within the range this cursor's transaction sees, lent
+    /// (see TupleRef): what `next` yields, without the copy. Valid until
+    /// the next call.
     // Loops rather than resolving just one raw row per call: a single
     // physical row can be invisible for two different reasons, and either
     // one must make the cursor move on to the next row instead of
     // stopping or surfacing something the caller shouldn't see.
-    //   - find_last_committed returns None when the row's writer isn't
-    //     committed and there's no committed ancestor to walk back to (an
-    //     in-flight insert with nothing before it) — the old `.unwrap()`
-    //     here would panic on exactly this, which a concurrent writer
-    //     racing the scan makes entirely reachable, not just theoretical.
-    //   - a resolved-but-tombstoned tuple means the key was removed (a
-    //     committed remove's tombstone, matching Db::find's own check) —
-    //     it must be treated as absent, the same way Db::find does.
-    fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
+    //   - an in-flight insert with nothing before it: no version this
+    //     reader sees, which a concurrent writer racing the scan makes
+    //     entirely reachable, not just theoretical.
+    //   - a tombstone: the key was removed (a committed remove's
+    //     tombstone, matching Db::find's own check) — it must be treated
+    //     as absent, the same way Db::find does.
+    pub fn next_ref(&mut self) -> Result<Option<TupleRef<'_>>, StoreError> {
+        self.lent = Lent::Nothing;
         if self.done {
             return Ok(None);
         }
@@ -457,78 +528,101 @@ where
         let reader = self.transaction.id();
         // See Db::find: a finished reader may not keep scanning.
         self.db.require_active(&reader)?;
-        loop {
-            match self.next_index_entry(&table)? {
-                Some(entry) => {
-                    // The leaf containing `start` generally holds entries
-                    // both below and at/above it — skip the ones below.
-                    let before_start = match &self.start {
-                        Bound::Included(k) => entry.id < *k,
-                        Bound::Excluded(k) => entry.id <= *k,
-                        Bound::Unbounded => false,
-                    };
-                    if before_start {
-                        continue;
-                    }
-                    // Ascending leaf-chain order guarantees everything
-                    // from here on is also >= end, so this is a real
-                    // early-termination, not just a filter.
-                    let past_end = match &self.end {
-                        Bound::Included(k) => entry.id > *k,
-                        Bound::Excluded(k) => entry.id >= *k,
-                        Bound::Unbounded => false,
-                    };
-                    let range = self.ranges.as_ref().map(|r| &r[self.range_idx]);
-                    let range_position = match (range, &entry.id) {
-                        (Some(r), DBIdType::Rec(k)) => r.position(k),
-                        (Some(_), _) => {
-                            return Err(StoreError::UnknownError(
-                                "a key-range scan needs a table keyed by IndexKey".into(),
-                            ));
-                        }
-                        (None, _) => std::cmp::Ordering::Equal,
-                    };
-                    if range_position == std::cmp::Ordering::Less {
-                        continue;
-                    }
-                    if range_position == std::cmp::Ordering::Greater && !past_end {
-                        // This entry may well be in a later range: the
-                        // repositioned scan reads it again from there.
-                        if self.next_range(&table)? {
-                            continue;
-                        }
-                    }
-                    if past_end || range_position == std::cmp::Ordering::Greater {
-                        self.done = true;
-                        return Ok(None);
-                    }
-                    // Resolve the index entry's Node::Leaf pointer to the
-                    // real row. None here would mean the index still has
-                    // an entry for a row that's already gone from its data
-                    // page — the same kind of transient inconsistency
-                    // remove()'s own retry logic exists to close, not a
-                    // new failure mode this cursor needs to invent
-                    // handling for; skip and move on rather than erroring
-                    // the whole scan over one stale entry.
-                    let Some((tuple, page, at)) =
-                        table.resolve_index_entry(&entry, self.last_row)?
-                    else {
-                        continue;
-                    };
-                    self.last_row = Some((page, at));
-                    match self.db.find_visible_to(&tuple, &reader)? {
-                        Some(committed) if !committed.is_tombstoned() => {
-                            return Ok(Some(committed.into_owned()));
-                        }
-                        _ => continue,
-                    }
-                }
+        self.lent = loop {
+            let Some(i) = self.next_index_entry(&table)? else {
                 // The end of the tree ends a range too — the next one may
                 // lie earlier in the key order.
-                None if self.next_range(&table)? => continue,
-                None => return Ok(None),
+                if self.next_range(&table)? {
+                    continue;
+                }
+                return Ok(None);
+            };
+            let entry = self.entry(i)?;
+            // The leaf containing `start` generally holds entries both
+            // below and at/above it — skip the ones below.
+            let before_start = match &self.start {
+                Bound::Included(k) => entry.id().cmp_owned(k).is_lt(),
+                Bound::Excluded(k) => entry.id().cmp_owned(k).is_le(),
+                Bound::Unbounded => false,
+            };
+            if before_start {
+                continue;
             }
-        }
+            // Ascending leaf-chain order guarantees everything from here
+            // on is also >= end, so this is a real early-termination, not
+            // just a filter.
+            let past_end = match &self.end {
+                Bound::Included(k) => entry.id().cmp_owned(k).is_gt(),
+                Bound::Excluded(k) => entry.id().cmp_owned(k).is_ge(),
+                Bound::Unbounded => false,
+            };
+            let range_position = match &self.ranges {
+                Some(ranges) => entry.id().range_position(&ranges[self.range_idx]).ok_or_else(
+                    || {
+                        StoreError::UnknownError(
+                            "a key-range scan needs a table keyed by IndexKey".into(),
+                        )
+                    },
+                )?,
+                None => std::cmp::Ordering::Equal,
+            };
+            if range_position == std::cmp::Ordering::Less {
+                continue;
+            }
+            if range_position == std::cmp::Ordering::Greater && !past_end {
+                // This entry may well be in a later range: the
+                // repositioned scan reads it again from there.
+                if self.next_range(&table)? {
+                    continue;
+                }
+            }
+            if past_end || range_position == std::cmp::Ordering::Greater {
+                self.done = true;
+                return Ok(None);
+            }
+            // Resolve the index entry's Node::Leaf pointer to the real
+            // row. None here would mean the index still has an entry for
+            // a row that's already gone from its data page — the same kind
+            // of transient inconsistency remove()'s own retry logic exists
+            // to close, not a new failure mode this cursor needs to invent
+            // handling for; skip and move on rather than erroring the
+            // whole scan over one stale entry.
+            let entry = self.entry(i)?;
+            let Some((content, page, at)) = table.locate_index_entry(&entry, self.last_row)?
+            else {
+                continue;
+            };
+            self.last_row = Some((page, at));
+            let visible = {
+                let row = content.at_ref(at).ok_or_else(|| {
+                    StoreError::UnknownError(format!("no row at position {at} of {page:?}"))
+                })?;
+                self.db.visible_version(&row, &reader)?
+            };
+            match visible {
+                Visible::Itself => break Lent::Row(content, at),
+                Visible::Ancestor(t) => break Lent::Owned(t),
+                Visible::Not => continue,
+            }
+        };
+        Ok(self.lent.get(None))
+    }
+
+    // The index entry at position `i` of the leaf being read.
+    fn entry(&self, i: usize) -> Result<TupleRef<'_>, StoreError> {
+        self.current_iter.get(i).ok_or_else(|| {
+            StoreError::UnknownError(format!("no entry at position {i} of its index leaf"))
+        })
+    }
+}
+
+impl<F: DBFile> Cursor for RangeCursor<F>
+where
+    F: DBFile<Item = F> + 'static,
+{
+    type Item = Tuple;
+    fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
+        Ok(self.next_ref()?.map(TupleRef::into_owned))
     }
 
     // Same lookup `new()` did to find the leaf holding `start` — keeps
@@ -559,33 +653,8 @@ where
     F: DBFile<Item = F> + 'static,
 {
     type Item = Tuple;
-    // Loops rather than resolving just one raw row per call: a single
-    // physical row can be invisible for two different reasons, and either
-    // one must make the cursor move on to the next row instead of
-    // stopping or surfacing something the caller shouldn't see.
-    //   - find_last_committed returns None when the row's writer isn't
-    //     committed and there's no committed ancestor to walk back to (an
-    //     in-flight insert with nothing before it) — the old `.unwrap()`
-    //     here would panic on exactly this, which a concurrent writer
-    //     racing the scan makes entirely reachable, not just theoretical.
-    //   - a resolved-but-tombstoned tuple means the key was removed (a
-    //     committed remove's tombstone, matching Db::find's own check) —
-    //     it must be treated as absent, the same way Db::find does.
     fn next(&mut self) -> Result<Option<Self::Item>, StoreError> {
-        let reader = self.transaction.id();
-        // See Db::find: a finished reader may not keep scanning.
-        self.db.require_active(&reader)?;
-        loop {
-            match self.next_tuple()? {
-                Some(t) => match self.db.find_visible_to(&t, &reader)? {
-                    Some(committed) if !committed.is_tombstoned() => {
-                        return Ok(Some(committed.into_owned()));
-                    }
-                    _ => continue,
-                },
-                None => return Ok(None),
-            }
-        }
+        Ok(self.next_ref()?.map(TupleRef::into_owned))
     }
 
     // Same lookup `new()` did to find the table's first data page — keeps
@@ -1721,6 +1790,48 @@ mod tests {
         // Scans that own their transaction do not see the uncommitted row.
         assert_eq!(drain_keys(&mut db.prefix_scan(tid, p).unwrap()).len(), 1);
         db.commit(txn).unwrap();
+    }
+
+    // A row whose newest version is another transaction's uncommitted
+    // update: a scan lends the version before it (walked back to, not on
+    // any page — Lent::Owned), while the writer's own scan lends the page's
+    // (Lent::At / Lent::Row). next and next_ref agree.
+    #[test]
+    fn test_scans_lend_the_version_their_reader_sees() {
+        let keys = [sk(1, "a", 0), sk(2, "a", 0), sk(3, "a", 0)];
+        let (db, tid) = prefix_db("scan_lends_versions.db", &keys);
+        let writer = db.begin().unwrap();
+        db.update(
+            tid,
+            Tuple::new_with(DBIdType::Rec(sk(2, "a", 0)), b"new", None, None),
+            &writer,
+        )
+        .unwrap();
+
+        fn lent<F: DBFile<Item = F>>(c: &mut TableCursor<F>) -> Vec<Vec<u8>> {
+            std::iter::from_fn(|| c.next_ref().unwrap().map(|t| t.data().to_vec())).collect()
+        }
+        fn lent_range<F: DBFile<Item = F>>(c: &mut RangeCursor<F>) -> Vec<Vec<u8>> {
+            std::iter::from_fn(|| c.next_ref().unwrap().map(|t| t.data().to_vec())).collect()
+        }
+        let before = vec![b"v".to_vec(), b"v".to_vec(), b"v".to_vec()];
+        let after = vec![b"v".to_vec(), b"new".to_vec(), b"v".to_vec()];
+
+        assert_eq!(lent(&mut db.table_scan(tid).unwrap()), before);
+        assert_eq!(lent(&mut db.table_scan_in_txn(tid, &writer).unwrap()), after);
+        let all = |txn: Option<&Transaction>| match txn {
+            Some(txn) => db
+                .range_scan_bounds_in_txn(tid, txn, Bound::Unbounded, Bound::Unbounded)
+                .unwrap(),
+            None => db.range_scan_bounds(tid, Bound::Unbounded, Bound::Unbounded).unwrap(),
+        };
+        assert_eq!(lent_range(&mut all(None)), before);
+        assert_eq!(lent_range(&mut all(Some(&writer))), after);
+
+        let owned: Vec<Vec<u8>> = scan_all(&db, tid).into_iter().map(|t| t.data().to_vec()).collect();
+        assert_eq!(owned, before);
+        db.commit(writer).unwrap();
+        assert_eq!(lent(&mut db.table_scan(tid).unwrap()), after);
     }
 
     // The cursor only borrows the id, so its transaction can end under it;

@@ -5,7 +5,7 @@ use crate::{
     db::DBSizeType,
     error::StoreError,
     pages::{PageTuple, anytuple::AnyTuplePage},
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
 };
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -63,6 +63,14 @@ impl PageTuple for FixedTuplePage {
 
     fn at(&self, i: usize) -> Option<Tuple> {
         self.data.at(i)
+    }
+
+    fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
+        self.data.at_ref(i)
+    }
+
+    fn find_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<usize>, StoreError> {
+        self.data.find_hinted(id, hint)
     }
 
     fn seek(&self, lower: std::ops::Bound<&DBIdType>) -> Result<usize, StoreError> {

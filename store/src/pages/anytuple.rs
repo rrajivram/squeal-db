@@ -7,7 +7,7 @@ use crate::{
     db::DBSizeType,
     error::StoreError,
     pages::PageTuple,
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
 };
 
 // A page's tuples, sorted by id (DBIdType's own Ord), in one Vec: a lookup
@@ -193,6 +193,17 @@ impl PageTuple for AnyTuplePage {
         self.data.get(i).cloned()
     }
 
+    fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
+        self.data.get(i).map(TupleRef::borrowed)
+    }
+
+    fn find_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<usize>, StoreError> {
+        if self.data.get(hint).is_some_and(|t| t.id == *id) {
+            return Ok(Some(hint));
+        }
+        Ok(self.position(id))
+    }
+
     fn seek(&self, lower: Bound<&DBIdType>) -> Result<usize, StoreError> {
         Ok(match lower {
             Bound::Included(k) => self.lower_bound(k),
@@ -221,12 +232,7 @@ impl PageTuple for AnyTuplePage {
     }
 
     fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
-        if let Some(t) = self.data.get(hint)
-            && t.id == *id
-        {
-            return Ok(Some((t.clone(), hint)));
-        }
-        Ok(self.position(id).map(|i| (self.data[i].clone(), i)))
+        Ok(self.find_hinted(id, hint)?.map(|i| (self.data[i].clone(), i)))
     }
 
     fn replace(&mut self, id: &DBIdType, tuple: Tuple) -> Result<Tuple, StoreError> {

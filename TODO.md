@@ -102,6 +102,27 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [ ] What's left on that scan's page loads is building each tuple's key
   (an IndexKey: a String and an Arc per tuple, ~22%) and freeing them on
   eviction (~8%) — pages readable without a decode (above).
+- [x] Borrowed tuples, step 1 of 3 (branch `tuple-ref`). `TupleRef` is
+  an opaque lent tuple (id as `IdRef`: an int, or key fields as
+  `ValueRef`s; data; the MVCC fields); `PageTuple::at_ref` lends one
+  (AnyTuplePage/FixedTuplePage borrow, the rest copy), and
+  `TableCursor`/`RangeCursor::next_ref` lend the row their reader sees —
+  from the page snapshot, or an ancestor version walked back to — with no
+  per-row Tuple clone. Visibility runs on txn_id/pre_lsn alone
+  (`Db::walk_back`, `visible_version`). The owned `next` is `next_ref` +
+  a copy. Table, index and lookup sources, CREATE INDEX, FK checks and
+  ANALYZE read through it. Warm, against main: orders `count(*)` 41.5 ->
+  37 ms, 100k-row range count 19.5 -> 17.3 ms, a filtered scan of orders
+  71 -> 66 ms, order_details (bigger than the cache) 376 -> 361 ms.
+- [ ] Step 2: a page that keeps its tuples as bytes and lends views into
+  them (slot directory with inline key prefixes, keys in ValueItem's byte
+  form so ties compare as ValueRefs, a fixed-width record header), behind
+  the same TupleRef/IdRef. Gate: `bench_repeated_get_on_an_already_
+  loaded_page` even with AnyTuplePage. Step 3: make it the default, as a
+  page format version. Still owned on the way: the nested-loop join's
+  inner rows (they read through `self` while the cursor lends), Db::find,
+  and TableSource's `last_id` (an id copy per row that only UPDATE/DELETE
+  read — free with a borrowed key, an allocation once keys are bytes).
 - [ ] Concurrent scans don't scale: 4 threads scanning order_details finish
   no more queries than 1 (8 do worse), on main as on this branch. Not
   locks — the threads are in malloc/free (system allocator) for those keys

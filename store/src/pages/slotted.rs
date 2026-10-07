@@ -562,6 +562,10 @@ impl PageTuple for SlottedPage {
         Ok(self.find_exact(id)?.is_some())
     }
 
+    fn find_hinted(&self, id: &DBIdType, _hint: usize) -> Result<Option<usize>, StoreError> {
+        self.find_exact(id)
+    }
+
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
         match self.find_exact(id)? {
             Some(idx) => Ok(Some(self.decode_at(idx)?)),

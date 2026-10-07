@@ -51,6 +51,21 @@ impl ValueRef<'_> {
     }
 }
 
+impl ValueItem {
+    /// This value, borrowed (see ValueRef).
+    pub fn as_ref(&self) -> ValueRef<'_> {
+        match self {
+            ValueItem::Null => ValueRef::Null,
+            ValueItem::Integer(i) => ValueRef::Integer(*i),
+            ValueItem::Double(d) => ValueRef::Double(*d),
+            ValueItem::Datetime(d) => ValueRef::Datetime(*d),
+            ValueItem::Str((s, cap)) => ValueRef::Str(s, *cap),
+            ValueItem::Blob((b, cap)) => ValueRef::Blob(b, *cap),
+            ValueItem::Boolean(b) => ValueRef::Boolean(*b),
+        }
+    }
+}
+
 impl<'a> ValueRef<'a> {
     // One value off the front of `bytes` (ValueItem::to_bytes's form), and
     // how many bytes it took, padding included.

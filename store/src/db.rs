@@ -35,7 +35,7 @@ use crate::tables::bplustree::Decision;
 use crate::tables::bplustree::Written;
 use crate::temppool::{DEFAULT_TEMP_CACHE_BYTES, TempPool, TempStats};
 use crate::tuple::DBIdType;
-use crate::tuple::Tuple;
+use crate::tuple::{Tuple, TupleRef};
 use crate::txn::ConflictPolicy;
 use crate::txn::Transaction;
 use crate::txn::TransactionId;
@@ -662,6 +662,23 @@ enum Visibility<'a> {
     Found(Cow<'a, Tuple>),
     NoAncestor,
     MissingUndoRecord,
+}
+
+// Db::walk_back's result: Visibility's cases, with the version it started
+// from (Itself) told apart from an ancestor it walked back to.
+enum Walk {
+    Itself,
+    Ancestor(Tuple),
+    NoAncestor,
+    MissingUndoRecord,
+}
+
+/// What a cursor yields for a lent tuple (see Db::visible_version): the
+/// tuple itself, the ancestor version its reader sees instead, or nothing.
+pub(crate) enum Visible {
+    Itself,
+    Ancestor(Tuple),
+    Not,
 }
 
 impl<F: DBFile + 'static> Db<F>
@@ -2308,63 +2325,102 @@ where
         tuple: &'a Tuple,
         is_visible: impl Fn(&TransactionId) -> bool,
     ) -> Result<Visibility<'a>, StoreError> {
-        if let Some(txn) = tuple.txn_id {
-            if is_visible(&txn) {
-                Ok(Visibility::Found(Cow::Borrowed(tuple)))
-            } else {
-                let mut tuple = tuple.clone();
-                loop {
-                    // A genuine dead end: this tuple has no prior version
-                    // at all (only true of a fresh INSERT), so there is
-                    // nothing further back to find. Must NOT be treated
-                    // the same as a missing undo record below — see
-                    // Visibility's own doc comment.
-                    let Some(pre_lsn) = tuple.pre_lsn else {
-                        return Ok(Visibility::NoAncestor);
-                    };
+        Ok(
+            match self.walk_back(tuple.txn_id, tuple.pre_lsn, &tuple.id, is_visible)? {
+                Walk::Itself => Visibility::Found(Cow::Borrowed(tuple)),
+                Walk::Ancestor(t) => Visibility::Found(Cow::Owned(t)),
+                Walk::NoAncestor => Visibility::NoAncestor,
+                Walk::MissingUndoRecord => Visibility::MissingUndoRecord,
+            },
+        )
+    }
 
-                    // Tolerate a missing record: an aborting txn's undo can
-                    // be discarded concurrently once its rows are reverted. If we
-                    // can't walk further, treat the row as ambiguous rather than
-                    // panicking or silently asserting it has no ancestor.
-                    let Some(op) = self.versions.find(pre_lsn) else {
-                        return Ok(Visibility::MissingUndoRecord);
-                    };
-                    let next_tuple = match op {
-                        Operation::Add { post, .. } => post.tuple,
-                        Operation::Mod { pre, .. } => pre.tuple,
-                        Operation::Del { pre, .. } => pre.tuple,
-                        // A record without a usable pre-image (a "redo-only"
-                        // Mod, or a Commit/Rollback marker) should never be
-                        // what a pre_lsn points at — defensive fallback,
-                        // matching the old code's leniency (it mapped every
-                        // Add/Del/Mod to a tuple unconditionally).
-                        _ => return Ok(Visibility::MissingUndoRecord),
-                    };
-                    let Some(next_txn) = next_tuple.txn_id else {
-                        return Ok(Visibility::NoAncestor);
-                    };
-                    if is_visible(&next_txn) {
-                        // next_tuple is the visible ancestor we walked back
-                        // to — return it, not the in-flight `tuple` we started
-                        // from (which belongs to a not-yet-visible txn and must
-                        // stay invisible to other readers).
-                        return Ok(Visibility::Found(Cow::Owned(next_tuple)));
-                    }
-                    tuple = next_tuple;
-                }
-            }
-        } else {
-            // STORE_AUDIT.md S8: every real insert/update/remove always
-            // sets txn_id — this used to be `panic!`, which for an
-            // embedded library is a process crash for the host. A
-            // corrupted or hand-crafted on-disk file could easily produce
-            // a tuple missing it; surface that as a typed error instead.
-            Err(StoreError::Corruption(format!(
-                "tuple {:?} has no txn_id",
-                tuple.id
-            )))
+    // resolve_visible's walk, from a version's writer (`txn_id`) and its
+    // pre-image's record (`pre_lsn`) alone — all it reads of the version
+    // it starts from, so a lent one (TupleRef) needs no copy. `id` names
+    // the row in an error.
+    fn walk_back(
+        &self,
+        txn_id: Option<TransactionId>,
+        pre_lsn: Option<LsnId>,
+        id: &dyn std::fmt::Debug,
+        is_visible: impl Fn(&TransactionId) -> bool,
+    ) -> Result<Walk, StoreError> {
+        // STORE_AUDIT.md S8: every real insert/update/remove always sets
+        // txn_id — this used to be `panic!`, which for an embedded library
+        // is a process crash for the host. A corrupted or hand-crafted
+        // on-disk file could easily produce a tuple missing it; surface
+        // that as a typed error instead.
+        let Some(txn) = txn_id else {
+            return Err(StoreError::Corruption(format!("tuple {id:?} has no txn_id")));
+        };
+        if is_visible(&txn) {
+            return Ok(Walk::Itself);
         }
+        let mut pre_lsn = pre_lsn;
+        loop {
+            // A genuine dead end: this version has no prior version at all
+            // (only true of a fresh INSERT), so there is nothing further
+            // back to find. Must NOT be treated the same as a missing undo
+            // record below — see Visibility's own doc comment.
+            let Some(lsn) = pre_lsn else {
+                return Ok(Walk::NoAncestor);
+            };
+            // Tolerate a missing record: an aborting txn's undo can be
+            // discarded concurrently once its rows are reverted. If we
+            // can't walk further, treat the row as ambiguous rather than
+            // panicking or silently asserting it has no ancestor.
+            let Some(op) = self.versions.find(lsn) else {
+                return Ok(Walk::MissingUndoRecord);
+            };
+            let next_tuple = match op {
+                Operation::Add { post, .. } => post.tuple,
+                Operation::Mod { pre, .. } => pre.tuple,
+                Operation::Del { pre, .. } => pre.tuple,
+                // A record without a usable pre-image (a "redo-only" Mod,
+                // or a Commit/Rollback marker) should never be what a
+                // pre_lsn points at — defensive fallback, matching the old
+                // code's leniency (it mapped every Add/Del/Mod to a tuple
+                // unconditionally).
+                _ => return Ok(Walk::MissingUndoRecord),
+            };
+            let Some(next_txn) = next_tuple.txn_id else {
+                return Ok(Walk::NoAncestor);
+            };
+            if is_visible(&next_txn) {
+                // next_tuple is the visible ancestor we walked back to —
+                // return it, not the in-flight version we started from
+                // (which belongs to a not-yet-visible txn and must stay
+                // invisible to other readers).
+                return Ok(Walk::Ancestor(next_tuple));
+            }
+            pre_lsn = next_tuple.pre_lsn;
+        }
+    }
+
+    /// The version of a lent tuple `reader` sees, if any, as a cursor
+    /// yields it: None where find_visible_to finds none or a tombstone.
+    pub(crate) fn visible_version(
+        &self,
+        tuple: &TupleRef,
+        reader: &TransactionId,
+    ) -> Result<Visible, StoreError> {
+        let walk = self.walk_back(tuple.txn_id(), tuple.pre_lsn(), &tuple.id(), |txn| {
+            self.tx_mgr.is_visible(txn, reader)
+        })?;
+        Ok(match walk {
+            Walk::Itself if !tuple.is_tombstoned() => Visible::Itself,
+            Walk::Ancestor(t) if !t.is_tombstoned() => Visible::Ancestor(t),
+            Walk::Itself | Walk::Ancestor(_) | Walk::NoAncestor => Visible::Not,
+            // See find_visible_to.
+            Walk::MissingUndoRecord => {
+                return Err(StoreError::Corruption(format!(
+                    "version record missing for pre_lsn of {:?} (reader {reader}, oldest active {:?})",
+                    tuple.id(),
+                    self.tx_mgr.oldest_active()
+                )));
+            }
+        })
     }
 
     // Write-write conflict guard for update()/remove(), called against the

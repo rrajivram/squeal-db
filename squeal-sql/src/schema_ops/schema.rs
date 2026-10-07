@@ -896,7 +896,7 @@ where
                 Some(txn) => self.db.table_scan_in_txn(part.rows(), txn)?,
                 None => self.db.table_scan(part.rows())?,
             };
-            while let Some(tuple) = cursor.next()? {
+            while let Some(tuple) = cursor.next_ref()? {
                 rows.push(table.decode_row(tuple.data(), None)?.values().to_vec());
                 count += 1;
             }
@@ -1011,7 +1011,7 @@ where
             .expect("checked present above");
         for part in &table.partitions {
             let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
-            while let Some(tuple) = cursor.next()? {
+            while let Some(tuple) = cursor.next_ref()? {
                 let row = table.decode_row(tuple.data(), None)?;
                 let value = &row.values()[pos];
                 if *value != ValueItem::Null {
@@ -1136,11 +1136,11 @@ where
             let txn = self.db.begin()?;
             for (part, tree) in table.partitions.iter().zip(&trees) {
                 let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
-                while let Some(tuple) = cursor.next()? {
+                while let Some(tuple) = cursor.next_ref()? {
                     let row = table.decode_row(tuple.data(), None)?;
-                    let identity = match tuple.id() {
-                        DBIdType::Rec(ik) => ik.clone(),
-                        DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
+                    let identity = match tuple.id().to_owned() {
+                        DBIdType::Rec(ik) => ik,
+                        DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(n as i64)])?,
                     };
                     let mut values = table.extract_field_values(&fields, row.values());
                     if !is_unique {
@@ -1362,7 +1362,7 @@ where
         stats.add_table(table.clone())?;
         for part in &table.partitions {
             let mut cursor = self.db.table_scan(part.rows())?;
-            while let Some(tuple) = cursor.next()? {
+            while let Some(tuple) = cursor.next_ref()? {
                 stats.record_row_sync(table.id, part.id, table.decode_row(tuple.data(), None)?);
             }
         }

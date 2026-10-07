@@ -52,10 +52,12 @@ impl<F> RowCursor<F>
 where
     F: DBFile<Item = F> + 'static,
 {
-    fn next(&mut self) -> Result<Option<store::tuple::Tuple>, store::error::StoreError> {
+    fn next_ref(
+        &mut self,
+    ) -> Result<Option<store::tuple::TupleRef<'_>>, store::error::StoreError> {
         match self {
-            RowCursor::Scan(c) => c.next(),
-            RowCursor::Seek(c) => c.next(),
+            RowCursor::Scan(c) => c.next_ref(),
+            RowCursor::Seek(c) => c.next_ref(),
         }
     }
 
@@ -227,9 +229,9 @@ where
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = self.timer.start();
-        if let Some(tuple) = self.cursor.next()? {
+        if let Some(tuple) = self.cursor.next_ref()? {
             let out = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
-            self.last_id = Some(tuple.id().clone());
+            self.last_id = Some(tuple.id().to_owned());
             crate::source::timing::add(&mut self.next_time, start);
             Ok(Some(out))
         } else {

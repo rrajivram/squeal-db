@@ -19,7 +19,7 @@ use crate::{
         content::{PageContentKind, PageContentRegistry},
         fixedtuple::FixedTuplePage,
     },
-    tuple::{DBIdType, Tuple},
+    tuple::{DBIdType, Tuple, TupleRef},
 };
 use atomic_bitfield::AtomicBitField as _;
 // Header fields are serialized before the data payload so the header can be
@@ -758,6 +758,12 @@ impl Page {
         }
     }
 
+    // A snapshot of the page's content, as iter() reads it: what a reader
+    // lends tuples from once the page's lock is let go.
+    pub(crate) fn content(&self) -> Arc<dyn PageTuple> {
+        Arc::clone(&self.inner.read().data)
+    }
+
     // iter(), from the first tuple at or after `lower`.
     pub(crate) fn iter_from(
         &self,
@@ -1114,6 +1120,23 @@ impl PageHeader {
 
     pub(crate) fn usable_data_size(&self) -> DBSizeType {
         self.page_data_size.saturating_sub(USABLE_DATA_MARGIN)
+    }
+}
+
+// By position, for a cursor that lends what it yields (see TableCursor::
+// next_ref): `advance` moves past a position, and `get` lends the tuple
+// there from the snapshot this iterator holds.
+impl PageTupleIterator {
+    pub(crate) fn advance(&mut self) -> Option<usize> {
+        let i = self.next;
+        (i < self.content.count().unwrap_or(0)).then(|| {
+            self.next += 1;
+            i
+        })
+    }
+
+    pub(crate) fn get(&self, i: usize) -> Option<TupleRef<'_>> {
+        self.content.at_ref(i)
     }
 }
 
