@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sql_parser::ddl::{
     ColumnDef, ColumnOption, CreateTable, ForeignKeyReference, TableConstraint, TableConstraintKind,
 };
+use sql_parser::expr::BinaryOp;
 use sql_parser::ident::Ident;
 use store::db::DBFile;
 use store::table::TableIdType;
@@ -16,6 +17,7 @@ use crate::constant::{DEFAULT_VAR_SIZE, MAX_TABLE_NAME_LEN};
 use crate::datatype::DataType;
 use crate::error::SchemaError;
 use crate::partition::{Partition, PartitionBound, PartitionKind, Partitioning};
+use crate::plan::eval::EvalExpr;
 use crate::schema_ops::schema::Schema;
 
 // A store-level Tuple wraps whatever's actually stored (row or index
@@ -201,6 +203,90 @@ impl RowLayout {
     fn fixed_count(row: &[u8]) -> Option<u64> {
         let count = u64::from_le_bytes(row.get(..ROW_COUNT_BYTES)?.try_into().ok()?);
         (count & FIXED_ROW != 0).then_some(count & !FIXED_ROW)
+    }
+}
+
+// One comparison a row is checked against before it is built (see
+// SqlTable::decode_row_if): column `pos` `op` a literal of the column's own
+// type. Only what a lent value answers exactly as WHERE would: integers,
+// datetimes, strings and booleans order plainly; a double (NaN, the two
+// zeros) or two different types (an error, or integer-against-double by
+// value) are WHERE's alone. WHERE still runs on every row this passes, so
+// it only ever spares building a row WHERE would then drop.
+#[derive(Debug, Clone)]
+pub(crate) struct ColumnTest {
+    pos: usize,
+    op: BinaryOp,
+    value: ValueItem,
+}
+
+impl ColumnTest {
+    /// The test `filter` is, if it is one: a column of `fields` compared
+    /// with a literal of its type, either way round.
+    pub(crate) fn of(fields: &[Arc<Field>], filter: &EvalExpr) -> Option<Self> {
+        let EvalExpr::Binary { lhs, op, rhs } = filter else {
+            return None;
+        };
+        let (pos, op, value) = match (lhs.as_ref(), rhs.as_ref()) {
+            (EvalExpr::Value(pos), EvalExpr::Literal(v)) => (*pos, op.clone(), v),
+            // `5 < x` is `x > 5`.
+            (EvalExpr::Literal(v), EvalExpr::Value(pos)) => {
+                let flipped = match op {
+                    BinaryOp::Lt => BinaryOp::Gt,
+                    BinaryOp::LtEq => BinaryOp::GtEq,
+                    BinaryOp::Gt => BinaryOp::Lt,
+                    BinaryOp::GtEq => BinaryOp::LtEq,
+                    other => other.clone(),
+                };
+                (*pos, flipped, v)
+            }
+            _ => return None,
+        };
+        let compares = matches!(
+            op,
+            BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+        );
+        let typed = matches!(
+            (fields.get(pos)?.datatype, value),
+            (DataType::Integer, ValueItem::Integer(_))
+                | (DataType::Datetime, ValueItem::Datetime(_))
+                | (DataType::Str(_), ValueItem::Str(_))
+                | (DataType::Boolean, ValueItem::Boolean(_))
+        );
+        (compares && typed).then(|| Self {
+            pos,
+            op,
+            value: value.clone(),
+        })
+    }
+
+    // Whether a row whose column holds `column` can pass WHERE: false only
+    // where the comparison is certainly not true — a NULL compares as
+    // NULL. A value of another type than the column's (it shouldn't hold
+    // one) is left to WHERE.
+    fn passes(&self, column: ValueRef) -> bool {
+        let literal = self.value.as_ref();
+        if column == ValueRef::Null {
+            return false;
+        }
+        if std::mem::discriminant(&column) != std::mem::discriminant(&literal) {
+            return true;
+        }
+        let ord = column.cmp(&literal);
+        match self.op {
+            BinaryOp::Eq => ord.is_eq(),
+            BinaryOp::NotEq => ord.is_ne(),
+            BinaryOp::Lt => ord.is_lt(),
+            BinaryOp::LtEq => ord.is_le(),
+            BinaryOp::Gt => ord.is_gt(),
+            BinaryOp::GtEq => ord.is_ge(),
+            _ => true,
+        }
     }
 }
 
@@ -1201,8 +1287,43 @@ impl SqlTable {
         wanted: Option<&[bool]>,
     ) -> Result<IndexKey, SchemaError> {
         let row: StoredRow = postcard::from_bytes(data)?;
+        self.decode_stored_row(&row, wanted)
+    }
+
+    /// decode_row, unless the row fails one of `tests` (see ColumnTest):
+    /// None then, with nothing of the row copied out. Only a fixed-width
+    /// row of the current version is tested — its columns are where the
+    /// schema says; any other row is decoded, for WHERE to judge.
+    pub(crate) fn decode_row_if(
+        &self,
+        data: &[u8],
+        wanted: Option<&[bool]>,
+        tests: &[ColumnTest],
+    ) -> Result<Option<IndexKey>, SchemaError> {
+        let row: StoredRow = postcard::from_bytes(data)?;
+        if !tests.is_empty()
+            && row.version == self.version()
+            && RowLayout::fixed_count(row.values).is_some()
+            && let Some(layout) = self.versions[row.version as usize].layout()
+            && layout.len() == row.values.len()
+        {
+            for test in tests {
+                let (value, _) = ValueRef::decode(layout.column(row.values, test.pos))?;
+                if !test.passes(value) {
+                    return Ok(None);
+                }
+            }
+        }
+        self.decode_stored_row(&row, wanted).map(Some)
+    }
+
+    fn decode_stored_row(
+        &self,
+        row: &StoredRow,
+        wanted: Option<&[bool]>,
+    ) -> Result<IndexKey, SchemaError> {
         if let Some(count) = RowLayout::fixed_count(row.values) {
-            return self.decode_fixed_row(&row, count, wanted);
+            return self.decode_fixed_row(row, count, wanted);
         }
         if row.version != self.version() {
             return self.reproject(&VersionedRow {

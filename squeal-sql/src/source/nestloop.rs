@@ -235,8 +235,8 @@ where
     // The inner row an entry of the sought tree gives: the row itself for
     // the table's own tree, or the row its identity points to for an index.
     fn inner_row(&self, part: usize, entry: &Tuple) -> Result<Option<IndexKey>, SchemaError> {
-        let tuple = match self.seek.index {
-            None => entry.clone(),
+        let id = match self.seek.index {
+            None => return Ok(Some(self.table.decode_row(entry.data(), None)?)),
             Some(_) => {
                 let identity = from_bytes::<IndexKey>(entry.data())?;
                 let id = if self.has_pk {
@@ -253,16 +253,16 @@ where
                         }
                     }
                 };
-                match self
-                    .db
-                    .find_as(self.table.partitions[part].rows(), id, self.reader)?
-                {
-                    Some(t) => t,
-                    None => return Ok(None),
-                }
+                id
             }
         };
-        Ok(Some(self.table.decode_row(tuple.data(), None)?))
+        // Read in place (find_as_with): the row's bytes are decoded, not
+        // copied out first.
+        self.db
+            .find_as_with(self.table.partitions[part].rows(), &id, self.reader, |row| {
+                self.table.decode_row(row.data(), None)
+            })?
+            .transpose()
     }
 
     fn combine(outer: &IndexKey, inner: &[ValueItem]) -> Result<IndexKey, SchemaError> {

@@ -184,12 +184,17 @@ where
     // being visible should rule out.
     fn fetch_row(&mut self, db: &Arc<Db<F>>, id: DBIdType) -> Result<Option<IndexKey>, SchemaError> {
         let rows = self.table.partitions[self.part].rows();
-        let Some(tuple) = db.find_as(rows, id.clone(), self.cursor.reader())? else {
+        // Read in place (find_as_with): the row's bytes are decoded, not
+        // copied out first.
+        let wanted = self.wanted.as_deref();
+        let Some(row) = db.find_as_with(rows, &id, self.cursor.reader(), |row| {
+            self.table.decode_row(row.data(), wanted)
+        })?
+        else {
             return Ok(None);
         };
-        let row = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
         self.last_id = Some(id);
-        Ok(Some(row))
+        Ok(Some(row?))
     }
 
     // The table row id an index entry's data holds: the PRIMARY KEY's

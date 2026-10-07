@@ -200,3 +200,95 @@ fn test_a_row_that_does_not_fit_its_columns_is_written_the_old_way() {
     assert_eq!(table.decode_row(&bytes, None).unwrap().values(), &values[..]);
     assert_eq!(postcard::from_bytes::<VersionedRow>(&bytes).unwrap().values.values(), &values[..]);
 }
+
+// A table scan passes over rows that fail a WHERE comparison before
+// building them (table.rs's ColumnTest). What it answers must be what
+// WHERE alone does: every comparison, either way round, with NULLs (which
+// no comparison is true of) — against the same query on a table whose
+// scan can't be tested that way, its rows written the old way.
+#[test]
+fn test_rows_passed_over_before_they_are_built_are_the_ones_where_drops() {
+    let c = conn();
+    for t in ["fixed", "walked"] {
+        run(
+            &c,
+            &format!(
+                "create table {t} (id integer not null, n integer, s varchar(8), b boolean, \
+                 d double, primary key(id))"
+            ),
+        )
+        .unwrap();
+    }
+    let schema = c.current_schema().unwrap();
+    let walked = schema.get_table("walked").unwrap();
+    let db = c.database.read().db.clone();
+    let txn = db.begin().unwrap();
+    for i in 0..40i64 {
+        let n = if i % 7 == 0 { "null".to_string() } else { (i % 5).to_string() };
+        let sv = if i % 6 == 0 { "null".to_string() } else { format!("'s{}'", i % 4) };
+        let b = if i % 9 == 0 { "null" } else if i % 2 == 0 { "true" } else { "false" };
+        run(&c, &format!("insert into fixed values ({i}, {n}, {sv}, {b}, {}.5)", i % 3)).unwrap();
+        // The same row, as a build before fixed-width rows wrote it.
+        let values = vec![
+            ValueItem::Integer(i),
+            if i % 7 == 0 { ValueItem::Null } else { ValueItem::Integer(i % 5) },
+            if i % 6 == 0 { ValueItem::Null } else { s(&format!("s{}", i % 4), 8) },
+            if i % 9 == 0 { ValueItem::Null } else { ValueItem::Boolean(i % 2 == 0) },
+            ValueItem::Double((i % 3) as f64 + 0.5),
+        ];
+        let data = postcard::to_allocvec(&VersionedRow {
+            version: walked.version(),
+            values: IndexKey::new_from(&values).unwrap(),
+        })
+        .unwrap();
+        let key = store::tuple::DBIdType::Rec(IndexKey::new_from(&values[..1]).unwrap());
+        db.insert(
+            walked.rows_tree(),
+            store::tuple::Tuple::new_with(key, &data, None, None),
+            &txn,
+        )
+        .unwrap();
+    }
+    db.commit(txn).unwrap();
+    for cond in [
+        "n = 3", "n <> 3", "n < 2", "n <= 2", "n > 2", "n >= 2", "2 < n", "3 = n",
+        "s = 's1'", "s <> 's1'", "s > 's1'", "'s2' >= s", "b = true", "b <> true",
+        "n > 1 and s = 's3'", "n > 1 and d > 1.0", "d > 1.0", "n > 1.5", "n = 1 or s = 's2'",
+        "n is null", "n > 0 and b = false and s < 's3'",
+    ] {
+        let q = |t: &str| rows(&c, &format!("select id, n, s from {t} where {cond} order by id"));
+        let plan = explain(&c, &format!("select id from fixed where {cond}"));
+        assert!(plan.contains("TableScan fixed"), "{cond}: {plan}");
+        assert_eq!(q("fixed"), q("walked"), "{cond}");
+    }
+    assert!(!rows(&c, "select id from fixed where n > 2").is_empty());
+}
+
+// Which of WHERE's terms a row is tested on before it is built: a column
+// against a literal of its own type, integers, datetimes, strings and
+// booleans only.
+#[test]
+fn test_only_plain_same_type_comparisons_are_tested_early() {
+    use crate::plan::eval::EvalExpr;
+    use crate::table::ColumnTest;
+    use sql_parser::expr::BinaryOp;
+    let c = setup();
+    let table = c.current_schema().unwrap().get_table("t").unwrap();
+    let cmp = |pos: usize, op: BinaryOp, v: ValueItem| EvalExpr::Binary {
+        lhs: Box::new(EvalExpr::Value(pos)),
+        op,
+        rhs: Box::new(EvalExpr::Literal(v)),
+    };
+    let tested = |e: &EvalExpr| ColumnTest::of(table.fields(), e).is_some();
+    assert!(tested(&cmp(0, BinaryOp::Gt, ValueItem::Integer(3))));
+    assert!(tested(&cmp(1, BinaryOp::Eq, s("x", 1))));
+    // Another type than the column's; arithmetic; a column against a column.
+    assert!(!tested(&cmp(0, BinaryOp::Gt, ValueItem::Double(3.0))));
+    assert!(!tested(&cmp(0, BinaryOp::Eq, s("3", 1))));
+    assert!(!tested(&cmp(0, BinaryOp::Plus, ValueItem::Integer(3))));
+    assert!(!tested(&EvalExpr::Binary {
+        lhs: Box::new(EvalExpr::Value(1)),
+        op: BinaryOp::Eq,
+        rhs: Box::new(EvalExpr::Value(2)),
+    }));
+}

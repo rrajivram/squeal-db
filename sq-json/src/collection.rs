@@ -759,10 +759,13 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
                     if multikey && !seen.insert(key.to_bytes()) {
                         continue;
                     }
-                    let Some(tuple) = db.find(state.tid, DBIdType::Rec(key), txn)? else {
+                    let Some(doc) = db.find_with(state.tid, &DBIdType::Rec(key), txn, |t| {
+                        postcard::from_bytes::<Document>(t.data())
+                    })?
+                    else {
                         continue;
                     };
-                    if !keep(postcard::from_bytes(tuple.data())?) {
+                    if !keep(doc?) {
                         break;
                     }
                 }

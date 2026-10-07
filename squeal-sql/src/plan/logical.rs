@@ -2024,6 +2024,7 @@ where
                     AccessPath::TableScan => Box::new(
                         TableSource::new(db.clone(), table.clone(), part, txn, stats)?
                             .reading(&needs.columns)
+                            .filtering(&needs.filters)
                             .without_row_ids(),
                     ),
                     AccessPath::TableSeek(range) => Box::new(
@@ -2037,6 +2038,7 @@ where
                             rows,
                         )?
                         .reading(&needs.columns)
+                        .filtering(&needs.filters)
                         .without_row_ids(),
                     ),
                     // A covering index.

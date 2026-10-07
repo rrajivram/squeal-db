@@ -12,7 +12,7 @@ use store::{
 use crate::{
     error::SchemaError,
     source::{ProjectableField, QueryStats, Source},
-    table::SqlTable,
+    table::{ColumnTest, SqlTable},
 };
 
 // Reads a table: every row (TableScan), or with a key range the rows
@@ -44,6 +44,9 @@ pub struct TableSource<F: DBFile> {
     // Whether to keep last_id: a copy of every row's key, which only
     // UPDATE/DELETE read (see without_row_ids).
     keep_ids: bool,
+    // Comparisons from WHERE a row is checked against before it is built
+    // (see filtering): one that fails is passed over here.
+    tests: Vec<ColumnTest>,
 }
 
 enum RowCursor<F: DBFile + 'static> {
@@ -148,6 +151,17 @@ where
         self
     }
 
+    /// Passes over the rows that fail what of `filters` (WHERE's terms on
+    /// this table alone, by position in its row) can be checked on a row
+    /// before it is built — see ColumnTest. WHERE still runs above this.
+    pub(crate) fn filtering(mut self, filters: &[crate::plan::eval::EvalExpr]) -> Self {
+        self.tests = filters
+            .iter()
+            .filter_map(|f| ColumnTest::of(self.table.fields(), f))
+            .collect();
+        self
+    }
+
     /// Doesn't keep each row's key for last_id: for a reader that never
     /// asks (a query, not an UPDATE or DELETE), which then copies no key
     /// out of the row it is lent.
@@ -190,6 +204,7 @@ where
             fields,
             wanted: None,
             keep_ids: true,
+            tests: vec![],
             next_time: 0,
             stats,
             last_id: None,
@@ -241,18 +256,23 @@ where
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = self.timer.start();
-        if let Some(tuple) = self.cursor.next_ref()? {
-            let out = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
+        // Loops past the rows `tests` rule out (see filtering).
+        while let Some(tuple) = self.cursor.next_ref()? {
+            let Some(out) =
+                self.table
+                    .decode_row_if(tuple.data(), self.wanted.as_deref(), &self.tests)?
+            else {
+                continue;
+            };
             if self.keep_ids {
                 self.last_id = Some(tuple.id().to_owned());
             }
             crate::source::timing::add(&mut self.next_time, start);
-            Ok(Some(out))
-        } else {
-            self.last_id = None;
-            crate::source::timing::add(&mut self.next_time, start);
-            Ok(None)
+            return Ok(Some(out));
         }
+        self.last_id = None;
+        crate::source::timing::add(&mut self.next_time, start);
+        Ok(None)
     }
 
     fn last_id(&self) -> Option<store::tuple::DBIdType> {

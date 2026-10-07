@@ -168,15 +168,21 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
     100k-row PK range count                17.1 -> 18.3 ms
     Db::find (owned tuple)                 0.51 -> 0.69 us
     bulk load                              about even; file +12%
-- [ ] Owned tuples are what still cost on byte pages: `Db::find`, the
-  nested-loop join's inner rows, store's `Cursor::next` (2-3x on a warm
-  scan) build a Tuple from bytes. A lent `Db::find` (a closure over a
-  TupleRef) would cover the index-lookup and nested-loop paths.
+- [x] Lent `Db::find` (`find_with` / `find_as_with`: the row the reader
+  sees, lent to a closure). The index-lookup source, the nested-loop
+  join's inner rows and sq-json's index plan read through it; the owned
+  `find_as` is it plus a copy. An index lookup fetching 9k rows: 64 ->
+  17 ms. Still owned, by design: `Db::find` itself (0.71 us vs main's
+  0.51) and store's `Cursor::next` — API for callers that keep the row.
 - [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
   index pages too. u16 offsets/lengths would halve that for pages under
   64 KiB — a change to SlottedPage's layout, so a page format version.
-- [ ] WHERE on a fixed-width row before the row is built (read the
-  filtered column at its offset; skip the row if it fails).
+- [x] WHERE before the row is built: a table scan checks a fixed-width
+  row's column against WHERE's plain comparisons (a column vs a literal
+  of its own type — integer, datetime, string, boolean; `ColumnTest`) and
+  passes over rows that fail without building them. WHERE still runs on
+  what passes. orders `where customer_id = ...` 46 -> 13 ms;
+  order_details `where quantity > 3` 235 -> 143 ms.
 - [ ] If kept: step 3 is done by this (the default switched; old
   AnyTuplePage data pages still read). Still owned on the way: the
   nested-loop join's inner rows, Db::find.

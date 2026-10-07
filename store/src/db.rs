@@ -2000,29 +2000,50 @@ where
         id: DBIdType,
         txn_id: TransactionId,
     ) -> Result<Option<Tuple>, StoreError> {
+        self.find_as_with(tid, &id, txn_id, |t| t.into_owned())
+    }
+
+    /// `find`, lending the row `txn` sees to `f` (see TupleRef) rather
+    /// than copying it out: what `f` returns, or None if `txn` sees no
+    /// row with that id.
+    pub fn find_with<R>(
+        &self,
+        tid: TableIdType,
+        id: &DBIdType,
+        txn: &Transaction,
+        f: impl FnOnce(TupleRef<'_>) -> R,
+    ) -> Result<Option<R>, StoreError> {
+        self.find_as_with(tid, id, txn.id(), f)
+    }
+
+    /// `find_with` as the transaction `txn_id` (see find_as).
+    pub fn find_as_with<R>(
+        &self,
+        tid: TableIdType,
+        id: &DBIdType,
+        txn_id: TransactionId,
+        f: impl FnOnce(TupleRef<'_>) -> R,
+    ) -> Result<Option<R>, StoreError> {
         // A finished transaction no longer pins its snapshot (vacuum may
         // have reclaimed what it could see), so it may not read: the error
         // says why it finished (SnapshotTooOld, or already finished).
         self.require_active(&txn_id)?;
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
-        let tuple = table.find(id.clone())?;
-        if let Some(tuple) = tuple {
-            let visible = self
-                .find_visible_to(&tuple, &txn_id)?
-                .map(|t| t.into_owned());
-            // A committed tombstone means the key was removed — it must be
-            // invisible even if its physical row hasn't been reclaimed yet.
-            // (commit reclaims tombstones best-effort AFTER its commit point, so
-            // a committed-but-not-yet-reclaimed tombstone can legitimately still
-            // be present in the tree.)
-            match visible {
-                Some(t) if t.is_tombstoned() => Ok(None),
-                other => Ok(other),
-            }
-        } else {
-            Ok(None)
-        }
+        // The version txn_id sees (visible_version: the row itself, or the
+        // one before it a writer it can't see replaced) — none for a
+        // committed tombstone, a key removed whose row hasn't been
+        // reclaimed yet (commit reclaims tombstones best-effort AFTER its
+        // commit point).
+        Ok(table
+            .find_with(id, |row| {
+                Ok(match self.visible_version(&row, &txn_id)? {
+                    Visible::Itself => Some(f(row)),
+                    Visible::Ancestor(t) => Some(f(TupleRef::borrowed(&t))),
+                    Visible::Not => None,
+                })
+            })?
+            .flatten())
     }
 
     pub fn update(

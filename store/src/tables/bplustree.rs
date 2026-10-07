@@ -802,6 +802,35 @@ where
         self.buffer.get_page(page_id)?.get(id)
     }
 
+    /// `find`, lending the row to `f` (see TupleRef) instead of copying it
+    /// out: read from a snapshot of its data page's content, with no page
+    /// lock held while `f` runs. None if there is no row with that id.
+    pub(crate) fn find_with<R>(
+        &self,
+        id: &DBIdType,
+        f: impl FnOnce(TupleRef<'_>) -> Result<R, StoreError>,
+    ) -> Result<Option<R>, StoreError> {
+        // See find: index lookup and data page read as one step against a
+        // relocation.
+        let content = {
+            let _guard = self
+                .relocation_lock
+                .read()
+                .map_err(|_| StoreError::UnknownError("relocation_lock poisoned".into()))?;
+            let Some(page_id) = self.find_page(id.clone(), self.table.first_index_page)? else {
+                return Ok(None);
+            };
+            self.buffer.get_page(page_id)?.content()
+        };
+        let Some(at) = content.find_hinted(id, usize::MAX)? else {
+            return Ok(None);
+        };
+        let row = content.at_ref(at).ok_or_else(|| {
+            StoreError::UnknownError(format!("no row at position {at} of its page"))
+        })?;
+        f(row).map(Some)
+    }
+
     /// Replace the row for `tuple.id` with `tuple` (tests and recovery).
     pub fn update(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
         let id = tuple.id.clone();
