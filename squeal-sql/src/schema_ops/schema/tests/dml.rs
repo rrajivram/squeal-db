@@ -4,17 +4,19 @@ use store::valueitem::{IndexKey, ValueItem};
 
 use super::*;
 
-// Reads a row back from a table's own row-storage backing table, raw —
-// decodes the VersionedRow wrapper Schema::insert_rows_in_txn actually
-// writes there (see table.rs) and hands back its values verbatim, NOT
-// reprojected onto the table's current schema (that's SqlTable::reproject's
-// job, exercised separately by the alter-table tests below) — exactly
-// what these plain-insert tests want to assert against.
+// Reads a row back from a table's own row-storage backing table, by its
+// key, and decodes what Schema::insert_rows_in_txn wrote there (see
+// SqlTable::encode_row/decode_row) — a row's bytes are read by its
+// table's schema, so the table whose rows tree this is does it.
 fn find_row(s: &Arc<Schema<MemFile>>, table_id: TableIdType, key: DBIdType) -> Option<Vec<ValueItem>> {
     let txn = s.db.begin().unwrap();
     let tuple = s.db.find(table_id, key, &txn).unwrap()?;
-    let row = postcard::from_bytes::<crate::table::VersionedRow>(tuple.data()).unwrap();
-    Some(row.values.values().to_vec())
+    let tables = s.tables.read();
+    let table = tables
+        .values()
+        .find(|t| t.partitions.iter().any(|p| p.rows() == table_id))
+        .expect("a table with that rows tree");
+    Some(table.decode_row(tuple.data(), None).unwrap().values().to_vec())
 }
 
 // Reads an entry back from an INDEX's own backing table — unlike a row

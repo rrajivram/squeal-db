@@ -41,6 +41,45 @@ pub enum ValueRef<'a> {
 }
 
 impl ValueRef<'_> {
+    /// Appends this value as `decode` reads it: a tag, then a number's
+    /// eight little-endian bytes, a boolean's one, or a string's or blob's
+    /// capacity, length and content, zero-padded out to the capacity.
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        fn sized(out: &mut Vec<u8>, cap: u32, content: &[u8]) {
+            out.extend_from_slice(&cap.to_le_bytes());
+            out.extend_from_slice(&(content.len() as u32).to_le_bytes());
+            out.extend_from_slice(content);
+            out.resize(out.len() + (cap as usize).saturating_sub(content.len()), 0);
+        }
+        match *self {
+            ValueRef::Null => out.push(0),
+            ValueRef::Integer(i) => {
+                out.push(5);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            ValueRef::Double(f) => {
+                out.push(10);
+                out.extend_from_slice(&f.to_le_bytes());
+            }
+            ValueRef::Datetime(d) => {
+                out.push(15);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            ValueRef::Str(s, cap) => {
+                out.push(20);
+                sized(out, cap, s.as_bytes());
+            }
+            ValueRef::Blob(b, cap) => {
+                out.push(25);
+                sized(out, cap, b);
+            }
+            ValueRef::Boolean(b) => {
+                out.push(30);
+                out.push(b as u8);
+            }
+        }
+    }
+
     // See ValueItem::hash.
     pub(crate) fn hash(&self) -> u64 {
         match self {
@@ -376,7 +415,7 @@ impl IndexKey {
         // wire-format bug like this, only a real run can).
         bytes.extend_from_slice(&(self.data.len() as u64).to_le_bytes());
         for d in self.data.iter() {
-            bytes.extend_from_slice(&d.to_bytes());
+            d.as_ref().write_to(&mut bytes);
         }
         bytes
     }
@@ -697,39 +736,7 @@ impl ValueItem {
 
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = vec![];
-        let value = match self {
-            ValueItem::Null => 0u8,
-            ValueItem::Integer(_) => 5,
-            ValueItem::Double(_) => 10,
-            ValueItem::Datetime(_) => 15,
-            ValueItem::Str(_) => 20,
-            ValueItem::Blob(_) => 25,
-            ValueItem::Boolean(_) => 30,
-        };
-        bytes.push(value);
-        match self {
-            ValueItem::Integer(i) => bytes.extend_from_slice(&i.to_le_bytes()),
-            ValueItem::Double(f) => bytes.extend_from_slice(&f.to_le_bytes()),
-            ValueItem::Datetime(d) => bytes.extend_from_slice(&d.to_le_bytes()),
-            ValueItem::Str(s) => {
-                bytes.extend_from_slice(&s.1.to_le_bytes());
-                bytes.extend_from_slice(&(s.0.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(s.0.as_bytes());
-                if s.0.len() < s.1 as usize {
-                    bytes.extend_from_slice(&vec![0u8; s.1 as usize - s.0.len()]);
-                }
-            }
-            ValueItem::Blob(b) => {
-                bytes.extend_from_slice(&b.1.to_le_bytes());
-                bytes.extend_from_slice(&(b.0.len() as u32).to_le_bytes());
-                bytes.extend_from_slice(&b.0);
-                if b.0.len() < b.1 as usize {
-                    bytes.extend_from_slice(&vec![0u8; b.1 as usize - b.0.len()]);
-                }
-            }
-            ValueItem::Boolean(b) => bytes.push(*b as u8),
-            ValueItem::Null => {}
-        }
+        self.as_ref().write_to(&mut bytes);
         bytes
     }
 

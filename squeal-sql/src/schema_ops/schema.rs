@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::{Mutex, RwLock};
-use postcard::{from_bytes, to_allocvec};
+use postcard::to_allocvec;
 use store::clock::Instant;
 use store::{
     cursor::Cursor,
@@ -19,7 +19,7 @@ use crate::{
     optim::table_stats::{SchemaStats, TableStat},
     partition::{Partition, PartitionBound},
     rslt::resultset::ResultSet,
-    table::{Field, SqlForeignKey, SqlIndex, SqlTable, VersionedRow},
+    table::{Field, SqlForeignKey, SqlIndex, SqlTable},
 };
 
 // Default per-column-value sampling rate for a schema's SchemaStats (see
@@ -665,18 +665,11 @@ where
         // version (see VersionedRow, SqlTable::reproject). Moves
         // `row` (see new_from_owned) — must be the last thing that
         // touches it.
-        let row_data = VersionedRow {
-            version: table.version(),
-            values: IndexKey::new_from_owned(row)?,
-        };
+        let row = IndexKey::new_from_owned(row)?;
+        let row_data = table.encode_row(&row)?;
         self.db.insert(
             part.rows(),
-            Tuple::new_with(
-                row_key.clone(),
-                &to_allocvec(&row_data)?,
-                Some(txn.id()),
-                None,
-            ),
+            Tuple::new_with(row_key.clone(), &row_data, Some(txn.id()), None),
             txn,
         )?;
         // Best-effort, matching SchemaStats' own approximate nature
@@ -688,7 +681,7 @@ where
         // worth threading commit/rollback awareness into an already-
         // lossy background collector for.
         if let Some(stats) = self.stats.lock().as_ref() {
-            stats.log_stat(table.id, part.id, row_data.values.clone());
+            stats.log_stat(table.id, part.id, row.clone());
         }
         Ok(())
     }
@@ -1514,7 +1507,7 @@ where
         {
             let mut cursor = self.db.table_scan(default.rows())?;
             while let Some(tuple) = cursor.next()? {
-                let row = table.reproject(&from_bytes::<VersionedRow>(tuple.data())?)?;
+                let row = table.decode_row(tuple.data(), None)?;
                 let value = &row.values()[pos];
                 if values.iter().any(|v| v.cmp(value).is_eq()) {
                     return Err(SchemaError::UserError(format!(

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::de::{self, Visitor};
 use serde::ser::SerializeStruct;
@@ -10,7 +10,7 @@ use sql_parser::ddl::{
 use sql_parser::ident::Ident;
 use store::db::DBFile;
 use store::table::TableIdType;
-use store::valueitem::{IndexKey, ValueItem};
+use store::valueitem::{IndexKey, ValueItem, ValueRef};
 
 use crate::constant::{DEFAULT_VAR_SIZE, MAX_TABLE_NAME_LEN};
 use crate::datatype::DataType;
@@ -81,6 +81,127 @@ pub struct SchemaVersion {
     // every time, even though each element (Arc<Field>) was already
     // cheap to clone on its own.
     pub(crate) fields: Arc<[Arc<Field>]>,
+    // Where each column of a fixed-width row is (see RowLayout), worked
+    // out from `fields` the first time it is asked for. Not persisted.
+    #[serde(skip)]
+    layout: OnceLock<Option<RowLayout>>,
+}
+
+impl SchemaVersion {
+    pub(crate) fn new(fields: Arc<[Arc<Field>]>) -> Self {
+        Self {
+            fields,
+            layout: OnceLock::new(),
+        }
+    }
+
+    // None if some column's type has no width (see column_width): rows of
+    // this version are then written the old way.
+    fn layout(&self) -> Option<&RowLayout> {
+        self.layout
+            .get_or_init(|| RowLayout::of(&self.fields))
+            .as_ref()
+    }
+}
+
+// A fixed-width row: every column takes the bytes its datatype does,
+// whatever its value — a number its nine, a string or blob its declared
+// capacity (ValueRef::write_to pads those already), and a NULL its
+// column's too, a zero tag and zero padding. So where a column is follows
+// from the SchemaVersion the row was written under, and a reader goes
+// straight to the ones it wants (SqlTable::decode_row) instead of
+// stepping over every value before them. An UPDATE never changes a row's
+// size, either.
+//
+// The row's bytes are those of IndexKey::to_bytes — a u64 count, then
+// each value as ValueRef::decode reads it — except for the NULLs'
+// padding, which a reader stepping from value to value would misread. So
+// such a row says what it is: FIXED_ROW is set in its count, where a row
+// written the old way (a NULL its one byte) never has it, and an old
+// reader fails on the count rather than misreading the row.
+#[derive(Debug, Clone)]
+struct RowLayout {
+    // Each column's offset in the row's bytes, and one past the last.
+    offsets: Vec<usize>,
+}
+
+const FIXED_ROW: u64 = 1 << 63;
+const ROW_COUNT_BYTES: usize = size_of::<u64>();
+
+// The bytes a column of `datatype` takes in a fixed-width row: any of
+// its values', as ValueItem::size counts them. None for what isn't a
+// column type a value is stored as.
+fn column_width(datatype: DataType) -> Option<usize> {
+    match datatype {
+        DataType::Integer | DataType::Double | DataType::Datetime => Some(9),
+        DataType::Boolean => Some(2),
+        DataType::Str(n) | DataType::Blob(n) => Some(9 + n as usize),
+        DataType::Null | DataType::Unsupported => None,
+    }
+}
+
+impl RowLayout {
+    fn of(fields: &[Arc<Field>]) -> Option<Self> {
+        let mut offsets = Vec::with_capacity(fields.len() + 1);
+        let mut at = ROW_COUNT_BYTES;
+        for f in fields {
+            offsets.push(at);
+            at += column_width(f.datatype)?;
+        }
+        offsets.push(at);
+        Some(Self { offsets })
+    }
+
+    fn columns(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    fn len(&self) -> usize {
+        self.offsets[self.columns()]
+    }
+
+    // Column `pos` of a row of this layout.
+    fn column<'a>(&self, row: &'a [u8], pos: usize) -> &'a [u8] {
+        &row[self.offsets[pos]..self.offsets[pos + 1]]
+    }
+
+    // The row's bytes, or None if a value doesn't fit its column's width
+    // (a type the column isn't, a string past its capacity): no fixed-
+    // width row can hold it.
+    fn encode(&self, fields: &[Arc<Field>], values: &[ValueItem]) -> Option<Vec<u8>> {
+        if values.len() != self.columns() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.len());
+        out.extend_from_slice(&(values.len() as u64 | FIXED_ROW).to_le_bytes());
+        for (pos, (value, field)) in values.iter().zip(fields).enumerate() {
+            // A string or blob is written with the column's capacity,
+            // whatever the value came with.
+            let value = match (value.as_ref(), field.datatype) {
+                (ValueRef::Str(s, _), DataType::Str(n)) if s.len() <= n as usize => {
+                    ValueRef::Str(s, n)
+                }
+                (ValueRef::Blob(b, _), DataType::Blob(n)) if b.len() <= n as usize => {
+                    ValueRef::Blob(b, n)
+                }
+                (v, _) => v,
+            };
+            value.write_to(&mut out);
+            let end = self.offsets[pos + 1];
+            if out.len() > end || (out.len() < end && value != ValueRef::Null) {
+                return None;
+            }
+            out.resize(end, 0);
+        }
+        Some(out)
+    }
+
+    // How many columns a row's bytes say it has, if it is a fixed-width
+    // row (FIXED_ROW).
+    fn fixed_count(row: &[u8]) -> Option<u64> {
+        let count = u64::from_le_bytes(row.get(..ROW_COUNT_BYTES)?.try_into().ok()?);
+        (count & FIXED_ROW != 0).then_some(count & !FIXED_ROW)
+    }
 }
 
 // What Schema::insert_rows_in_txn actually writes as a row's stored
@@ -186,6 +307,25 @@ impl Serialize for VersionedRow {
 pub(crate) struct StoredRow<'a> {
     pub(crate) version: u32,
     pub(crate) values: &'a [u8],
+}
+
+// Written as VersionedRow is: the version, then the values' bytes.
+impl Serialize for StoredRow<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        struct Bytes<'a>(&'a [u8]);
+        impl Serialize for Bytes<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.serialize_bytes(self.0)
+            }
+        }
+        let mut s = serializer.serialize_struct("VersionedRow", 2)?;
+        s.serialize_field("ver", &self.version)?;
+        s.serialize_field("data", &Bytes(self.values))?;
+        s.end()
+    }
 }
 
 // Field names given to deserialize_struct below only matter to
@@ -447,9 +587,7 @@ impl TableBuilder {
 
         let mut table = SqlTable {
             name: self.name.as_ref().unwrap().clone(),
-            versions: vec![SchemaVersion {
-                fields: fields.into(),
-            }],
+            versions: vec![SchemaVersion::new(fields.into())],
             indices: vec![],
             foreign_keys: vec![],
             id: TableIdType::none(),
@@ -1063,6 +1201,9 @@ impl SqlTable {
         wanted: Option<&[bool]>,
     ) -> Result<IndexKey, SchemaError> {
         let row: StoredRow = postcard::from_bytes(data)?;
+        if let Some(count) = RowLayout::fixed_count(row.values) {
+            return self.decode_fixed_row(&row, count, wanted);
+        }
         if row.version != self.version() {
             return self.reproject(&VersionedRow {
                 version: row.version,
@@ -1092,6 +1233,62 @@ impl SqlTable {
             }
         }
         Ok(IndexKey::new_from_owned(values)?)
+    }
+
+    // decode_row, of a fixed-width row (see RowLayout): each wanted column
+    // read from where its SchemaVersion says it is.
+    fn decode_fixed_row(
+        &self,
+        row: &StoredRow,
+        count: u64,
+        wanted: Option<&[bool]>,
+    ) -> Result<IndexKey, SchemaError> {
+        let layout = self
+            .versions
+            .get(row.version as usize)
+            .and_then(SchemaVersion::layout)
+            .filter(|l| l.columns() as u64 == count && l.len() == row.values.len())
+            .ok_or_else(|| {
+                SchemaError::UnknownError(format!(
+                    "row of {count} fixed-width value(s) in {} byte(s) doesn't match schema \
+                     version {} of table {:?}",
+                    row.values.len(),
+                    row.version,
+                    self.name
+                ))
+            })?;
+        let current = row.version == self.version();
+        let mut values = Vec::with_capacity(layout.columns());
+        for pos in 0..layout.columns() {
+            values.push(match wanted {
+                Some(w) if current && !w[pos] => ValueItem::Null,
+                _ => ValueRef::decode(layout.column(row.values, pos))?.0.to_owned(),
+            });
+        }
+        let values = IndexKey::new_from_owned(values)?;
+        if current {
+            return Ok(values);
+        }
+        self.reproject(&VersionedRow {
+            version: row.version,
+            values,
+        })
+    }
+
+    /// A row's stored bytes (a tuple's data), written under the current
+    /// version: fixed-width (see RowLayout) where its values fit their
+    /// columns, as they do unless something got past INSERT's typing —
+    /// and the old way, each value its own size, otherwise.
+    pub(crate) fn encode_row(&self, row: &IndexKey) -> Result<Vec<u8>, SchemaError> {
+        let version = &self.versions[self.version() as usize];
+        let values = version
+            .layout()
+            .and_then(|l| l.encode(&version.fields, row.values()))
+            .unwrap_or_else(|| row.to_bytes());
+        Ok(postcard::to_allocvec(&StoredRow {
+            version: self.version(),
+            values: &values,
+        })?)
     }
 
     // Decodes a stored row back into ValueItems in the table's CURRENT
@@ -1184,9 +1381,7 @@ impl SqlTable {
         let mut fields = self.fields().to_vec();
         fields.push(Arc::new(field.with_id(self.next_field_id)));
         self.next_field_id += 1;
-        self.versions.push(SchemaVersion {
-            fields: fields.into(),
-        });
+        self.versions.push(SchemaVersion::new(fields.into()));
         Ok(())
     }
 
@@ -1233,9 +1428,7 @@ impl SqlTable {
                 "Cannot drop the last remaining column".into(),
             ));
         }
-        self.versions.push(SchemaVersion {
-            fields: fields.into(),
-        });
+        self.versions.push(SchemaVersion::new(fields.into()));
         Ok(())
     }
 
@@ -1291,9 +1484,7 @@ impl SqlTable {
                 }
             })
             .collect();
-        self.versions.push(SchemaVersion {
-            fields: fields.into(),
-        });
+        self.versions.push(SchemaVersion::new(fields.into()));
         Ok(())
     }
 

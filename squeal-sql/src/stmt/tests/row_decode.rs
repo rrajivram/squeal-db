@@ -147,3 +147,56 @@ fn test_decode_row_reads_what_versioned_row_writes() {
         assert!(table.decode_row(&bytes[..cut], None).is_err(), "cut at {cut}");
     }
 }
+
+// A row is written fixed-width (see table.rs's RowLayout): the same bytes
+// long whatever its strings' lengths and wherever its NULLs are, each
+// column where the schema says, read without the others.
+#[test]
+fn test_rows_are_fixed_width_and_read_by_column() {
+    let c = setup();
+    let table = c.current_schema().unwrap().get_table("t").unwrap();
+    let key = |v: Vec<ValueItem>| IndexKey::new_from(&v).unwrap();
+    let full = vec![ValueItem::Integer(7), s("name07", 20), s("c", 20), s("a note", 200)];
+    let sparse = vec![ValueItem::Integer(8), ValueItem::Null, ValueItem::Null, s("", 200)];
+    let full_bytes = table.encode_row(&key(full.clone())).unwrap();
+    let sparse_bytes = table.encode_row(&key(sparse.clone())).unwrap();
+    assert_eq!(full_bytes.len(), sparse_bytes.len());
+    assert_eq!(table.decode_row(&full_bytes, None).unwrap().values(), &full[..]);
+    assert_eq!(table.decode_row(&sparse_bytes, None).unwrap().values(), &sparse[..]);
+    assert_eq!(
+        table
+            .decode_row(&full_bytes, Some(&[false, false, true, true]))
+            .unwrap()
+            .values(),
+        &[ValueItem::Null, ValueItem::Null, s("c", 20), s("a note", 200)]
+    );
+    // A string comes back with its column's capacity, whatever it was
+    // written with.
+    let odd = vec![ValueItem::Integer(9), s("n", 3), ValueItem::Null, s("x", 1)];
+    let odd_bytes = table.encode_row(&key(odd)).unwrap();
+    assert_eq!(odd_bytes.len(), full_bytes.len());
+    assert_eq!(
+        table.decode_row(&odd_bytes, None).unwrap().values(),
+        &[ValueItem::Integer(9), s("n", 20), ValueItem::Null, s("x", 200)]
+    );
+    // A reader of the old layout refuses such a row rather than misread
+    // the NULLs' padding; cut short anywhere, it is an error.
+    assert!(postcard::from_bytes::<VersionedRow>(&sparse_bytes).is_err());
+    for cut in 0..sparse_bytes.len() {
+        assert!(table.decode_row(&sparse_bytes[..cut], None).is_err(), "cut at {cut}");
+    }
+}
+
+// A value that can't take its column's width — here a string longer than
+// the column, declared with room for it — leaves the row written the old
+// way, each value its own size, and it reads back all the same.
+#[test]
+fn test_a_row_that_does_not_fit_its_columns_is_written_the_old_way() {
+    let c = setup();
+    let table = c.current_schema().unwrap().get_table("t").unwrap();
+    let long = "x".repeat(30);
+    let values = vec![ValueItem::Integer(1), s(&long, 40), ValueItem::Null, s("n", 200)];
+    let bytes = table.encode_row(&IndexKey::new_from(&values).unwrap()).unwrap();
+    assert_eq!(table.decode_row(&bytes, None).unwrap().values(), &values[..]);
+    assert_eq!(postcard::from_bytes::<VersionedRow>(&bytes).unwrap().values.values(), &values[..]);
+}

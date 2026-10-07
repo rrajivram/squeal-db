@@ -10,7 +10,6 @@
 // pass: the second operation now waits for the first.
 use std::time::{Duration, Instant};
 
-use postcard::from_bytes;
 use store::{cursor::Cursor, tuple::DBIdType, valueitem::IndexKey};
 
 use super::*;
@@ -84,9 +83,7 @@ pub(super) fn storage_problems(c: &Arc<Connection<MemFile>>, name: &str) -> Vec<
         let mut cursor = db.table_scan_in_txn(part.rows(), &txn).unwrap();
         while let Some(tuple) = cursor.next().unwrap() {
             rows += 1;
-            let row = table
-                .reproject(&from_bytes::<VersionedRow>(tuple.data()).unwrap())
-                .unwrap();
+            let row = table.decode_row(tuple.data(), None).unwrap();
             match table.partition_for(row.values()) {
                 Ok(want) if want == p => {}
                 Ok(want) => problems.push(format!(

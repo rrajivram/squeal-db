@@ -135,6 +135,22 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   Left on the warm path: a range scan reads the data row's key to check
   its hint and parses each row's header to lend it, where AnyTuplePage
   compares/borrows in memory.
+- [x] Fixed-width rows (branch `fixed-rows`, on `byte-page`, not merged).
+  A row's columns each take their datatype's bytes whatever the value — a
+  NULL its column's width, zero-padded; strings already padded to capacity
+  — so where a column is follows from the SchemaVersion the row was
+  written under (`RowLayout`, cached per version) and `decode_row` reads
+  the wanted ones directly. No bytes per row: the count word's top bit
+  says a row is fixed-width, old rows read as before, an old reader
+  refuses a new row. Against `byte-page`: orders count(*) 46 -> 39 ms,
+  filtered count 79 -> 67 ms, order_details count 325 -> 274 ms (main:
+  37 / 65 / 352). The retail data stores no NULLs (sentinels instead), so
+  its file is the same size; a table with NULLs in wide columns grows by
+  their width.
+- [ ] Next: a fixed record header and a key layout the table declares
+  (squeal-sql's PRIMARY KEY columns), in a new page content kind — a
+  key's fields at known offsets, lending a row with no parsing. Then
+  WHERE on a fixed row before the row is built.
 - [ ] If kept: step 3 is done by this (the default switched; old
   AnyTuplePage data pages still read). Still owned on the way: the
   nested-loop join's inner rows, Db::find.
