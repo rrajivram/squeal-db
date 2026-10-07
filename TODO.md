@@ -114,15 +114,30 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   ANALYZE read through it. Warm, against main: orders `count(*)` 41.5 ->
   37 ms, 100k-row range count 19.5 -> 17.3 ms, a filtered scan of orders
   71 -> 66 ms, order_details (bigger than the cache) 376 -> 361 ms.
-- [ ] Step 2: a page that keeps its tuples as bytes and lends views into
-  them (slot directory with inline key prefixes, keys in ValueItem's byte
-  form so ties compare as ValueRefs, a fixed-width record header), behind
-  the same TupleRef/IdRef. Gate: `bench_repeated_get_on_an_already_
-  loaded_page` even with AnyTuplePage. Step 3: make it the default, as a
-  page format version. Still owned on the way: the nested-loop join's
-  inner rows (they read through `self` while the cursor lends), Db::find,
-  and TableSource's `last_id` (an id copy per row that only UPDATE/DELETE
-  read — free with a borrowed key, an allocation once keys are bytes).
+- [x] Step 2 (branch `byte-page`, NOT merged — the trade-off below is
+  your call): a table's data pages are SlottedPages read in place. A
+  tuple is never decoded to be read: its id is read from its postcard
+  bytes (`wire`: key values as ValueRefs, compared/equalled/hashed as
+  DBIdType does — pinned against DBIdType over every pair of a set of
+  edge-case ids), an in-memory prefix per slot decides most probes, and
+  `at_ref` lends a view of the bytes (where each id ends kept per slot).
+  Page bytes on disk are unchanged (SlottedPage's own layout, kind 4,
+  which earlier builds already read). ValueItem's `==`/order/hash now
+  live on ValueRef. Against main (1M-row retail):
+  - wins: order_details count (bigger than the cache) 422 -> 346 ms, on
+    4 threads 398 -> 247 ms (scans scale with threads now); sum/max 427
+    -> 400 ms, 4 threads 582 -> 407 ms; cold `Db::find` 3.85 -> 3.4 us;
+    bulk load 63 -> 48 s.
+  - costs, warm (everything cached): SQL count(*) of orders 36 -> 44 ms,
+    100k-row PK range count 16.6 -> 26.7 ms, `Db::find` 0.48 -> 0.63 us
+    (SQL point lookups flat), store's owned `Cursor::next` (it now
+    decodes each row) 3-4x. Database file +5% (slot directory).
+  Left on the warm path: a range scan reads the data row's key to check
+  its hint and parses each row's header to lend it, where AnyTuplePage
+  compares/borrows in memory.
+- [ ] If kept: step 3 is done by this (the default switched; old
+  AnyTuplePage data pages still read). Still owned on the way: the
+  nested-loop join's inner rows, Db::find.
 - [ ] Concurrent scans don't scale: 4 threads scanning order_details finish
   no more queries than 1 (8 do worse), on main as on this branch. Not
   locks — the threads are in malloc/free (system allocator) for those keys

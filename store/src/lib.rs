@@ -66,3 +66,4 @@ mod version;
 mod versioned;
 mod utils;
 pub mod valueitem;
+mod wire;

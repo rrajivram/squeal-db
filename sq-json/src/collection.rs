@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use parking_lot::RwLockReadGuard;
-use store::cursor::{Cursor, KeyRange};
+use store::cursor::KeyRange;
 use store::db::{DBFile, Durability};
 use store::error::StoreError;
 use store::tuple::{DBIdType, Tuple};
@@ -732,7 +732,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
         match plan {
             Plan::CollScan => {
                 let mut cursor = db.table_scan_in_txn(state.tid, txn)?;
-                while let Some(tuple) = cursor.next()? {
+                while let Some(tuple) = cursor.next_ref()? {
                     if !tuple.is_tombstoned() && !keep(postcard::from_bytes(tuple.data())?) {
                         break;
                     }
@@ -740,7 +740,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
             }
             Plan::Id(seek) => {
                 let mut cursor = db.key_ranges_scan(state.tid, Some(txn.id()), seek.ranges)?;
-                while let Some(tuple) = cursor.next()? {
+                while let Some(tuple) = cursor.next_ref()? {
                     if !tuple.is_tombstoned() && !keep(postcard::from_bytes(tuple.data())?) {
                         break;
                     }
@@ -750,7 +750,7 @@ impl<F: DBFile<Item = F> + 'static> Collection<F> {
                 let multikey = ix.multikey.load(Ordering::SeqCst);
                 let mut seen = HashSet::new();
                 let mut cursor = db.key_ranges_scan(ix.tid, Some(txn.id()), seek.ranges)?;
-                while let Some(entry) = cursor.next()? {
+                while let Some(entry) = cursor.next_ref()? {
                     if entry.is_tombstoned() {
                         continue;
                     }

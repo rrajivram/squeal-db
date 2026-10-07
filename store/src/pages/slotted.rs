@@ -9,48 +9,30 @@
 // `from_bytes()` only ever parses the (small, fixed-size) slot directory —
 // tuple bytes stay raw/undecoded until actually requested.
 //
-// ## Why this isn't the default (kept, but not wired into `Page::new`)
+// ## The data page (Page::new's, for a table's rows)
 //
-// This type is fully implemented, tested (including the two load-bearing
-// ordering/tie-break contracts `AnyTuplePage` also has to satisfy — see
-// below), and was briefly wired in as `Page::new`'s default. It was reverted
-// after measuring a real, reproducible ~45-50% END-TO-END throughput
-// regression on the stress harness (107K → 54-60K ops/s) — the opposite of
-// what P6 set out to do. Root cause, confirmed by a direct microbenchmark
-// (`bench_repeated_get_on_an_already_loaded_page`, this file and
-// `anytuple.rs`'s matching one): `AnyTuplePage` decodes every tuple once, on
-// `from_bytes` (page load), into a live sorted `Vec<Tuple>` —
-// every subsequent `get`/`add`/`replace`/`successor` for as long as that page
-// stays cache-resident is then a free, no-decode in-memory comparison.
-// `SlottedPage` inverts that trade: `from_bytes` decodes nothing (just the
-// slot directory), but its O(log N) binary search fully `postcard`-decodes a
-// *whole* candidate `Tuple` (id, txn_id, pre_lsn, data, flags — not just the
-// id it actually needs to compare) at every single comparison, on *every*
-// access, for as long as the page is in memory — never amortized the way
-// AnyTuplePage's one-time decode is. Measured: ~23.3M gets/s (AnyTuplePage)
-// vs. ~1.07M gets/s (SlottedPage) on an identical 200-tuple page — ~22x.
-// For a page that gets touched many times while resident (the common case,
-// especially given this session's own P2/P3 caching work, which keeps hot
-// pages cached far more effectively than the audit's original "one-row
-// change re-serializes a 16 KiB page" framing accounted for), that repeated-
-// access cost dominates completely and swamps the real, genuine win on
-// load/flush cost this type does deliver.
+// It wasn't, at first: every binary-search step decoded a whole Tuple (then,
+// later, its id) — allocating — where AnyTuplePage, having decoded every
+// tuple once at load, compared in memory. ~22x slower on repeated gets of a
+// resident page, and ~45-50% slower end to end on the stress harness when
+// it was briefly the default.
 //
-// UPDATE: the id-only-decode path sketched above IS now implemented —
-// see `decode_id_at`'s own doc comment for the fix and the dhat-profiled
-// numbers that motivated it (found via HashedSource, this type's one
-// real consumer today, not via any change to Page::new's default). It
-// measurably helps there (~1.87x wall-clock, ~775MB less allocated on a
-// synthetic 4-way-join benchmark) but that's a build-once/probe-many
-// access pattern, not the repeated-arbitrary-get pattern
-// `bench_repeated_get_on_an_already_loaded_page` measured above — this
-// has NOT been re-benchmarked against that specific 22x regression, so
-// it's not evidence the regression is fixed or that `Page::new`'s
-// default choice should be revisited. Kept in the tree, registered in
-// `PageContentRegistry` (`content.rs`'s `SLOTTED_TUPLE` kind), and
-// covered by its own full test suite below as a preserved, working
-// design exploration — just not the active choice `Page::new` reaches
-// for.
+// Now nothing on this page is decoded to be read. Each slot's id is read in
+// place from its bytes (wire::tuple_id_ending: a key's values as ValueRefs,
+// compared, equalled and hashed as DBIdType does), most probes don't read
+// it at all (an in-memory order_prefix per slot, as AnyTuplePage keeps),
+// and a tuple is lent as a view of its bytes (at_ref, TupleRef) — where it
+// ends and the rest begins kept per slot (id_ends), so lending one is a few
+// varints. Page load is one pass over the slots, allocating nothing per
+// tuple; flushing is a copy of the buffer.
+//
+// What that measured, against AnyTuplePage (1M-row retail data): scans
+// bigger than the cache 6-18% faster on one thread and 30-38% on four (the
+// allocator no longer serializes them); cold first-touch lookups -12%; bulk
+// load -23%. A page already resident is read a little slower — its tuples
+// are parsed where AnyTuplePage's are in memory: warm table scans +20%,
+// warm range scans through an index +50%, point lookups +30% in store
+// (flat through SQL). See TODO.md.
 //
 // ## On-disk layout (the buffer this struct owns and returns verbatim from
 // `to_bytes()`)
@@ -108,14 +90,13 @@
 //
 // ## Complexity
 //
-// `add`/`replace`/`remove`/`get`/`contains`/`successor` are all O(log N)
-// *id-only decodes* (binary search over the slot directory, decoding just
-// the candidate's `id` field at each comparison step via `decode_id_at` —
-// there's no way to avoid decoding entirely without a fixed-width,
-// universally order-preserving key encoding, which `DBIdType::Rec`'s
-// structural `Ord` rules out, see the design doc) plus exactly one *full*
-// tuple decode once the target slot is actually found (`get`/`replace`/
-// `remove`/`successor` all need the real payload, not just its id), plus
+// `add`/`replace`/`remove`/`get`/`contains`/`successor` are all an O(log N)
+// binary search over the slot directory's in-memory prefixes, reading a
+// slot's id in place (`id_at`, nothing decoded) only where prefixes tie —
+// a memcmp-able key encoding is ruled out by `DBIdType::Rec`'s structural
+// `Ord`, see the design doc — plus exactly one *full* tuple decode once
+// the target slot is found for the owned-tuple methods (`get`/`replace`/
+// `remove`/`successor` return the real payload; `at_ref` lends it), plus
 // an O(N) but cheap *byte* memmove of the slot directory (not tuple
 // decodes) to open/close the gap. `to_bytes()` for the common "nothing
 // changed since load" case is a plain `Vec<u8>` clone — no per-tuple work
@@ -126,8 +107,12 @@ use postcard::{from_bytes, to_allocvec};
 use crate::{
     db::DBSizeType,
     error::StoreError,
-    pages::PageTuple,
-    tuple::{DBIdType, Tuple},
+    pages::{
+        PageTuple,
+        anytuple::{order_prefix, order_prefix_of, prefix_order},
+    },
+    tuple::{DBIdType, IdRef, Tuple, TupleRef},
+    wire::{WireId, WireTuple, id_end, tuple_id_ending},
 };
 
 const SLOT_COUNT_BYTES: usize = 4;
@@ -136,7 +121,7 @@ const DECLARED_CAPACITY_BYTES: usize = 4;
 const HEADER_BYTES: usize = SLOT_COUNT_BYTES + DECLARED_CAPACITY_BYTES;
 // offset: u32 LE + len: u32 LE. No tombstone bit — see this file's own
 // top comment on why (deviation #1).
-const SLOT_ENTRY_BYTES: usize = 8;
+pub(crate) const SLOT_ENTRY_BYTES: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct SlotEntry {
@@ -180,6 +165,11 @@ fn blank_buffer(len: usize, declared_capacity: usize) -> Vec<u8> {
     buf
 }
 
+// Every tuple's bytes on a page have keys whose strings are UTF-8, so
+// they are read without checking (see wire::WireKey::assume_checked):
+// from_bytes checks each key as the page is read in, and add/replace write
+// only Tuples' own encodings. Moving bytes around (compact, the directory
+// memmoves) keeps them whole.
 #[derive(Debug)]
 pub struct SlottedPage {
     buf: Vec<u8>,
@@ -194,6 +184,15 @@ pub struct SlottedPage {
     // longer pointed to by any slot, only reclaimed by compact(). See this
     // file's own top comment, deviation #1.
     dead_heap_bytes: usize,
+    // The order_prefix of each slot's id, in step with the slot directory
+    // — in memory only, built as the page is read (from_bytes): most
+    // binary-search probes compare these and never read a tuple, as in
+    // AnyTuplePage.
+    prefixes: Vec<u128>,
+    // Where each slot's id ends within its bytes (see wire::id_end), in
+    // step with the directory, in memory only: a slot is then read
+    // (at_ref, id_at) without stepping over its key to find the rest.
+    id_ends: Vec<u32>,
 }
 
 impl Clone for SlottedPage {
@@ -202,6 +201,8 @@ impl Clone for SlottedPage {
             buf: self.buf.clone(),
             heap_start: self.heap_start,
             dead_heap_bytes: self.dead_heap_bytes,
+            prefixes: self.prefixes.clone(),
+            id_ends: self.id_ends.clone(),
         }
     }
 }
@@ -224,6 +225,8 @@ impl SlottedPage {
             buf,
             heap_start,
             dead_heap_bytes: 0,
+            prefixes: Vec::new(),
+            id_ends: Vec::new(),
         }
     }
 
@@ -246,6 +249,8 @@ impl SlottedPage {
         }
         let mut heap_start = buf.len();
         let mut live_bytes: usize = 0;
+        let mut prefixes = Vec::with_capacity(slot_count);
+        let mut id_ends = Vec::with_capacity(slot_count);
         for idx in 0..slot_count {
             let e = slot_entry_at(&buf, idx);
             let off = e.offset as usize;
@@ -259,12 +264,24 @@ impl SlottedPage {
             }
             heap_start = heap_start.min(off);
             live_bytes += len;
+            // Read in once, here: every key's strings checked (see
+            // WireKey::check), its prefix taken, where it ends kept.
+            let record = &buf[off..off + len];
+            let end = id_end(record)?;
+            let id = tuple_id_ending(record, end)?;
+            if let WireId::Rec(k) = id {
+                k.check()?;
+            }
+            prefixes.push(order_prefix_of(IdRef::wire(id)));
+            id_ends.push(end as u32);
         }
         let dead_heap_bytes = (buf.len() - heap_start).saturating_sub(live_bytes);
         Ok(Self {
             buf,
             heap_start,
             dead_heap_bytes,
+            prefixes,
+            id_ends,
         })
     }
 
@@ -292,10 +309,14 @@ impl SlottedPage {
         write_slot_entry_at(&mut self.buf, idx, e);
     }
 
-    fn decode_at(&self, idx: usize) -> Result<Tuple, StoreError> {
+    // Slot `idx`'s tuple, as its encoded bytes.
+    fn record(&self, idx: usize) -> &[u8] {
         let e = self.slot(idx);
-        let bytes = &self.buf[e.offset as usize..e.offset as usize + e.len as usize];
-        Ok(from_bytes::<Tuple>(bytes)?)
+        &self.buf[e.offset as usize..e.offset as usize + e.len as usize]
+    }
+
+    fn decode_at(&self, idx: usize) -> Result<Tuple, StoreError> {
+        Ok(from_bytes::<Tuple>(self.record(idx))?)
     }
 
     // Persistence versioning Stage 5: `id` being `Tuple`'s first field is a
@@ -303,33 +324,21 @@ impl SlottedPage {
     // a page format version that moves it must change this function in the
     // same commit.
     //
-    // PERF (revert this whole function + its two call sites below back to
-    // `decode_at(idx)?.id` if measurement ever says otherwise): `id` is
-    // `Tuple`'s first declared struct field, and postcard serializes
-    // struct fields in declaration order with no field-name framing, so
-    // it's self-delimiting at the front of every candidate's byte range —
-    // `from_bytes::<DBIdType>` reads exactly as many bytes as the id
-    // needs and silently ignores the rest (see postcard::from_bytes' own
-    // doc comment: "the unused portion, if any, is not returned"), never
-    // touching `txn_id`/`pre_lsn`/`flags`/the `data: Arc<[u8]>` payload.
-    // This file's own top comment named this exact gap as the reason
-    // SlottedPage lost a 22x repeated-access microbenchmark to
-    // AnyTuplePage and got reverted as Page::new's default: every binary-
-    // search comparison step was fully decoding (and heap-allocating) a
-    // candidate's entire payload just to compare one field. Confirmed via
-    // dhat profiling of a 4-way HashedSource join: `SlottedPage::bound`'s
-    // full-tuple decode was ~27% of every join/hash/sort-attributable
-    // allocation in that run, all of it wasted on the `data` field these
-    // comparisons never look at.
-    fn decode_id_at(&self, idx: usize) -> Result<DBIdType, StoreError> {
-        let e = self.slot(idx);
-        let bytes = &self.buf[e.offset as usize..e.offset as usize + e.len as usize];
-        Ok(from_bytes::<DBIdType>(bytes)?)
+    // Slot `idx`'s id, read in place from the front of its bytes (see
+    // wire::tuple_id) — nothing decoded, nothing allocated. Decoding it
+    // (a whole Tuple at first, then the id alone) at every binary-search
+    // step is what made this page ~22x slower than AnyTuplePage on
+    // repeated gets (see this file's top comment).
+    fn id_at(&self, idx: usize) -> Result<IdRef<'_>, StoreError> {
+        let id = tuple_id_ending(self.record(idx), self.id_ends[idx] as usize)?;
+        // SAFETY: every key on this page is UTF-8 (see SlottedPage).
+        Ok(IdRef::wire(unsafe { id.assume_checked() }))
     }
+
 
     // First index in [0, slot_count) whose decoded id is NOT Less than
     // `id` (i.e. >= id), or slot_count if every entry is < id. O(log N)
-    // id-only decodes, one per comparison step.
+    // in-memory prefix compares, reading a slot's id only on a tie.
     fn lower_bound(&self, id: &DBIdType) -> Result<usize, StoreError> {
         self.bound(id, false)
     }
@@ -341,21 +350,35 @@ impl SlottedPage {
     }
 
     fn bound(&self, id: &DBIdType, strict_greater: bool) -> Result<usize, StoreError> {
-        let mut lo = 0usize;
-        let mut hi = self.slot_count();
+        if strict_greater {
+            self.search(id, |o| o.is_gt())
+        } else {
+            self.search(id, |o| o.is_ge())
+        }
+    }
+
+    // The first slot for which `past` holds; it holds for every one after.
+    // Most probes are decided by the inline prefixes alone (see
+    // prefix_order); only a tie reads the slot's id.
+    #[inline(always)]
+    fn search(
+        &self,
+        id: &DBIdType,
+        past: impl Fn(std::cmp::Ordering) -> bool,
+    ) -> Result<usize, StoreError> {
+        let prefix = order_prefix(id);
+        let prefixes = &self.prefixes[..];
+        let (mut lo, mut hi) = (0, prefixes.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let cand_id = self.decode_id_at(mid)?;
-            let ord = cand_id.cmp(id);
-            let go_right = if strict_greater {
-                ord != std::cmp::Ordering::Greater
-            } else {
-                ord == std::cmp::Ordering::Less
+            let ord = match prefix_order(prefixes[mid], prefix) {
+                Some(ord) => ord,
+                None => self.id_at(mid)?.cmp_owned(id),
             };
-            if go_right {
-                lo = mid + 1;
-            } else {
+            if past(ord) {
                 hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
         Ok(lo)
@@ -368,17 +391,33 @@ impl SlottedPage {
     // searches.
     fn find_exact_in(&self, id: &DBIdType, lo: usize, hi: usize) -> Result<Option<usize>, StoreError> {
         for idx in lo..hi {
-            if self.decode_id_at(idx)? == *id {
+            if self.id_at(idx)?.eq_owned(id) {
                 return Ok(Some(idx));
             }
         }
         Ok(None)
     }
 
+    // One binary search, then along the run of ids tied with `id` — most
+    // often none — rather than a second search for the run's end.
     fn find_exact(&self, id: &DBIdType) -> Result<Option<usize>, StoreError> {
-        let lo = self.lower_bound(id)?;
-        let hi = self.upper_bound(id)?;
-        self.find_exact_in(id, lo, hi)
+        let prefix = order_prefix(id);
+        for idx in self.lower_bound(id)?..self.slot_count() {
+            match prefix_order(self.prefixes[idx], prefix) {
+                // Only row ids' prefixes say Equal, and theirs say all.
+                Some(std::cmp::Ordering::Equal) => return Ok(Some(idx)),
+                Some(_) => break,
+                None => {}
+            }
+            let cand = self.id_at(idx)?;
+            if cand.eq_owned(id) {
+                return Ok(Some(idx));
+            }
+            if cand.cmp_owned(id).is_ne() {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     fn contiguous_free(&self) -> usize {
@@ -477,7 +516,7 @@ impl SlottedPage {
     // shifting later entries right by one slot width and allocating heap
     // space at the current frontier. Caller must have already called
     // ensure_room(encoded.len()) — this does no capacity checking itself.
-    fn insert_at(&mut self, idx: usize, encoded: &[u8]) {
+    fn insert_at(&mut self, idx: usize, encoded: &[u8], prefix: u128, id_end: usize) {
         let n = self.slot_count();
         let len = encoded.len();
         let shift_start = dir_offset(idx);
@@ -497,6 +536,8 @@ impl SlottedPage {
             },
         );
         self.set_slot_count(n + 1);
+        self.prefixes.insert(idx, prefix);
+        self.id_ends.insert(idx, id_end as u32);
     }
 
     // Deletes the directory entry at `idx` (closing the gap via a
@@ -516,6 +557,8 @@ impl SlottedPage {
             self.buf.copy_within(src..src + len, dst);
         }
         self.set_slot_count(n - 1);
+        self.prefixes.remove(idx);
+        self.id_ends.remove(idx);
         Ok(removed)
     }
 }
@@ -531,6 +574,18 @@ impl PageTuple for SlottedPage {
 
     fn at(&self, i: usize) -> Option<Tuple> {
         (i < self.slot_count()).then(|| self.decode_at(i).ok()).flatten()
+    }
+
+    fn at_ref(&self, i: usize) -> Option<TupleRef<'_>> {
+        (i < self.slot_count())
+            .then(|| WireTuple::read_after(self.record(i), self.id_ends[i] as usize).ok())
+            .flatten()
+            // SAFETY: every key on this page is UTF-8 (see SlottedPage).
+            .map(|t| TupleRef::wire(unsafe { t.assume_checked() }))
+    }
+
+    fn entry_overhead(&self) -> DBSizeType {
+        SLOT_ENTRY_BYTES as DBSizeType
     }
 
     fn seek(&self, lower: std::ops::Bound<&DBIdType>) -> Result<usize, StoreError> {
@@ -554,7 +609,7 @@ impl PageTuple for SlottedPage {
         // don't) but never grown a non-empty page and never reorders
         // existing entries, so `lo` — computed against the pre-compaction
         // directory — is still the correct insertion index.
-        self.insert_at(lo, &encoded);
+        self.insert_at(lo, &encoded, order_prefix(&tuple.id), id_end(&encoded)?);
         Ok(())
     }
 
@@ -562,8 +617,18 @@ impl PageTuple for SlottedPage {
         Ok(self.find_exact(id)?.is_some())
     }
 
-    fn find_hinted(&self, id: &DBIdType, _hint: usize) -> Result<Option<usize>, StoreError> {
+    fn find_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<usize>, StoreError> {
+        if hint < self.slot_count() && self.id_at(hint)?.eq_owned(id) {
+            return Ok(Some(hint));
+        }
         self.find_exact(id)
+    }
+
+    fn get_hinted(&self, id: &DBIdType, hint: usize) -> Result<Option<(Tuple, usize)>, StoreError> {
+        match self.find_hinted(id, hint)? {
+            Some(idx) => Ok(Some((self.decode_at(idx)?, idx))),
+            None => Ok(None),
+        }
     }
 
     fn get(&self, id: &DBIdType) -> Result<Option<Tuple>, StoreError> {
@@ -643,7 +708,7 @@ impl PageTuple for SlottedPage {
             // compacted — recompute the insertion point fresh rather than
             // reusing idx.
             let insert_idx = self.lower_bound(id)?;
-            self.insert_at(insert_idx, &encoded);
+            self.insert_at(insert_idx, &encoded, order_prefix(id), id_end(&encoded)?);
             Ok(old)
         }
     }
@@ -665,10 +730,9 @@ impl PageTuple for SlottedPage {
 
     fn keys(&self) -> Result<Vec<DBSizeType>, StoreError> {
         // Unused externally — see AnyTuplePage::keys' own matching note.
-        // decode_id_at, not decode_at: only `.id` is read here either way
-        // (see decode_id_at's own doc comment).
+        // id_at, not decode_at: only `.id` is read here either way.
         (0..self.slot_count())
-            .map(|idx| Ok(self.decode_id_at(idx)?.hashed()))
+            .map(|idx| Ok(self.id_at(idx)?.hashed()))
             .collect()
     }
 
@@ -684,6 +748,8 @@ impl PageTuple for SlottedPage {
         self.buf = blank_buffer(declared_capacity, declared_capacity);
         self.heap_start = self.buf.len();
         self.dead_heap_bytes = 0;
+        self.prefixes.clear();
+        self.id_ends.clear();
         Ok(())
     }
 
@@ -1215,6 +1281,22 @@ mod tests {
         eprintln!(
             "SlottedPage bench_repeated_get_on_an_already_loaded_page: {ITERS} gets in \
              {elapsed:?} ({:.0} gets/s)",
+            ITERS as f64 / elapsed.as_secs_f64()
+        );
+        // The same, lent (find_hinted + at_ref, as a scan reads rows):
+        // no tuple copied out.
+        let start = crate::clock::Instant::now();
+        for _ in 0..ITERS {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let id = DBIdType::Int(state % 200);
+            let i = p.find_hinted(&id, usize::MAX).unwrap().unwrap();
+            std::hint::black_box(p.at_ref(i).unwrap().data().len());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "SlottedPage, lent: {ITERS} gets in {elapsed:?} ({:.0} gets/s)",
             ITERS as f64 / elapsed.as_secs_f64()
         );
     }

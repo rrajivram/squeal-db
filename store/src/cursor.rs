@@ -9,7 +9,7 @@ use crate::{
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple, TupleRef},
     txn::{Transaction, TransactionId},
-    valueitem::{IndexKey, ValueItem},
+    valueitem::{IndexKey, ValueItem, ValueRef},
 };
 
 /// A contiguous run of an IndexKey-keyed tree's keys: those whose leading
@@ -40,11 +40,13 @@ impl KeyRange {
     // Where `key` lies relative to the range: Less (before it), Equal
     // (inside), Greater (after it). Keys come in ascending order, so the
     // first Greater ends a scan.
-    pub(crate) fn position(&self, key: &IndexKey) -> std::cmp::Ordering {
+    pub(crate) fn position<'v>(
+        &self,
+        mut values: impl Iterator<Item = ValueRef<'v>>,
+    ) -> std::cmp::Ordering {
         use std::cmp::Ordering::*;
-        let values = key.values();
-        for (i, p) in self.prefix.iter().enumerate() {
-            match values.get(i).map(|v| v.cmp(p)) {
+        for p in &self.prefix {
+            match values.next().map(|v| v.cmp(&p.as_ref())) {
                 Some(Equal) => {}
                 Some(other) => return other,
                 None => return Greater,
@@ -54,20 +56,20 @@ impl KeyRange {
             (&self.lower, &self.upper),
             (Bound::Unbounded, Bound::Unbounded)
         );
-        let Some(v) = values.get(self.prefix.len()) else {
+        let Some(v) = values.next() else {
             return if bounded { Greater } else { Equal };
         };
         let before = match &self.lower {
-            Bound::Included(lo) => v < lo,
-            Bound::Excluded(lo) => v <= lo,
+            Bound::Included(lo) => v < lo.as_ref(),
+            Bound::Excluded(lo) => v <= lo.as_ref(),
             Bound::Unbounded => false,
         };
         if before {
             return Less;
         }
         let after = match &self.upper {
-            Bound::Included(hi) => v > hi,
-            Bound::Excluded(hi) => v >= hi,
+            Bound::Included(hi) => v > hi.as_ref(),
+            Bound::Excluded(hi) => v >= hi.as_ref(),
             Bound::Unbounded => false,
         };
         if after { Greater } else { Equal }
@@ -172,24 +174,20 @@ impl LeafEntries {
     }
 }
 
-// What a cursor's next_ref last lent, kept where the TupleRef it hands out
-// borrows from: a position in the page snapshot the cursor is reading (a
-// TableCursor's), a position in a data page's snapshot (the row a
-// RangeCursor's index entry points to), or a version walked back to (see
-// Db::visible_version), which no page holds.
+// What a cursor's next_ref lends from when it isn't the page snapshot the
+// cursor is reading (a TableCursor's current_iter): a data page's snapshot
+// (the row a RangeCursor's index entry points to, at a position), or a
+// version walked back to (see Db::visible_version), which no page holds.
 enum Lent {
     Nothing,
-    At(usize),
     Row(Arc<dyn PageTuple>, usize),
     Owned(Tuple),
 }
 
 impl Lent {
-    // `page` is the snapshot an At position is in.
-    fn get<'a>(&'a self, page: Option<&'a PageTupleIterator>) -> Option<TupleRef<'a>> {
+    fn get(&self) -> Option<TupleRef<'_>> {
         match self {
             Lent::Nothing => None,
-            Lent::At(i) => page?.get(*i),
             Lent::Row(content, i) => content.at_ref(*i),
             Lent::Owned(t) => Some(TupleRef::borrowed(t)),
         }
@@ -272,16 +270,25 @@ where
                 self.lent = Lent::Nothing;
                 return Ok(None);
             };
-            let tuple = self.current_iter.get(i).ok_or_else(|| {
+            // SAFETY: `tuple` borrows the page snapshot current_iter holds.
+            // It is returned (tying it to `self`'s borrow), or it is done
+            // with before anything below or the next time round the loop
+            // changes current_iter — the borrow checker can't see that a
+            // borrow returned from one iteration of a loop needn't block
+            // the next (Rust's NLL "problem case #3"); through a pointer it
+            // isn't asked. A plain borrow here means reading the tuple a
+            // second time to lend it.
+            let iter: *const PageTupleIterator = &self.current_iter;
+            let tuple = unsafe { &*iter }.get(i).ok_or_else(|| {
                 StoreError::UnknownError(format!("no tuple at position {i} of its page"))
             })?;
             match self.db.visible_version(&tuple, &reader)? {
-                Visible::Itself => break Lent::At(i),
+                Visible::Itself => return Ok(Some(tuple)),
                 Visible::Ancestor(t) => break Lent::Owned(t),
                 Visible::Not => continue,
             }
         };
-        Ok(self.lent.get(Some(&self.current_iter)))
+        Ok(self.lent.get())
     }
 
     // The position of the next row on the page being read, moving on to
@@ -593,19 +600,21 @@ where
                 continue;
             };
             self.last_row = Some((page, at));
-            let visible = {
-                let row = content.at_ref(at).ok_or_else(|| {
-                    StoreError::UnknownError(format!("no row at position {at} of {page:?}"))
-                })?;
-                self.db.visible_version(&row, &reader)?
-            };
-            match visible {
-                Visible::Itself => break Lent::Row(content, at),
+            self.lent = Lent::Row(content, at);
+            // SAFETY: as in TableCursor::next_ref — `row` borrows the data
+            // page snapshot just kept in self.lent, and is returned or done
+            // with before self.lent next changes.
+            let lent: *const Lent = &self.lent;
+            let row = unsafe { &*lent }.get().ok_or_else(|| {
+                StoreError::UnknownError(format!("no row at position {at} of {page:?}"))
+            })?;
+            match self.db.visible_version(&row, &reader)? {
+                Visible::Itself => return Ok(Some(row)),
                 Visible::Ancestor(t) => break Lent::Owned(t),
                 Visible::Not => continue,
             }
         };
-        Ok(self.lent.get(None))
+        Ok(self.lent.get())
     }
 
     // The index entry at position `i` of the leaf being read.

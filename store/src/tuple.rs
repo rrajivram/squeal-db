@@ -14,11 +14,20 @@ use crate::{
     logger::LsnId,
     txn::TransactionId,
     valueitem::{IndexKey, ValueItem, ValueRef},
+    wire::{WireId, WireTuple, WireValues},
 };
 
 const NONE: u8 = 0;
 const INDEXED: u8 = 1;
 const TOMBSTONED: u8 = 2;
+
+fn is_index(flags: u8) -> bool {
+    flags & INDEXED == INDEXED
+}
+
+fn is_tombstoned(flags: u8) -> bool {
+    flags & 1 << TOMBSTONED != 0
+}
 
 // Hand-rolled codec, not derived: see table.rs's TableType for why. DBIdType
 // is embedded directly in every persisted Tuple, so its wire tag must never
@@ -140,7 +149,7 @@ pub struct Tuple {
     // unchanged. Mutation replaces the whole Arc (see `set_data`).
     #[serde(deserialize_with = "arc_bytes")]
     pub(crate) data: Arc<[u8]>,
-    flags: u8,
+    pub(crate) flags: u8,
     // Cached serialized size — not persisted. Zero means not yet computed (e.g. after serde
     // deserialization, which skips this field); size() computes it on demand in that case.
     #[serde(skip)]
@@ -216,7 +225,7 @@ impl Tuple {
     }
 
     pub fn is_index(&self) -> bool {
-        self.flags & INDEXED == INDEXED
+        is_index(self.flags)
     }
 
     pub fn set_txn_id(&mut self, id: TransactionId) {
@@ -248,7 +257,7 @@ impl Tuple {
     }
 
     pub fn is_tombstoned(&self) -> bool {
-        self.flags & 1 << TOMBSTONED != 0
+        is_tombstoned(self.flags)
     }
 
     /// The opposite of `tombstone()`: a fresh insert over a visible tombstone
@@ -293,88 +302,221 @@ impl Tuple {
 
 // A tuple a reader is handed without it being copied out: what a page or
 // cursor lends (see PageTuple::at_ref, TableCursor::next_ref). Opaque on
-// purpose — a page that keeps its tuples as bytes will lend views into
-// those bytes behind this same surface. Today it is a borrowed Tuple, or,
-// from a page that decodes on demand or a version walked back to, an
-// owned one.
+// purpose: behind it is a borrowed Tuple (AnyTuplePage), an owned one (a
+// version walked back to, or a page that decodes on demand), or a tuple's
+// encoded bytes read in place (SlottedPage, see wire::WireTuple).
 #[derive(Debug, Clone)]
-pub struct TupleRef<'a>(Cow<'a, Tuple>);
+pub struct TupleRef<'a>(Lent<'a>);
+
+#[derive(Debug, Clone)]
+enum Lent<'a> {
+    Tuple(Cow<'a, Tuple>),
+    Wire(WireTuple<'a>),
+}
 
 impl<'a> TupleRef<'a> {
     pub(crate) fn borrowed(tuple: &'a Tuple) -> Self {
-        Self(Cow::Borrowed(tuple))
+        Self(Lent::Tuple(Cow::Borrowed(tuple)))
     }
 
     pub(crate) fn owned(tuple: Tuple) -> Self {
-        Self(Cow::Owned(tuple))
+        Self(Lent::Tuple(Cow::Owned(tuple)))
+    }
+
+    pub(crate) fn wire(tuple: WireTuple<'a>) -> Self {
+        Self(Lent::Wire(tuple))
     }
 
     pub fn id(&self) -> IdRef<'_> {
-        IdRef(&self.0.id)
+        match &self.0 {
+            Lent::Tuple(t) => IdRef::of(&t.id),
+            Lent::Wire(w) => IdRef(Id::Wire(w.id)),
+        }
     }
 
     pub fn data(&self) -> &[u8] {
-        &self.0.data
+        match &self.0 {
+            Lent::Tuple(t) => &t.data,
+            Lent::Wire(w) => w.data,
+        }
+    }
+
+    fn flags(&self) -> u8 {
+        match &self.0 {
+            Lent::Tuple(t) => t.flags,
+            Lent::Wire(w) => w.flags,
+        }
     }
 
     pub fn is_index(&self) -> bool {
-        self.0.is_index()
+        is_index(self.flags())
     }
 
     pub fn is_tombstoned(&self) -> bool {
-        self.0.is_tombstoned()
+        is_tombstoned(self.flags())
     }
 
     pub(crate) fn txn_id(&self) -> Option<TransactionId> {
-        self.0.txn_id
+        match &self.0 {
+            Lent::Tuple(t) => t.txn_id,
+            Lent::Wire(w) => w.txn_id,
+        }
     }
 
     pub(crate) fn pre_lsn(&self) -> Option<LsnId> {
-        self.0.pre_lsn
+        match &self.0 {
+            Lent::Tuple(t) => t.pre_lsn,
+            Lent::Wire(w) => w.pre_lsn,
+        }
     }
 
     pub fn to_owned(&self) -> Tuple {
-        self.0.clone().into_owned()
+        self.clone().into_owned()
     }
 
     pub fn into_owned(self) -> Tuple {
-        self.0.into_owned()
+        match self.0 {
+            Lent::Tuple(t) => t.into_owned(),
+            Lent::Wire(w) => Tuple {
+                id: IdRef(Id::Wire(w.id)).to_owned(),
+                txn_id: w.txn_id,
+                pre_lsn: w.pre_lsn,
+                data: Arc::from(w.data),
+                flags: w.flags,
+                serialized_size: 0,
+            },
+        }
     }
 }
 
-// A tuple's id, lent with it (see TupleRef).
+// A tuple's id, lent with it (see TupleRef): an owned id borrowed, or one
+// read in place from a tuple's bytes. Compares, hashes and equals exactly
+// as DBIdType does.
 #[derive(Debug, Clone, Copy)]
-pub struct IdRef<'a>(&'a DBIdType);
+pub struct IdRef<'a>(Id<'a>);
+
+#[derive(Debug, Clone, Copy)]
+enum Id<'a> {
+    Owned(&'a DBIdType),
+    Wire(WireId<'a>),
+}
+
+/// See IdRef::key_values.
+pub struct KeyValues<'a>(Values<'a>);
+
+enum Values<'a> {
+    Owned(std::slice::Iter<'a, ValueItem>),
+    Wire(WireValues<'a>),
+}
+
+impl<'a> Iterator for KeyValues<'a> {
+    type Item = ValueRef<'a>;
+
+    fn next(&mut self) -> Option<ValueRef<'a>> {
+        match &mut self.0 {
+            Values::Owned(i) => i.next().map(ValueItem::as_ref),
+            Values::Wire(i) => i.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match &self.0 {
+            Values::Owned(i) => i.size_hint(),
+            Values::Wire(i) => i.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for KeyValues<'_> {}
 
 impl<'a> IdRef<'a> {
+    pub(crate) fn of(id: &'a DBIdType) -> Self {
+        IdRef(Id::Owned(id))
+    }
+
+    pub(crate) fn wire(id: WireId<'a>) -> Self {
+        IdRef(Id::Wire(id))
+    }
+
     /// A row-id key's number; None for a column key.
     pub fn as_int(&self) -> Option<u64> {
         match self.0 {
-            DBIdType::Int(i) => Some(*i),
-            DBIdType::Rec(_) => None,
+            Id::Owned(DBIdType::Int(i)) => Some(*i),
+            Id::Wire(WireId::Int(i)) => Some(i),
+            _ => None,
         }
     }
 
     /// A column key's fields, in order; None for a row-id key.
-    pub fn key_values(&self) -> Option<impl ExactSizeIterator<Item = ValueRef<'a>> + 'a> {
+    pub fn key_values(&self) -> Option<KeyValues<'a>> {
         match self.0 {
-            DBIdType::Int(_) => None,
-            DBIdType::Rec(k) => Some(k.values().iter().map(ValueItem::as_ref)),
+            Id::Owned(DBIdType::Rec(k)) => Some(KeyValues(Values::Owned(k.values().iter()))),
+            Id::Wire(WireId::Rec(k)) => Some(KeyValues(Values::Wire(k.values()))),
+            _ => None,
         }
     }
 
     pub fn to_owned(&self) -> DBIdType {
-        self.0.clone()
+        match self.0 {
+            Id::Owned(id) => id.clone(),
+            Id::Wire(WireId::Int(i)) => DBIdType::Int(i),
+            Id::Wire(WireId::Rec(k)) => {
+                DBIdType::Rec(IndexKey::from_stored(k.values().map(|v| v.to_owned()).collect()))
+            }
+        }
     }
 
     // `f` of this id as a DBIdType, for what looks ids up by one.
     pub(crate) fn with_owned<R>(&self, f: impl FnOnce(&DBIdType) -> R) -> R {
-        f(self.0)
+        match self.0 {
+            Id::Owned(id) => f(id),
+            Id::Wire(_) => f(&self.to_owned()),
+        }
     }
 
-    // DBIdType's own order (see its Ord) against an owned id.
+    // See DBIdType::hashed.
+    pub(crate) fn hashed(&self) -> u64 {
+        match self.key_values() {
+            Some(values) => IndexKey::hash_refs(values),
+            None => self.as_int().unwrap_or_default(),
+        }
+    }
+
+    // DBIdType's order (see its Ord): field by field between two column
+    // keys — a key that runs out first ties — and by hashed() otherwise.
+    pub(crate) fn cmp(&self, other: &IdRef) -> std::cmp::Ordering {
+        if let (Id::Owned(a), Id::Owned(b)) = (self.0, other.0) {
+            return a.cmp(b);
+        }
+        match (self.key_values(), other.key_values()) {
+            (Some(a), Some(b)) => a
+                .zip(b)
+                .map(|(a, b)| a.cmp(&b))
+                .find(|o| o.is_ne())
+                .unwrap_or(std::cmp::Ordering::Equal),
+            _ => self.hashed().cmp(&other.hashed()),
+        }
+    }
+
+    // DBIdType's order against an owned id.
     pub(crate) fn cmp_owned(&self, other: &DBIdType) -> std::cmp::Ordering {
-        self.0.cmp(other)
+        self.cmp(&IdRef::of(other))
+    }
+
+    // DBIdType's `==` (exact: the same kind, and for column keys the same
+    // number of fields, each equal) against an owned id.
+    pub(crate) fn eq_owned(&self, other: &DBIdType) -> bool {
+        match self.0 {
+            Id::Owned(id) => id == other,
+            Id::Wire(WireId::Int(i)) => *other == DBIdType::Int(i),
+            Id::Wire(WireId::Rec(k)) => match other {
+                DBIdType::Rec(o) => {
+                    k.len() == o.values().len()
+                        && k.values().zip(o.values()).all(|(a, b)| a == b.as_ref())
+                }
+                DBIdType::Int(_) => false,
+            },
+        }
     }
 
     // Where this id lies against `range` (see KeyRange::position); None
@@ -383,10 +525,7 @@ impl<'a> IdRef<'a> {
         &self,
         range: &crate::cursor::KeyRange,
     ) -> Option<std::cmp::Ordering> {
-        match self.0 {
-            DBIdType::Rec(k) => Some(range.position(k)),
-            DBIdType::Int(_) => None,
-        }
+        Some(range.position(self.key_values()?))
     }
 }
 
@@ -562,5 +701,64 @@ mod tests {
         assert_eq!(t2.id, DBIdType::Int(10));
         assert_eq!(t2.data.to_vec(), b"payload");
         assert_eq!(t2.txn_id, Some(txn_id));
+    }
+
+    // An id read in place from a tuple's bytes (IdRef over wire::WireId)
+    // compares, equals, hashes and copies out exactly as the DBIdType it
+    // was written from — over every pair from a set built to hit the
+    // edges: NaN and -0.0, a string's capacity (not part of its value),
+    // a key that runs out before another, mixed types, and row ids.
+    #[test]
+    fn test_an_id_read_from_bytes_behaves_as_the_id() {
+        use crate::tuple::{IdRef, TupleRef};
+        use crate::wire::WireTuple;
+        use std::sync::Arc;
+
+        let s = |v: &str, cap: u32| ValueItem::Str((v.to_owned(), cap));
+        let rec = |vs: &[ValueItem]| DBIdType::Rec(IndexKey::new_from(vs).unwrap());
+        let ids = vec![
+            DBIdType::Int(0),
+            DBIdType::Int(7),
+            DBIdType::Int(u64::MAX),
+            rec(&[]),
+            rec(&[ValueItem::Null]),
+            rec(&[ValueItem::Integer(-1)]),
+            rec(&[ValueItem::Integer(7)]),
+            rec(&[ValueItem::Double(0.0)]),
+            rec(&[ValueItem::Double(-0.0)]),
+            rec(&[ValueItem::Double(f64::NAN)]),
+            rec(&[ValueItem::Double(f64::NEG_INFINITY)]),
+            rec(&[ValueItem::Datetime(5)]),
+            rec(&[ValueItem::Boolean(true)]),
+            rec(&[s("abc", 3)]),
+            rec(&[s("abc", 12)]),
+            rec(&[s("abd", 12)]),
+            rec(&[s("", 4)]),
+            rec(&[ValueItem::Blob((Arc::from(&b"ab"[..]), 2))]),
+            rec(&[s("abc", 12), ValueItem::Integer(1)]),
+            rec(&[s("abc", 12), ValueItem::Integer(2)]),
+            rec(&[s("abc", 12), ValueItem::Null]),
+            rec(&[ValueItem::Integer(7), s("x", 1), ValueItem::Double(1.5)]),
+        ];
+        let bytes: Vec<Vec<u8>> = ids
+            .iter()
+            .map(|id| postcard::to_allocvec(&Tuple::new_with(id.clone(), b"", None, None)).unwrap())
+            .collect();
+        let lent: Vec<TupleRef> = bytes
+            .iter()
+            .map(|b| TupleRef::wire(WireTuple::read(b).unwrap()))
+            .collect();
+        for (a, la) in ids.iter().zip(&lent) {
+            let wa = la.id();
+            assert_eq!(&wa.to_owned(), a);
+            assert_eq!(wa.hashed(), a.hashed(), "{a:?}");
+            for (b, lb) in ids.iter().zip(&lent) {
+                let wb = lb.id();
+                assert_eq!(wa.cmp_owned(b), a.cmp(b), "{a:?} vs {b:?}");
+                assert_eq!(wa.cmp(&wb), a.cmp(b), "{a:?} vs {b:?}, both read");
+                assert_eq!(IdRef::of(a).cmp(&wb), a.cmp(b), "{a:?} vs read {b:?}");
+                assert_eq!(wa.eq_owned(b), a == b, "{a:?} == {b:?}");
+            }
+        }
     }
 }

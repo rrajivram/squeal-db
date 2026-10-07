@@ -2019,10 +2019,12 @@ where
             over_partitions(table, &parts, merge_order.as_deref(), rows, |part| {
                 let stats = stats.clone();
                 let source: Box<dyn Source> = match path.clone() {
-                    // Only the columns the query reads, here and below.
+                    // Only the columns the query reads, here and below, and
+                    // no row keys kept (a query never asks for last_id).
                     AccessPath::TableScan => Box::new(
                         TableSource::new(db.clone(), table.clone(), part, txn, stats)?
-                            .reading(&needs.columns),
+                            .reading(&needs.columns)
+                            .without_row_ids(),
                     ),
                     AccessPath::TableSeek(range) => Box::new(
                         TableSource::seek(
@@ -2034,7 +2036,8 @@ where
                             range,
                             rows,
                         )?
-                        .reading(&needs.columns),
+                        .reading(&needs.columns)
+                        .without_row_ids(),
                     ),
                     // A covering index.
                     AccessPath::IndexScan(i) => Box::new(

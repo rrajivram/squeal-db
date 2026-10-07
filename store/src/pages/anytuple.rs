@@ -7,7 +7,7 @@ use crate::{
     db::DBSizeType,
     error::StoreError,
     pages::PageTuple,
-    tuple::{DBIdType, Tuple, TupleRef},
+    tuple::{DBIdType, IdRef, Tuple, TupleRef},
 };
 
 // A page's tuples, sorted by id (DBIdType's own Ord), in one Vec: a lookup
@@ -80,14 +80,30 @@ impl<'de> Deserialize<'de> for AnyTuplePage {
 // tie, never reverse it. A key with no fields ties with every key: no
 // prefix.
 pub(crate) fn order_prefix(id: &DBIdType) -> u128 {
-    use crate::valueitem::ValueItem;
+    order_prefix_of(IdRef::of(id))
+}
+
+// How two ids compare, if their order_prefixes say: both known, of the
+// same kind, and different — or both row ids, whose prefix is the whole
+// id (an Int's order is its number), so equal prefixes are equal ids.
+#[inline(always)]
+pub(crate) fn prefix_order(a: u128, b: u128) -> Option<Ordering> {
+    let kind = b >> 126;
+    (a >> 126 == kind && (a != b && kind != 0 || kind == INT_PREFIX)).then(|| a.cmp(&b))
+}
+
+// order_prefix's kind for a row id (see there).
+const INT_PREFIX: u128 = 1;
+
+// order_prefix, of a lent id.
+pub(crate) fn order_prefix_of(id: IdRef) -> u128 {
+    use crate::valueitem::ValueRef;
     const INT: u128 = 1 << 126;
     const REC: u128 = 2 << 126;
-    let rec = match id {
-        DBIdType::Int(i) => return INT | *i as u128,
-        DBIdType::Rec(k) => k,
+    let Some(mut values) = id.key_values() else {
+        return INT | id.as_int().unwrap_or_default() as u128;
     };
-    let Some(first) = rec.values().first() else {
+    let Some(first) = values.next() else {
         return 0;
     };
     let ordered = |n: u64| (n as u128) << 56;
@@ -98,17 +114,17 @@ pub(crate) fn order_prefix(id: &DBIdType) -> u128 {
         u128::from_be_bytes(out)
     };
     let value = match first {
-        ValueItem::Null => 0,
-        ValueItem::Boolean(b) => ordered(*b as u64),
-        ValueItem::Integer(i) => ordered(*i as u64 ^ (1 << 63)),
-        ValueItem::Double(d) => {
+        ValueRef::Null => 0,
+        ValueRef::Boolean(b) => ordered(b as u64),
+        ValueRef::Integer(i) => ordered(i as u64 ^ (1 << 63)),
+        ValueRef::Double(d) => {
             let bits = d.to_bits() as i64;
             let total = bits ^ (((bits >> 63) as u64) >> 1) as i64;
             ordered(total as u64 ^ (1 << 63))
         }
-        ValueItem::Datetime(t) => ordered(*t),
-        ValueItem::Str((s, _)) => bytes(s.as_bytes()),
-        ValueItem::Blob((b, _)) => bytes(b),
+        ValueRef::Datetime(t) => ordered(t),
+        ValueRef::Str(s, _) => bytes(s.as_bytes()),
+        ValueRef::Blob(b, _) => bytes(b),
     };
     REC | (first.type_rank() as u128) << 123 | value
 }
@@ -136,11 +152,7 @@ impl AnyTuplePage {
     // Entry `i` against `id`, whose order_prefix is `prefix`.
     #[inline(always)]
     fn cmp_at(&self, i: usize, id: &DBIdType, prefix: u128) -> Ordering {
-        let mine = self.prefixes[i];
-        if mine != prefix && mine >> 126 == prefix >> 126 && prefix >> 126 != 0 {
-            return mine.cmp(&prefix);
-        }
-        self.data[i].id.cmp(id)
+        prefix_order(self.prefixes[i], prefix).unwrap_or_else(|| self.data[i].id.cmp(id))
     }
 
     // The first entry for which `past` holds; it holds for every one after.
@@ -702,6 +714,22 @@ mod tests {
              {elapsed:?} ({:.0} gets/s)",
             ITERS as f64 / elapsed.as_secs_f64()
         );
+        // The same, lent (find_hinted + at_ref, as a scan reads rows):
+        // no tuple copied out.
+        let start = crate::clock::Instant::now();
+        for _ in 0..ITERS {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let id = DBIdType::Int(state % 200);
+            let i = p.find_hinted(&id, usize::MAX).unwrap().unwrap();
+            std::hint::black_box(p.at_ref(i).unwrap().data().len());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "AnyTuplePage, lent: {ITERS} gets in {elapsed:?} ({:.0} gets/s)",
+            ITERS as f64 / elapsed.as_secs_f64()
+        );
     }
 
     // Why a sorted Vec with inline key prefixes and not the BTreeMap it
@@ -724,6 +752,7 @@ mod tests {
         for (pages, n) in [(1usize, 600usize), (400, 600), (400, 150)] {
             let mut maps = vec![];
             let mut vecs = vec![];
+            let mut slotted = vec![];
             for p in 0..pages {
                 let ts: Vec<Tuple> = (0..n)
                     .map(|i| Tuple::new_with(key(p * n + i), &7u64.to_le_bytes(), None, None))
@@ -735,6 +764,11 @@ mod tests {
                 }
                 maps.push(map);
                 vecs.push(AnyTuplePage::from_bytes(&bytes).unwrap());
+                let mut sp = crate::pages::slotted::SlottedPage::new(64 * 1024);
+                for t in &ts {
+                    sp.add(t.clone()).unwrap();
+                }
+                slotted.push(sp);
             }
             let mut x: u64 = 0x2545_F491_4F6C_DD1D;
             let probes: Vec<(usize, DBIdType)> = (0..200_000)
@@ -761,7 +795,21 @@ mod tests {
                 std::hint::black_box(vecs[*p].get(k).unwrap());
             }
             let vec_ns = start.elapsed().as_nanos() as f64 / probes.len() as f64;
-            eprintln!("{pages} pages of {n}: BTreeMap {map_ns:.0} ns, AnyTuplePage {vec_ns:.0} ns");
+            // Lent (find_hinted + at_ref), as a scan reads rows.
+            let lent = |pages: &[&dyn PageTuple]| {
+                let start = std::time::Instant::now();
+                for (p, k) in &probes {
+                    let i = pages[*p].find_hinted(k, usize::MAX).unwrap().unwrap();
+                    std::hint::black_box(pages[*p].at_ref(i).unwrap().data().len());
+                }
+                start.elapsed().as_nanos() as f64 / probes.len() as f64
+            };
+            let vec_lent = lent(&vecs.iter().map(|v| v as &dyn PageTuple).collect::<Vec<_>>());
+            let slot_lent = lent(&slotted.iter().map(|v| v as &dyn PageTuple).collect::<Vec<_>>());
+            eprintln!(
+                "{pages} pages of {n}: BTreeMap {map_ns:.0} ns, AnyTuplePage {vec_ns:.0} ns, \
+                 lent: AnyTuplePage {vec_lent:.0} ns, SlottedPage {slot_lent:.0} ns"
+            );
         }
     }
 }

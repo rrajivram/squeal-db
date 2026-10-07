@@ -374,8 +374,21 @@ fn test_indexes_supply_sort_order_with_the_same_results() {
         };
         assert_eq!(keys(&got), keys(&want), "{filter} {sort}");
         if limit.is_none() {
-            let mut g: Vec<String> = got.iter().map(Document::to_json).collect();
-            let mut w: Vec<String> = want.iter().map(Document::to_json).collect();
+            // skip(2) can cut through a run of ties, and which of the tied
+            // documents it drops follows the order they are read in — a
+            // table's rows come back page by page, not sorted. Documents
+            // tied with the first one returned are compared by count (the
+            // keys above); the rest must match.
+            let cut = keys(&got).first().cloned();
+            let past_cut = |docs: &[Document]| {
+                docs.iter()
+                    .zip(keys(docs))
+                    .filter(|(_, k)| Some(k) != cut.as_ref())
+                    .map(|(doc, _)| doc.to_json())
+                    .collect::<Vec<_>>()
+            };
+            let mut g = past_cut(&got);
+            let mut w = past_cut(&want);
             g.sort();
             w.sort();
             assert_eq!(g, w, "{filter} {sort}");
@@ -514,3 +527,4 @@ fn test_regex_prefixes_seek_indexes() {
     assert_eq!(stage(&c, filters[4]), "COLLSCAN");
     assert_eq!(stage(&c, filters[5]), "COLLSCAN");
 }
+

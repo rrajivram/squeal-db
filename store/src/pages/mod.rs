@@ -26,6 +26,12 @@ pub trait PageTuple: Send + Sync {
         self.at(i).map(TupleRef::owned)
     }
 
+    /// Bytes the page takes for each tuple beyond the tuple's own size()
+    /// (see Page::can_store): SlottedPage's slot directory entry.
+    fn entry_overhead(&self) -> DBSizeType {
+        0
+    }
+
     /// Where `id` is in the page's own order (`at`), told where it probably
     /// is as `get_hinted` is. The default looks at every tuple.
     fn find_hinted(&self, id: &DBIdType, _hint: usize) -> Result<Option<usize>, StoreError> {

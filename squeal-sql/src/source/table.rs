@@ -39,8 +39,11 @@ pub struct TableSource<F: DBFile> {
     // The most recently yielded tuple's own key — see Source::last_id's
     // own doc comment for why this exists at all (UPDATE/DELETE's own
     // use). None before the first next() call or after next() returns
-    // None.
+    // None, and always None without `keep_ids`.
     last_id: Option<store::tuple::DBIdType>,
+    // Whether to keep last_id: a copy of every row's key, which only
+    // UPDATE/DELETE read (see without_row_ids).
+    keep_ids: bool,
 }
 
 enum RowCursor<F: DBFile + 'static> {
@@ -145,6 +148,14 @@ where
         self
     }
 
+    /// Doesn't keep each row's key for last_id: for a reader that never
+    /// asks (a query, not an UPDATE or DELETE), which then copies no key
+    /// out of the row it is lent.
+    pub(crate) fn without_row_ids(mut self) -> Self {
+        self.keep_ids = false;
+        self
+    }
+
     // What EXPLAIN calls what this reads: the table, and which partition of
     // it when it has several.
     fn label(&self) -> String {
@@ -178,6 +189,7 @@ where
             part,
             fields,
             wanted: None,
+            keep_ids: true,
             next_time: 0,
             stats,
             last_id: None,
@@ -231,7 +243,9 @@ where
         let start = self.timer.start();
         if let Some(tuple) = self.cursor.next_ref()? {
             let out = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
-            self.last_id = Some(tuple.id().to_owned());
+            if self.keep_ids {
+                self.last_id = Some(tuple.id().to_owned());
+            }
             crate::source::timing::add(&mut self.next_time, start);
             Ok(Some(out))
         } else {

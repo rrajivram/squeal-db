@@ -25,7 +25,10 @@ pub enum ValueItem {
 // borrows the buffer instead of being copied out. Decoding a row this way
 // allocates nothing, so a reader can look at every field and copy out only
 // the ones it keeps (`to_owned`).
-#[derive(Debug, Clone, Copy, PartialEq)]
+//
+// ValueItem's `==`, order and hash are this type's (ValueItem's delegate
+// here), so an owned and a lent value always compare alike.
+#[derive(Debug, Clone, Copy)]
 pub enum ValueRef<'a> {
     Null,
     Integer(i64),
@@ -38,6 +41,32 @@ pub enum ValueRef<'a> {
 }
 
 impl ValueRef<'_> {
+    // See ValueItem::hash.
+    pub(crate) fn hash(&self) -> u64 {
+        match self {
+            ValueRef::Null => 0,
+            ValueRef::Integer(i) => *i as u64,
+            ValueRef::Double(f) => f.to_bits(),
+            ValueRef::Datetime(d) => *d,
+            ValueRef::Str(s, _) => db_hash(s.as_bytes()),
+            ValueRef::Blob(b, _) => db_hash(b),
+            ValueRef::Boolean(b) => *b as u64,
+        }
+    }
+
+    // See ValueItem::type_rank.
+    pub(crate) fn type_rank(&self) -> u8 {
+        match self {
+            ValueRef::Null => 0,
+            ValueRef::Boolean(_) => 1,
+            ValueRef::Integer(_) => 2,
+            ValueRef::Double(_) => 3,
+            ValueRef::Datetime(_) => 4,
+            ValueRef::Str(..) => 5,
+            ValueRef::Blob(..) => 6,
+        }
+    }
+
     pub fn to_owned(&self) -> ValueItem {
         match *self {
             ValueRef::Null => ValueItem::Null,
@@ -158,21 +187,29 @@ fn sized(bytes: &[u8]) -> Result<(u32, &[u8], usize), StoreError> {
 // Str/Blob compare by content only — see the arms below.
 impl PartialEq for ValueItem {
     fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl PartialEq for ValueRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ValueItem::Null, ValueItem::Null) => true,
-            (ValueItem::Integer(a), ValueItem::Integer(b)) => a == b,
-            (ValueItem::Double(a), ValueItem::Double(b)) => a.to_bits() == b.to_bits(),
-            (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a == b,
+            (ValueRef::Null, ValueRef::Null) => true,
+            (ValueRef::Integer(a), ValueRef::Integer(b)) => a == b,
+            (ValueRef::Double(a), ValueRef::Double(b)) => a.to_bits() == b.to_bits(),
+            (ValueRef::Datetime(a), ValueRef::Datetime(b)) => a == b,
             // Content only: the u32 beside a Str/Blob is reserved on-disk
             // capacity (a sizing hint), not part of the logical value — the
             // same view Ord and Hash take, so `==`, `cmp` and `hash` agree.
-            (ValueItem::Str(a), ValueItem::Str(b)) => a.0 == b.0,
-            (ValueItem::Blob(a), ValueItem::Blob(b)) => a.0 == b.0,
-            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a == b,
+            (ValueRef::Str(a, _), ValueRef::Str(b, _)) => a == b,
+            (ValueRef::Blob(a, _), ValueRef::Blob(b, _)) => a == b,
+            (ValueRef::Boolean(a), ValueRef::Boolean(b)) => a == b,
             _ => false,
         }
     }
 }
+
+impl Eq for ValueRef<'_> {}
 
 #[derive(Debug, PartialEq, Clone, Default, Hash)]
 pub struct IndexKey {
@@ -309,6 +346,14 @@ impl IndexKey {
         })
     }
 
+    // Values read back as they were stored: like Deserialize, never
+    // re-validated (see Deserialize for IndexKey).
+    pub(crate) fn from_stored(data: Vec<ValueItem>) -> Self {
+        Self {
+            data: Arc::from(data),
+        }
+    }
+
     pub fn size(&self) -> usize {
         size_of::<u64>() + self.data.iter().map(|d| d.size()).sum::<usize>()
     }
@@ -376,6 +421,11 @@ impl IndexKey {
     /// mean validating every field and allocating an `Arc<[ValueItem]>`
     /// just to hash it once and immediately discard it.
     pub fn hash_fields<'a>(fields: impl IntoIterator<Item = &'a ValueItem>) -> u64 {
+        Self::hash_refs(fields.into_iter().map(ValueItem::as_ref))
+    }
+
+    // hash_fields, over lent values.
+    pub(crate) fn hash_refs<'a>(fields: impl IntoIterator<Item = ValueRef<'a>>) -> u64 {
         let mut h: u64 = 0x811C9DC5;
         for d in fields {
             // Unlike db_hash's own byte-at-a-time loop (where XORing in
@@ -684,15 +734,7 @@ impl ValueItem {
     }
 
     pub(super) fn hash(&self) -> u64 {
-        match self {
-            ValueItem::Null => 0,
-            ValueItem::Integer(i) => *i as u64,
-            ValueItem::Double(f) => f.to_bits(),
-            ValueItem::Datetime(d) => *d,
-            ValueItem::Str((s, _l)) => db_hash(s.as_bytes()),
-            ValueItem::Blob((b, _)) => db_hash(b),
-            ValueItem::Boolean(b) => *b as u64,
-        }
+        self.as_ref().hash()
     }
 
     pub(super) fn from_bytes_single(bytes: &[u8]) -> Result<ValueItem, StoreError> {
@@ -759,31 +801,35 @@ impl ValueItem {
     // Null ranks lowest (unchanged from the old special-casing); the rest
     // is an arbitrary but fixed and documented order.
     pub(crate) fn type_rank(&self) -> u8 {
-        match self {
-            ValueItem::Null => 0,
-            ValueItem::Boolean(_) => 1,
-            ValueItem::Integer(_) => 2,
-            ValueItem::Double(_) => 3,
-            ValueItem::Datetime(_) => 4,
-            ValueItem::Str(_) => 5,
-            ValueItem::Blob(_) => 6,
-        }
+        self.as_ref().type_rank()
     }
 }
 
 impl Ord for ValueItem {
     fn cmp(&self, other: &Self) -> Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
+impl PartialOrd for ValueRef<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ValueRef<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
-            (ValueItem::Integer(a), ValueItem::Integer(b)) => a.cmp(b),
-            (ValueItem::Double(a), ValueItem::Double(b)) => a.total_cmp(b),
-            (ValueItem::Datetime(a), ValueItem::Datetime(b)) => a.cmp(b),
-            (ValueItem::Str(a), ValueItem::Str(b)) => a.0.cmp(&b.0),
-            (ValueItem::Boolean(a), ValueItem::Boolean(b)) => a.cmp(b),
+            (ValueRef::Integer(a), ValueRef::Integer(b)) => a.cmp(b),
+            (ValueRef::Double(a), ValueRef::Double(b)) => a.total_cmp(b),
+            (ValueRef::Datetime(a), ValueRef::Datetime(b)) => a.cmp(b),
+            (ValueRef::Str(a, _), ValueRef::Str(b, _)) => a.cmp(b),
+            (ValueRef::Boolean(a), ValueRef::Boolean(b)) => a.cmp(b),
             // Content-based, like Str above — the u32 alongside the bytes
             // is reserved on-disk capacity, not part of the logical value
             // (see PartialEq's own handling of this same distinction).
-            (ValueItem::Blob(a), ValueItem::Blob(b)) => a.0.cmp(&b.0),
-            (ValueItem::Null, ValueItem::Null) => Ordering::Equal,
+            (ValueRef::Blob(a, _), ValueRef::Blob(b, _)) => a.cmp(b),
+            (ValueRef::Null, ValueRef::Null) => Ordering::Equal,
             // Different variants: fall back to the fixed type rank instead
             // of panicking — see type_rank's own comment. Subsumes the old
             // Null-vs-anything special cases (Null's rank is lowest) and

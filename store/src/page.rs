@@ -156,7 +156,7 @@ pub(crate) const PAGE_MAGIC: u32 = u32::from_le_bytes(*b"SQDB");
 /// of versioning, rather than a tag per `Tuple`, because `AnyTuplePage`
 /// decodes its tuples with one bulk `Vec<Tuple>` call that has no per-element
 /// hook (see PERSISTENCE_VERSIONING_PROGRESS.md, Stage 2). It also means
-/// `SlottedPage::decode_id_at`'s "`id` is `Tuple`'s first field" fast path is
+/// `SlottedPage::id_at`'s "`id` is `Tuple`'s first field" fast path is
 /// a promise made by page format versions 0 to 2; a version that moves it
 /// must change that function in the same commit.
 ///
@@ -488,6 +488,14 @@ impl Page {
                     Box::new(FixedTuplePage::new(record_size)),
                     PageContentKind::FIXED_TUPLE,
                 )
+            } else if flags & PINNED == 0 {
+                // A table's data page: its tuples kept as their bytes, read
+                // and lent in place (see pages::slotted).
+                let capacity = (size - page_overhead as DBSizeType) as usize;
+                (
+                    Box::new(crate::pages::slotted::SlottedPage::new(capacity)),
+                    PageContentKind::SLOTTED_TUPLE,
+                )
             } else {
                 (Box::new(AnyTuplePage::new()), PageContentKind::ANY_TUPLE)
             };
@@ -804,8 +812,17 @@ impl Page {
         // chain. This keeps overflow off the common path: ordinary pages fill to
         // capacity and link to the next data page instead of every near-full
         // page spilling into (and rewriting) an overflow chain on each write.
-        let used = self.inner.read().page_used_size;
-        used == 0 || used + tuple.size() <= self.usable_data_size()
+        let inner = self.inner.read();
+        let used = inner.page_used_size;
+        used == 0 || used + Self::stored_size(&inner, tuple) <= self.usable_data_size()
+    }
+
+    // The bytes `tuple` takes on this page, as page_used_size counts them:
+    // its own size() plus whatever the content adds per tuple (see
+    // PageTuple::entry_overhead). A replace swaps one entry for one, so
+    // only the sizes differ there.
+    fn stored_size(inner: &PageInner, tuple: &Tuple) -> DBSizeType {
+        tuple.size() + inner.data.entry_overhead()
     }
 
     // &self, not &mut self: single-record mutation only needs a write lock on
@@ -834,9 +851,9 @@ impl Page {
         if !self.can_store(&tuple) {
             return Err(StoreError::PageCapacityError);
         }
-        let sz = tuple.size();
         {
             let mut inner = self.inner.write();
+            let sz = Self::stored_size(&inner, &tuple);
             inner.data_mut().add(tuple)?;
             inner.page_used_size += sz;
         }
@@ -848,6 +865,7 @@ impl Page {
         let old = {
             let mut inner = self.inner.write();
             let old = inner.data_mut().remove(id)?;
+            let old_size = Self::stored_size(&inner, &old);
             // checked_sub: an underflow here would wrap page_used_size to
             // ~u64::MAX, which then drives handle_large_page_size to allocate
             // a giant overflow chain (observed: 21 GB file / OOM). Surface it
@@ -855,12 +873,11 @@ impl Page {
             inner.page_used_size =
                 inner
                     .page_used_size
-                    .checked_sub(old.size())
+                    .checked_sub(old_size)
                     .ok_or_else(|| {
                         StoreError::UnknownError(format!(
                             "remove_tuple used_size underflow: used={} old={}",
-                            inner.page_used_size,
-                            old.size()
+                            inner.page_used_size, old_size
                         ))
                     })?;
             old
@@ -1394,7 +1411,10 @@ mod tests {
 
     #[test]
     fn page_test_accurate_page_bytes() {
-        let tuple_sz = Tuple::new(0, b"abcdef").size();
+        // A data page counts each tuple's slot entry too (see
+        // PageTuple::entry_overhead).
+        let tuple_sz = Tuple::new(0, b"abcdef").size()
+            + crate::pages::slotted::SLOT_ENTRY_BYTES as crate::db::DBSizeType;
         // can_store's fullness ceiling is page_data_size - USABLE_DATA_MARGIN
         // (room reserved for page-serialization framing the per-tuple size sum
         // doesn't see — see USABLE_DATA_MARGIN), so fitting 10 tuples with 1
@@ -1632,7 +1652,8 @@ mod tests {
     fn test_used_size_tracks_tuple_size() {
         let p = Page::new_data(1000, TEST_OVERHEAD);
         let t = Tuple::new(1, b"hello");
-        let expected = t.size();
+        // Plus its slot entry (see PageTuple::entry_overhead).
+        let expected = t.size() + crate::pages::slotted::SLOT_ENTRY_BYTES as crate::db::DBSizeType;
         p.add_tuple(t).unwrap();
         assert_eq!(p.header().page_used_size, expected);
     }
