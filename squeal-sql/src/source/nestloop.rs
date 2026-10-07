@@ -33,7 +33,7 @@ use crate::{
     source::{
         ProjectableField, QueryStats, Source, column_names, join::JoinType, planinfo::PlanNode,
     },
-    table::{SqlTable, VersionedRow},
+    table::SqlTable,
 };
 
 /// Which key of the inner table a nested-loop join seeks.
@@ -262,8 +262,7 @@ where
                 }
             }
         };
-        let row = from_bytes::<VersionedRow>(tuple.data())?;
-        Ok(Some(self.table.reproject(&row)?))
+        Ok(Some(self.table.decode_row(tuple.data(), None)?))
     }
 
     fn combine(outer: &IndexKey, inner: &[ValueItem]) -> Result<IndexKey, SchemaError> {

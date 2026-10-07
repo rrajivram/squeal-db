@@ -15,7 +15,7 @@ use crate::{
     error::SchemaError,
     optim::table_stats::ComputedTableStat,
     source::{ProjectableField, QueryStats, Source},
-    table::{SqlIndex, SqlTable, VersionedRow},
+    table::{SqlIndex, SqlTable},
 };
 
 // Reads one of a table's indexes — all of it (IndexScan) or a key range
@@ -204,9 +204,9 @@ where
         let Some(tuple) = db.find_as(rows, id.clone(), self.cursor.reader())? else {
             return Ok(None);
         };
-        let row = from_bytes::<VersionedRow>(tuple.data())?;
+        let row = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
         self.last_id = Some(id);
-        Ok(Some(self.table.reproject(&row)?))
+        Ok(Some(row))
     }
 
     fn index_name(&self) -> String {

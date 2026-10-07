@@ -177,7 +177,16 @@ impl Serialize for VersionedRow {
     }
 }
 
-struct VersionedRowVisitor;
+// A stored row as written (VersionedRow's Serialize), its values still
+// in place: decoding one reads the version and borrows the values' bytes
+// (IndexKey::to_bytes's form) rather than copying them out. The values
+// were written as a Vec<u8>, which postcard lays out exactly as it does
+// bytes — a length, then the bytes — so they borrow straight off the
+// tuple. See SqlTable::decode_row.
+pub(crate) struct StoredRow<'a> {
+    pub(crate) version: u32,
+    pub(crate) values: &'a [u8],
+}
 
 // Field names given to deserialize_struct below only matter to
 // self-describing formats (JSON, ...) that key on them; postcard (the
@@ -186,8 +195,10 @@ struct VersionedRowVisitor;
 // declaration order — same as the Serialize side's serialize_struct.
 const VERSIONED_ROW_FIELDS: &[&str] = &["ver", "data"];
 
-impl<'de> Visitor<'de> for VersionedRowVisitor {
-    type Value = VersionedRow;
+struct StoredRowVisitor;
+
+impl<'de> Visitor<'de> for StoredRowVisitor {
+    type Value = StoredRow<'de>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("struct VersionedRow")
@@ -200,13 +211,19 @@ impl<'de> Visitor<'de> for VersionedRowVisitor {
         let version = seq
             .next_element()?
             .ok_or_else(|| de::Error::invalid_length(0, &self))?;
-        let bytes: Vec<u8> = seq
+        let values = seq
             .next_element()?
             .ok_or_else(|| de::Error::invalid_length(1, &self))?;
-        Ok(VersionedRow {
-            version,
-            values: IndexKey::from_bytes(&bytes).map_err(de::Error::custom)?,
-        })
+        Ok(StoredRow { version, values })
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredRow<'de> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_struct("VersionedRow", VERSIONED_ROW_FIELDS, StoredRowVisitor)
     }
 }
 
@@ -215,7 +232,11 @@ impl<'de> Deserialize<'de> for VersionedRow {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_struct("VersionedRow", VERSIONED_ROW_FIELDS, VersionedRowVisitor)
+        let row = StoredRow::deserialize(deserializer)?;
+        Ok(VersionedRow {
+            version: row.version,
+            values: IndexKey::from_bytes(row.values).map_err(de::Error::custom)?,
+        })
     }
 }
 
@@ -1028,6 +1049,49 @@ impl SqlTable {
 
     fn fields_at(&self, version: u32) -> Option<&[Arc<Field>]> {
         self.versions.get(version as usize).map(|v| &v.fields[..])
+    }
+
+    // A stored row (a tuple's data), decoded and reprojected (see
+    // reproject). `wanted`, by position in the current version: the
+    // columns to fill; the others come out NULL. A row written under the
+    // current version is read in place (StoredRow, IndexKey::refs) and
+    // only the wanted columns are copied out; an older one is decoded
+    // whole and reprojected.
+    pub(crate) fn decode_row(
+        &self,
+        data: &[u8],
+        wanted: Option<&[bool]>,
+    ) -> Result<IndexKey, SchemaError> {
+        let row: StoredRow = postcard::from_bytes(data)?;
+        if row.version != self.version() {
+            return self.reproject(&VersionedRow {
+                version: row.version,
+                values: IndexKey::from_bytes(row.values)?,
+            });
+        }
+        let fields = self.fields().len();
+        let mut refs = IndexKey::refs(row.values)?;
+        if refs.remaining() != fields as u64 {
+            return Err(SchemaError::UnknownError(format!(
+                "row has {} value(s) but schema version {} of table {:?} declared {} field(s)",
+                refs.remaining(),
+                row.version,
+                self.name,
+                fields
+            )));
+        }
+        let mut values = Vec::with_capacity(fields);
+        for pos in 0..fields {
+            let value = match wanted {
+                Some(w) if !w[pos] => refs.skip_value().map(|r| r.map(|()| ValueItem::Null)),
+                _ => refs.next().map(|r| r.map(|v| v.to_owned())),
+            };
+            match value {
+                Some(value) => values.push(value?),
+                None => break,
+            }
+        }
+        Ok(IndexKey::new_from_owned(values)?)
     }
 
     // Decodes a stored row back into ValueItems in the table's CURRENT

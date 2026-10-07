@@ -897,8 +897,7 @@ where
                 None => self.db.table_scan(part.rows())?,
             };
             while let Some(tuple) = cursor.next()? {
-                let row = from_bytes::<VersionedRow>(tuple.data())?;
-                rows.push(table.reproject(&row)?.values().to_vec());
+                rows.push(table.decode_row(tuple.data(), None)?.values().to_vec());
                 count += 1;
             }
         }
@@ -1013,8 +1012,7 @@ where
         for part in &table.partitions {
             let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
             while let Some(tuple) = cursor.next()? {
-                let versioned = from_bytes::<VersionedRow>(tuple.data())?;
-                let row = table.reproject(&versioned)?;
+                let row = table.decode_row(tuple.data(), None)?;
                 let value = &row.values()[pos];
                 if *value != ValueItem::Null {
                     let key = DBIdType::Rec(IndexKey::new_from(std::slice::from_ref(value))?);
@@ -1139,8 +1137,7 @@ where
             for (part, tree) in table.partitions.iter().zip(&trees) {
                 let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
                 while let Some(tuple) = cursor.next()? {
-                    let versioned = from_bytes::<VersionedRow>(tuple.data())?;
-                    let row = table.reproject(&versioned)?;
+                    let row = table.decode_row(tuple.data(), None)?;
                     let identity = match tuple.id() {
                         DBIdType::Rec(ik) => ik.clone(),
                         DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(*n as i64)])?,
@@ -1366,8 +1363,7 @@ where
         for part in &table.partitions {
             let mut cursor = self.db.table_scan(part.rows())?;
             while let Some(tuple) = cursor.next()? {
-                let row = from_bytes::<VersionedRow>(tuple.data())?;
-                stats.record_row_sync(table.id, part.id, table.reproject(&row)?);
+                stats.record_row_sync(table.id, part.id, table.decode_row(tuple.data(), None)?);
             }
         }
         Ok(())

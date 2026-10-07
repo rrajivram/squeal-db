@@ -2197,6 +2197,7 @@ mod ordering;
 mod partition;
 mod partition_diff;
 mod partition_races;
+mod row_decode;
 mod sql_gaps;
 mod oracle;
 mod soak;

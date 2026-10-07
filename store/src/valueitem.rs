@@ -21,6 +21,113 @@ pub enum ValueItem {
     Boolean(bool) = 30,
 }
 
+// A ValueItem read in place from its `to_bytes` form: a string or blob
+// borrows the buffer instead of being copied out. Decoding a row this way
+// allocates nothing, so a reader can look at every field and copy out only
+// the ones it keeps (`to_owned`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ValueRef<'a> {
+    Null,
+    Integer(i64),
+    Double(f64),
+    Datetime(u64),
+    // Content, and reserved capacity (see ValueItem::Str).
+    Str(&'a str, u32),
+    Blob(&'a [u8], u32),
+    Boolean(bool),
+}
+
+impl ValueRef<'_> {
+    pub fn to_owned(&self) -> ValueItem {
+        match *self {
+            ValueRef::Null => ValueItem::Null,
+            ValueRef::Integer(i) => ValueItem::Integer(i),
+            ValueRef::Double(d) => ValueItem::Double(d),
+            ValueRef::Datetime(d) => ValueItem::Datetime(d),
+            ValueRef::Str(s, cap) => ValueItem::Str((s.to_string(), cap)),
+            ValueRef::Blob(b, cap) => ValueItem::Blob((Arc::from(b), cap)),
+            ValueRef::Boolean(b) => ValueItem::Boolean(b),
+        }
+    }
+}
+
+impl<'a> ValueRef<'a> {
+    // One value off the front of `bytes` (ValueItem::to_bytes's form), and
+    // how many bytes it took, padding included.
+    //
+    // STORE_AUDIT.md S3: every extraction below is bounds-checked (`take`)
+    // instead of a raw slice index / `try_into().unwrap()` — this hand-
+    // rolled format decodes bytes read straight off disk, so a truncated
+    // or corrupted buffer must surface as an `Err`, not a panic (which,
+    // per S8, would poison the page lock this runs under on the hot read
+    // path).
+    pub fn decode(bytes: &'a [u8]) -> Result<(ValueRef<'a>, usize), StoreError> {
+        let vtype = *bytes
+            .first()
+            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
+        Ok(match vtype {
+            0 => (ValueRef::Null, 1),
+            5 => (ValueRef::Integer(i64::from_le_bytes(word(bytes, 1)?)), 9),
+            10 => (ValueRef::Double(f64::from_le_bytes(word(bytes, 1)?)), 9),
+            15 => (ValueRef::Datetime(u64::from_le_bytes(word(bytes, 1)?)), 9),
+            20 => {
+                let (cap, content, end) = sized(bytes)?;
+                (ValueRef::Str(std::str::from_utf8(content).unwrap_or_default(), cap), end)
+            }
+            25 => {
+                let (cap, content, end) = sized(bytes)?;
+                (ValueRef::Blob(content, cap), end)
+            }
+            30 => (ValueRef::Boolean(take(bytes, 1, 1)?[0] != 0), 2),
+            i => {
+                error!("Unknown value item : {i}");
+                (ValueRef::Null, 1)
+            }
+        })
+    }
+
+    // How many bytes `decode` would take, without decoding: a string's
+    // content isn't checked for UTF-8. Errs where `decode` would.
+    pub fn width(bytes: &[u8]) -> Result<usize, StoreError> {
+        let vtype = *bytes
+            .first()
+            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
+        Ok(match vtype {
+            5 | 10 | 15 => take(bytes, 1, 8).map(|_| 9)?,
+            20 | 25 => sized(bytes)?.2,
+            30 => take(bytes, 1, 1).map(|_| 2)?,
+            _ => 1,
+        })
+    }
+}
+
+fn take(bytes: &[u8], index: usize, len: usize) -> Result<&[u8], StoreError> {
+    let end = index.checked_add(len).ok_or_else(|| {
+        StoreError::TruncatedValueItem(format!("offset {index} + {len} overflows"))
+    })?;
+    bytes.get(index..end).ok_or_else(|| {
+        StoreError::TruncatedValueItem(format!(
+            "need {len} byte(s) at offset {index}, buffer is {} byte(s)",
+            bytes.len()
+        ))
+    })
+}
+
+fn word<const N: usize>(bytes: &[u8], index: usize) -> Result<[u8; N], StoreError> {
+    Ok(take(bytes, index, N)?.try_into().unwrap())
+}
+
+// A Str's or Blob's capacity, its content, and where the value ends:
+// to_bytes pads the content out to the capacity when it is shorter, and
+// that padding is skipped too, or the next value in the buffer is misread
+// starting mid-padding.
+fn sized(bytes: &[u8]) -> Result<(u32, &[u8], usize), StoreError> {
+    let cap = u32::from_le_bytes(word(bytes, 1)?);
+    let len = u32::from_le_bytes(word(bytes, 5)?) as usize;
+    let content = take(bytes, 9, len)?;
+    Ok((cap, content, 9usize.saturating_add(len.max(cap as usize))))
+}
+
 // Hand-written, not derived, for exactly one reason: Double. `impl Hash
 // for ValueItem` (below) already hashes a Double by its bit pattern
 // (`f.to_bits()`), not by IEEE-754 `==` — derived PartialEq would use
@@ -214,11 +321,22 @@ impl IndexKey {
         bytes
     }
 
-    // STORE_AUDIT.md S3: bounds-checked instead of a raw slice index /
-    // `try_into().unwrap()` on the leading count prefix — this hand-rolled
-    // format decodes bytes read straight off disk, so truncated/malformed
-    // input must surface as an `Err`, not a panic.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+        let refs = Self::refs(bytes)?;
+        let mut data = Vec::with_capacity(refs.size_hint().1.unwrap_or(0));
+        for v in refs {
+            data.push(v?.to_owned());
+        }
+        Ok(Self::new_from_owned(data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap()))
+    }
+
+    /// The fields of a key in its `to_bytes` form, read in place (see
+    /// ValueRef): nothing is copied out of `bytes`.
+    pub fn refs(bytes: &[u8]) -> Result<ValueRefs<'_>, StoreError> {
+        // STORE_AUDIT.md S3: bounds-checked instead of a raw slice index /
+        // `try_into().unwrap()` on the leading count prefix — this hand-
+        // rolled format decodes bytes read straight off disk, so truncated/
+        // malformed input must surface as an `Err`, not a panic.
         let count_bytes = bytes.get(0..size_of::<u64>()).ok_or_else(|| {
             StoreError::TruncatedValueItem(format!(
                 "need {} byte(s) for the field-count prefix, buffer is {} byte(s)",
@@ -226,31 +344,11 @@ impl IndexKey {
                 bytes.len()
             ))
         })?;
-        let count = u64::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-        let mut index = size_of::<u64>();
-        let mut data = vec![];
-        for _ in 0..count {
-            // from_bytes_many's returned index is relative to the sub-slice
-            // it was handed (bytes[index..]), not absolute — it must be
-            // added to the running offset, not replace it, or every field
-            // after the first is read starting mid-way through the
-            // previous one instead of where it actually begins. `index` is
-            // fetched via `get` (not a raw `bytes[index..]` slice), since a
-            // prior field's declared-but-truncated length can otherwise
-            // push it clean past `bytes.len()`, which would itself panic
-            // (slice start index out of range) before from_bytes_many ever
-            // gets a chance to report it as an ordinary Err.
-            let rest = bytes.get(index..).ok_or_else(|| {
-                StoreError::TruncatedValueItem(format!(
-                    "offset {index} past end of buffer ({} byte(s))",
-                    bytes.len()
-                ))
-            })?;
-            let (v, i) = ValueItem::from_bytes_many(rest)?;
-            index = index.saturating_add(i);
-            data.push(v);
-        }
-        Ok(Self::new_from(&data).unwrap_or(Self::new_from(&[ValueItem::Null]).unwrap()))
+        Ok(ValueRefs {
+            bytes,
+            index: size_of::<u64>(),
+            left: u64::from_le_bytes(count_bytes.try_into().unwrap()),
+        })
     }
 
     /// Combines each field's own hash with an FNV-1a-style XOR+multiply
@@ -325,6 +423,78 @@ impl IndexKey {
         Some(Self {
             data: Arc::from(data),
         })
+    }
+}
+
+/// See IndexKey::refs. Yields an `Err`, then stops, on a truncated or
+/// malformed buffer.
+#[derive(Clone)]
+pub struct ValueRefs<'a> {
+    bytes: &'a [u8],
+    index: usize,
+    left: u64,
+}
+
+impl<'a> ValueRefs<'a> {
+    /// How many fields are left — as the buffer claims; a truncated one
+    /// ends early, with an `Err`.
+    pub fn remaining(&self) -> u64 {
+        self.left
+    }
+
+    /// Steps over the next field without decoding it (see ValueRef::width):
+    /// for a reader that doesn't want it. None when there are none left.
+    pub fn skip_value(&mut self) -> Option<Result<(), StoreError>> {
+        self.step(|b| ValueRef::width(b).map(|w| ((), w)))
+    }
+
+    fn step<T>(
+        &mut self,
+        read: impl FnOnce(&'a [u8]) -> Result<(T, usize), StoreError>,
+    ) -> Option<Result<T, StoreError>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        // `index` is fetched via `get` (not a raw `bytes[index..]` slice):
+        // a prior field's declared-but-truncated length can push it clean
+        // past `bytes.len()`, which would panic.
+        let read = self
+            .bytes
+            .get(self.index..)
+            .ok_or_else(|| {
+                StoreError::TruncatedValueItem(format!(
+                    "offset {} past end of buffer ({} byte(s))",
+                    self.index,
+                    self.bytes.len()
+                ))
+            })
+            .and_then(read);
+        match read {
+            Ok((v, used)) => {
+                self.index = self.index.saturating_add(used);
+                Some(Ok(v))
+            }
+            Err(e) => {
+                self.left = 0;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+impl<'a> Iterator for ValueRefs<'a> {
+    type Item = Result<ValueRef<'a>, StoreError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.step(ValueRef::decode)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // At least one byte per field, so a corrupt count can't ask for
+        // more than the buffer could hold.
+        let most = self.left.min(self.bytes.len().saturating_sub(self.index) as u64) as usize;
+        (0, Some(most))
     }
 }
 
@@ -514,90 +684,10 @@ impl ValueItem {
         Self::from_bytes_many(bytes).map(|(v, _)| v)
     }
 
-    // STORE_AUDIT.md S3: every extraction below is bounds-checked (`take`)
-    // instead of a raw slice index / `try_into().unwrap()` — this hand-
-    // rolled format decodes bytes read straight off disk, so a truncated
-    // or corrupted buffer must surface as an `Err`, not a panic (which,
-    // per S8, would poison the page lock this runs under on the hot read
-    // path).
+    // One value off the front of `bytes`, and how many bytes it took. See
+    // ValueRef::decode.
     pub(super) fn from_bytes_many(bytes: &[u8]) -> Result<(ValueItem, usize), StoreError> {
-        fn take(bytes: &[u8], index: usize, len: usize) -> Result<&[u8], StoreError> {
-            let end = index.checked_add(len).ok_or_else(|| {
-                StoreError::TruncatedValueItem(format!("offset {index} + {len} overflows"))
-            })?;
-            bytes.get(index..end).ok_or_else(|| {
-                StoreError::TruncatedValueItem(format!(
-                    "need {len} byte(s) at offset {index}, buffer is {} byte(s)",
-                    bytes.len()
-                ))
-            })
-        }
-        let mut index = 0usize;
-        let vtype = *bytes
-            .first()
-            .ok_or_else(|| StoreError::TruncatedValueItem("empty buffer".into()))?;
-        index += 1;
-        let val = match vtype {
-            0 => ValueItem::Null,
-            5 => {
-                let v =
-                    i64::from_le_bytes(take(bytes, index, size_of::<i64>())?.try_into().unwrap());
-                index += size_of::<i64>();
-                ValueItem::Integer(v)
-            }
-            10 => {
-                let v =
-                    f64::from_le_bytes(take(bytes, index, size_of::<f64>())?.try_into().unwrap());
-                index += size_of::<f64>();
-                ValueItem::Double(v)
-            }
-            15 => {
-                let v =
-                    u64::from_le_bytes(take(bytes, index, size_of::<u64>())?.try_into().unwrap());
-                index += size_of::<u64>();
-                ValueItem::Datetime(v)
-            }
-            20 => {
-                let len =
-                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
-                index += size_of::<u32>();
-                let real_len =
-                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap())
-                        as usize;
-                index += size_of::<u32>();
-                let str =
-                    String::from_utf8(take(bytes, index, real_len)?.to_vec()).unwrap_or_default();
-                // to_bytes() pads the content out to `len` bytes when the
-                // real content is shorter than the reserved capacity — skip
-                // that padding too, not just the real content, or the next
-                // value in the buffer is misread starting mid-padding.
-                index = index.saturating_add(real_len.max(len as usize));
-                ValueItem::Str((str, len))
-            }
-            25 => {
-                let len =
-                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap());
-                index += size_of::<u32>();
-                let real_len =
-                    u32::from_le_bytes(take(bytes, index, size_of::<u32>())?.try_into().unwrap())
-                        as usize;
-                index += size_of::<u32>();
-                let arc = Arc::from(take(bytes, index, real_len)?);
-                // See the Str case above: skip trailing padding too.
-                index = index.saturating_add(real_len.max(len as usize));
-                ValueItem::Blob((arc, len))
-            }
-            30 => {
-                let v = take(bytes, index, size_of::<u8>())?[0] != 0;
-                index += size_of::<u8>();
-                ValueItem::Boolean(v)
-            }
-            i => {
-                error!("Unknown value item : {i}");
-                ValueItem::Null
-            }
-        };
-        Ok((val, index))
+        ValueRef::decode(bytes).map(|(v, i)| (v.to_owned(), i))
     }
 
     fn discriminant(&self) -> u8 {
@@ -1040,6 +1130,92 @@ mod valueitem_tests {
         let b = ValueItem::Blob((Arc::from(&b"this is way more than five bytes"[..]), 5));
         let bytes = b.to_bytes();
         assert_eq!(b, ValueItem::from_bytes_single(&bytes).unwrap());
+    }
+
+    fn one_of_each() -> Vec<ValueItem> {
+        vec![
+            ValueItem::Null,
+            ValueItem::Integer(-7),
+            ValueItem::Double(2.5),
+            ValueItem::Datetime(1_700_000_000),
+            ValueItem::Str(("ab".to_owned(), 5)),
+            ValueItem::Str(("exact".to_owned(), 5)),
+            ValueItem::Blob((Arc::from(&b"\x00\x01"[..]), 4)),
+            ValueItem::Boolean(true),
+        ]
+    }
+
+    // A key's fields read in place are the fields it was written with, and
+    // every one of them borrows rather than copies.
+    #[test]
+    fn test_refs_read_back_what_to_bytes_wrote() {
+        use crate::valueitem::{IndexKey, ValueRef};
+        let values = one_of_each();
+        let bytes = IndexKey::new_from(&values).unwrap().to_bytes();
+        let refs = IndexKey::refs(&bytes).unwrap();
+        assert_eq!(refs.remaining(), values.len() as u64);
+        let read: Vec<ValueRef> = refs.collect::<Result<_, _>>().unwrap();
+        assert_eq!(read.iter().map(|v| v.to_owned()).collect::<Vec<_>>(), values);
+        let ValueRef::Str(s, 5) = read[4] else {
+            panic!("{:?}", read[4])
+        };
+        assert!(bytes.as_ptr_range().contains(&s.as_ptr()));
+    }
+
+    // Skipping a field steps exactly as far as decoding it does — padding
+    // included — so the fields after it read the same either way.
+    #[test]
+    fn test_skip_value_steps_as_far_as_decoding() {
+        use crate::valueitem::IndexKey;
+        let values = one_of_each();
+        let bytes = IndexKey::new_from(&values).unwrap().to_bytes();
+        for skipped in 0..values.len() {
+            let mut refs = IndexKey::refs(&bytes).unwrap();
+            for (i, v) in values.iter().enumerate() {
+                if i == skipped {
+                    refs.skip_value().unwrap().unwrap();
+                } else {
+                    assert_eq!(refs.next().unwrap().unwrap().to_owned(), *v);
+                }
+            }
+            assert!(refs.next().is_none());
+        }
+    }
+
+    // A buffer cut short anywhere is an error from both reading and
+    // skipping — never a panic, never a silently shorter row.
+    #[test]
+    fn test_refs_and_skip_value_err_on_a_truncated_buffer() {
+        use crate::valueitem::IndexKey;
+        let bytes = IndexKey::new_from(&one_of_each()).unwrap().to_bytes();
+        for cut in 0..bytes.len() {
+            let short = &bytes[..cut];
+            let Ok(refs) = IndexKey::refs(short) else {
+                continue;
+            };
+            assert!(refs.clone().any(|v| v.is_err()), "read, cut at {cut}");
+            let mut refs = refs;
+            let mut failed = false;
+            while let Some(r) = refs.skip_value() {
+                failed |= r.is_err();
+            }
+            assert!(failed, "skipped, cut at {cut}");
+        }
+    }
+
+    // As the owned decode always has: a string that isn't UTF-8 reads as
+    // empty.
+    #[test]
+    fn test_ref_of_a_non_utf8_string_is_empty() {
+        use crate::valueitem::ValueRef;
+        let mut bytes = ValueItem::Str(("ab".to_owned(), 2)).to_bytes();
+        let n = bytes.len();
+        bytes[n - 2] = 0xFF;
+        assert_eq!(ValueRef::decode(&bytes).unwrap(), (ValueRef::Str("", 2), n));
+        assert_eq!(
+            ValueItem::from_bytes_single(&bytes).unwrap(),
+            ValueItem::Str((String::new(), 2))
+        );
     }
 
     #[test]

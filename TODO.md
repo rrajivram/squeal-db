@@ -46,6 +46,20 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   when it got there, as before; the one difference is the leaf a seek
   lands in, which used to be re-read chunk by chunk. Store table scan 10.3
   -> 9.5 ms, key seek 1.01 -> 0.95 us; ranges flat.
+- [x] Rows read in place (branch `value-ref`). Profiled `select count(*)
+  from orders` first: 67% was decoding each row — postcard copying the
+  payload into a Vec<u8> byte by byte, then IndexKey::from_bytes copying
+  every value twice. Now `store::valueitem::ValueRef` borrows strings and
+  blobs from the row bytes (`IndexKey::refs`), `StoredRow` borrows the
+  payload (same bytes on disk), and `SqlTable::decode_row` copies out only
+  the columns the query reads (table scans/seeks and index lookups get
+  `reading`, as covering index scans already did; UPDATE/DELETE still read
+  whole rows), skipping the rest without a UTF-8 check. Warm, main ->
+  branch: orders count(*) 72 -> 41 ms; order_details `count(*) where
+  quantity > 3` 0.95 -> 0.70 s, `sum(unit_price), max(return_reason)` 0.96
+  -> 0.77 s; `select * from orders` 94 -> 79 ms; point lookups flat.
+  What's left per row: the Vec plus Arc<[ValueItem]> of the row itself
+  (~11%).
 - [ ] `Arc<Tuple>` entries in `AnyTuplePage` (branch `arc-tuple-entries`,
   on top of part 2): undoes part 1's random-insert cost (500k on the
   memory backend 2.77 -> 2.21 s, the BTreeMap's figure) but reads pay a
@@ -67,6 +81,10 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   entries, so first-touch random lookups are ~15-20% slower in a fresh
   process (warm ones are faster). Fix: pages readable without a full decode
   (slotted layout / lazy decode). Store change.
+- [ ] Same cost on a scan bigger than the cache: a scan of order_details
+  (1M rows, doesn't fit) spends 70% in `get_page` — 24% `Page::from_bytes`
+  (postcard, every Tuple), 13% `install`, 9% `ShardedPQ::pop` eviction, and
+  28% in `get_page` itself (not yet broken down).
 
 ## Bugs
 

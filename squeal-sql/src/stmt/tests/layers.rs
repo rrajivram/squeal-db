@@ -222,14 +222,18 @@ fn lookup_loop() {
 }
 
 // The 100k-row range count, repeated, for a profiler (by hand, as above).
+// SQ_LOOP_SQL runs another query instead.
 #[test]
 #[ignore]
 fn range_loop() {
     let path = std::env::var("SQ_LAYERS_DB").expect("SQ_LAYERS_DB: a scratch retail database");
     let c = ConnectionManager::<File>::get_manager().connect(&path).unwrap();
     c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
-    let sql =
-        "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'";
+    let sql = std::env::var("SQ_LOOP_SQL").unwrap_or_else(|_| {
+        "select count(*) from orders where order_id >= 'ORD0100000' and order_id < 'ORD0200000'"
+            .into()
+    });
+    let sql = sql.as_str();
     let seconds: u64 = std::env::var("SQ_LOOP_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
     let start = Instant::now();
     let mut n = 0usize;

@@ -2,7 +2,6 @@ use crate::{optim::table_stats::ComputedTableStat, source::planinfo::PlanNode};
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 use store::clock::Instant;
 
-use postcard::from_bytes;
 use store::{
     cursor::{Cursor, KeyRange, RangeCursor, TableCursor},
     db::{DBFile, Db},
@@ -13,13 +12,14 @@ use store::{
 use crate::{
     error::SchemaError,
     source::{ProjectableField, QueryStats, Source},
-    table::{SqlTable, VersionedRow},
+    table::SqlTable,
 };
 
 // Reads a table: every row (TableScan), or with a key range the rows
 // within a range of the table's own key — its PRIMARY KEY, which the
-// table's tree is keyed by (TableSeek). Either way rows come out whole, in
-// the table's own layout.
+// table's tree is keyed by (TableSeek). Either way rows come out in the
+// table's own layout: whole, or with only the columns the query reads
+// filled (see reading).
 pub struct TableSource<F: DBFile> {
     timer: crate::source::timing::RowTimer,
     cursor: RowCursor<F>,
@@ -31,6 +31,9 @@ pub struct TableSource<F: DBFile> {
     // Which of the table's partitions this reads.
     part: usize,
     fields: Arc<[ProjectableField]>,
+    // Per table column, whether the query reads it (see reading); None:
+    // every column.
+    wanted: Option<Vec<bool>>,
     next_time: u128,
     stats: Option<ComputedTableStat>,
     // The most recently yielded tuple's own key — see Source::last_id's
@@ -129,6 +132,17 @@ where
         Ok(Self::over(RowCursor::Scan(cursor), table, part, stats))
     }
 
+    /// Fills only `columns` (positions in the table's row) — the ones the
+    /// query reads; every other column comes out NULL.
+    pub(crate) fn reading(mut self, columns: &std::collections::BTreeSet<usize>) -> Self {
+        self.wanted = Some(
+            (0..self.fields.len())
+                .map(|c| columns.contains(&c))
+                .collect(),
+        );
+        self
+    }
+
     // What EXPLAIN calls what this reads: the table, and which partition of
     // it when it has several.
     fn label(&self) -> String {
@@ -161,6 +175,7 @@ where
             table,
             part,
             fields,
+            wanted: None,
             next_time: 0,
             stats,
             last_id: None,
@@ -213,8 +228,7 @@ where
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = self.timer.start();
         if let Some(tuple) = self.cursor.next()? {
-            let row = from_bytes::<VersionedRow>(tuple.data())?;
-            let out = self.table.reproject(&row)?;
+            let out = self.table.decode_row(tuple.data(), self.wanted.as_deref())?;
             self.last_id = Some(tuple.id().clone());
             crate::source::timing::add(&mut self.next_time, start);
             Ok(Some(out))

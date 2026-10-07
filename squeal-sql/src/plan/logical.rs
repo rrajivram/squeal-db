@@ -2019,23 +2019,24 @@ where
             over_partitions(table, &parts, merge_order.as_deref(), rows, |part| {
                 let stats = stats.clone();
                 let source: Box<dyn Source> = match path.clone() {
-                    AccessPath::TableScan => Box::new(TableSource::new(
-                        db.clone(),
-                        table.clone(),
-                        part,
-                        txn,
-                        stats,
-                    )?),
-                    AccessPath::TableSeek(range) => Box::new(TableSource::seek(
-                        db.clone(),
-                        table.clone(),
-                        part,
-                        txn,
-                        stats,
-                        range,
-                        rows,
-                    )?),
-                    // A covering index: only the columns the query reads.
+                    // Only the columns the query reads, here and below.
+                    AccessPath::TableScan => Box::new(
+                        TableSource::new(db.clone(), table.clone(), part, txn, stats)?
+                            .reading(&needs.columns),
+                    ),
+                    AccessPath::TableSeek(range) => Box::new(
+                        TableSource::seek(
+                            db.clone(),
+                            table.clone(),
+                            part,
+                            txn,
+                            stats,
+                            range,
+                            rows,
+                        )?
+                        .reading(&needs.columns),
+                    ),
+                    // A covering index.
                     AccessPath::IndexScan(i) => Box::new(
                         IndexSource::new(&self.conn, table, part, i, txn, stats)?
                             .reading(&needs.columns),
@@ -2046,9 +2047,12 @@ where
                         )?
                         .reading(&needs.columns),
                     ),
-                    AccessPath::IndexLookup(i, range) => Box::new(IndexSource::seek(
-                        &self.conn, table, part, i, txn, stats, range, true, rows,
-                    )?),
+                    AccessPath::IndexLookup(i, range) => Box::new(
+                        IndexSource::seek(
+                            &self.conn, table, part, i, txn, stats, range, true, rows,
+                        )?
+                        .reading(&needs.columns),
+                    ),
                 };
                 Ok(source)
             })
