@@ -176,7 +176,9 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   0.51) and store's `Cursor::next` — API for callers that keep the row.
 - [x] The last two owned reads on a hot path: a foreign key check (per
   inserted row) asks whether the key is there through `find_with`, not a
-  copied-out tuple — bulk load 70 -> 52 s; the nested-loop join's inner
+  copied-out tuple (bulk load: no measurable change — the 70 -> 52 s
+  first reported was machine noise; load is even with the session's
+  start, 49.5 vs 51.3 s); the nested-loop join's inner
   side reads through `next_ref`. Still owned, and fine so: spill runs
   (RunCursor, its own page type), catalog/stats loads at open, DDL scans.
 - [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
