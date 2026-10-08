@@ -116,6 +116,16 @@ phase 2 notes; phase 3 removes the drains from `begin()` entirely.
   unit-tested (`test_visibility_is_commit_before_reader_began`, `test_conflict_is_first_committer_wins`,
   `test_prune_keeps_commits_a_live_reader_must_not_see`).
 - `prune_committed()` forgets entries with `commit_ts < oldest active id` (all, if none active).
+- Later (read scaling): every row a scan yielded asked the table twice, under its one `RwLock`
+  (`require_active`, `is_visible`) — 89% of an 8-thread scan was that lock. A reader now takes a
+  `Snapshot` as it begins, under the write lock that mints its id: the ids of what hadn't committed
+  then, and an `active` flag kept in step with its state. `Snapshot::sees` answers as `is_visible`
+  does with no lock; a writer that was Committing as the reader began is left to `is_visible`
+  (which waits), since the horizon releases its pre-images as soon as it commits — treating it as
+  invisible lost versions (`test_a_reader_never_loses_a_version_to_a_concurrent_vacuum`). Not the
+  phase-1 snapshot sets: the table with commit timestamps stays the truth, the snapshot is an
+  immutable copy of it taken under the same lock and counter. Scans and index lookups read through
+  it (cursors hold it; `Db::find_in`). `test_a_snapshot_sees_what_is_visible_sees`.
 - `find_visible_to(tuple, reader)` lost its snapshot parameter; cursors lost their snapshot field;
   `check_write_conflict` is one call. The synthetic-id conflict test was replaced by the rule tests.
 - `DbStats.committed_retained` added.

@@ -187,7 +187,7 @@ where
         // Read in place (find_as_with): the row's bytes are decoded, not
         // copied out first.
         let wanted = self.wanted.as_deref();
-        let Some(row) = db.find_as_with(rows, &id, self.cursor.reader(), |row| {
+        let Some(row) = db.find_in(rows, &id, self.cursor.snapshot(), |row| {
             self.table.decode_row(row.data(), wanted)
         })?
         else {

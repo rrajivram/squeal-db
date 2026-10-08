@@ -8,7 +8,7 @@ use crate::{
     table::TableIdType,
     tables::bplustree::BPlusTree,
     tuple::{DBIdType, Tuple, TupleRef},
-    txn::{Transaction, TransactionId},
+    txn::{Snapshot, Transaction, TransactionId},
     valueitem::{IndexKey, ValueItem, ValueRef},
 };
 
@@ -139,6 +139,9 @@ pub struct TableCursor<F: DBFile + 'static> {
     current_page: Arc<Page>,
     current_iter: PageTupleIterator,
     transaction: ScanTxn,
+    // What the transaction reads, taken once: per row, visibility and
+    // "still open?" are asked of it without a lock (see txn::Snapshot).
+    snapshot: Arc<Snapshot>,
     lent: Lent,
 }
 
@@ -208,6 +211,8 @@ pub struct RangeCursor<F: DBFile + 'static> {
     current_leaf: Arc<Page>,
     current_iter: LeafEntries,
     transaction: ScanTxn,
+    // See TableCursor's.
+    snapshot: Arc<Snapshot>,
     start: Bound<DBIdType>,
     end: Bound<DBIdType>,
     // Some for key-range scans (see Db::key_range_scan, Db::prefix_scan):
@@ -237,6 +242,7 @@ where
         transaction: Option<TransactionId>,
     ) -> Result<Self, StoreError> {
         let transaction = ScanTxn::new(&db, transaction)?;
+        let snapshot = db.snapshot(&transaction.id())?;
         let (current_page_id, current_page) = db
             .table_by_id(table)?
             .next_data_page(None)?
@@ -249,6 +255,7 @@ where
             current_page_id,
             current_page,
             transaction,
+            snapshot,
             lent: Lent::Nothing,
         })
     }
@@ -256,9 +263,8 @@ where
     /// The next row this cursor's transaction sees, lent (see TupleRef):
     /// what `next` yields, without the copy. Valid until the next call.
     pub fn next_ref(&mut self) -> Result<Option<TupleRef<'_>>, StoreError> {
-        let reader = self.transaction.id();
         // See Db::find: a finished reader may not keep scanning.
-        self.db.require_active(&reader)?;
+        self.db.check_snapshot(&self.snapshot)?;
         // Loops rather than resolving just one raw row per call: a single
         // physical row can be invisible for two different reasons, and
         // either one must make the cursor move on to the next row instead
@@ -286,7 +292,7 @@ where
             let tuple = unsafe { &*iter }.get(i).ok_or_else(|| {
                 StoreError::UnknownError(format!("no tuple at position {i} of its page"))
             })?;
-            match self.db.visible_version(&tuple, &reader)? {
+            match self.db.visible_version(&tuple, &self.snapshot)? {
                 Visible::Itself => return Ok(Some(tuple)),
                 Visible::Ancestor(t) => break Lent::Owned(t),
                 Visible::Not => continue,
@@ -337,6 +343,7 @@ where
         end: Bound<DBIdType>,
     ) -> Result<Self, StoreError> {
         let transaction = ScanTxn::new(&db, transaction)?;
+        let snapshot = db.snapshot(&transaction.id())?;
         // Positional: finds the leaf that would hold `start` whether or
         // not `start` actually exists as a key (unlike the old
         // find_first_page, which did an exact index lookup and errored
@@ -349,6 +356,7 @@ where
             current_iter,
             current_leaf,
             transaction,
+            snapshot,
             start,
             end,
             ranges: None,
@@ -380,6 +388,7 @@ where
         ranges: Vec<KeyRange>,
     ) -> Result<Self, StoreError> {
         let transaction = ScanTxn::new(&db, transaction)?;
+        let snapshot = db.snapshot(&transaction.id())?;
         let tree = db.table_by_id(table)?;
         let start = match ranges.first() {
             Some(r) => Self::range_start(&tree, r)?,
@@ -393,6 +402,7 @@ where
             current_iter,
             current_leaf,
             transaction,
+            snapshot,
             start,
             end: Bound::Unbounded,
             done: ranges.is_empty(),
@@ -448,6 +458,13 @@ where
     /// Db::find_as).
     pub fn reader(&self) -> TransactionId {
         self.transaction.id()
+    }
+
+    /// The snapshot this cursor reads with — for looking up, as it does,
+    /// the rows its index entries point to (see Db::find_in), with no lock
+    /// per lookup.
+    pub fn snapshot(&self) -> &Arc<Snapshot> {
+        &self.snapshot
     }
 
     fn range_start(
@@ -530,9 +547,8 @@ where
             return Ok(None);
         }
         let table = self.db.table_by_id(self.table)?;
-        let reader = self.transaction.id();
         // See Db::find: a finished reader may not keep scanning.
-        self.db.require_active(&reader)?;
+        self.db.check_snapshot(&self.snapshot)?;
         self.lent = loop {
             let Some(i) = self.next_index_entry(&table)? else {
                 // The end of the tree ends a range too — the next one may
@@ -618,7 +634,7 @@ where
             let row = unsafe { &*lent }.get().ok_or_else(|| {
                 StoreError::UnknownError(format!("no row at position {at} of {page:?}"))
             })?;
-            match self.db.visible_version(&row, &reader)? {
+            match self.db.visible_version(&row, &self.snapshot)? {
                 Visible::Itself => return Ok(Some(row)),
                 Visible::Ancestor(t) => break Lent::Owned(t),
                 Visible::Not => continue,

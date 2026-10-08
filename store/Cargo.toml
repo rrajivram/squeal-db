@@ -3,6 +3,10 @@ name = "store"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Install alloc::TrackingAllocator as the global allocator (see lib.rs).
+alloc-tracking = []
+
 [dependencies]
 log = "0.4.32"
 thiserror = "2.0.18"

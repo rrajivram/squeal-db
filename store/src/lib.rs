@@ -10,7 +10,15 @@
 // `cargo +nightly miri test` — Miri can only interpret actual Rust, not
 // arbitrary FFI, and System is the one allocator it knows how to
 // intercept directly.
-#[global_allocator]
+//
+// Installed only with the `alloc-tracking` feature (squeal-cli turns it
+// on, to print the stats): its counters are shared atomics updated on
+// every allocation and free, by every thread, and that bookkeeping alone
+// made an aggregate over a million rows 4x slower on four threads than on
+// plain System. Without the feature, System allocates and alloc::stats()
+// reads zeros — the alloc_proxy_* measurement tests want
+// `--features alloc-tracking`.
+#[cfg_attr(feature = "alloc-tracking", global_allocator)]
 static GLOBAL: alloc::TrackingAllocator = alloc::TrackingAllocator::new();
 
 pub mod alloc;

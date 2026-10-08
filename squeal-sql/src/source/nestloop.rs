@@ -19,7 +19,7 @@ use store::{
     cursor::{KeyRange, RangeCursor},
     db::{DBFile, Db},
     tuple::DBIdType,
-    txn::TransactionId,
+    txn::{Snapshot, TransactionId},
     valueitem::{IndexKey, ValueItem},
 };
 
@@ -74,6 +74,10 @@ pub(crate) struct NestedLoopJoin<F: DBFile + 'static> {
     // seeks only the partition its value routes to.
     route_by: Option<(usize, DataType)>,
     current: Option<Current<F>>,
+    // What `reader` reads (see store::txn::Snapshot), taken from the first
+    // inner cursor: the rows an index's entries point to are looked up as
+    // it, with no lock per lookup (Db::find_in).
+    snapshot: Option<Arc<Snapshot>>,
     lookups: usize,
     time_spent: u128,
 }
@@ -147,6 +151,7 @@ where
             parts,
             route_by,
             current: None,
+            snapshot: None,
             lookups: 0,
             time_spent: 0,
         })
@@ -240,7 +245,7 @@ where
     fn inner_row(
         db: &Db<F>,
         table: &SqlTable,
-        reader: TransactionId,
+        snapshot: &Snapshot,
         by_index: bool,
         has_pk: bool,
         part: usize,
@@ -269,7 +274,7 @@ where
         };
         // Read in place (find_as_with): the row's bytes are decoded, not
         // copied out first.
-        db.find_as_with(table.partitions[part].rows(), &id, reader, |row| {
+        db.find_in(table.partitions[part].rows(), &id, snapshot, |row| {
             table.decode_row(row.data(), None)
         })?
         .transpose()
@@ -284,13 +289,16 @@ where
     fn step(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         loop {
             if let Some(cur) = &mut self.current {
+                let snapshot = self
+                    .snapshot
+                    .get_or_insert_with(|| Arc::clone(cur.cursor.snapshot()));
                 match cur.cursor.next_ref()? {
                     Some(entry) => {
                         // Lent (next_ref): decoded where it lies, no copy.
                         let inner = Self::inner_row(
                             &self.db,
                             &self.table,
-                            self.reader,
+                            snapshot,
                             self.seek.index.is_some(),
                             self.has_pk,
                             cur.part,

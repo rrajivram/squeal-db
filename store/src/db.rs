@@ -39,6 +39,7 @@ use crate::tuple::{Tuple, TupleRef};
 use crate::txn::ConflictPolicy;
 use crate::txn::Transaction;
 use crate::txn::TransactionId;
+use crate::txn::Snapshot;
 use crate::txn::TransactionManager;
 use crate::txn::TxnSink;
 use crate::utils::shardedmap::ShardedMap;
@@ -2027,7 +2028,21 @@ where
         // A finished transaction no longer pins its snapshot (vacuum may
         // have reclaimed what it could see), so it may not read: the error
         // says why it finished (SnapshotTooOld, or already finished).
-        self.require_active(&txn_id)?;
+        let snapshot = self.snapshot(&txn_id)?;
+        self.find_in(tid, id, &snapshot, f)
+    }
+
+    /// `find_with`, as the reader whose Snapshot this is (a cursor's — see
+    /// RangeCursor::snapshot): for a lookup per row, which then takes no
+    /// lock to ask what the reader sees.
+    pub fn find_in<R>(
+        &self,
+        tid: TableIdType,
+        id: &DBIdType,
+        snapshot: &Snapshot,
+        f: impl FnOnce(TupleRef<'_>) -> R,
+    ) -> Result<Option<R>, StoreError> {
+        self.check_snapshot(snapshot)?;
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         // The version txn_id sees (visible_version: the row itself, or the
@@ -2037,7 +2052,7 @@ where
         // commit point).
         Ok(table
             .find_with(id, |row| {
-                Ok(match self.visible_version(&row, &txn_id)? {
+                Ok(match self.visible_version(&row, snapshot)? {
                     Visible::Itself => Some(f(row)),
                     Visible::Ancestor(t) => Some(f(TupleRef::borrowed(&t))),
                     Visible::Not => None,
@@ -2419,29 +2434,66 @@ where
         }
     }
 
-    /// The version of a lent tuple `reader` sees, if any, as a cursor
-    /// yields it: None where find_visible_to finds none or a tombstone.
+    /// The version of a lent tuple a reader sees (by its Snapshot), if any,
+    /// as a cursor yields it: None where it sees none, or a tombstone (a
+    /// key removed). Decided from the snapshot — no lock (see
+    /// txn::Snapshot), where this asked the shared transaction table for
+    /// every version it looked at.
     pub(crate) fn visible_version(
         &self,
         tuple: &TupleRef,
-        reader: &TransactionId,
+        snapshot: &Snapshot,
     ) -> Result<Visible, StoreError> {
         let walk = self.walk_back(tuple.txn_id(), tuple.pre_lsn(), &tuple.id(), |txn| {
-            self.tx_mgr.is_visible(txn, reader)
+            snapshot
+                .sees(txn)
+                .unwrap_or_else(|| self.tx_mgr.is_visible(txn, &snapshot.reader()))
         })?;
         Ok(match walk {
             Walk::Itself if !tuple.is_tombstoned() => Visible::Itself,
             Walk::Ancestor(t) if !t.is_tombstoned() => Visible::Ancestor(t),
+            // NoAncestor is a genuine dead end — this version has no
+            // ancestor at all: a fresh INSERT by a writer the reader can't
+            // see (a phantom row).
             Walk::Itself | Walk::Ancestor(_) | Walk::NoAncestor => Visible::Not,
-            // See find_visible_to.
+            // Phase 3: retention is the horizon's rule (proposal §3.6), so
+            // a version a live reader can still need is never gone.
+            // Reaching this is an invariant violation, reported as such —
+            // not papered over with the latest committed version.
             Walk::MissingUndoRecord => {
                 return Err(StoreError::Corruption(format!(
-                    "version record missing for pre_lsn of {:?} (reader {reader}, oldest active {:?})",
+                    "version record missing for pre_lsn of {:?} (reader {}, oldest active {:?})",
                     tuple.id(),
+                    snapshot.reader(),
                     self.tx_mgr.oldest_active()
                 )));
             }
         })
+    }
+
+    /// The snapshot `txn` reads with — what a scan or lookup takes once, as
+    /// it starts. The error require_active gives if `txn` isn't active.
+    pub(crate) fn snapshot(&self, txn: &TransactionId) -> Result<Arc<Snapshot>, StoreError> {
+        match self.tx_mgr.snapshot(txn) {
+            Some(s) => Ok(s),
+            None => {
+                self.require_active(txn)?;
+                // Active, yet no snapshot: can't happen (both are set under
+                // one lock); said as the transaction being finished.
+                Err(StoreError::TransactionAlreadyFinished)
+            }
+        }
+    }
+
+    /// require_active, for a reader holding its snapshot: a load of its
+    /// `active` flag, no lock — what a scan checks per row. A finished
+    /// reader may not keep reading (see require_active).
+    pub(crate) fn check_snapshot(&self, snapshot: &Snapshot) -> Result<(), StoreError> {
+        if snapshot.is_active() {
+            return Ok(());
+        }
+        self.require_active(&snapshot.reader())?;
+        Err(StoreError::TransactionAlreadyFinished)
     }
 
     // Write-write conflict guard for update()/remove(), called against the
@@ -2502,37 +2554,6 @@ where
         match self.resolve_visible(tuple, |txn| self.tx_mgr.is_committed(txn))? {
             Visibility::Found(t) => Ok(Some(t)),
             Visibility::NoAncestor | Visibility::MissingUndoRecord => Ok(None),
-        }
-    }
-
-    // Snapshot-isolated visibility for reads (Db::find, TableCursor,
-    // RangeCursor). TXN_SIMPLIFICATION_PLAN.md phase 2: the whole rule lives
-    // in TransactionManager::is_visible — a version is visible iff its
-    // writer is the reader, or committed before the reader began
-    // (commit_ts < reader.id). No per-reader snapshot set exists anymore.
-    pub(crate) fn find_visible_to<'a>(
-        &self,
-        tuple: &'a Tuple,
-        reader: &TransactionId,
-    ) -> Result<Option<Cow<'a, Tuple>>, StoreError> {
-        match self.resolve_visible(tuple, |txn| self.tx_mgr.is_visible(txn, reader))? {
-            Visibility::Found(t) => Ok(Some(t)),
-            // A genuine dead end — this version has no ancestor at all, so
-            // there is nothing to fall back to. This is also exactly what a
-            // phantom row looks like: a fresh INSERT by a writer that isn't
-            // visible to `reader` has pre_lsn == None, so the walk hits this
-            // on its first step. Must NOT fall through to
-            // find_last_committed below.
-            Visibility::NoAncestor => Ok(None),
-            // Phase 3: retention is the horizon's rule (proposal §3.6), so a
-            // version a live reader can still need is never gone. Reaching
-            // this is an invariant violation, reported as such — not papered
-            // over with the latest committed version.
-            Visibility::MissingUndoRecord => Err(StoreError::Corruption(format!(
-                "version record missing for pre_lsn of {:?} (reader {reader}, oldest active {:?})",
-                tuple.id,
-                self.tx_mgr.oldest_active()
-            ))),
         }
     }
 

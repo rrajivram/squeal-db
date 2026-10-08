@@ -181,6 +181,16 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   start, 49.5 vs 51.3 s); the nested-loop join's inner
   side reads through `next_ref`. Still owned, and fine so: spill runs
   (RunCursor, its own page type), catalog/stats loads at open, DDL scans.
+- [x] Concurrent scans scale. Two things serialized them: the global
+  TrackingAllocator (shared atomic counters on every allocation and free —
+  now only with store's `alloc-tracking` feature, which squeal-cli turns
+  on), and the transaction table's RwLock, taken twice per row (now a
+  per-reader `Snapshot`, see TXN_SIMPLIFICATION_PROGRESS.md). Per query,
+  1 / 4 / 8 / 12 threads: order_details sum/max 336/392/613/673 ms ->
+  297/84/41/29; order_details count 144/91/234/340 -> 140/48/27/22;
+  orders count 32/45/73/84 -> 30/7.8/4.6/3.5. Note `cargo test
+  --workspace` builds squeal-cli too, which turns tracking on for the
+  whole build — measure per package.
 - [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
   index pages too. u16 offsets/lengths would halve that for pages under
   64 KiB — a change to SlottedPage's layout, so a page format version.

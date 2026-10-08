@@ -10,8 +10,11 @@
 //! sequence, no wall clock, and no `(id, ts)` pair to reconcile.
 
 use std::{
-    collections::{BTreeMap, HashSet},
-    sync::Arc,
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 
 use parking_lot::RwLock;
@@ -108,6 +111,68 @@ pub(crate) struct TransactionManager {
     // BTreeMap so the oldest active transaction (the retention horizon) is
     // the first Active key.
     states: RwLock<BTreeMap<TransactionId, TxnState>>,
+    // Each Active transaction's Snapshot (see there), taken as it began.
+    // Read once per scan or lookup (see `snapshot`), not per row; changed,
+    // like its `active` flag, only under `states`' write lock.
+    snapshots: RwLock<HashMap<TransactionId, Arc<Snapshot>>>,
+}
+
+/// What a transaction reads: everything committed before it began, and its
+/// own writes — decided from what was true when it began, so with no lock
+/// (`sees`), giving the answers `is_visible` gives. Ids and commit
+/// timestamps come from one counter, so a writer that began after the
+/// reader has a larger id, and every transaction that had committed by
+/// then is either remembered as Committed with an earlier timestamp or
+/// forgotten. What else a reader must not see is what hadn't committed
+/// when it began — Active, Aborting, or Aborted but kept for an older
+/// reader — and those ids are taken then.
+///
+/// Except a writer partway through committing as the reader began
+/// (Committing, its timestamp already below the reader's id): the reader
+/// sees it if that commit succeeds, and `sees` can't know yet — it says
+/// so (None), for the caller to ask `is_visible`, which waits. Treating it
+/// as invisible instead would be a snapshot too, but not the one the
+/// retention horizon keeps versions for: its pre-images can go as soon as
+/// it commits, being below every active reader's id.
+#[derive(Debug)]
+pub struct Snapshot {
+    reader: TransactionId,
+    // Ids of the transactions that hadn't committed when `reader` began,
+    // and weren't committing, sorted.
+    unfinished: Box<[TransactionId]>,
+    // Ids of those that were committing (see above), sorted.
+    committing: Box<[TransactionId]>,
+    // Whether `reader` is still Active (TransactionManager keeps it so):
+    // what a scan checks per row instead of asking the shared state.
+    active: AtomicBool,
+}
+
+impl Snapshot {
+    pub(crate) fn reader(&self) -> TransactionId {
+        self.reader
+    }
+
+    /// Whether this snapshot sees a version `writer` wrote, without a
+    /// lock — or None for a writer that was committing as it began, whose
+    /// outcome decides (see above): ask TransactionManager::is_visible.
+    pub(crate) fn sees(&self, writer: &TransactionId) -> Option<bool> {
+        if *writer == self.reader {
+            return Some(true);
+        }
+        if writer.0 > self.reader.0 || self.unfinished.binary_search(writer).is_ok() {
+            return Some(false);
+        }
+        if self.committing.binary_search(writer).is_ok() {
+            return None;
+        }
+        Some(true)
+    }
+
+    /// Whether its transaction is still Active: set and cleared under the
+    /// state lock, read without it.
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(AtomicOrdering::Acquire)
+    }
 }
 
 /// What a `Transaction` guard needs from its owner: the one place a commit,
@@ -187,6 +252,7 @@ impl TransactionManager {
         Self {
             clock,
             states: RwLock::new(BTreeMap::new()),
+            snapshots: RwLock::new(HashMap::new()),
         }
     }
 
@@ -283,7 +349,25 @@ impl TransactionManager {
         // versions this transaction's snapshot still needed.
         let mut states = self.states.write();
         let txn = TransactionId(self.clock.next_lsn().0);
+        // Its snapshot: what hasn't committed as it begins (see Snapshot).
+        let (mut unfinished, mut committing) = (vec![], vec![]);
+        for (id, s) in states.iter() {
+            match s {
+                TxnState::Committed { .. } => {}
+                TxnState::Committing { .. } => committing.push(*id),
+                _ => unfinished.push(*id),
+            }
+        }
         states.insert(txn, TxnState::Active { policy });
+        self.snapshots.write().insert(
+            txn,
+            Arc::new(Snapshot {
+                reader: txn,
+                unfinished: unfinished.into(),
+                committing: committing.into(),
+                active: AtomicBool::new(true),
+            }),
+        );
         Ok(txn)
     }
 
@@ -295,6 +379,31 @@ impl TransactionManager {
     ) -> Result<Transaction, StoreError> {
         let id = self.create_transaction(policy)?;
         Ok(Transaction::new(id, Arc::clone(self) as Arc<dyn TxnSink>))
+    }
+
+    /// The snapshot `txn` reads with, while it is Active — once per scan
+    /// or lookup; per row, the snapshot itself (`Snapshot::sees`,
+    /// `is_active`) answers without a lock.
+    pub(crate) fn snapshot(&self, txn: &TransactionId) -> Option<Arc<Snapshot>> {
+        self.snapshots
+            .read()
+            .get(txn)
+            .filter(|s| s.is_active())
+            .cloned()
+    }
+
+    // Keeps `txn`'s snapshot in step with its state: called under `states`'
+    // write lock wherever a transaction stops or starts again being
+    // Active. Dropped once it can't be Active again (committed, aborting,
+    // gone); a scan still holding it sees `active` false.
+    fn set_active(&self, txn: &TransactionId, active: bool, for_good: bool) {
+        let mut snapshots = self.snapshots.write();
+        if let Some(s) = snapshots.get(txn) {
+            s.active.store(active, AtomicOrdering::Release);
+        }
+        if for_good {
+            snapshots.remove(txn);
+        }
     }
 
     pub(crate) fn is_transaction_active(&self, txn: &TransactionId) -> bool {
@@ -383,6 +492,7 @@ impl TransactionManager {
                 };
                 let commit_ts = self.clock.next_lsn().0;
                 *state = TxnState::Committing { commit_ts, policy };
+                self.set_active(&txn, false, false);
                 Ok(commit_ts)
             }
             _ => Err(StoreError::TransactionAlreadyFinished),
@@ -402,6 +512,7 @@ impl TransactionManager {
             } else {
                 TxnState::Active { policy }
             };
+            self.set_active(&txn, !logged, logged);
         }
     }
 
@@ -410,6 +521,7 @@ impl TransactionManager {
         match states.get_mut(&txn) {
             Some(state @ TxnState::Active { .. }) => {
                 *state = TxnState::Committed { commit_ts };
+                self.set_active(&txn, false, true);
                 Ok(())
             }
             _ => Err(StoreError::TransactionAlreadyFinished),
@@ -458,6 +570,7 @@ impl TransactionManager {
         match states.get_mut(&txn) {
             Some(state @ TxnState::Active { .. }) => {
                 *state = TxnState::Aborting;
+                self.set_active(&txn, false, true);
                 Ok(())
             }
             _ => Err(StoreError::TransactionAlreadyFinished),
@@ -467,7 +580,9 @@ impl TransactionManager {
     /// Retire a transaction whose writes were already physically reverted by
     /// a Db-level rollback (revert-while-active).
     pub(crate) fn finish_rolled_back(&self, txn: TransactionId) {
-        self.states.write().remove(&txn);
+        let mut states = self.states.write();
+        states.remove(&txn);
+        self.set_active(&txn, false, true);
     }
 
     /// Finish aborting `txn` — call only after its undo log has been fully
@@ -486,6 +601,7 @@ impl TransactionManager {
             false
         } else {
             states.remove(txn);
+            self.set_active(txn, false, true);
             true
         }
     }
@@ -625,6 +741,53 @@ mod tests {
     }
 
     // ---- phase 2: the two rules and the horizon ----
+
+    // A reader's Snapshot answers as is_visible does, for a writer in every
+    // state when the reader began — and keeps answering so after those
+    // writers move on — except the writer that was committing, which it
+    // leaves to is_visible (None). Its own `active` flag follows its state.
+    #[test]
+    fn test_a_snapshot_sees_what_is_visible_sees() {
+        let mgr = make_mgr();
+        let begin = || mgr.create_transaction(ConflictPolicy::default()).unwrap();
+        let committed = begin();
+        mgr.commit(committed, mgr.clock.next_lsn().0).unwrap();
+        let active = begin();
+        let aborting = begin();
+        mgr.abort(aborting).unwrap();
+        let committing = begin();
+        mgr.begin_commit(committing).unwrap();
+
+        let reader = begin();
+        let snap = mgr.snapshot(&reader).unwrap();
+        let later = begin();
+
+        // As the reader began.
+        for w in [committed, active, aborting, reader, later] {
+            assert_eq!(snap.sees(&w), Some(mgr.is_visible(&w, &reader)), "{w}");
+        }
+        assert_eq!(snap.sees(&committing), None);
+        assert_eq!(snap.sees(&TransactionId(0)), Some(true), "long committed");
+
+        // After: what was in flight commits, the committing one finishes,
+        // a later one commits. Still the same answers.
+        mgr.commit(active, mgr.clock.next_lsn().0).unwrap();
+        mgr.finish_commit(committing, true);
+        mgr.commit(later, mgr.clock.next_lsn().0).unwrap();
+        for w in [committed, active, aborting, later] {
+            assert_eq!(snap.sees(&w), Some(mgr.is_visible(&w, &reader)), "{w}");
+        }
+        assert!(mgr.is_visible(&committing, &reader), "committed before the reader");
+
+        // `active`: cleared as it commits, set again if the commit fails.
+        assert!(snap.is_active());
+        mgr.begin_commit(reader).unwrap();
+        assert!(!snap.is_active() && mgr.snapshot(&reader).is_none());
+        mgr.finish_commit(reader, false);
+        assert!(snap.is_active() && mgr.snapshot(&reader).is_some());
+        mgr.abort(reader).unwrap();
+        assert!(!snap.is_active() && mgr.snapshot(&reader).is_none());
+    }
 
     #[test]
     fn test_visibility_is_commit_before_reader_began() {
