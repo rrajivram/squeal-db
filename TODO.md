@@ -174,6 +174,11 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   `find_as` is it plus a copy. An index lookup fetching 9k rows: 64 ->
   17 ms. Still owned, by design: `Db::find` itself (0.71 us vs main's
   0.51) and store's `Cursor::next` — API for callers that keep the row.
+- [x] The last two owned reads on a hot path: a foreign key check (per
+  inserted row) asks whether the key is there through `find_with`, not a
+  copied-out tuple — bulk load 70 -> 52 s; the nested-loop join's inner
+  side reads through `next_ref`. Still owned, and fine so: spill runs
+  (RunCursor, its own page type), catalog/stats loads at open, DDL scans.
 - [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
   index pages too. u16 offsets/lengths would halve that for pages under
   64 KiB — a change to SlottedPage's layout, so a page format version.

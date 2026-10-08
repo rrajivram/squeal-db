@@ -16,9 +16,9 @@ use sql_parser::expr::BinaryOp;
 
 use postcard::from_bytes;
 use store::{
-    cursor::{Cursor, KeyRange, RangeCursor},
+    cursor::{KeyRange, RangeCursor},
     db::{DBFile, Db},
-    tuple::{DBIdType, Tuple},
+    tuple::DBIdType,
     txn::TransactionId,
     valueitem::{IndexKey, ValueItem},
 };
@@ -232,14 +232,25 @@ where
         parts
     }
 
-    // The inner row an entry of the sought tree gives: the row itself for
-    // the table's own tree, or the row its identity points to for an index.
-    fn inner_row(&self, part: usize, entry: &Tuple) -> Result<Option<IndexKey>, SchemaError> {
-        let id = match self.seek.index {
-            None => return Ok(Some(self.table.decode_row(entry.data(), None)?)),
-            Some(_) => {
-                let identity = from_bytes::<IndexKey>(entry.data())?;
-                let id = if self.has_pk {
+    // The inner row an entry of the sought tree gives (its data, lent by
+    // the cursor): the row itself for the table's own tree (`by_index`
+    // false), or the row its identity points to for an index. Takes only
+    // what it reads of the join, not `self`: the entry is lent out of
+    // `self.current`'s cursor while this runs.
+    fn inner_row(
+        db: &Db<F>,
+        table: &SqlTable,
+        reader: TransactionId,
+        by_index: bool,
+        has_pk: bool,
+        part: usize,
+        entry: &[u8],
+    ) -> Result<Option<IndexKey>, SchemaError> {
+        let id = match by_index {
+            false => return Ok(Some(table.decode_row(entry, None)?)),
+            true => {
+                let identity = from_bytes::<IndexKey>(entry)?;
+                let id = if has_pk {
                     DBIdType::Rec(identity)
                 } else {
                     match identity.values() {
@@ -248,7 +259,7 @@ where
                             return Err(SchemaError::InternalSchemaError(format!(
                                 "an index of {} points to a row id that isn't one integer: \
                                  {other:?}",
-                                self.table.name
+                                table.name
                             )));
                         }
                     }
@@ -258,11 +269,10 @@ where
         };
         // Read in place (find_as_with): the row's bytes are decoded, not
         // copied out first.
-        self.db
-            .find_as_with(self.table.partitions[part].rows(), &id, self.reader, |row| {
-                self.table.decode_row(row.data(), None)
-            })?
-            .transpose()
+        db.find_as_with(table.partitions[part].rows(), &id, reader, |row| {
+            table.decode_row(row.data(), None)
+        })?
+        .transpose()
     }
 
     fn combine(outer: &IndexKey, inner: &[ValueItem]) -> Result<IndexKey, SchemaError> {
@@ -274,13 +284,22 @@ where
     fn step(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         loop {
             if let Some(cur) = &mut self.current {
-                match cur.cursor.next()? {
+                match cur.cursor.next_ref()? {
                     Some(entry) => {
-                        let (outer, part) = (cur.outer.clone(), cur.part);
-                        let Some(inner) = self.inner_row(part, &entry)? else {
+                        // Lent (next_ref): decoded where it lies, no copy.
+                        let inner = Self::inner_row(
+                            &self.db,
+                            &self.table,
+                            self.reader,
+                            self.seek.index.is_some(),
+                            self.has_pk,
+                            cur.part,
+                            entry.data(),
+                        )?;
+                        let Some(inner) = inner else {
                             continue;
                         };
-                        let row = Self::combine(&outer, inner.values())?;
+                        let row = Self::combine(&cur.outer, inner.values())?;
                         let on = self.on_expr.eval(std::slice::from_ref(&row), 0)?;
                         if on == ValueItem::Boolean(true) {
                             if let Some(cur) = &mut self.current {

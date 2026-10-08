@@ -344,8 +344,10 @@ where
         key: &DBIdType,
         txn: &Transaction,
     ) -> Result<bool, SchemaError> {
+        // Whether it's there, not what it holds: lent (find_with) and not
+        // looked at, rather than copied out and dropped.
         for part in &table.partitions {
-            if self.db.find(part.index(index), key.clone(), txn)?.is_some() {
+            if self.db.find_with(part.index(index), key, txn, |_| ())?.is_some() {
                 return Ok(true);
             }
         }
