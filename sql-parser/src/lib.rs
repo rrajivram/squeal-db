@@ -27,6 +27,7 @@ pub mod span;
 pub mod statement;
 pub mod token;
 pub mod utils;
+mod values;
 pub mod visitor;
 
 use chumsky::{
@@ -96,6 +97,9 @@ pub fn parse_sql(src: &str) -> Result<Vec<Statement>, Vec<ParseError>> {
     // the text parses. The grammar is the same either way, so a text that
     // parses gives the same statements; only a failure is parsed again,
     // with Rich errors, for its message.
+    if let Some(stmts) = values::fast_insert(&tokens) {
+        return Ok(stmts);
+    }
     if let Ok(stmts) = parse_tokens::<EmptyErr>(&tokens).into_result() {
         return Ok(stmts);
     }
@@ -116,7 +120,7 @@ pub fn parse_sql(src: &str) -> Result<Vec<Statement>, Vec<ParseError>> {
 }
 
 // Statements separated by semicolons, with errors of type `Error`.
-fn parse_tokens<'src, Error>(
+pub(crate) fn parse_tokens<'src, Error>(
     tokens: &'src [TokenStruct<'src>],
 ) -> chumsky::ParseResult<Vec<Statement>, Error>
 where

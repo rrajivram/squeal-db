@@ -10,7 +10,7 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
   with optim::picker, as a SELECT of the whole row would (primary-key seek,
   or an index with row lookups). Single-row autocommit UPDATE 25 -> 235/s
   (SQLite 247/s); in a transaction 28 -> 5,155/s (SQLite 14,100/s).
-- [x] **Bulk load: 27k -> 135k rows/s** (SQLite 1.45M/s). Three things:
+- [x] **Bulk load: 27k -> 194k rows/s** (SQLite 1.5M/s). Four things:
   - Parsing was 3.45 s of 8.2: chumsky built a `Rich` error at every
     alternative even on success. parse_sql now parses with `EmptyErr`
     first, and again with `Rich` only on failure (a 500-row INSERT 7.6 ->
@@ -19,8 +19,13 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
     now fsyncs only a batch holding a record someone waits on (Commit,
     Rollback, Sequence, Purge) or when asked (Sync, Roll, ShutDown).
   - Allocating a page pwrote it; it is now cached dirty for the checkpoint.
-  What is left is expression parsing per literal (an allocation and a
-  precedence layer each) and the engine's per-row work.
+  - Each VALUES value was parsed as a whole expression. Rows of plain
+    literals after an INSERT's first are now built straight from their
+    tokens (sql-parser's values.rs): a 500-row INSERT 1.4 -> 0.2 ms.
+  (Raising the parse cache's 8 KiB limit instead does not help: a shape
+  keeps each literal's length, so no two bulk INSERTs share one — 0 hits
+  of 400, and each miss parses twice.)
+  What is left is the engine's per-row work: ~5 us a row.
 - [x] **CREATE INDEX**: 9.2 -> 2.0 s for three (SQLite 0.14 s), from the
   same store changes. Still a row-at-a-time insert into the new tree; a
   sorted bulk build would be the next step.

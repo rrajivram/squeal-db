@@ -50,6 +50,10 @@ pub struct With {
    why.
 2. **Parse.** `parse_sql` / `parse_one` return `Vec<Statement>` / one
    `Statement`, or every error with its span.
+   A bulk `INSERT … VALUES` takes a shortcut: its head and first row go
+   through the grammar, and each further row of plain literals is built
+   straight from its tokens (`values.rs`), about 7x faster. A test checks
+   that it builds exactly what the grammar does.
 3. **Cache.** `parse_sql_cached` keeps parses process-wide at two levels:
    - **By exact text.**
    - **By shape:** statements that differ only in their literals share one
