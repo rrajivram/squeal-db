@@ -239,6 +239,7 @@ fn every_position(e: &EvalExpr) -> Vec<usize> {
                 FuncArgs::Wildcard => vec![],
             })
             .collect(),
+        EvalExpr::Subquery(s) => s.operands().flat_map(every_position).collect(),
     }
 }
 

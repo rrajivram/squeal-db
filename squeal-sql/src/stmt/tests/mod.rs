@@ -2200,6 +2200,7 @@ mod partition_races;
 mod row_decode;
 mod sql_gaps;
 mod oracle;
+mod subquery;
 mod soak;
 
 #[cfg(test)]

@@ -2948,7 +2948,9 @@ mod tests {
         }
     }
 
-    // The "no page lock across a blocking wait" rule is checked, not assumed.
+    // The "no page lock across a blocking wait" rule is checked, not assumed
+    // — by a debug assertion, so only where those are on.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "while holding page locks")]
     fn test_blocking_wait_with_a_page_lock_held_is_caught() {

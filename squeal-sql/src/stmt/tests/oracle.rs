@@ -226,6 +226,8 @@ struct Item {
 struct Gen<'a> {
     rng: &'a mut Rng,
     items: Vec<Item>,
+    // Whether conditions may hold subqueries (see subquery_cond).
+    subqueries: bool,
 }
 
 impl Gen<'_> {
@@ -283,6 +285,9 @@ impl Gen<'_> {
     }
 
     fn cond(&mut self, depth: u32) -> String {
+        if self.subqueries && depth <= 1 && self.rng.chance(45) {
+            return self.subquery_cond();
+        }
         let op = *self.rng.pick(&["=", "<>", "<", "<=", ">", ">="]);
         match self.rng.below(if depth > 1 { 9 } else { 12 }) {
             0 | 1 => format!("{} {op} {}", self.int_col(), self.rng.int(-10, 60)),
@@ -326,6 +331,77 @@ impl Gen<'_> {
                 self.cond(depth + 1)
             ),
             _ => format!("not ({})", self.cond(depth + 1)),
+        }
+    }
+
+    // A condition holding a subquery over one or two inner tables (aliased
+    // sq, sq2): IN / NOT IN, EXISTS / NOT EXISTS, or a scalar comparison;
+    // uncorrelated, or correlated through `inner = outer` equalities.
+    fn subquery_cond(&mut self) -> String {
+        let table = *self.rng.pick(&["ev", "reg", "dim"]);
+        let from = format!("{} sq", Self::table_name(table));
+        let inner = |g: &mut Self| format!("sq.{}", g.rng.pick(int_columns(table)));
+        let not = |g: &mut Self| if g.rng.chance(40) { "not " } else { "" };
+        let local = |g: &mut Self| -> String {
+            if g.rng.chance(50) {
+                let op = *g.rng.pick(&["=", "<>", "<", ">=", ">"]);
+                format!(" and {} {op} {}", inner(g), g.rng.int(-5, 50))
+            } else {
+                String::new()
+            }
+        };
+        match self.rng.below(8) {
+            // Uncorrelated IN.
+            0 | 1 => {
+                let (outer, c, l) = (self.int_col(), inner(self), local(self));
+                let n = not(self);
+                format!("{outer} {n}in (select {c} from {from} where 1 = 1{l})")
+            }
+            // Correlated EXISTS.
+            2 | 3 => {
+                let (c, outer, l) = (inner(self), self.int_col(), local(self));
+                let n = not(self);
+                if self.rng.chance(50) {
+                    format!("{n}exists (select 1 from {from} where {c} = {outer}{l})")
+                } else {
+                    format!("{n}exists (select * from {from} where {outer} = {c}{l})")
+                }
+            }
+            // Correlated IN.
+            4 => {
+                let (outer, v, c, key, l) = (
+                    self.int_col(),
+                    inner(self),
+                    inner(self),
+                    self.int_col(),
+                    local(self),
+                );
+                let n = not(self);
+                format!("{outer} {n}in (select {v} from {from} where {c} = {key}{l})")
+            }
+            // Uncorrelated EXISTS.
+            5 => {
+                let (c, n) = (inner(self), not(self));
+                format!("{n}exists (select 1 from {from} where {c} > {})", self.rng.int(-10, 210))
+            }
+            // A scalar subquery.
+            6 => {
+                let (outer, c) = (self.int_col(), inner(self));
+                let op = *self.rng.pick(&["=", "<", ">="]);
+                let agg = *self.rng.pick(&["max", "min", "count"]);
+                format!("{outer} {op} (select {agg}({c}) from {from})")
+            }
+            // Correlated EXISTS over a join of two inner tables.
+            _ => {
+                let outer = self.int_col();
+                let n = not(self);
+                format!(
+                    "{n}exists (select 1 from dim sq join {} sq2 on sq.k = sq2.cat \
+                     where sq2.day = {outer} and sq.w > {})",
+                    Self::table_name("ev"),
+                    self.rng.int(0, 30)
+                )
+            }
         }
     }
 
@@ -551,6 +627,7 @@ fn check(
     lite: &rusqlite::Connection,
     seed: u64,
     count: usize,
+    subqueries: bool,
     tally: &mut Tally,
 ) {
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
@@ -558,6 +635,7 @@ fn check(
         let mut g = Gen {
             rng: &mut rng,
             items: vec![],
+            subqueries,
         };
         let (q, is_ordered) = g.query();
         if std::env::var_os("SQ_ORACLE_TRACE").is_some() {
@@ -605,11 +683,11 @@ fn check(
     }
 }
 
-fn run_oracle(seeds: &[u64], count: usize) -> Tally {
+fn run_oracle(seeds: &[u64], count: usize, subqueries: bool) -> Tally {
     let (c, lite) = setup();
     let mut tally = Tally::default();
     for seed in seeds {
-        check(&c, &lite, *seed, count, &mut tally);
+        check(&c, &lite, *seed, count, subqueries, &mut tally);
     }
     tally
 }
@@ -627,7 +705,7 @@ fn test_random_queries_agree_with_sqlite_and_across_partitioning() {
         Some(seed) => vec![seed],
         None => vec![1, 2, 3, 4],
     };
-    let tally = run_oracle(&seeds, count);
+    let tally = run_oracle(&seeds, count, false);
     println!(
         "agreed {}, both refused {}, sqlite refused {}, findings {}",
         tally.agreed,
@@ -642,5 +720,37 @@ fn test_random_queries_agree_with_sqlite_and_across_partitioning() {
         tally.findings[..tally.findings.len().min(15)].join("\n")
     );
     // Not vacuous: most queries are answered, and alike.
+    assert!(tally.agreed * 10 >= seeds.len() * count * 7, "{tally:?}");
+}
+
+// The same, with IN / EXISTS / scalar subqueries in conditions (see
+// Gen::subquery_cond) — uncorrelated and correlated, NULLs included.
+#[test]
+fn test_random_subqueries_agree_with_sqlite_and_across_partitioning() {
+    let count = std::env::var("SQ_ORACLE_QUERIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    let seeds: Vec<u64> = match std::env::var("SQ_ORACLE_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(seed) => vec![seed],
+        None => vec![5, 6, 7, 8],
+    };
+    let tally = run_oracle(&seeds, count, true);
+    println!(
+        "agreed {}, both refused {}, sqlite refused {}, findings {}",
+        tally.agreed,
+        tally.both_refused,
+        tally.sqlite_refused,
+        tally.findings.len()
+    );
+    assert!(
+        tally.findings.is_empty(),
+        "{} findings:\n{}",
+        tally.findings.len(),
+        tally.findings[..tally.findings.len().min(15)].join("\n")
+    );
     assert!(tally.agreed * 10 >= seeds.len() * count * 7, "{tally:?}");
 }

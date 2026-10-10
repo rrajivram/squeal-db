@@ -1,5 +1,38 @@
 # Open items
 
+## From the SQLite comparison (2026-10-10)
+
+`cargo run --release -p squeal-sql --example load_vs_sqlite -- 200000 4`,
+on an M4 Max: 20k customers, 200k orders, both engines on disk and fully
+fsynced. The answers agreed in every phase. Where squeal-db trails most:
+
+- [ ] **UPDATE/DELETE scan the whole table.** `update orders set ... where
+  id = 7` reads all 200k rows (~35 ms) where SELECT seeks (~8 us):
+  `Statement::execute` builds them on `table_scan_source`, not the
+  optimizer's access paths. Single-row autocommit UPDATE: 25/s against
+  SQLite's 246/s. In a transaction: 28/s against 15,600/s.
+- [ ] **Parsing large INSERTs.** 3.45 of the 8.2 s that a 200k-row load
+  takes (500-row INSERTs) is parsing: chumsky builds `Rich` error
+  alternatives (`add_alt_err`, `expected_found`) at every choice, even on
+  success. A hand-written VALUES-list fast path, like the lexer's, or a
+  cheaper error type for the first attempt. Load: 27k rows/s, SQLite
+  1.6M/s.
+- [ ] **CREATE INDEX**: three indexes over 220k rows take 9.2 s (SQLite
+  125 ms).
+- [ ] **IndexLookup costing.** A one-week range (~2% of orders) chose a
+  TableScan over the `day` index, because each fetched row is charged a
+  whole page read, as if never cached. 122 queries/s against SQLite's 556.
+- [ ] **Constant folding.** `day < 10 + 7` can't bound a seek.
+- [ ] **Hash join where a seek would do.** `orders (day = ?) join customers`
+  hashes ~550 orders and scans all 20k customers rather than seeking
+  customers by primary key per order. 254/s against 2,300/s.
+- [ ] **Per-statement overhead.** Point lookup by PK: 125k/s (SQLite,
+  prepared, 750k/s). Concurrent (4 threads): 259k/s against 774k/s.
+- Ahead or level: correlated NOT EXISTS 4.5x faster (hash anti-join
+  against SQLite's per-row probe), join + GROUP BY 1.2x, single-row
+  autocommit INSERT level (both bound by fsync).
+
+
 Measured on a generated retail database (1M order details), warm, release
 build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 

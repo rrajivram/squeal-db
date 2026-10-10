@@ -44,7 +44,10 @@ pub struct With {
 
 1. **Lex.** `lexer::tokenize` turns text into span-carrying tokens, with
    keywords classified once, case-insensitively. Whitespace and comments
-   are dropped.
+   are dropped. A hand-written lexer does the work, several times faster
+   than the combinator lexer it mirrors. A test checks that both give the
+   same tokens. When text doesn't lex, the combinator lexer runs to report
+   why.
 2. **Parse.** `parse_sql` / `parse_one` return `Vec<Statement>` / one
    `Statement`, or every error with its span.
 3. **Cache.** `parse_sql_cached` keeps parses process-wide at two levels:

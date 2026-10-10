@@ -31,6 +31,7 @@ use crate::{
         eval::EvalExpr,
         memory::QueryMemory,
         sarg::condition_set,
+        subquery,
     },
     rslt::resultset::StreamingResultSet,
     source::{
@@ -884,6 +885,20 @@ where
         // projected SELECT-list output, not the raw FROM-clause tables
         // at all — see SortSource::create_from's own doc comment.)
         let flat_tables = Self::flatten_tables(&tables);
+        // Subqueries in the SELECT list, WHERE and HAVING run now, at this
+        // query's snapshot; what they found is compiled in below (see
+        // plan::subquery). Registered until this SELECT is planned.
+        let subquery_exprs: Vec<&Expr> = select
+            .projection
+            .items()
+            .filter_map(|i| match i {
+                SelectItem::Expr { expr, .. } => Some(expr),
+                _ => None,
+            })
+            .chain(select.where_clause.as_ref().map(|w| &w.expr))
+            .chain(select.having.as_ref().map(|h| &h.expr))
+            .collect();
+        let _subqueries = subquery::resolve_all(self, &subquery_exprs, &flat_tables)?;
         let proj = self.get_projections(&select.projection, &flat_tables)?;
         let mut projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
         // ORDER BY may name a column the SELECT list leaves out (`SELECT
@@ -2507,6 +2522,38 @@ where
 }
 
 #[allow(unused)]
+impl<F> subquery::SubqueryPlanner<F> for QueryVisitor<F>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    fn plan(&mut self, query: &Query) -> Result<Box<dyn Source>, SchemaError> {
+        self.plan_query(query)
+    }
+
+    fn scope(&mut self, from: &Option<FromClause>) -> Result<Vec<TableQuery<F>>, SchemaError> {
+        let tables = self.get_tables(from)?;
+        Ok(Self::flatten_tables(&tables))
+    }
+}
+
+/// Runs the subqueries in `exprs` — an UPDATE's or DELETE's WHERE and SET
+/// values, reading `tables` — in the connection's transaction (or one of
+/// their own outside one), registering their answers for
+/// EvalExpr::from_expr until the guard drops (see plan::subquery).
+pub(crate) fn resolve_subqueries<F>(
+    conn: Arc<Connection<F>>,
+    exprs: &[&Expr],
+    tables: &[TableQuery<F>],
+) -> Result<subquery::Registered, SchemaError>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    let mut visitor = QueryVisitor::new(conn, QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT))?;
+    subquery::resolve_all(&mut visitor, exprs, tables)
+}
+
 impl<F> LogicalPlan<F>
 where
     F: DBFile + 'static,

@@ -12,6 +12,7 @@ use crate::{
     plan::{
         funcs::{FuncArgs, FuncObj, FuncTrait},
         logical::TableQuery,
+        subquery::{self, SubqueryExpr},
     },
 };
 
@@ -46,6 +47,9 @@ pub enum EvalExpr {
         rhs: Box<EvalExpr>,
     },
     Function(FuncObj),
+    // `x IN (SELECT ...)`, `EXISTS (SELECT ...)`, `(SELECT ...)`: answered
+    // when planned (see plan::subquery).
+    Subquery(SubqueryExpr),
 }
 
 impl EvalExpr {
@@ -69,6 +73,7 @@ impl EvalExpr {
                 use crate::plan::funcs::FuncTrait;
                 f.fields()
             }
+            Self::Subquery(s) => s.operands().flat_map(|e| e.column_positions()).collect(),
         }
     }
 
@@ -92,6 +97,13 @@ impl EvalExpr {
                 rhs: Box::new(rhs.shifted(offset)?),
             },
             Self::Function(_) => return Option::None,
+            Self::Subquery(s) => {
+                let mut s = s.clone();
+                for e in s.operands_mut() {
+                    *e = e.shifted(offset)?;
+                }
+                Self::Subquery(s)
+            }
         })
     }
 
@@ -160,6 +172,7 @@ impl EvalExpr {
                     .join(", ");
                 format!("{}({args})", f.name())
             }
+            Self::Subquery(s) => s.describe(names),
         }
     }
 
@@ -176,6 +189,7 @@ impl EvalExpr {
                         FuncArgs::Wildcard => false,
                     })
             }
+            Self::Subquery(s) => s.operands().any(|e| e.has_aggregate()),
             _ => false,
         }
     }
@@ -201,6 +215,7 @@ impl EvalExpr {
                     vec![]
                 }
             }
+            Self::Subquery(s) => s.operands().flat_map(|e| e.get_non_agg_fields()).collect(),
         }
     }
 
@@ -223,6 +238,7 @@ impl EvalExpr {
                 FuncArgs::Field(e) => e.ungrouped_column(grouped),
                 FuncArgs::Wildcard => None,
             }),
+            Self::Subquery(s) => s.operands().find_map(|e| e.ungrouped_column(grouped)),
         }
     }
 
@@ -250,6 +266,7 @@ impl EvalExpr {
                         .collect()
                 }
             }
+            Self::Subquery(s) => s.operands_mut().flat_map(|e| e.get_funcs()).collect(),
             _ => vec![],
         }
     }
@@ -287,6 +304,11 @@ impl EvalExpr {
                 }
                 f.eval(&[])?
             }
+            Self::Subquery(s) => s.answer(
+                s.operands()
+                    .map(|e| e.eval_empty_group())
+                    .collect::<Result<_, _>>()?,
+            ),
         })
     }
     pub(crate) fn eval(
@@ -312,6 +334,13 @@ impl EvalExpr {
             // its stored FuncArgs against `data`/`_index` to produce
             // them yet.
             Self::Function(obj) => &obj.eval(data)?,
+            Self::Subquery(s) => {
+                let mut operands = Vec::with_capacity(s.keys.len() + 1);
+                for e in s.operands_mut() {
+                    operands.push(e.eval(data, _index)?);
+                }
+                &s.answer(operands)
+            }
             Self::None => &ValueItem::Null,
         };
         Ok(v.clone())
@@ -523,6 +552,23 @@ impl EvalExpr {
                     any
                 }
             }
+            Expr::InSubquery {
+                expr: lhs,
+                query,
+                negated,
+            } => {
+                let found = subquery::compile(query, subquery::Kind::In, Some(lhs), tables)?;
+                if *negated {
+                    EvalExpr::Unary {
+                        op: sql_parser::expr::UnaryOp::Not,
+                        field: Box::new(found),
+                    }
+                } else {
+                    found
+                }
+            }
+            Expr::Exists { query } => subquery::compile(query, subquery::Kind::Exists, None, tables)?,
+            Expr::Subquery(query) => subquery::compile(query, subquery::Kind::Scalar, None, tables)?,
             other => {
                 return Err(SchemaError::UnsupportedFeature(format!(
                     "this kind of expression: {}",

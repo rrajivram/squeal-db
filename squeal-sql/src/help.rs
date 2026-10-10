@@ -40,6 +40,10 @@ pub const SQL_HELP: &[HelpSection] = &[
                 "common table expressions",
             ),
             (
+                "x [NOT] IN (SELECT ...), [NOT] EXISTS (SELECT ...), (SELECT ...)",
+                "subqueries in SELECT, WHERE, HAVING, UPDATE and DELETE",
+            ),
+            (
                 "[INNER|LEFT [OUTER]|RIGHT [OUTER]|FULL [OUTER]|CROSS] JOIN t ON expr | USING (cols)",
                 "join tables",
             ),

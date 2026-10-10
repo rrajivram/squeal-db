@@ -11,6 +11,9 @@ The SQL database, built on [`store`](../store/README.md) with
   - inner, left, right, full and cross joins (`ON` or `USING`)
   - `UNION [ALL]`, `INTERSECT`, `EXCEPT`
   - `WITH` (common table expressions), subqueries in `FROM`
+  - `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)` and scalar
+    `(SELECT …)` in `SELECT`, `WHERE` and `HAVING`, and in `UPDATE` and
+    `DELETE` (see below)
   - aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COUNT(DISTINCT)`)
     and scalar functions
 - **Writes:** `INSERT … VALUES | SELECT`, `UPDATE`, `DELETE`, `TRUNCATE`,
@@ -181,6 +184,24 @@ The other rewrites:
 same `Source`s, each describing itself, with the estimated rows. `!print
 stats` (CLI) shows per-operator rows and time from the last query.
 
+**Subqueries in expressions** (`plan::subquery`) run once, while the
+query holding them is planned and inside its transaction, never once per
+outer row:
+
+- **Uncorrelated.** The rows are the answer. `IN` keeps them as a hash
+  set, with SQL's NULL rules. `EXISTS` and a scalar subquery become
+  constants, so they can still bound an index seek.
+- **Correlated through equalities.** Take `EXISTS (SELECT 1 FROM c WHERE
+  c.pid = p.id AND c.qty > 5)`. The `inner = outer` conditions are taken
+  out and their inner sides selected instead, which leaves an
+  uncorrelated query. Its rows are grouped by those keys, and each outer
+  row looks its key up. The effect is a hash semi-join, or an anti-join
+  for `NOT`.
+- **Anything else correlated is refused** rather than answered wrongly:
+  - an outer column outside an `=` condition
+  - a correlated scalar subquery
+  - a correlated subquery that groups, aggregates or limits
+
 ## Executors
 
 Execution is a pull-based tree of `Source`s:
@@ -199,8 +220,14 @@ its input.
 
 ## Known gaps
 
-- **Subqueries in expressions.** `IN (SELECT …)` and `EXISTS` are
-  unsupported. Rewrite them as joins.
+- **Correlated subqueries beyond equalities.** Correlated subqueries
+  run only when linked to the outer query by `inner = outer` conditions,
+  and not when they aggregate or are used as a value (see above). They
+  are not allowed in `JOIN … ON` or `GROUP BY` either.
+- **`UPDATE` and `DELETE` scan the whole table**, even with `WHERE id =
+  …`. They don't use the optimizer's seeks yet (see TODO.md).
+- **No constant folding.** `day < 10 + 7` can't bound a seek, but
+  `day < 17` can.
 - **Deleting a referenced row.** Nothing checks it: there is no `ON
   DELETE` action, and no restriction.
 - **Join order.** Joins run in `FROM` order and are not reordered by cost.
@@ -208,6 +235,25 @@ its input.
   rows are produced lazily, after the later statements have run. So
   `begin; select …; rollback` reads after the rollback. The browser demo
   runs statements one at a time. See [TODO.md](../TODO.md).
+
+## Comparing with SQLite
+
+```bash
+cargo run --release -p squeal-sql --example load_vs_sqlite -- 200000 4
+```
+
+The example runs one workload against squeal-db and SQLite (bundled),
+both on disk and equally durable: SQLite in WAL mode, with
+`synchronous=FULL` and `fullfsync` on. The workload covers:
+- bulk load, index builds, `ANALYZE`
+- point, index and range lookups
+- scans, joins and subqueries
+- durable single-row and batched writes
+- concurrent readers
+
+It prints a table of each phase's time and rate on both engines, and
+checks that their answers agree. `SQ_EXPLAIN=1` also prints the plans
+squeal-db chose.
 
 ## Testing
 
@@ -220,6 +266,8 @@ About 760 tests. Among them:
 - **`stmt/tests/oracle.rs`.** A differential test against SQLite (through
   `rusqlite`). It generates random schemas, data and queries (joins,
   aggregates, set operations, NULLs) and fails on any
-  disagreement. The failure names the seed and the query.
+  disagreement. The failure names the seed and the query. A second run
+  adds random `IN`, `EXISTS` and scalar subqueries, both correlated and
+  uncorrelated.
 - **Partition, merge-join, index-seek and soak suites,** and race tests
   for DDL against running statements.

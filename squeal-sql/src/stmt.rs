@@ -761,6 +761,18 @@ where
                     // matching row against that row's own current values
                     // (so `SET age = age + 1` reads the row it's
                     // updating, not some other one).
+                    // Subqueries in SET values and WHERE (see plan::subquery).
+                    let subquery_exprs: Vec<&sql_parser::Expr> = update
+                        .assignments
+                        .items()
+                        .map(|a| &a.value)
+                        .chain(update.where_clause.as_ref().map(|w| &w.expr))
+                        .collect();
+                    let _subqueries = crate::plan::logical::resolve_subqueries(
+                        self.conn.clone(),
+                        &subquery_exprs,
+                        &tq,
+                    )?;
                     let mut assignments = Vec::with_capacity(update.assignments.len());
                     let mut seen = std::collections::HashSet::new();
                     for a in update.assignments.items() {
@@ -808,6 +820,11 @@ where
                     let where_expr = match &delete.where_clause {
                         Some(wc) => {
                             let tq = [table_query_for(&schema, &table)];
+                            let _subqueries = crate::plan::logical::resolve_subqueries(
+                                self.conn.clone(),
+                                &[&wc.expr],
+                                &tq,
+                            )?;
                             Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?)
                         }
                         None => None,
