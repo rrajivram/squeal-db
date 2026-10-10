@@ -683,9 +683,35 @@ fn worker(
                                 let got = v.map(|t| t.data.to_vec());
                                 let want = local.get(&key).cloned().flatten();
                                 if got != want {
-                                    // Not a crash bug but a visibility bug; surface it loudly.
+                                    // Not a crash bug but a visibility bug; surface it loudly,
+                                    // with what else can see the row.
+                                    let fresh = db.begin().ok().map(|t2| {
+                                        let v = db.find(tables[ti], DBIdType::Int(k), &t2);
+                                        let _ = db.commit(t2);
+                                        v.map(|o| o.map(|t| (t.data.to_vec(), t.txn_id)))
+                                    });
+                                    let again = db
+                                        .find(tables[ti], DBIdType::Int(k), &txn)
+                                        .map(|o| o.map(|t| t.data.to_vec()));
+                                    let mut scanned = vec![];
+                                    if let Ok(mut c) = db.table_scan_in_txn(tables[ti], &txn) {
+                                        while let Ok(Some(t)) = c.next() {
+                                            if t.id == DBIdType::Int(k) {
+                                                scanned.push((t.data.to_vec(), t.txn_id));
+                                            }
+                                        }
+                                    }
+                                    let recent: Vec<String> = history
+                                        .iter()
+                                        .rev()
+                                        .take(4)
+                                        .map(|h| format!("#{} engine {} {}", h.txn_no, h.engine_id, h.outcome))
+                                        .collect();
                                     panic!(
-                                        "thread {thread_idx}: own-view read of {key:?} returned {got:?}, expected {want:?}"
+                                        "thread {thread_idx}: own-view read of {key:?} returned {got:?}, expected {want:?}\n  \
+                                         reader txn {engine_id} (#{txn_no}); same txn again: {again:?}\n  \
+                                         a fresh txn: {fresh:?}\n  this txn's scan: {scanned:?}\n  \
+                                         this thread's last txns: {recent:?}"
                                     );
                                 }
                                 continue;

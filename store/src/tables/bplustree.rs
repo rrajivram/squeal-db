@@ -1632,9 +1632,17 @@ where
         new_vals
             .iter()
             .try_for_each(|t| new_page.add_tuple(t.clone()))?;
+        // The new sibling first. Until current_page's new version is in the
+        // cache, readers see its old one — every entry, the old high key —
+        // and find everything there; once it is, they follow next_page to
+        // the sibling for the keys that moved. The other way round, a
+        // lookup between the two found the truncated page sending it to a
+        // sibling still cached empty (as alloc_sibling_index_page made it)
+        // and reported a key that exists as missing (the crash harness's
+        // own-view check caught it, about once a thousand seeds).
+        self.buffer.write_locked_page_with_lsn(new_handle, lsn)?;
         self.buffer
             .write_locked_page_with_lsn(current_handle, lsn)?;
-        self.buffer.write_locked_page_with_lsn(new_handle, lsn)?;
         Ok((separator_id, new_page_id))
     }
 

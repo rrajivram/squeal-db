@@ -1055,7 +1055,7 @@ where
                 .into(),
         };
         let p = Page::new_indexed(self.header.page_size, record_size, self.page_overhead);
-        self.write_page(page_num, &p)?;
+        self.install_new_page(page_num, p)?;
         Ok(page_num)
     }
 
@@ -1322,14 +1322,28 @@ where
         } else {
             Page::new_data(self.header.page_size, self.page_overhead)
         };
-        // Adopt the page into this database's WAL clock so later mutations stamp
-        // their lsn from it (and copy-on-write clones inherit it).
-        self.write_page(page_num, &p)?;
-        Ok(())
+        self.install_new_page(page_num, p)
+    }
+
+    // A freshly formatted page, into the cache only — dirty, so the next
+    // checkpoint writes it (a dirty page is never evicted before then, so
+    // nothing can look for it on disk first). Writing it at allocation, as
+    // this used to, was a synchronous pwrite per new page that nothing
+    // needed: modified pages reach disk only through checkpoints, and that
+    // write was never fsynced, so recovery never relied on it. Half of a
+    // bulk load's time went to it.
+    fn install_new_page(&self, page_num: PageId, page: Page) -> Result<(), StoreError> {
+        page.set_dirty(true)?;
+        self.cache_strong(page_num, Arc::new(page))
     }
 
     /// Shared handle to this database's WAL clock, for callers (e.g. BPlusTree)
     /// that create a Page outside the buffer and must adopt it before use.
+    /// How many pages the cache holds before it evicts.
+    pub(crate) fn capacity_pages(&self) -> usize {
+        self.max_entries
+    }
+
     pub(crate) fn clock(&self) -> Arc<LsnClock> {
         self.clock.clone()
     }

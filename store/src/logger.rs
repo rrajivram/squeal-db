@@ -121,6 +121,28 @@ impl LsnClock {
         }
     }
 
+    /// Blocks until `synced` reaches `ticket`, a value of `queued` read
+    /// after the caller's own record was queued: every record queued
+    /// before that read — the caller's among them — is then durable (see
+    /// `queued`). What a commit waits on. Not the LSN watermark: records
+    /// reach the writer out of LSN order, so a batch holding a later LSN
+    /// can be synced while an earlier one is still on its way, and the
+    /// watermark passes the earlier one before it is written.
+    pub(crate) fn wait_until_synced(&self, ticket: u64) {
+        let synced = || self.synced.load(std::sync::atomic::Ordering::Acquire) >= ticket;
+        if synced() {
+            return;
+        }
+        let mut guard = self.durable_mutex.lock().unwrap();
+        while !synced() {
+            let (g, _timeout) = self
+                .durable_condvar
+                .wait_timeout(guard, Duration::from_millis(50))
+                .unwrap();
+            guard = g;
+        }
+    }
+
     fn is_durable(&self, lsn: LsnId) -> bool {
         self.last_written.load(std::sync::atomic::Ordering::Relaxed) >= lsn.0
     }
@@ -1078,6 +1100,19 @@ impl Logger {
         Ok(())
     }
 
+    /// `log`, returning the ticket to wait on for this record's durability
+    /// (see LsnClock::wait_until_synced).
+    pub(crate) fn log_ticketed(&self, lsn: LsnId, op: Operation) -> Result<u64, StoreError> {
+        self.log(lsn, op)?;
+        Ok(self.clock.queued.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Blocks until the record `log_ticketed` returned `ticket` for is
+    /// durable.
+    pub(crate) fn wait_for_ticket(&self, ticket: u64) {
+        self.clock.wait_until_synced(ticket)
+    }
+
     /// Mint and log in one step, returning the lsn assigned.
     pub(crate) fn log_new(&self, op: Operation) -> Result<LsnId, StoreError> {
         let lsn = self.next_lsn();
@@ -1329,6 +1364,16 @@ fn log_runner<F: DBFile>(
     // batch): with no history yet, behave exactly as before until there's
     // real evidence one way or the other.
     let mut last_batch_had_concurrency = true;
+    // Records written since the last fsync: how many, and the highest LSN.
+    // A batch is only fsynced when it holds a record someone waits on (see
+    // `needs_sync`) or a Sync/Roll/ShutDown asks; the rest wait in the
+    // OS's cache for the next fsync, which — one append-only file — makes
+    // them durable along with it. A transaction's own Add/Mod/Del records
+    // need no fsync of their own: nothing waits on them until its Commit,
+    // whose batch is fsynced. A bulk load in one transaction used to fsync
+    // every 256 records.
+    let mut unsynced_records = 0usize;
+    let mut unsynced_lsn: Option<LsnId> = None;
     loop {
         // Block for the first message, then linger briefly for more to
         // accumulate into the same batch (see LOG_BATCH_LINGER's own
@@ -1345,6 +1390,7 @@ fn log_runner<F: DBFile>(
         let mut batch_record_count = 0usize;
         let mut highest_lsn: Option<LsnId> = None;
         let mut special: Option<LogMsg> = None;
+        let mut needs_sync = false;
         let mut pending = Some(first);
         for _ in 0..MAX_LOG_BATCH {
             let msg = match pending.take() {
@@ -1371,6 +1417,10 @@ fn log_runner<F: DBFile>(
                     break;
                 }
                 LogMsg::Record(rec) => {
+                    needs_sync |= !matches!(
+                        rec.operation,
+                        Operation::Add { .. } | Operation::Mod { .. } | Operation::Del { .. }
+                    );
                     highest_lsn = Some(match highest_lsn {
                         Some(l) if l.0 >= rec.lsn.0 => l,
                         _ => rec.lsn,
@@ -1384,26 +1434,37 @@ fn log_runner<F: DBFile>(
         if !batch.is_empty() {
             st.file.seek(SeekFrom::End(0))?;
             st.file.write_all(&batch)?;
-            st.file.do_sync()?;
             st.segment_bytes
                 .fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            // Only after the whole batch is durable — mark_written signals
-            // "everything up to this lsn is safe to flush its page", which
-            // must not be true before the bytes actually landed.
             if let Some(lsn) = highest_lsn {
                 st.current.max_lsn = st.current.max_lsn.max(lsn.0);
-                clock.mark_written(lsn);
+                unsynced_lsn = Some(unsynced_lsn.map_or(lsn, |l| if l.0 >= lsn.0 { l } else { lsn }));
             }
+            unsynced_records += batch_record_count;
+            st.publish_counts();
+        }
+        // A Sync, Roll or ShutDown makes everything before it durable too.
+        if (needs_sync || special.is_some()) && unsynced_records > 0 {
+            st.file.do_sync()?;
+            // Only once durable — mark_written signals "everything up to
+            // this lsn is safe to flush its page", which must not be true
+            // before the bytes actually landed.
+            // Counted first: mark_written wakes the waiters, and a commit
+            // waits on the count (see LsnClock::wait_until_synced).
             clock
                 .synced
-                .fetch_add(batch_record_count as u64, std::sync::atomic::Ordering::AcqRel);
-            st.publish_counts();
+                .fetch_add(unsynced_records as u64, std::sync::atomic::Ordering::AcqRel);
+            unsynced_records = 0;
+            match unsynced_lsn.take() {
+                Some(lsn) => clock.mark_written(lsn),
+                None => clock.mark_written(LsnId(0)),
+            }
         }
         match special {
             Some(LogMsg::ShutDown) => break,
             Some(LogMsg::Sync(reply)) => {
                 // Everything queued before this message went out in the
-                // batches above, each synced before its LSNs were marked.
+                // batches above, and is synced (just above) and marked.
                 let _ = reply.send(());
             }
             Some(LogMsg::Roll { floor, reply }) => {

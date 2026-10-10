@@ -714,6 +714,11 @@ where
         let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_index_key_size)?;
         sf.generator.attach_logger(sf.logger.clone());
         sf.create_system_tables()?;
+        // Durable before it is returned: the system pages are only in the
+        // cache until a checkpoint writes them (see PageBuffer::
+        // install_new_page), and a crash must never leave a database that
+        // was created but can't be opened.
+        sf.checkpoint()?;
         let db = Arc::new(sf);
         db.maintenance.start(&db);
         Ok(db)
@@ -1556,11 +1561,11 @@ where
         // discard (Corruption: version record missing), or read two
         // different versions in one snapshot.
         let commit_lsn = LsnId(self.tx_mgr.begin_commit(id)?);
-        let logged = self.logger.log(commit_lsn, Operation::Commit(id));
+        let logged = self.logger.log_ticketed(commit_lsn, Operation::Commit(id));
         // THE commit point for every other thread. Versions are never
         // discarded here — retention is the horizon's decision.
         self.tx_mgr.finish_commit(id, logged.is_ok());
-        logged?;
+        let ticket = logged?;
         self.versions.mark_committed(id, commit_lsn.0);
         self.maintenance_wake();
         // STORE_AUDIT.md T1: don't report success until the record is
@@ -1568,7 +1573,7 @@ where
         // long the fsync takes.
         if durability == Durability::Sync {
             crate::buffer::debug_assert_no_page_locks_held("waiting for commit durability");
-            self.logger.wait_until_durable(commit_lsn);
+            self.logger.wait_for_ticket(ticket);
         }
         Ok(())
     }
@@ -3059,6 +3064,12 @@ where
         Ok(())
     }
 
+    /// The page cache's size in bytes: what a planner can assume stays in
+    /// memory once read.
+    pub fn cache_bytes(&self) -> usize {
+        self.buffer.capacity_pages() * self.header.page_size as usize
+    }
+
     pub fn get_page_data_size(&self) -> usize {
         self.buffer.page_data_size()
     }
@@ -3355,12 +3366,15 @@ mod tests {
         assert!(page.is_ok());
         let page = page.unwrap();
         assert_eq!(page, 3usize.into());
-        thread::sleep(Duration::from_millis(100));
+        // A new page is cached dirty, not written (see PageBuffer::
+        // install_new_page): the file grows at the next checkpoint.
+        assert_eq!(db.file.get_metadata().unwrap().len, DEFAULT_PAGE_SIZE * 3 + ZERO_PAGE_SIZE);
+        db.checkpoint().unwrap();
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, DEFAULT_PAGE_SIZE * 4 + ZERO_PAGE_SIZE);
         let page = db.buffer.alloc_page(false).unwrap_or(0usize.into());
         assert_eq!(page, 4usize.into());
-        thread::sleep(Duration::from_millis(100));
+        db.checkpoint().unwrap();
         let m = db.file.get_metadata().unwrap();
         assert_eq!(m.len, ZERO_PAGE_SIZE + 5 * DEFAULT_PAGE_SIZE);
         assert_eq!(db.page_count(), 5);
