@@ -168,16 +168,19 @@ back (see [store/README.md](store/README.md#testing)).
 
 ## How it was built
 
-The architecture is Rajiv's: the blob-store-plus-layers design, the page
-and transaction models, and the parser approach. Claude Fable built the
-design out fully. Across the board, Claude (Anthropic's model) wrote all
-the tests, and debugged and fixed some hairy transactional issues.
+The architecture is mine: the blob-store-plus-layers design, bplus tree design 
+and implementation (specifically using a crabbing approach to minimize locking),
+the page and transaction models, and the parser approach. I designed and built the 
+various components for the most part. In specific cases, I used Claude to 
+complete some time consuming tasks (e.g. finishing up sql-parser after I 
+got the initial design sketched and built). Across the board, 
+Claude wrote all the tests, and debugged and fixed some hairy transactional issues.
 
 The project is open on GitHub and every commit is visible:
 
 - **Commits with a `Co-Authored-By: Claude …` trailer** are ones where
   Claude wrote all the code and tests.
-- **Commits without one** are ones where Rajiv did most of the work.
+- **Commits without one** are ones where I did most of the work.
 - **The SQL CLI, the WebAssembly and Node.js builds, and JSON document
   support** were built entirely by Claude. They needed no architectural
   changes.
