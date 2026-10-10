@@ -360,12 +360,14 @@ impl EvalExpr {
             Expr::Unary { op, expr } => Self::Unary {
                 op: *op,
                 field: Self::from_expr(expr, tables)?,
-            },
+            }
+            .folded(),
             Expr::Binary { left, op, right } => Self::Binary {
                 lhs: Self::from_expr(left, tables)?,
                 op: *op,
                 rhs: Self::from_expr(right, tables)?,
-            },
+            }
+            .folded(),
             Expr::Literal(l) => match l {
                 sql_parser::literal::Literal::Boolean(b) => {
                     Self::Literal(ValueItem::Boolean(b.value()))
@@ -577,6 +579,29 @@ impl EvalExpr {
             }
         };
         Ok(Box::new(eval_expr))
+    }
+
+    // An operator over literals, as the literal it computes — `10 + 7` is
+    // `17` — so it reads as a constant everywhere a constant counts (a
+    // seek's bounds: `day < 10 + 7`). One that fails to compute (a type
+    // mismatch, a division by zero) is left as it is, to fail where it
+    // always did: when a row is evaluated.
+    fn folded(self) -> Self {
+        let value = match &self {
+            Self::Unary { op, field } => match field.as_ref() {
+                Self::Literal(v) => CrateValueItem::unary(v, op).ok(),
+                _ => None,
+            },
+            Self::Binary { lhs, op, rhs } => match (lhs.as_ref(), rhs.as_ref()) {
+                (Self::Literal(a), Self::Literal(b)) => CrateValueItem::binary(a, b, op).ok(),
+                _ => None,
+            },
+            _ => None,
+        };
+        match value {
+            Some(v) => Self::Literal(v),
+            None => self,
+        }
     }
 
     pub(crate) fn validate_field<F: DBFile + 'static>(

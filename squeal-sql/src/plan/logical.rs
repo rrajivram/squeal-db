@@ -21,7 +21,8 @@ use crate::{
     error::SchemaError,
     optim::{
         picker::{
-            Access, AccessPath, ItemNeeds, OrderWanted, SORT_BYTES_PER_COMPARE, analyze_query,
+            Access, AccessPath, ItemNeeds, OrderWanted, PageCosts, SORT_BYTES_PER_COMPARE,
+            analyze_query,
             filtered_rows, pick_access, pick_join_seek,
         },
         table_stats::{ComputedTableStat, compute_table_stats},
@@ -1609,7 +1610,7 @@ where
             required: true,
         };
         let (base_order, inner_order) = (order(&left_fields), order(&right_fields));
-        let page = self.conn.database.read().db.get_page_data_size();
+        let page = PageCosts::of(&self.conn.database.read().db);
         let read = |table: &SqlTable, item: &TableQuery<F>, needs, order| {
             pick_access(table, item.stats.as_ref(), needs, page, order)
         };
@@ -1743,7 +1744,7 @@ where
             limit: None,
             required: true,
         };
-        let page = self.conn.database.read().db.get_page_data_size();
+        let page = PageCosts::of(&self.conn.database.read().db);
         let stats = j.relation.stats.as_ref();
         let inner_plain = pick_access(inner_table, stats, j_needs, page, None);
         let inner_ordered = pick_access(inner_table, stats, j_needs, page, Some(&inner_order));
@@ -1936,7 +1937,7 @@ where
             })
             .collect();
         let db = self.conn.database.read().db.clone();
-        let page_size = db.get_page_data_size();
+        let page_size = PageCosts::of(&db);
         // What a hash join would read of this table: however it would be
         // read on its own.
         let hash_rows = pick_access(table, scoped.as_ref(), needs, page_size, None)
@@ -2020,7 +2021,7 @@ where
             table,
             scoped.as_ref(),
             needs,
-            db.get_page_data_size(),
+            PageCosts::of(&db),
             order,
         );
         let merge_order: Option<Vec<(usize, bool)>> =

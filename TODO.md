@@ -10,27 +10,58 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
   with optim::picker, as a SELECT of the whole row would (primary-key seek,
   or an index with row lookups). Single-row autocommit UPDATE 25 -> 235/s
   (SQLite 247/s); in a transaction 28 -> 5,155/s (SQLite 14,100/s).
-- [ ] **Parsing large INSERTs.** 3.45 of the 8.2 s that a 200k-row load
-  takes (500-row INSERTs) is parsing: chumsky builds `Rich` error
-  alternatives (`add_alt_err`, `expected_found`) at every choice, even on
-  success. A hand-written VALUES-list fast path, like the lexer's, or a
-  cheaper error type for the first attempt. Load: 27k rows/s, SQLite
-  1.6M/s.
-- [ ] **CREATE INDEX**: three indexes over 220k rows take 9.2 s (SQLite
-  125 ms).
-- [ ] **IndexLookup costing.** A one-week range (~2% of orders) chose a
-  TableScan over the `day` index, because each fetched row is charged a
-  whole page read, as if never cached. 122 queries/s against SQLite's 556.
-- [ ] **Constant folding.** `day < 10 + 7` can't bound a seek.
-- [ ] **Hash join where a seek would do.** `orders (day = ?) join customers`
-  hashes ~550 orders and scans all 20k customers rather than seeking
-  customers by primary key per order. 254/s against 2,300/s.
-- [ ] **Per-statement overhead.** Point lookup by PK: 125k/s (SQLite,
-  prepared, 750k/s). Concurrent (4 threads): 259k/s against 774k/s.
-- Ahead or level: correlated NOT EXISTS 4.5x faster (hash anti-join
+- [x] **Bulk load: 27k -> 135k rows/s** (SQLite 1.45M/s). Three things:
+  - Parsing was 3.45 s of 8.2: chumsky built a `Rich` error at every
+    alternative even on success. parse_sql now parses with `EmptyErr`
+    first, and again with `Rich` only on failure (a 500-row INSERT 7.6 ->
+    1.4 ms; a point SELECT 33 -> 13 us).
+  - The WAL writer fsynced every batch of 256 records, mid-transaction. It
+    now fsyncs only a batch holding a record someone waits on (Commit,
+    Rollback, Sequence, Purge) or when asked (Sync, Roll, ShutDown).
+  - Allocating a page pwrote it; it is now cached dirty for the checkpoint.
+  What is left is expression parsing per literal (an allocation and a
+  precedence layer each) and the engine's per-row work.
+- [x] **CREATE INDEX**: 9.2 -> 2.0 s for three (SQLite 0.14 s), from the
+  same store changes. Still a row-at-a-time insert into the new tree; a
+  sorted bulk build would be the next step.
+- [x] **IndexLookup costing.** A page touch in a tree that fits the page
+  cache is charged CACHED_PAGE_TOUCH (4096, calibrated: lookups overtake a
+  scan at ~3% of the rows), not a page read. The one-week range uses the
+  index: 122 -> 214/s (SQLite 531/s).
+- [x] **Constant folding.** `day < 10 + 7` is `day < 17` when planned.
+- [x] **Hash join where a seek would do.** With descents costed as cached,
+  `orders (day = ?) join customers` seeks customers per order: 254 -> 599/s
+  (SQLite 2,200/s).
+- [ ] **A row fetched through an index costs ~1.5 us** (a primary-key
+  Db::find is ~0.5): per fetch, the entry's key is decoded and allocated,
+  the table guard and relocation lock taken, the table's tree descended
+  from the root, the row decoded. What the two phases above still trail
+  SQLite by. Ideas: fetch a range's rows in page order; keep the last
+  leaf; skip the per-row guards under the cursor's own.
+- [ ] **Per-statement overhead.** Point lookup by PK: 119k/s (SQLite,
+  prepared, 707k/s). Concurrent (4 threads): 275k/s against 836k/s.
+- [ ] **On disk**: 66 MB against SQLite's 18 MB (fixed-width rows, 16 KiB
+  pages half full after splits, retained WAL).
+- Ahead or level: correlated NOT EXISTS 4.1x faster (hash anti-join
   against SQLite's per-row probe), join + GROUP BY 1.2x, single-row
-  autocommit INSERT level (both bound by fsync).
+  autocommit INSERT and UPDATE level (both bound by fsync).
 
+### Found on the way (store, fixed)
+
+- **A commit could return before its record was durable.** It waited for
+  the LSN watermark, but records reach the log writer out of LSN order: a
+  batch holding a later LSN, once synced, moved the watermark past a
+  commit record still on its way. Commit now waits on its place in the
+  queue (LsnClock::wait_until_synced). The crash harness lost a committed
+  transaction about once in 100-300 seeds before; 1,800 seeds clean after.
+- **A lookup could miss a row that exists** during a leaf split: the
+  truncated left page was installed in the cache before the new right
+  sibling, so a lookup in between followed the link to a sibling still
+  cached empty. The sibling is installed first now. About once in 1,000
+  seeds before (the harness's own-view check).
+- **A database crashed right after `create` could not be opened** once new
+  pages stopped being written at allocation; `create` now ends with a
+  checkpoint.
 
 Measured on a generated retail database (1M order details), warm, release
 build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.

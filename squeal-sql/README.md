@@ -147,9 +147,14 @@ Their costs are estimated as follows:
   WHERE still runs on top, except for conditions the path is known to
   enforce exactly.
 - **Row estimates.** Rows in range are estimated from min/max
-  interpolation and distinct counts. Each seek costs one page for the
-  descent. An `IndexLookup` pays one page per fetched row, because those
-  rows are scattered.
+  interpolation and distinct counts.
+- **Page touches.** Each seek pays one page touch for its descent, and
+  an `IndexLookup` pays one more per fetched row, because those rows are
+  scattered. A touch is a page read (the page size) when the tree is
+  bigger than the page cache. When the tree fits, it is a cached lookup,
+  calibrated against scans: fetching rows through an index overtakes
+  scanning the whole table at about 3% of the rows (`PageCosts` in
+  `optim::picker`).
 - **Order.** When `ORDER BY` (with an optional `LIMIT`) can be served by a
   key's order, a path that produces it saves the sort and can stop after
   `LIMIT` rows. A path that doesn't produce the order pays for the sort.
@@ -174,6 +179,9 @@ The other rewrites:
 
 - **Implicit joins.** `FROM a, b WHERE a.x = b.y` becomes a hash join, not
   a cross join.
+- **Constant folding.** An operator over literals is computed when the
+  statement is planned, so `day < 10 + 7` bounds a seek like `day < 17`.
+  One that fails to compute is left to fail per row, as before.
 - **Predicate pushdown.** Conditions are pushed to the table they read,
   except below the NULL-extended side of an outer join, where pushing would
   change the answer.
@@ -227,8 +235,6 @@ its input.
   run only when linked to the outer query by `inner = outer` conditions,
   and not when they aggregate or are used as a value (see above). They
   are not allowed in `JOIN … ON` or `GROUP BY` either.
-- **No constant folding.** `day < 10 + 7` can't bound a seek, but
-  `day < 17` can.
 - **Deleting a referenced row.** Nothing checks it: there is no `ON
   DELETE` action, and no restriction.
 - **Join order.** Joins run in `FROM` order and are not reordered by cost.

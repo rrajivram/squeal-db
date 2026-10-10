@@ -348,7 +348,7 @@ where
         table,
         stats.as_ref(),
         &needs,
-        schema.db.get_page_data_size(),
+        crate::optim::picker::PageCosts::of(&schema.db),
         None,
     );
     let rows = access.rows;

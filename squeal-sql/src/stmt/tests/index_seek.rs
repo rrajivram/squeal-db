@@ -457,3 +457,25 @@ fn test_a_key_range_count_reads_the_primary_key_index() {
     assert!(plan.contains("IndexSeek o using primary key"), "{plan}");
     assert_eq!(select_rows(&c, sql).1, vec![vec![ValueItem::Integer(700)]]);
 }
+
+// Operators over literals are computed once, when the statement is planned,
+// so a bound written as arithmetic still seeks (see EvalExpr::folded).
+#[test]
+fn test_constant_expressions_bound_a_seek() {
+    let c = setup();
+    let plan = explain(&c, "select * from t where id >= 5 * 2 and id < 10 + 3");
+    assert!(
+        plan.contains("TableSeek t (id >= 10 AND id < 13)"),
+        "{plan}"
+    );
+    agree(&c, "select id from t where {}", "id < 10 + 3", "id + 0 < 13");
+    let plan = explain(&c, "select id from t where id = -(-7)");
+    assert!(plan.contains("(id = 7) (~1 rows)"), "{plan}");
+    // One that fails to compute fails where it did: only for a row.
+    run(&c, "create table empty (k integer not null, primary key(k))").unwrap();
+    assert_eq!(
+        super::partition_diff::outcome(&c, "select k from empty where k = 'a' + 1"),
+        Ok(vec![])
+    );
+    assert!(super::partition_diff::outcome(&c, "select id from t where id = 'a' + 1").is_err());
+}

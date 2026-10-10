@@ -331,7 +331,7 @@ pub(crate) fn pick_access(
     table: &SqlTable,
     stats: Option<&ComputedTableStat>,
     needs: &ItemNeeds,
-    page_size: usize,
+    pages: PageCosts,
     order: Option<&OrderWanted>,
 ) -> Access {
     let fields = table.fields();
@@ -534,7 +534,7 @@ pub(crate) fn pick_access(
         // A seek on the primary key reads a subset of what scanning the
         // same table reads, so it is never the worse of the two — whatever
         // the (possibly stale) statistics say.
-        let descent = page_size.min(rows * table_row);
+        let descent = pages.touch(rows * table_row);
         let cost =
             (est * (table_row + TREE_ROW_BYTES) + descent * ranges.len()).min(rows * table_row);
         candidates.push(Candidate {
@@ -571,10 +571,11 @@ pub(crate) fn pick_access(
         let covered: BTreeSet<usize> = key.iter().chain(&pk_columns).copied().collect();
         let covering = needs.columns.is_subset(&covered);
         let entry = stat.row_size + identity_bytes;
-        // A descent, or a row fetched from the table, reads a page — or all
-        // of the index or table, when that is less.
-        let descent = page_size.min(rows * entry);
-        let fetch = page_size.min(rows * table_row);
+        // A descent, or a row fetched from the table, touches a page (see
+        // PageCosts).
+        let descent = pages.touch(rows * entry);
+        // Finding the row, then reading it.
+        let fetch = pages.touch(rows * table_row) + table_row;
         match (key_ranges(&key, &sets), covering) {
             (Some((ranges, used)), true) => {
                 let est = estimate(&key, &ranges, unique);
@@ -687,6 +688,43 @@ pub(crate) fn pick_access(
 // slower to count than the table itself).
 const TREE_ROW_BYTES: usize = 100;
 
+// Touching a page outside a sequential scan — a descent's step, or finding
+// a row by its key — when the tree it is in fits the page cache: no page
+// read, but a cache lookup, locks, a binary search, a visibility check.
+// In this model's units, set by a scan's cost per row: measured on a
+// cached 200k-row table, fetching rows through an index (~1.5 us a row)
+// overtakes scanning the whole table (~40 ns a row) at ~3% of the rows,
+// which this puts the crossover at for a table of that shape. Uncached,
+// it is a page read (page_size).
+const CACHED_PAGE_TOUCH: usize = 4096;
+
+/// What touching one page costs, given its tree's size: a cached lookup
+/// while the tree fits the page cache, else a page read (or the whole tree,
+/// when that is less).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageCosts {
+    pub page_size: usize,
+    pub cache_bytes: usize,
+}
+
+impl PageCosts {
+    pub(crate) fn of<F: DBFile + 'static>(db: &store::db::Db<F>) -> Self {
+        Self {
+            page_size: db.get_page_data_size(),
+            cache_bytes: db.cache_bytes(),
+        }
+    }
+
+    // One page of a tree `tree_bytes` big.
+    fn touch(&self, tree_bytes: usize) -> usize {
+        if tree_bytes <= self.cache_bytes {
+            CACHED_PAGE_TOUCH.min(tree_bytes)
+        } else {
+            self.page_size.min(tree_bytes)
+        }
+    }
+}
+
 // What sorting costs, in the same units as reading: per comparison.
 // Measured: sorting 30k rows in memory added 1-2 ms to a 32 ms scan of
 // them (~4 MB of reading in these units), about 0.4 per comparison.
@@ -752,7 +790,7 @@ pub(crate) fn pick_join_seek(
     trees: usize,
     hash_rows: usize,
     hash_extra: f64,
-    page_size: usize,
+    pages: PageCosts,
 ) -> Option<JoinSeek> {
     let outer_rows = outer_rows?;
     let stats = stats?;
@@ -793,7 +831,7 @@ pub(crate) fn pick_join_seek(
     let primary = table.indices.iter().position(|i| i.is_primary);
     let identity_bytes = primary.map_or(8, |p| index_stats[p].row_size);
     let table_row = self_index.row_size + stats.row_size;
-    let fetch = page_size.min(rows * table_row);
+    let fetch = pages.touch(rows * table_row) + table_row;
     let per_key = |key: &[usize], used: &[(usize, usize)], unique: bool| -> usize {
         if unique && used.len() == key.len() {
             return 1;
@@ -827,7 +865,7 @@ pub(crate) fn pick_join_seek(
             if range.is_some() {
                 rows_per_key = rows_per_key.div_ceil(3).max(1);
             }
-            let descent = page_size.min(rows * entry);
+            let descent = pages.touch(rows * entry);
             let cost = outer_rows * (trees * descent + rows_per_key * (row + TREE_ROW_BYTES));
             if best.as_ref().is_none_or(|(c, _)| cost < *c) {
                 best = Some((

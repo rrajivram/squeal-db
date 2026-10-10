@@ -77,8 +77,9 @@ fn test_primary_key_columns_come_through_a_secondary_index() {
         rows(&c, sql),
         vec![vec![ValueItem::Integer(7), s("name07")]]
     );
-    // A non-unique index carries the key too.
-    let sql = "select id, city from t where id = 8";
+    // A non-unique index carries the key too. (`id + 0`: with `id = 8` a
+    // primary-key seek of the one row is cheaper than any index read.)
+    let sql = "select id, city from t where id + 0 = 8";
     assert!(
         explain(&c, sql).contains("using t_city"),
         "{}",
@@ -117,7 +118,7 @@ fn test_count_star_reads_an_index() {
 fn test_each_side_of_a_self_join_picks_its_own_index() {
     let c = setup();
     let sql =
-        "select a.name, b.city from t a join t b on a.id = b.id where a.id < 3 order by a.name";
+        "select a.name, b.city from t a join t b on a.id = b.id where a.id + 0 < 3 order by a.name";
     let plan = explain(&c, sql);
     assert!(
         plan.contains("using t_name") && plan.contains("using t_city"),
