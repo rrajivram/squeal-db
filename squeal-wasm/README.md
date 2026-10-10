@@ -1,5 +1,12 @@
 # squeal-wasm
 
+Part of [squeal-db](../README.md). This is the browser build: SQL
+([`squeal-sql`](../squeal-sql/README.md)) and JSON documents
+([`sq-json`](../sq-json/README.md)) over one in-memory
+[`store`](../store/README.md), persisted to IndexedDB. Live at
+https://squeal-db-demo.rrajivram-seattle.workers.dev. Built by Claude; it
+needed no architectural changes.
+
 The wasm-facing shim for squeal-db — `squeal-cli`'s equivalent for a browser.
 Exposes a single JS-facing type, `SquealDb`, with one method (`execute(sql)
 -> JSON string`) covering every statement kind (DDL, DML, batched statements,

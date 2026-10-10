@@ -1,5 +1,11 @@
 # sq-json
 
+Part of [squeal-db](../README.md): the JSON document layer over
+[`store`](../store/README.md), alongside the SQL layer
+([`squeal-sql`](../squeal-sql/README.md)). Collections are store tables, and
+one store database can hold both collections and SQL tables. Built by
+Claude on the existing store APIs, with no architectural changes.
+
 A MongoDB-style document database on `store`, with a Rust API and a
 mongosh-style shell:
 

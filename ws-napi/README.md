@@ -1,5 +1,9 @@
 # ws-napi
 
+Part of [squeal-db](../README.md): the Node.js front end for
+[`squeal-sql`](../squeal-sql/README.md). Built by Claude; it needed no
+architectural changes, only a new file backend (`WasiFile`) in `store`.
+
 A napi-rs-facing shim exposing squeal-db to Node.js — like `squeal-wasm`
 (its browser counterpart), but backed by a real, **persistent**
 `std::fs::File` instead of an ephemeral `MemFile`. Built for an embedded

@@ -54,8 +54,17 @@ fn main() -> Result<()> {
             // buffer across separate open() calls via its own
             // process-wide registry, so nothing is lost by not sharing
             // one manager instance.
+            //
+            // Always created, never opened: memory starts empty each run,
+            // and opening a name NamedMemFile has never seen fails reading
+            // its header (an I/O error, not not-found — see NamedMemFile),
+            // which connect_or_create would report rather than create.
             let mgr: Arc<ConnectionManager<NamedMemFile>> = Arc::new(ConnectionManager::new());
-            run_repl(rl, connect_or_create(&mgr, &db_path), &db_path)
+            let conn = mgr.create_and_connect(&db_path).unwrap_or_else(|e| {
+                eprintln!("failed to create database {db_path:?}: {e}");
+                std::process::exit(1);
+            });
+            run_repl(rl, conn, &db_path)
         }
     };
     print_memory_stats();
