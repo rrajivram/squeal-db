@@ -174,7 +174,20 @@ the page and transaction models, and the parser approach. I designed and built t
 various components for the most part. In specific cases, I used Claude to 
 complete some time consuming tasks (e.g. finishing up sql-parser after I 
 got the initial design sketched and built). Across the board, 
-Claude wrote all the tests, and debugged and fixed some hairy transactional issues.
+Claude wrote all the tests, and debugged and fixed some hairy transactional issues. 
+Also, my initial design had seprate redo and undo log files. I used Claude to clean that 
+up and create one single WAL that is sequenced,
+
+Some overall design and build goals:
+1. 100% Rust
+2. Minimal unsafe
+3. Idiomatic rust.  Use iterators, closures and other functional concepts; minimize use of indexing
+4. Multi-threaded safe
+5. Separate concerns where possible
+6. Support File and Memory for all operations out of the box
+7. No unwraps. All errors are mapped and propogated, never hidden
+8. Every commit is public - you can see exactly what I did and what Claude did
+9. Extensive testing, unit and stress , all built by Claude
 
 The project is open on GitHub and every commit is visible:
 
