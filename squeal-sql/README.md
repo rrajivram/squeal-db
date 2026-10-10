@@ -245,22 +245,69 @@ its input.
 
 ## Comparing with SQLite
 
+One workload, run against squeal-db and SQLite 3.53 (bundled, through
+`rusqlite`): 20,000 customers and 200,000 orders, with indexes on
+`orders(customer_id)`, `orders(day)` and `customers(tier)`. Every phase's
+answers are compared, and they agree in all of them.
+
+Both databases are on disk and equally durable. Every commit waits for a
+full flush to stable storage (`F_FULLFSYNC` on macOS): SQLite runs in WAL
+mode with `synchronous=FULL` and `fullfsync` on. SQLite uses prepared
+statements, its usual mode of use; squeal-db is sent SQL text, which its
+parse cache shares a parse across.
+
+Measured 2026-10-10 on an Apple M4 Max, release build, median of three
+runs. The last column is SQLite's time divided by squeal-db's, so above 1
+means squeal-db is faster.
+
+| phase | squeal-db | SQLite | squeal-db vs SQLite |
+|---|---:|---:|---:|
+| Bulk load, 220k rows in one transaction | 194,000 rows/s | 1,670,000 rows/s | 0.12x |
+| Create 3 indexes | 1,963 ms | 120 ms | 0.06x |
+| `ANALYZE` | 50.1 ms | 18.0 ms | 0.36x |
+| Point lookup by primary key | 123,000/s | 714,000/s | 0.17x |
+| Secondary-index lookup + aggregate | 41,900/s | 100,000/s | 0.42x |
+| Index range (1 week of 52) + aggregate | 229/s | 548/s | 0.42x |
+| Full scan with `GROUP BY` | 14/s | 20/s | 0.68x |
+| Join + `GROUP BY` | 8.0/s | 7.0/s | **1.15x** |
+| Join, filtered, `ORDER BY` + `LIMIT` | 683/s | 2,310/s | 0.30x |
+| `IN (subquery)` | 31/s | 45/s | 0.68x |
+| Correlated `EXISTS` | 33/s | 37/s | 0.89x |
+| Correlated `NOT EXISTS` | 64/s | 15/s | **4.34x** |
+| `UPDATE` one row, autocommit | 246/s | 248/s | **0.99x** |
+| `INSERT` one row, autocommit | 242/s | 245/s | **0.98x** |
+| `UPDATE`, 100 rows per transaction | 12,700/s | 16,300/s | 0.78x |
+| Point lookups, 4 threads | 266,000/s | 808,000/s | 0.33x |
+
+What the numbers say:
+
+- **Level on durable single-row writes.** Both are bound by the disk
+  flush per commit.
+- **Ahead on correlated `NOT EXISTS`.** The subquery is decorrelated
+  into a hash anti-join (see above), where SQLite probes per outer row.
+- **Slightly ahead on a join of both whole tables with `GROUP BY`** (a
+  hash join).
+- **Behind on per-statement overhead.** A point lookup is planned and
+  given a transaction each time it runs. SQLite compiles a statement once
+  and re-runs it.
+- **Behind on rows fetched through an index** (the range scan, the
+  filtered join): each fetch descends the table's tree from the root.
+- **Well behind on bulk load and index builds.** Both insert a row at a
+  time through the transactional path; index builds have no sorted bulk
+  build yet.
+- **On disk:** 66 MB against SQLite's 18 MB. Rows are fixed-width, pages
+  are 16 KiB and half full after splits, and the WAL is retained until a
+  checkpoint.
+
+The open items are in [TODO.md](../TODO.md). To run it yourself:
+
 ```bash
 cargo run --release -p squeal-sql --example load_vs_sqlite -- 200000 4
 ```
 
-The example runs one workload against squeal-db and SQLite (bundled),
-both on disk and equally durable: SQLite in WAL mode, with
-`synchronous=FULL` and `fullfsync` on. The workload covers:
-- bulk load, index builds, `ANALYZE`
-- point, index and range lookups
-- scans, joins and subqueries
-- durable single-row and batched writes
-- concurrent readers
-
-It prints a table of each phase's time and rate on both engines, and
-checks that their answers agree. `SQ_EXPLAIN=1` also prints the plans
-squeal-db chose.
+The arguments are the number of orders and the number of reader threads.
+It prints each phase's time and rate on both engines and whether their
+answers agree. `SQ_EXPLAIN=1` also prints the plans squeal-db chose.
 
 ## Testing
 
