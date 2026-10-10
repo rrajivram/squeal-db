@@ -310,6 +310,7 @@ where
 // not implemented yet as of this writing) instead of a second, parallel
 // implementation that would need its own, separate improvement.
 fn table_scan_source<F>(
+    conn: &Arc<Connection<F>>,
     schema: &Arc<crate::schema_ops::schema::Schema<F>>,
     table: &Arc<SqlTable>,
     where_expr: Option<crate::plan::eval::EvalExpr>,
@@ -319,26 +320,63 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
+    use crate::optim::picker::{AccessPath, ItemNeeds, pick_access};
+    use crate::source::{index::IndexSource, table::TableSource};
+
+    let mut filters = vec![];
+    if let Some(w) = &where_expr {
+        let mut terms = vec![];
+        crate::plan::logical::conjunct_terms(w, &mut terms);
+        filters = terms.into_iter().cloned().collect();
+    }
     // Only the partitions the WHERE leaves (see partition::
     // partitions_to_read).
-    let parts = match &where_expr {
-        Some(w) => {
-            let mut terms = vec![];
-            crate::plan::logical::conjunct_terms(w, &mut terms);
-            let filters: Vec<_> = terms.into_iter().cloned().collect();
-            crate::partition::partitions_to_read(table, &filters)
-        }
-        None => crate::source::append::all_partitions(table),
+    let parts = crate::partition::partitions_to_read(table, &filters);
+    // Read the way a SELECT of the whole row would be (see optim::picker):
+    // by primary key or index ranges where the WHERE allows. Every column
+    // is read, and every path here keeps each row's key for last_id: a
+    // TableSource does unless told not to, and an index is only ever read
+    // with a row lookup, which records the key of the row it fetched.
+    let stats = crate::optim::table_stats::compute_table_stats(conn, &schema.name, table)?
+        .map(|s| crate::optim::table_stats::for_partitions(table, &s, &parts));
+    let needs = ItemNeeds {
+        columns: (0..table.fields().len()).collect(),
+        stated: filters.len(),
+        filters,
     };
-    let mut source = crate::source::append::over_partitions(table, &parts, None, None, |part| {
-        Ok(Box::new(crate::source::table::TableSource::new(
-            schema.db.clone(),
-            table.clone(),
-            part,
-            txn,
-            None,
-        )?) as Box<dyn crate::source::Source>)
+    let access = pick_access(
+        table,
+        stats.as_ref(),
+        &needs,
+        schema.db.get_page_data_size(),
+        None,
+    );
+    let rows = access.rows;
+    let mut source = crate::source::append::over_partitions(table, &parts, None, rows, |part| {
+        let stats = stats.clone();
+        Ok(match access.path.clone() {
+            AccessPath::TableScan | AccessPath::IndexScan(_) => Box::new(TableSource::new(
+                schema.db.clone(),
+                table.clone(),
+                part,
+                txn,
+                stats,
+            )?) as Box<dyn crate::source::Source>,
+            AccessPath::TableSeek(ranges) => Box::new(TableSource::seek(
+                schema.db.clone(),
+                table.clone(),
+                part,
+                txn,
+                stats,
+                ranges,
+                rows,
+            )?),
+            AccessPath::IndexSeek(i, ranges) | AccessPath::IndexLookup(i, ranges) => Box::new(
+                IndexSource::seek(conn, table, part, i, txn, stats, ranges, true, rows)?,
+            ),
+        })
     })?;
+    // The whole WHERE, whatever the path enforced: a seek may be wider.
     if let Some(expr) = where_expr {
         source = Box::new(crate::source::where_source::WhereSource::new(source, expr)?);
     }
@@ -807,7 +845,7 @@ where
                     };
 
                     let count = with_active_txn(&self.conn, |txn| {
-                        let source = table_scan_source(&schema, &table, where_expr, Some(txn))?;
+                        let source = table_scan_source(&self.conn, &schema, &table, where_expr, Some(txn))?;
                         let matches = drain_with_ids(source)?;
                         schema.update_rows_matching(&table.name, matches, assignments, txn)
                     })?;
@@ -831,7 +869,7 @@ where
                     };
 
                     let count = with_active_txn(&self.conn, |txn| {
-                        let source = table_scan_source(&schema, &table, where_expr, Some(txn))?;
+                        let source = table_scan_source(&self.conn, &schema, &table, where_expr, Some(txn))?;
                         let matches = drain_with_ids(source)?;
                         schema.delete_rows_matching(&table.name, matches, txn)
                     })?;
@@ -1146,7 +1184,7 @@ where
                     reject_qualified_field("TRUNCATE", field)?;
                     let (schema, table) = expect_real(table_ref, "TRUNCATE")?;
                     let count = with_active_txn(&self.conn, |txn| {
-                        let source = table_scan_source(&schema, &table, None, Some(txn))?;
+                        let source = table_scan_source(&self.conn, &schema, &table, None, Some(txn))?;
                         let matches = drain_with_ids(source)?;
                         schema.delete_rows_matching(&table.name, matches, txn)
                     })?;

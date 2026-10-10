@@ -148,3 +148,28 @@ fn test_explain_shows_the_subquery() {
     );
     assert!(text.contains("EXISTS (subquery: 3 row(s) by id)"), "{text}");
 }
+
+// UPDATE and DELETE find their rows the way SELECT does — by primary key
+// or index ranges (see stmt::table_scan_source) — including through the
+// index of a column the UPDATE itself changes.
+#[test]
+fn test_update_and_delete_through_keys_and_indexes() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, v integer, w integer, primary key(id))").unwrap();
+    let rows: Vec<String> = (0..300).map(|i| format!("({i}, {}, {i})", i % 10)).collect();
+    run(&c, &format!("insert into t values {}", rows.join(", "))).unwrap();
+    run(&c, "create index t_v on t (v)").unwrap();
+    run(&c, "analyze table t").unwrap();
+    run(&c, "update t set w = -1 where id = 42").unwrap();
+    assert_eq!(ids(&c, "select id from t where w = -1"), [42]);
+    // Through t_v, changing v: each row moves once, not again when its new
+    // index entry is reached.
+    run(&c, "update t set v = v + 10 where v = 3").unwrap();
+    assert_eq!(ids(&c, "select count(*) from t where v = 13"), [30]);
+    assert_eq!(ids(&c, "select count(*) from t where v = 3"), [0]);
+    run(&c, "delete from t where v = 13 and id < 100").unwrap();
+    assert_eq!(ids(&c, "select count(*) from t where v = 13"), [20]);
+    run(&c, "delete from t where id >= 290").unwrap();
+    assert_eq!(ids(&c, "select count(*) from t"), [280]);
+    assert_eq!(ids(&c, "select count(*) from t where v = 9"), [29]);
+}

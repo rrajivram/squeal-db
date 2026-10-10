@@ -180,6 +180,9 @@ The other rewrites:
 - **Partition pruning.** A partitioned table reads only the partitions its
   conditions allow.
 
+**UPDATE and DELETE** pick their rows the same way: a seek on the primary
+key or an index where the WHERE allows, with the full WHERE on top.
+
 **EXPLAIN** prints the tree that would actually run. It is built from the
 same `Source`s, each describing itself, with the estimated rows. `!print
 stats` (CLI) shows per-operator rows and time from the last query.
@@ -224,8 +227,6 @@ its input.
   run only when linked to the outer query by `inner = outer` conditions,
   and not when they aggregate or are used as a value (see above). They
   are not allowed in `JOIN … ON` or `GROUP BY` either.
-- **`UPDATE` and `DELETE` scan the whole table**, even with `WHERE id =
-  …`. They don't use the optimizer's seeks yet (see TODO.md).
 - **No constant folding.** `day < 10 + 7` can't bound a seek, but
   `day < 17` can.
 - **Deleting a referenced row.** Nothing checks it: there is no `ON

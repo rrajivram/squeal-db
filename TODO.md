@@ -6,11 +6,10 @@
 on an M4 Max: 20k customers, 200k orders, both engines on disk and fully
 fsynced. The answers agreed in every phase. Where squeal-db trails most:
 
-- [ ] **UPDATE/DELETE scan the whole table.** `update orders set ... where
-  id = 7` reads all 200k rows (~35 ms) where SELECT seeks (~8 us):
-  `Statement::execute` builds them on `table_scan_source`, not the
-  optimizer's access paths. Single-row autocommit UPDATE: 25/s against
-  SQLite's 246/s. In a transaction: 28/s against 15,600/s.
+- [x] **UPDATE/DELETE scan the whole table.** Done: they find their rows
+  with optim::picker, as a SELECT of the whole row would (primary-key seek,
+  or an index with row lookups). Single-row autocommit UPDATE 25 -> 235/s
+  (SQLite 247/s); in a transaction 28 -> 5,155/s (SQLite 14,100/s).
 - [ ] **Parsing large INSERTs.** 3.45 of the 8.2 s that a 200k-row load
   takes (500-row INSERTs) is parsing: chumsky builds `Rich` error
   alternatives (`add_alt_err`, `expected_found`) at every choice, even on
