@@ -170,6 +170,13 @@ impl ConnectionManager<File> {
 }
 
 impl Connection<store::memfile::MemFile> {
+    /// The store database this connection runs on — for another front-end
+    /// to share it (squeal-wasm runs sq-json's document collections on the
+    /// same store, so one snapshot holds both).
+    pub fn store(&self) -> Arc<store::db::Db<store::memfile::MemFile>> {
+        self.database.read().db.clone()
+    }
+
     /// The current database's committed state as (data file, log file) —
     /// see `Db::<MemFile>::synced_snapshot`. Feed both to
     /// `ConnectionManager::connect_using` to reopen it.

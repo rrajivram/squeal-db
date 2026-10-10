@@ -2,140 +2,262 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>squeal-db — wasm demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>squeal-db — SQL and JSON documents in your browser</title>
 <style>
-  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
-  h1 { font-size: 1.3rem; }
-  .hint { color: #888; font-size: 0.8rem; }
-  #status { color: #666; font-size: 0.85rem; }
+  :root { --mono: ui-monospace, Menlo, Consolas, monospace; --accent: #2457c5; --json: #7a3fb8; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; max-width: 980px; margin: 1.5rem auto; padding: 0 1rem; color: #1a1a1a; }
+  h1 { font-size: 1.25rem; margin-bottom: 0.2rem; }
+  .sub { color: #666; font-size: 0.85rem; margin: 0 0 0.8rem; }
+  code, kbd { font-family: var(--mono); font-size: 0.85em; background: #f2f2f2; padding: 0.05rem 0.3rem; border-radius: 3px; }
+  kbd { border: 1px solid #ccc; }
 
-  #cells { margin-top: 1.5rem; }
+  #topbar { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+  .tab { padding: 0.45rem 1rem; border: 1px solid #ccc; background: #fafafa; cursor: pointer; border-radius: 6px; font-size: 0.9rem; }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .tab.json.active { background: var(--json); border-color: var(--json); }
+  .spacer { flex: 1; }
+  button { padding: 0.45rem 1rem; font-size: 0.9rem; cursor: pointer; border-radius: 6px; border: 1px solid #bbb; background: #fff; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  body.json-mode button.primary { background: var(--json); border-color: var(--json); }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  #cells { margin-top: 1.2rem; }
   .cell { border-left: 3px solid #ddd; padding: 0.2rem 0 0.2rem 0.8rem; margin-bottom: 1rem; }
-  .cell .idx { color: #999; font-size: 0.75rem; font-family: ui-monospace, Menlo, monospace; }
-  .cell .in { font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; white-space: pre-wrap; background: #f7f7f7; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.2rem 0 0.5rem; cursor: pointer; }
+  .cell.json { border-left-color: #d9c6ee; }
+  .cell .idx { color: #999; font-size: 0.75rem; font-family: var(--mono); }
+  .badge { font-size: 0.65rem; padding: 0 0.35rem; border-radius: 3px; color: #fff; background: var(--accent); margin-left: 0.4rem; }
+  .cell.json .badge { background: var(--json); }
+  .cell .in { font-family: var(--mono); font-size: 0.88rem; white-space: pre-wrap; background: #f7f7f7; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.2rem 0 0.5rem; cursor: pointer; }
   .cell .in:hover { background: #efefef; }
-  .cell .in::before { content: '↩ click to re-run in prompt below'; display: block; font-size: 0.7rem; color: #aaa; margin-bottom: 0.15rem; }
 
-  table { border-collapse: collapse; margin: 0.3rem 0 0.6rem; }
-  th, td { border: 1px solid #ccc; padding: 0.3rem 0.6rem; font-size: 0.9rem; }
-  th { background: #f0f0f0; }
-  .msg { font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; color: #444; padding: 0.2rem 0; white-space: pre-wrap; }
-  .err { color: #b00020; font-family: ui-monospace, Menlo, monospace; white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 4px; }
+  table.grid { border-collapse: collapse; margin: 0.3rem 0 0.4rem; }
+  table.grid th, table.grid td { border: 1px solid #ccc; padding: 0.25rem 0.55rem; font-size: 0.85rem; vertical-align: top; }
+  table.grid th { background: #f0f0f0; text-align: left; }
+  table.grid td.nested { font-family: var(--mono); font-size: 0.78rem; color: #444; }
+  .msg { font-family: var(--mono); font-size: 0.84rem; color: #444; padding: 0.15rem 0; white-space: pre-wrap; }
+  .err { color: #b00020; font-family: var(--mono); white-space: pre-wrap; padding: 0.5rem; background: #fff0f0; border: 1px solid #f0c0c0; border-radius: 4px; font-size: 0.85rem; }
+  .docs-bar { font-size: 0.75rem; color: #777; }
+  .docs-bar a { cursor: pointer; color: var(--json); margin-left: 0.5rem; }
+  pre.json { font-family: var(--mono); font-size: 0.8rem; background: #fbf8ff; border: 1px solid #eee3fa; padding: 0.4rem 0.6rem; border-radius: 4px; margin: 0.2rem 0; overflow-x: auto; }
 
-  #prompt { position: sticky; bottom: 0; background: #fff; padding-top: 0.8rem; border-top: 1px solid #ddd; }
-  textarea { width: 100%; height: 5rem; font-family: ui-monospace, Menlo, monospace; font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; }
-  .controls { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.4rem; }
-  button { padding: 0.5rem 1.2rem; font-size: 0.95rem; cursor: pointer; }
-  button.secondary { background: none; border: 1px solid #ccc; }
+  #prompt { position: sticky; bottom: 0; background: #fff; padding-top: 0.7rem; border-top: 1px solid #ddd; }
+  #mode-label { font-size: 0.8rem; color: #555; margin-bottom: 0.25rem; font-family: var(--mono); }
+  textarea { width: 100%; height: 6rem; font-family: var(--mono); font-size: 0.9rem; box-sizing: border-box; padding: 0.5rem; border-radius: 6px; border: 1px solid #bbb; }
+  body.json-mode textarea { border-color: #c9b2e6; }
+  .controls { display: flex; align-items: center; gap: 0.5rem; margin: 0.4rem 0 0.8rem; flex-wrap: wrap; }
+  #status { color: #666; font-size: 0.82rem; margin-left: auto; }
+
+  /* Help panel */
+  #help { position: fixed; inset: 0; background: rgba(0,0,0,0.35); display: none; z-index: 10; }
+  #help.open { display: block; }
+  #help .panel { position: absolute; top: 3vh; bottom: 3vh; left: 50%; transform: translateX(-50%); width: min(960px, 94vw); background: #fff; border-radius: 10px; display: flex; flex-direction: column; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }
+  #help header { display: flex; align-items: center; gap: 0.4rem; padding: 0.7rem 1rem; border-bottom: 1px solid #eee; flex-wrap: wrap; }
+  #help header h2 { font-size: 1.05rem; margin: 0 0.8rem 0 0; }
+  #help .htab { border: none; background: none; padding: 0.35rem 0.7rem; border-radius: 5px; }
+  #help .htab.active { background: #eef2fb; color: var(--accent); }
+  #help .close { margin-left: auto; }
+  #help .body { overflow-y: auto; padding: 0.8rem 1.2rem 1.5rem; font-size: 0.9rem; line-height: 1.45; }
+  #help h3 { font-size: 0.95rem; margin: 1.1rem 0 0.4rem; }
+  #help table.ref { border-collapse: collapse; width: 100%; }
+  #help table.ref td { border-bottom: 1px solid #f0f0f0; padding: 0.3rem 0.4rem; vertical-align: top; font-size: 0.84rem; }
+  #help table.ref td:first-child { font-family: var(--mono); font-size: 0.8rem; width: 55%; }
+  .example { border: 1px solid #e3e3e3; border-radius: 6px; margin: 0.5rem 0; }
+  .example .ehead { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.6rem; background: #fafafa; border-bottom: 1px solid #eee; font-size: 0.85rem; }
+  .example .ehead button { margin-left: auto; padding: 0.2rem 0.7rem; font-size: 0.8rem; }
+  .example pre { margin: 0; padding: 0.5rem 0.6rem; font-family: var(--mono); font-size: 0.8rem; white-space: pre-wrap; }
 </style>
 </head>
 <body>
 
-<h1>squeal-db, running entirely in this tab (WebAssembly, no server)</h1>
-<p class="hint">
-  Everything runs in your browser's wasm sandbox. The database is saved in this browser (IndexedDB)
-  shortly after each change and reopened on reload — nothing leaves your machine; <b>Forget saved
-  database</b> starts over. Each run below becomes its own block, like a
-  notebook cell, so earlier results stay on screen. Click any past command to load it back into the
-  prompt. In the prompt: <b>Enter</b> runs once the statement ends with <code>;</code> (otherwise it
-  just starts a new line, so multi-line statements keep typing), <b>Shift+Enter</b> always inserts a
-  newline, <b>⌘/Ctrl+Enter</b> always runs regardless, and <b>↑/↓</b> at the start/end of the text
-  recalls command history (also persisted across reloads). Type
-  <b>!help</b> and run it to see every supported command and SQL statement.
-  <b>Load CSV…</b> picks a CSV file from your machine, infers its column types from the first rows,
-  creates a table for it and loads every row — the file never leaves your browser.
-</p>
+<h1>squeal-db — SQL tables and JSON documents, running entirely in this tab</h1>
+<p class="sub">WebAssembly, no server: nothing you type or load leaves your browser. Your data is saved in this
+browser and comes back when you reload. New here? Open <b>Help</b>, or pick something from <b>Examples</b>.</p>
+
+<div id="topbar">
+  <button class="tab active" id="tab-sql" title="SQL statements against tables">SQL</button>
+  <button class="tab json" id="tab-json" title="mongosh-style statements against JSON document collections">JSON documents</button>
+  <span class="spacer"></span>
+  <button id="examples-btn">Examples</button>
+  <button id="help-btn">Help</button>
+</div>
 
 <div id="cells"></div>
 
 <div id="prompt">
-  <textarea id="sql" spellcheck="false">create table t (id integer not null, name varchar(20), primary key(id));
-insert into t values (1, 'alice'), (2, 'bob'), (3, 'carol');
-select * from t order by id;</textarea>
+  <div id="mode-label"></div>
+  <textarea id="input" spellcheck="false" autocapitalize="off" autocomplete="off"></textarea>
   <div class="controls">
-    <button id="run" disabled>Run</button>
-    <button id="clear" class="secondary">Clear notebook</button>
-    <button id="load-csv" class="secondary" disabled>Load CSV…</button>
+    <button id="run" class="primary" disabled>Run</button>
+    <button id="clear">Clear notebook</button>
+    <button id="load-csv" disabled title="Create a SQL table from a CSV file on your machine">Load CSV…</button>
     <input id="csv-file" type="file" accept=".csv,text/csv" hidden>
-    <button id="forget" class="secondary" disabled>Forget saved database</button>
+    <button id="forget" disabled title="Delete the saved database and start over">Forget saved database</button>
     <span id="status">loading wasm…</span>
   </div>
 </div>
 
+<div id="help">
+  <div class="panel">
+    <header>
+      <h2>Help</h2>
+      <button class="htab active" data-tab="start">Start here</button>
+      <button class="htab" data-tab="sql">SQL reference</button>
+      <button class="htab" data-tab="json">JSON reference</button>
+      <button class="htab" data-tab="examples">Examples</button>
+      <button class="htab" data-tab="keys">Keys &amp; saving</button>
+      <button class="close" id="help-close">Close (Esc)</button>
+    </header>
+    <div class="body" id="help-body"></div>
+  </div>
+</div>
+
 <script type="module">
-  import init from './pkg/squeal_wasm.js';
+  import init, { SquealDb } from './pkg/squeal_wasm.js';
   import { openPersistent } from './persist.js';
+  import { EXAMPLES } from './examples.js';
 
-  const runBtn = document.getElementById('run');
-  const clearBtn = document.getElementById('clear');
-  const statusEl = document.getElementById('status');
-  const sqlEl = document.getElementById('sql');
-  const cellsEl = document.getElementById('cells');
-  const loadCsvBtn = document.getElementById('load-csv');
-  const csvFileEl = document.getElementById('csv-file');
-  const forgetBtn = document.getElementById('forget');
+  const $ = (id) => document.getElementById(id);
+  const runBtn = $('run'), inputEl = $('input'), cellsEl = $('cells'), statusEl = $('status');
+  const loadCsvBtn = $('load-csv'), csvFileEl = $('csv-file'), forgetBtn = $('forget');
+  const helpEl = $('help'), helpBody = $('help-body');
 
+  // ---- mode ---------------------------------------------------------------
+  const MODE_KEY = 'squeal-demo-mode';
+  const DRAFTS = {
+    sql: `select * from orders limit 5;   -- try the Examples menu if there's no 'orders' table yet`,
+    json: `db.products.find({price: {$lt: 5}})`,
+  };
+  let mode = localStorage.getItem(MODE_KEY) === 'json' ? 'json' : 'sql';
+  const drafts = { sql: DRAFTS.sql, json: DRAFTS.json };
+
+  function setMode(m, text) {
+    drafts[mode] = inputEl.value;
+    mode = m;
+    localStorage.setItem(MODE_KEY, m);
+    document.body.classList.toggle('json-mode', m === 'json');
+    $('tab-sql').classList.toggle('active', m === 'sql');
+    $('tab-json').classList.toggle('active', m === 'json');
+    inputEl.value = text ?? drafts[m];
+    updateLabel();
+    historyPos = history.length;
+    inputEl.focus();
+  }
+  function updateLabel() {
+    $('mode-label').textContent = mode === 'sql'
+      ? 'SQL — Enter runs once the text ends with ;  ·  !help lists everything'
+      : `JSON ${db ? db.jsonPrompt().trim() : 'test>'}  — Enter runs when brackets are closed  ·  type help for the method list`;
+  }
+  $('tab-sql').addEventListener('click', () => setMode('sql'));
+  $('tab-json').addEventListener('click', () => setMode('json'));
+
+  // ---- history (shared, each entry remembers its mode) ---------------------
   const HISTORY_KEY = 'squeal-wasm-demo-history';
-  let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]');
-  let historyPos = history.length; // one past the end = "not browsing history"
-  let draft = '';
-
-  let db;
-  let persist;
-  let cellCount = 0;
-
-  async function boot() {
-    await init();
-    persist = await openPersistent('browser-demo', {
-      onSaved: () => { statusEl.textContent = 'saved'; },
-    });
-    db = persist.db;
-    statusEl.textContent = 'ready';
-    runBtn.disabled = false;
-    loadCsvBtn.disabled = false;
-    forgetBtn.disabled = false;
-    sqlEl.focus();
+  let history = JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]')
+    .map((h) => (typeof h === 'string' ? { mode: 'sql', text: h } : h));
+  let historyPos = history.length, draft = '';
+  function pushHistory(text) {
+    const last = history[history.length - 1];
+    if (!last || last.text !== text || last.mode !== mode) {
+      history.push({ mode, text });
+      if (history.length > 500) history = history.slice(-500);
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    }
+    historyPos = history.length;
   }
 
-  // Called after anything that may have written: schedules a save.
+  // ---- database ------------------------------------------------------------
+  let db, persist, cellCount = 0;
+  async function boot() {
+    await init();
+    persist = await openPersistent('browser-demo', { onSaved: () => { statusEl.textContent = 'saved'; } });
+    db = persist.db;
+    statusEl.textContent = 'ready';
+    for (const b of [runBtn, loadCsvBtn, forgetBtn]) b.disabled = false;
+    buildHelp();
+    setMode(mode);
+    if (!localStorage.getItem('squeal-demo-seen-help')) {
+      localStorage.setItem('squeal-demo-seen-help', '1');
+      openHelp('start');
+    }
+  }
   function changed() {
     persist.changed();
     if (persist.unsynced()) statusEl.textContent = 'unsaved changes…';
   }
-
-  // Leaving with changes not yet saved: have the browser ask first.
   window.addEventListener('squeal:unsynced', (e) => e.detail.event.preventDefault());
-
   forgetBtn.addEventListener('click', async () => {
-    if (!confirm('Delete the saved database and start over with an empty one?')) return;
+    if (!confirm('Delete the saved database (tables and collections) and start over with an empty one?')) return;
     await persist.clear();
     location.reload();
   });
 
-  function renderResult(r) {
+  // ---- rendering -----------------------------------------------------------
+  function gridTable(columns, rows) {
+    const table = document.createElement('table');
+    table.className = 'grid';
+    const head = table.insertRow();
+    for (const c of columns) { const th = document.createElement('th'); th.textContent = c; head.appendChild(th); }
+    for (const row of rows) {
+      const tr = table.insertRow();
+      for (const cell of row) {
+        const td = tr.insertCell();
+        if (cell !== null && typeof cell === 'object') { td.className = 'nested'; td.textContent = JSON.stringify(cell); }
+        else td.textContent = cell === null || cell === undefined ? (cell === null ? 'null' : '') : String(cell);
+      }
+    }
+    return table;
+  }
+
+  // A JSON statement's output is text: documents (one JSON value per line),
+  // a count, a name, or a message. Documents are shown as a table, with a
+  // link to see them as JSON.
+  function renderJsonText(text) {
+    const wrap = document.createElement('div');
+    const lines = text.split('\n').filter((l) => l.trim() !== '');
+    let values = null;
+    try { values = lines.map((l) => JSON.parse(l)); } catch { values = null; }
+    const docs = values && values.length && values.every((v) => v && typeof v === 'object' && !Array.isArray(v));
+    if (!docs) {
+      const pre = document.createElement(values ? 'pre' : 'div');
+      pre.className = values ? 'json' : 'msg';
+      pre.textContent = values ? values.map((v) => JSON.stringify(v, null, 2)).join('\n') : text;
+      wrap.appendChild(pre);
+      return wrap;
+    }
+    const columns = [];
+    for (const d of values) for (const k of Object.keys(d)) if (!columns.includes(k)) columns.push(k);
+    const table = gridTable(columns, values.map((d) => columns.map((c) => (c in d ? d[c] : undefined))));
+    const pre = document.createElement('pre');
+    pre.className = 'json';
+    pre.textContent = values.map((v) => JSON.stringify(v, null, 2)).join('\n');
+    pre.hidden = true;
+    const bar = document.createElement('div');
+    bar.className = 'docs-bar';
+    bar.textContent = `${values.length} document${values.length === 1 ? '' : 's'}`;
+    const toggle = document.createElement('a');
+    toggle.textContent = 'show as JSON';
+    toggle.addEventListener('click', () => {
+      const asJson = table.hidden;
+      table.hidden = !asJson; pre.hidden = asJson;
+      toggle.textContent = asJson ? 'show as JSON' : 'show as table';
+    });
+    bar.appendChild(toggle);
+    wrap.append(table, pre, bar);
+    return wrap;
+  }
+
+  function renderResult(r, cellMode) {
     const wrap = document.createElement('div');
     if (r.kind === 'Message') {
+      if (cellMode === 'json') return renderJsonText(r.text);
       wrap.className = 'msg';
       wrap.textContent = r.text;
     } else if (r.kind === 'Count') {
       wrap.className = 'msg';
       wrap.textContent = `${r.rows_affected} row(s) affected`;
     } else if (r.kind === 'Result' || r.kind === 'Rows') {
-      const table = document.createElement('table');
-      const thead = table.insertRow();
-      for (const col of r.columns) {
-        const th = document.createElement('th');
-        th.textContent = col;
-        thead.appendChild(th);
-      }
-      for (const row of r.rows) {
-        const tr = table.insertRow();
-        for (const cell of row) {
-          const td = tr.insertCell();
-          td.textContent = cell === null ? 'NULL' : cell;
-        }
-      }
-      wrap.appendChild(table);
+      wrap.appendChild(gridTable(r.columns, r.rows));
       const msg = document.createElement('div');
       msg.className = 'msg';
       msg.textContent = r.message;
@@ -146,153 +268,323 @@ select * from t order by id;</textarea>
     return wrap;
   }
 
-  function addCell(sql, body) {
+  function addCell(text, body, cellMode) {
     cellCount += 1;
     const cell = document.createElement('div');
-    cell.className = 'cell';
-
+    cell.className = 'cell' + (cellMode === 'json' ? ' json' : '');
     const idx = document.createElement('div');
     idx.className = 'idx';
     idx.textContent = `[${cellCount}]`;
-    cell.appendChild(idx);
-
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = cellMode === 'json' ? 'JSON' : 'SQL';
+    idx.appendChild(badge);
     const inEl = document.createElement('div');
     inEl.className = 'in';
-    inEl.textContent = sql;
-    inEl.title = 'click to load into the prompt below';
-    inEl.addEventListener('click', () => {
-      sqlEl.value = sql;
-      sqlEl.focus();
-      historyPos = history.length;
-    });
-    cell.appendChild(inEl);
-
-    cell.appendChild(body);
+    inEl.textContent = text;
+    inEl.title = 'click to load into the prompt';
+    inEl.addEventListener('click', () => setMode(cellMode, text));
+    cell.append(idx, inEl, body);
     cellsEl.appendChild(cell);
     cell.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }
 
-  function pushHistory(sql) {
-    if (history[history.length - 1] !== sql) {
-      history.push(sql);
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-    }
-    historyPos = history.length;
+  function errorBox(e) {
+    const div = document.createElement('div');
+    div.className = 'err';
+    div.textContent = e.message || String(e);
+    return div;
   }
 
-  function run() {
-    const sql = sqlEl.value;
-    if (!sql.trim()) return;
-
+  // ---- running ---------------------------------------------------------------
+  function runText(text, cellMode) {
     const body = document.createElement('div');
     try {
-      const json = db.execute(sql);
-      const results = JSON.parse(json);
-      for (const r of results) {
-        body.appendChild(renderResult(r));
-      }
+      const out = cellMode === 'sql' ? db.execute(text) : db.executeJson(text);
+      for (const r of JSON.parse(out)) body.appendChild(renderResult(r, cellMode));
     } catch (e) {
-      const pre = document.createElement('div');
-      pre.className = 'err';
-      pre.textContent = e.message || String(e);
-      body.appendChild(pre);
+      body.appendChild(errorBox(e));
     }
-
     changed();
-    addCell(sql, body);
-    pushHistory(sql);
-    sqlEl.value = '';
+    addCell(text, body, cellMode);
+    updateLabel();
+  }
+  function run() {
+    const text = inputEl.value;
+    if (!text.trim()) return;
+    runText(text, mode);
+    pushHistory(text);
+    inputEl.value = '';
+    drafts[mode] = '';
+  }
+  runBtn.addEventListener('click', run);
+  $('clear').addEventListener('click', () => { cellsEl.innerHTML = ''; cellCount = 0; });
+
+  // Brackets and quotes all closed: a JSON statement that Enter may run.
+  function jsonComplete(text) {
+    let depth = 0, quote = null;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+      if (c === '"' || c === "'") quote = c;
+      else if ('([{'.includes(c)) depth++;
+      else if (')]}'.includes(c)) depth--;
+    }
+    return depth <= 0 && !quote && text.trim() !== '' && !/[,.:]\s*$/.test(text);
   }
 
-  runBtn.addEventListener('click', run);
-  clearBtn.addEventListener('click', () => { cellsEl.innerHTML = ''; cellCount = 0; });
+  inputEl.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); run(); return; }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      const ready = mode === 'sql' ? inputEl.value.trim().endsWith(';') : jsonComplete(inputEl.value);
+      if (ready) { e.preventDefault(); run(); return; }
+    }
+    const atStart = inputEl.selectionStart === 0 && inputEl.selectionEnd === 0;
+    const atEnd = inputEl.selectionStart === inputEl.value.length && inputEl.selectionEnd === inputEl.value.length;
+    if (e.key === 'ArrowUp' && atStart && historyPos > 0) {
+      e.preventDefault();
+      if (historyPos === history.length) draft = { mode, text: inputEl.value };
+      historyPos -= 1;
+      loadHistory(history[historyPos]);
+      inputEl.setSelectionRange(0, 0);
+    } else if (e.key === 'ArrowDown' && atEnd && historyPos < history.length) {
+      e.preventDefault();
+      historyPos += 1;
+      loadHistory(historyPos === history.length ? draft : history[historyPos]);
+      const p = inputEl.value.length;
+      inputEl.setSelectionRange(p, p);
+    }
+  });
+  function loadHistory(h) {
+    if (!h) return;
+    if (h.mode !== mode) {
+      mode = h.mode;
+      document.body.classList.toggle('json-mode', mode === 'json');
+      $('tab-sql').classList.toggle('active', mode === 'sql');
+      $('tab-json').classList.toggle('active', mode === 'json');
+      localStorage.setItem(MODE_KEY, mode);
+      updateLabel();
+    }
+    inputEl.value = h.text;
+  }
 
-  // "orders-2024 (final).csv" -> "orders_2024_final" — something that
-  // parses as a bare SQL identifier without quoting.
+  // ---- CSV -----------------------------------------------------------------
   function tableNameFor(fileName) {
-    let name = fileName.replace(/\.[^.]*$/, '').toLowerCase()
-      .replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
+    let name = fileName.replace(/\.[^.]*$/, '').toLowerCase().replace(/[^a-z0-9_]+/g, '_').replace(/^_+|_+$/g, '');
     if (!name) name = 'csv_table';
     if (/^[0-9]/.test(name)) name = 't_' + name;
     return name;
   }
-
-  // Load CSV: the file is read entirely in the browser (File.text()) and
-  // handed to the wasm module as a string — there's no filesystem here
-  // for `CREATE TABLE ... AS COPY FROM @path` to read from, so this goes
-  // through SquealDb.createTableFromCsv instead (same inference, same
-  // load, no path involved).
   loadCsvBtn.addEventListener('click', () => csvFileEl.click());
   csvFileEl.addEventListener('change', async () => {
     const file = csvFileEl.files[0];
-    csvFileEl.value = ''; // so picking the same file again still fires 'change'
+    csvFileEl.value = '';
     if (!file) return;
-    const name = prompt(`Table name for ${file.name}:`, tableNameFor(file.name));
+    const name = prompt(`SQL table name for ${file.name}:`, tableNameFor(file.name));
     if (!name) return;
-
-    const label = `-- load ${file.name} as table ${name}`;
     const body = document.createElement('div');
     try {
       const text = await file.text();
-      for (const r of JSON.parse(db.createTableFromCsv(name, text))) {
-        body.appendChild(renderResult(r));
-      }
-      // Show what was inferred, then a peek at the data.
+      for (const r of JSON.parse(db.createTableFromCsv(name, text))) body.appendChild(renderResult(r, 'sql'));
       for (const sql of [`describe table ${name}`, `select * from ${name} limit 10`]) {
-        for (const r of JSON.parse(db.execute(sql))) {
-          body.appendChild(renderResult(r));
-        }
+        for (const r of JSON.parse(db.execute(sql))) body.appendChild(renderResult(r, 'sql'));
       }
     } catch (e) {
-      const pre = document.createElement('div');
-      pre.className = 'err';
-      pre.textContent = e.message || String(e);
-      body.appendChild(pre);
+      body.appendChild(errorBox(e));
     }
     changed();
-    addCell(label, body);
-    sqlEl.focus();
+    addCell(`-- load ${file.name} as table ${name}`, body, 'sql');
   });
 
-  sqlEl.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      e.preventDefault();
-      run();
-      return;
-    }
-    // Plain Enter: run once the statement looks complete (ends with ';'),
-    // same convention as sqlite3/psql/mysql's own rustyline-backed REPLs —
-    // otherwise fall through and let the textarea insert a newline as
-    // usual, so a multi-line statement can keep being typed. Shift+Enter
-    // always falls through to a newline (native textarea behavior, no
-    // special-casing needed since we only intercept the plain case here).
-    if (e.key === 'Enter' && !e.shiftKey && sqlEl.value.trim().endsWith(';')) {
-      e.preventDefault();
-      run();
-      return;
-    }
-    const atStart = sqlEl.selectionStart === 0 && sqlEl.selectionEnd === 0;
-    const atEnd = sqlEl.selectionStart === sqlEl.value.length && sqlEl.selectionEnd === sqlEl.value.length;
+  // ---- help ------------------------------------------------------------------
+  const el = (tag, props = {}, ...kids) => {
+    const n = Object.assign(document.createElement(tag), props);
+    for (const k of kids) n.append(k);
+    return n;
+  };
+  const html = (s) => { const d = document.createElement('div'); d.innerHTML = s; return d; };
+  function refTable(rows) {
+    const t = el('table', { className: 'ref' });
+    for (const [a, b] of rows) { const r = t.insertRow(); r.insertCell().textContent = a; r.insertCell().textContent = b; }
+    return t;
+  }
+  function exampleBox(ex) {
+    const box = el('div', { className: 'example' });
+    const head = el('div', { className: 'ehead' }, el('span', { className: 'badge', textContent: ex.mode === 'json' ? 'JSON' : 'SQL' }), ex.title);
+    const load = el('button', { textContent: 'Load' });
+    load.addEventListener('click', () => { closeHelp(); setMode(ex.mode, ex.text); });
+    const go = el('button', { textContent: 'Run' });
+    go.addEventListener('click', () => { closeHelp(); setMode(ex.mode, ''); runText(ex.text, ex.mode); pushHistory(ex.text); });
+    head.append(load, go);
+    box.append(head, el('pre', { textContent: ex.text }));
+    return box;
+  }
 
-    if (e.key === 'ArrowUp' && atStart && historyPos > 0) {
-      e.preventDefault();
-      if (historyPos === history.length) draft = sqlEl.value;
-      historyPos -= 1;
-      sqlEl.value = history[historyPos];
-      sqlEl.setSelectionRange(0, 0);
-    } else if (e.key === 'ArrowDown' && atEnd && historyPos < history.length) {
-      e.preventDefault();
-      historyPos += 1;
-      sqlEl.value = historyPos === history.length ? draft : history[historyPos];
-      const p = sqlEl.value.length;
-      sqlEl.setSelectionRange(p, p);
-    }
-  });
+  // What each collection method in sq-json's own help list does (that list
+  // gives only the syntax).
+  const METHOD_HELP = {
+    find: 'matching documents; chain .sort / .skip / .limit, or end with .count() or .explain() to see the plan',
+    findOne: 'the first matching document',
+    insertOne: 'add one document, or many',
+    updateOne: 'change the first / every match with update operators, or replace one whole document; {upsert: true} inserts when nothing matches',
+    deleteOne: 'remove the first / every match',
+    findOneAndUpdate: 'update one document and return it — as it was, or as it is with returnDocument: \'after\'',
+    findOneAndReplace: 'replace or delete one document and return it',
+    countDocuments: 'how many match; the distinct values of a field; or run an aggregation pipeline',
+    createIndex: 'index fields ({price: 1} ascending, -1 descending; {unique: true}); list or drop indexes; drop() deletes the collection',
+  };
 
-  boot().catch((e) => {
-    statusEl.textContent = 'failed to load: ' + e;
-    console.error(e);
-  });
+  const PAGES = {};
+  function buildHelp() {
+    const help = JSON.parse(SquealDb.help());
+
+    PAGES.start = () => [
+      html(`<p>This page is a complete database engine compiled to WebAssembly. It has two ways in, over one
+        database:</p>
+        <ul>
+          <li><b>SQL</b> — tables with typed columns, primary/foreign keys, indexes, joins, aggregates,
+            transactions, partitioning, <code>EXPLAIN</code>. Statements end with <code>;</code>.</li>
+          <li><b>JSON documents</b> — MongoDB-style collections of schemaless JSON documents, used with
+            mongosh syntax: <code>db.products.insertOne({name: 'pen', price: 1.5})</code>,
+            <code>db.products.find({price: {$lt: 5}})</code>, update operators, aggregation pipelines,
+            indexes, transactions.</li>
+        </ul>
+        <p>Switch between them with the <b>SQL</b> / <b>JSON documents</b> tabs. Both are saved together in
+        this browser and reopened when you come back.</p>
+        <h3>Try it in 30 seconds</h3>
+        <p>Run the two "load" examples below, then any of the others in <b>Examples</b>. Click a past
+        command in the notebook to put it back in the prompt.</p>`),
+      exampleBox(EXAMPLES.find((e) => e.mode === 'sql')),
+      exampleBox(EXAMPLES.find((e) => e.mode === 'json')),
+      html(`<h3>Where to look next</h3>
+        <ul>
+          <li><b>SQL reference</b> — every statement the engine accepts (the same list <code>!help</code> prints).</li>
+          <li><b>JSON reference</b> — every collection method, query/update operator and pipeline stage.</li>
+          <li><b>Keys &amp; saving</b> — how Enter works, history, CSV loading, and where data is kept.</li>
+        </ul>`),
+    ];
+
+    PAGES.sql = () => {
+      const out = [html(`<p>Statements end with <code>;</code> and several can run at once, in order
+        (each one finishes before the next starts). Identifiers are case-insensitive. <code>[brackets]</code>
+        are optional, <code>|</code> separates alternatives.</p>`)];
+      for (const section of help.sql) {
+        out.push(el('h3', { textContent: section.title }), refTable(section.entries));
+      }
+      out.push(el('h3', { textContent: 'Commands (SQL tab, one per run)' }), refTable(help.commands));
+      out.push(html(`<h3>Notes</h3><ul>
+        <li>Strings use single quotes; double a quote inside one: <code>'it''s'</code>.</li>
+        <li><code>COPY … FROM @path</code> needs a file system, which a browser hasn't got: use
+          <b>Load CSV…</b> instead.</li>
+        <li>Results show at most what the query returns — add <code>LIMIT</code> for big tables.</li></ul>`));
+      return out;
+    };
+
+    PAGES.json = () => [
+      html(`<p>Statements use mongosh syntax. Arguments are JavaScript-style object literals: keys may be
+        unquoted, strings single- or double-quoted, trailing commas are fine. Several statements can run at
+        once, one per line (or separated by <code>;</code>); a line starting with <code>.</code> continues the
+        one above, as in <code>db.c.find({})</code> then <code>.sort({a: 1})</code>. Documents get an
+        <code>_id</code> (an ObjectId) if you don't give one.</p>`),
+      el('h3', { textContent: 'Statements and collection methods' }),
+      refTable(help.json.split('\n').filter((l) => l.trim() && l.trim() !== 'exit').map((l) => {
+        const m = l.match(/^(.*?\S)\s{2,}(\S.*)$/);
+        if (m) return [m[1], m[2]];
+        const method = (l.match(/^db\.<coll>\.(\w+)/) || [])[1];
+        return [l, METHOD_HELP[method] || ''];
+      })),
+      el('h3', { textContent: 'Query operators (in find, findOne, countDocuments, $match, …)' }),
+      refTable([
+        ["{field: value}  ·  {'a.b': value}", 'equals (dotted paths reach into nested documents; on an array, matches any element)'],
+        ['$eq $ne $gt $gte $lt $lte', "comparison — {price: {$gte: 2, $lt: 10}}"],
+        ['$in $nin', "{tags: {$in: ['office', 'paper']}}"],
+        ['$exists $size $all $elemMatch', "{tags: {$size: 2}}, {items: {$elemMatch: {qty: {$gt: 5}}}}"],
+        ['$regex (with $options)', "{name: {$regex: '^p', $options: 'i'}}"],
+        ['$and $or $nor $not', "{$or: [{price: {$lt: 2}}, {tags: 'paper'}]}"],
+        ['$expr', "compare two fields: {$expr: {$gt: ['$stock.store', '$stock.warehouse']}}"],
+      ]),
+      el('h3', { textContent: 'Update operators (updateOne, updateMany, findOneAndUpdate)' }),
+      refTable([
+        ['$set $unset $rename', "{$set: {'stock.store': 0}}, {$unset: {premium: ''}}"],
+        ['$inc $mul $min $max', '{$inc: {qty: -1}}'],
+        ['$setOnInsert', 'only when an upsert inserts'],
+        ['$currentDate', "{$currentDate: {updated: true}}"],
+        ['$push $addToSet (with $each) $pull $pop', "{$push: {tags: {$each: ['a', 'b']}}}, {$pull: {tags: 'a'}}"],
+        ['{upsert: true}', 'insert when nothing matches (third argument)'],
+      ]),
+      el('h3', { textContent: 'Aggregation pipeline — db.<coll>.aggregate([stages])' }),
+      refTable([
+        ['$match $sort $skip $limit $count', 'filter, order and trim'],
+        ['$project $addFields / $set $unset', 'reshape documents; compute fields'],
+        ['$group', "{$group: {_id: '$tags', n: {$sum: 1}, avg: {$avg: '$price'}}}"],
+        ['$unwind', 'one document per array element'],
+        ['$lookup', "join: {$lookup: {from: 'products', localField: 'product', foreignField: '_id', as: 'p'}}"],
+        ['$replaceRoot / $replaceWith', 'make a subdocument the document'],
+        ['accumulators', '$sum $avg $min $max $first $last $push $addToSet'],
+        ['expressions', '$add $subtract $multiply $divide $mod $abs $concat $toLower $toUpper $cond $ifNull $eq $ne $gt $gte $lt $lte $cmp $and $or $not $in $size $arrayElemAt $literal'],
+      ]),
+      el('h3', { textContent: 'Values' }),
+      refTable([
+        ["'text'  42  1.5  true  null  [1, 2]  {a: 1}", 'the usual JSON values'],
+        ['ObjectId("…")', 'a 12-byte id (what _id defaults to)'],
+        ['ISODate("2024-05-01T10:00:00Z")  ·  new Date("…")', 'a date'],
+        ['NumberLong(…)  NumberInt(…)', 'explicit integer types'],
+      ]),
+      html(`<h3>Notes</h3><ul>
+        <li><code>use &lt;db&gt;</code> switches database (the prompt label shows the current one; it starts at <code>test</code>).</li>
+        <li>Documents and SQL tables live in one database file but don't see each other: SQL can't query a
+          collection, and a collection isn't a table.</li>
+        <li>Sorting and ranges compare values MongoDB's way (numbers before strings, and so on).</li></ul>`),
+    ];
+
+    PAGES.examples = () => [
+      html(`<p><b>Load</b> puts an example in the prompt for you to edit; <b>Run</b> runs it straight away.
+        They build on each other — run the first of each kind first.</p>`),
+      el('h3', { textContent: 'SQL' }), ...EXAMPLES.filter((e) => e.mode === 'sql').map(exampleBox),
+      el('h3', { textContent: 'JSON documents' }), ...EXAMPLES.filter((e) => e.mode === 'json').map(exampleBox),
+    ];
+
+    PAGES.keys = () => [html(`
+      <h3>Running</h3>
+      <table class="ref">
+        <tr><td><kbd>Enter</kbd></td><td>SQL: runs once the text ends with <code>;</code> (otherwise a new line).
+          JSON: runs once every bracket and quote is closed.</td></tr>
+        <tr><td><kbd>Shift</kbd>+<kbd>Enter</kbd></td><td>always a new line</td></tr>
+        <tr><td><kbd>⌘</kbd>/<kbd>Ctrl</kbd>+<kbd>Enter</kbd></td><td>always runs</td></tr>
+        <tr><td><kbd>↑</kbd> / <kbd>↓</kbd> at the start / end of the text</td><td>step through history (both
+          modes, kept across reloads)</td></tr>
+        <tr><td>click a past command</td><td>puts it back in the prompt, in its mode</td></tr>
+      </table>
+      <h3>Saving</h3>
+      <p>The database — tables and collections — is saved in this browser (IndexedDB) about half a second after
+      each change, and when the tab is hidden; it is reopened on reload. Only committed data is saved: an open
+      transaction's writes aren't, until you commit. If you try to leave with a save pending, the browser asks
+      first. <b>Forget saved database</b> deletes it and starts empty. The browser may evict saved data under
+      storage pressure, and two tabs each keep their own copy (the last to save wins) — this is a scratchpad,
+      not a server.</p>
+      <h3>Loading data</h3>
+      <p><b>Load CSV…</b> reads a CSV file from your machine, infers column types from its first rows, creates a
+      SQL table and loads every row. JSON documents can be pasted into <code>insertMany([...])</code>.</p>
+      <h3>About</h3>
+      <p>squeal-db is a Rust storage engine (B+ trees, MVCC transactions, a write-ahead log) with a SQL layer and
+      a document layer on top, compiled to WebAssembly. Everything runs on the page; there is no server.</p>`)];
+  }
+
+  function openHelp(tab = 'start') {
+    helpEl.classList.add('open');
+    for (const b of helpEl.querySelectorAll('.htab')) b.classList.toggle('active', b.dataset.tab === tab);
+    helpBody.replaceChildren(...PAGES[tab]());
+    helpBody.scrollTop = 0;
+  }
+  function closeHelp() { helpEl.classList.remove('open'); inputEl.focus(); }
+  $('help-btn').addEventListener('click', () => openHelp('start'));
+  $('examples-btn').addEventListener('click', () => openHelp('examples'));
+  $('help-close').addEventListener('click', closeHelp);
+  for (const b of helpEl.querySelectorAll('.htab')) b.addEventListener('click', () => openHelp(b.dataset.tab));
+  helpEl.addEventListener('click', (e) => { if (e.target === helpEl) closeHelp(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && helpEl.classList.contains('open')) closeHelp(); });
+
+  boot().catch((e) => { statusEl.textContent = 'failed to load: ' + e; console.error(e); });
 </script>
 
 </body>

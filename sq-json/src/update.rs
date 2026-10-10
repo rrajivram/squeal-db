@@ -194,8 +194,8 @@ fn apply_op(doc: &mut Document, op: Op, path: &str, arg: &Value, inserting: bool
             Ok(())
         }
         Op::CurrentDate => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            let now = store::clock::SystemTime::now()
+                .duration_since(store::clock::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             set_path(doc, path, Value::Date(now))

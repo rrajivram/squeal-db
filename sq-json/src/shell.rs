@@ -436,8 +436,8 @@ impl Parser<'_> {
                             }
                             ("ObjectId", Some(hex)) => tagged("$oid", hex),
                             ("ISODate" | "Date", None) => {
-                                let ms = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
+                                let ms = store::clock::SystemTime::now()
+                                    .duration_since(store::clock::UNIX_EPOCH)
                                     .map(|d| d.as_millis() as i64)
                                     .unwrap_or(0);
                                 format!("{{\"$date\":{ms}}}")

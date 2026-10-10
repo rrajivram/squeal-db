@@ -23,6 +23,10 @@ use squeal_sql::{
     rslt::resultset::{ResultSet, ResultType, StreamingResultSet},
     source::QueryStats,
 };
+use sq_json::{
+    Client,
+    shell::{Outcome, Shell},
+};
 use store::memfile::MemFile;
 use wasm_bindgen::prelude::*;
 
@@ -65,6 +69,10 @@ pub struct SquealDb {
     // only ever sees one handle to a given SquealDb, so there's no real
     // aliasing risk, just Rust's borrow rules needing satisfying.
     last_stats: RefCell<Option<Vec<(String, QueryStats)>>>,
+    // The document (JSON) side: sq-json's mongosh-style shell, over the
+    // same store database as the SQL connection — so one snapshot holds
+    // tables and collections both. Started on first use (see `json`).
+    json: RefCell<Option<Shell<MemFile>>>,
 }
 
 #[wasm_bindgen]
@@ -87,6 +95,7 @@ impl SquealDb {
             name: name.to_string(),
             conn,
             last_stats: RefCell::new(None),
+            json: RefCell::new(None),
         })
     }
 
@@ -147,6 +156,54 @@ impl SquealDb {
             .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
     }
 
+    /// Runs document (JSON) statements — sq-json's mongosh-style shell:
+    /// `db.orders.insertOne({...})`, `db.orders.find({qty: {$gt: 5}})`,
+    /// `use shop`, `show collections`, `begin`/`commit`, `help`. Several
+    /// may be given at once, separated by `;` or by line breaks (a line
+    /// that starts with `.` continues the statement before it, as in
+    /// `db.c.find({})` then `.sort({a: 1})`). Returns the same JSON-array
+    /// shape `execute()` does: one `Message` per statement, its text what
+    /// the shell printed (documents as JSON, one per line). Throws at the
+    /// first statement that fails, naming it; the ones before it have
+    /// taken effect.
+    ///
+    /// Collections live in the same store as the SQL tables (as `sqjson.*`
+    /// store tables, under their own catalog — a SQL schema named
+    /// `sqjson` would collide with them), so `snapshot()` saves both.
+    #[wasm_bindgen(js_name = executeJson)]
+    pub fn execute_json(&self, input: &str) -> Result<String, JsError> {
+        let out = self.run_json(input).map_err(|e| JsError::new(&e))?;
+        serde_json::to_string(&out)
+            .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
+    }
+
+    /// The JSON shell's prompt: its current database, and `(txn)` while a
+    /// transaction is open — e.g. `test> `.
+    #[wasm_bindgen(js_name = jsonPrompt)]
+    pub fn json_prompt(&self) -> String {
+        match &*self.json.borrow() {
+            Some(shell) => shell.prompt(),
+            None => "test> ".into(),
+        }
+    }
+
+    /// Every help text the page shows, as JSON — taken from the engines
+    /// themselves, so the page can't drift from what they accept:
+    /// `{ commands: [[cmd, what]], sql: [{ title, entries: [[syntax,
+    /// what]] }], json: "<sq-json's help>" }`.
+    pub fn help() -> String {
+        let sql: Vec<serde_json::Value> = squeal_sql::help::SQL_HELP
+            .iter()
+            .map(|s| serde_json::json!({ "title": s.title, "entries": s.entries }))
+            .collect();
+        serde_json::json!({
+            "commands": COMMANDS,
+            "sql": sql,
+            "json": sq_json::shell::HELP,
+        })
+        .to_string()
+    }
+
     /// Non-SQL: infers a table's columns/types from `csv_text` (a whole
     /// CSV document, header row included), creates `table_name` with
     /// them, and loads every row — this crate's own way to offer `CREATE
@@ -189,6 +246,98 @@ impl SquealDb {
         serde_json::to_string(&[JsonResult::Message { text }])
             .map_err(|e| JsError::new(&format!("failed to serialize results: {e}")))
     }
+}
+
+impl SquealDb {
+    // execute_json's work, its error as text (a JsError can't be made off
+    // wasm32, where the tests run).
+    fn run_json(&self, input: &str) -> Result<Vec<JsonResult>, String> {
+        let mut json = self.json.borrow_mut();
+        let shell = match &mut *json {
+            Some(shell) => shell,
+            None => {
+                let client = Client::start(self.conn.store()).map_err(|e| e.to_string())?;
+                json.insert(Shell::new(client))
+            }
+        };
+        let mut out = vec![];
+        for statement in split_json_statements(input) {
+            match shell.execute(&statement) {
+                Ok(Outcome::Output(text)) => out.push(JsonResult::Message {
+                    text: if text.is_empty() { "ok".into() } else { text },
+                }),
+                // There is no shell to leave: the page stays.
+                Ok(Outcome::Exit) => out.push(JsonResult::Message {
+                    text: "(nothing to exit — this is a page; close the tab to leave)".into(),
+                }),
+                Err(e) => return Err(format!("{statement}\n  error: {e}")),
+            }
+        }
+        Ok(out)
+    }
+}
+
+// Document statements in `input`, one per entry: split at a `;` or a line
+// break outside brackets and quotes — except before a line whose first
+// non-blank character is `.`, which continues the statement (a chained
+// `.sort(...)`). Empty pieces are dropped.
+fn split_json_statements(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = vec![];
+    let mut current = String::new();
+    let (mut depth, mut quote): (i32, Option<char>) = (0, None);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some(q) => {
+                current.push(c);
+                if c == '\\' {
+                    if let Some(&next) = chars.get(i + 1) {
+                        current.push(next);
+                        i += 1;
+                    }
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    current.push(c);
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    current.push(c);
+                }
+                ';' if depth <= 0 => {
+                    out.push(std::mem::take(&mut current));
+                }
+                '\n' if depth <= 0 => {
+                    let continues = chars[i + 1..]
+                        .iter()
+                        .find(|c| !c.is_whitespace())
+                        .is_some_and(|c| *c == '.');
+                    if continues {
+                        current.push(c);
+                    } else {
+                        out.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(c),
+            },
+        }
+        i += 1;
+    }
+    out.push(current);
+    out.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 // What snapshot() produces and fromSnapshot() reads back. `version` so a
@@ -240,6 +389,7 @@ fn restore(bytes: &[u8]) -> Result<SquealDb, String> {
         name: snapshot.name,
         conn,
         last_stats: RefCell::new(None),
+        json: RefCell::new(None),
     })
 }
 
@@ -279,7 +429,94 @@ enum JsonResult {
 // nothing in this batch was a SELECT at all, in which case the caller
 // leaves SquealDb::last_stats untouched rather than clobbering it.
 #[allow(clippy::type_complexity)]
+//
+// The statements in `sql` are run one at a time, each one's results drained
+// before the next runs: a batch run as one Statement produces a SELECT's
+// rows only after every statement in it has run, so `begin; select ...;
+// rollback` read the SELECT after the rollback had ended its transaction.
 fn execute_results(
+    conn: &Arc<Connection<MemFile>>,
+    sql: &str,
+) -> Result<(Vec<JsonResult>, Option<Vec<(String, QueryStats)>>), squeal_sql::error::SchemaError> {
+    let mut out = vec![];
+    let mut stats = None;
+    let statements = split_sql_statements(sql);
+    // A batch of nothing (blank, or only comments) still goes to the parser,
+    // for the same answer as ever.
+    let statements = if statements.is_empty() { vec![sql.to_string()] } else { statements };
+    for statement in statements {
+        let (results, s) = execute_one(conn, &statement)?;
+        out.extend(results);
+        if s.is_some() {
+            stats = s;
+        }
+    }
+    Ok((out, stats))
+}
+
+// SQL statements in `sql`, split at each `;` outside quotes ('...' with ''
+// for a quote inside, "..." identifiers) and comments (-- to the end of
+// the line, /* ... */). Empty pieces are dropped.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let b = sql.as_bytes();
+    let mut out = vec![];
+    let (mut start, mut i) = (0, 0);
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"') => {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        // '' inside a string is a quote, not its end.
+                        if b.get(i + 1) == Some(&q) {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if b.get(i + 1) == Some(&b'-') => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b';' => {
+                out.push(sql[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(sql[start.min(sql.len())..].to_string());
+    // A piece that is only blanks and comments isn't a statement.
+    out.into_iter()
+        .filter(|s| {
+            let mut rest = s.trim();
+            loop {
+                if let Some(r) = rest.strip_prefix("--") {
+                    rest = r.split_once('\n').map_or("", |(_, r)| r).trim();
+                } else if let Some(r) = rest.strip_prefix("/*") {
+                    rest = r.split_once("*/").map_or("", |(_, r)| r).trim();
+                } else {
+                    return !rest.is_empty();
+                }
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn execute_one(
     conn: &Arc<Connection<MemFile>>,
     sql: &str,
 ) -> Result<(Vec<JsonResult>, Option<Vec<(String, QueryStats)>>), squeal_sql::error::SchemaError> {
@@ -495,6 +732,105 @@ mod tests {
             .iter()
             .map(|r| r["kind"].as_str().unwrap())
             .collect()
+    }
+
+    fn json(db: &SquealDb, input: &str) -> Vec<String> {
+        let out = db.run_json(input).unwrap();
+        let v: Vec<serde_json::Value> =
+            serde_json::from_str(&serde_json::to_string(&out).unwrap()).unwrap();
+        v.iter().map(|r| r["text"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[test]
+    fn test_json_statements_insert_find_and_aggregate() {
+        let db = SquealDb::new("j1").unwrap();
+        let out = json(
+            &db,
+            "use shop\n\
+             db.orders.insertMany([{_id: 1, item: 'pen', qty: 5}, {_id: 2, item: 'ink', qty: 1},\n\
+                                   {_id: 3, item: 'pad', qty: 9}]);\n\
+             db.orders.find({qty: {$gt: 2}}, {item: 1, _id: 0})\n\
+               .sort({qty: -1})\n\
+             db.orders.aggregate([{$group: {_id: null, total: {$sum: '$qty'}}}])",
+        );
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[0], "switched to db shop");
+        assert_eq!(out[2], "{\"item\":\"pad\"}\n{\"item\":\"pen\"}");
+        assert!(out[3].contains("\"total\":15"), "{}", out[3]);
+        assert_eq!(db.json_prompt(), "shop> ");
+    }
+
+    #[test]
+    fn test_a_failing_json_statement_names_itself() {
+        let db = SquealDb::new("j2").unwrap();
+        let err = db.run_json("db.c.insertOne({a: 1})\ndb.c.find({a: })").unwrap_err();
+        assert!(err.starts_with("db.c.find({a: })"), "{err}");
+        // The statement before it took effect.
+        assert_eq!(json(&db, "db.c.countDocuments({})"), ["1"]);
+    }
+
+    // Collections live in the same store as tables: one snapshot keeps
+    // both.
+    #[test]
+    fn test_a_snapshot_keeps_collections_and_tables() {
+        let db = SquealDb::new("j3").unwrap();
+        db.execute("create table t (id integer not null, primary key(id)); insert into t values (7)")
+            .unwrap();
+        json(&db, "db.notes.insertOne({_id: 1, text: 'hello', tags: ['a', 'b']})");
+        let db = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        assert_eq!(
+            json(&db, "db.notes.findOne({_id: 1})"),
+            ["{\"_id\":1,\"text\":\"hello\",\"tags\":[\"a\",\"b\"]}"]
+        );
+        assert_eq!(exec(&db, "select id from t")[0]["rows"], serde_json::json!([["7"]]));
+    }
+
+    #[test]
+    fn test_json_statements_split_where_they_end() {
+        assert_eq!(
+            split_json_statements("show dbs; use x\n\ndb.a.find({b: ';\\n', c: [1,\n2]})\n  .limit(1)\n"),
+            ["show dbs", "use x", "db.a.find({b: ';\\n', c: [1,\n2]})\n  .limit(1)"]
+        );
+    }
+
+    // Statements in one batch run in order, each finished before the next:
+    // a SELECT inside a transaction is read before the ROLLBACK after it.
+    #[test]
+    fn test_a_select_inside_a_batched_transaction_reads_before_it_ends() {
+        let db = SquealDb::new("b1").unwrap();
+        db.execute("create table o (id integer not null, qty integer, primary key(id)); insert into o values (1, 5)")
+            .unwrap();
+        let out = exec(
+            &db,
+            "begin; update o set qty = 0 where id = 1; select qty from o; rollback; select qty from o",
+        );
+        assert_eq!(kinds(&out), ["Message", "Count", "Rows", "Message", "Rows"]);
+        assert_eq!(out[2]["rows"], serde_json::json!([["0"]]));
+        assert_eq!(out[4]["rows"], serde_json::json!([["5"]]));
+    }
+
+    #[test]
+    fn test_sql_statements_split_outside_quotes_and_comments() {
+        assert_eq!(
+            split_sql_statements(
+                "insert into t values ('a;b', 'it''s'); -- a; comment\nselect \"x;y\" from t /* ; */ ;  ;\n-- only a comment"
+            ),
+            [
+                "insert into t values ('a;b', 'it''s')",
+                " -- a; comment\nselect \"x;y\" from t /* ; */ ",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_help_is_json_with_every_part() {
+        let help: serde_json::Value = serde_json::from_str(&SquealDb::help()).unwrap();
+        assert!(help["commands"].as_array().unwrap().len() >= 4);
+        assert_eq!(
+            help["sql"].as_array().unwrap().len(),
+            squeal_sql::help::SQL_HELP.len()
+        );
+        assert!(help["json"].as_str().unwrap().contains("db.<coll>.find("));
     }
 
     #[test]
@@ -738,3 +1074,4 @@ mod tests {
         );
     }
 }
+

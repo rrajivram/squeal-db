@@ -10,5 +10,9 @@ serde_json = "1.0"
 postcard = { version = "1.1.3", features = ["alloc"] }
 parking_lot = "0.12.5"
 thiserror = "2.0.18"
-rustyline = "18.0.1"
 regex = "1"
+
+# The shell binary's line editor (src/main.rs) — not on wasm32, where the
+# library runs inside squeal-wasm and rustyline can't build.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustyline = "18.0.1"

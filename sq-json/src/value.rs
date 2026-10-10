@@ -120,8 +120,8 @@ static OID_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 impl ObjectId {
     pub fn new() -> Self {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let secs = store::clock::SystemTime::now()
+            .duration_since(store::clock::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
         let random = process_random();
@@ -157,13 +157,22 @@ impl Default for ObjectId {
 }
 
 // Per-process random bytes, from the standard library's randomly seeded
-// hasher (no extra dependency needed for 5 bytes of entropy).
+// hasher (no extra dependency needed for 5 bytes of entropy), mixed with
+// the process id and the time — wasm32 has no process ids (asking panics)
+// and no OS randomness behind that hasher, so there the time is what
+// tells two page loads apart.
 fn process_random() -> [u8; 8] {
     use std::hash::{BuildHasher, Hasher};
     static RANDOM: std::sync::OnceLock<[u8; 8]> = std::sync::OnceLock::new();
     *RANDOM.get_or_init(|| {
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        #[cfg(not(target_arch = "wasm32"))]
         h.write_u64(std::process::id() as u64);
+        let nanos = store::clock::SystemTime::now()
+            .duration_since(store::clock::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        h.write_u128(nanos);
         h.finish().to_be_bytes()
     })
 }

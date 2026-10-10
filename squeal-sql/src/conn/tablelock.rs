@@ -33,8 +33,11 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+// Not std's: its now() panics on wasm32 (see store::clock).
+use store::clock::Instant;
 
 use parking_lot::{Condvar, Mutex};
 

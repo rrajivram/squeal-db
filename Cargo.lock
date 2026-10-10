@@ -1548,6 +1548,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "sq-json",
  "squeal-sql",
  "store",
  "wasm-bindgen",

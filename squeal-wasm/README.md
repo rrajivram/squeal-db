@@ -31,6 +31,27 @@ Requires `wasm-bindgen-cli`, matching the `wasm-bindgen` version in
 cargo install wasm-bindgen-cli --version 0.2.126 --locked
 ```
 
+## JSON documents
+
+The same database also holds MongoDB-style collections of JSON documents,
+used with mongosh syntax through sq-json's shell:
+
+```js
+db.executeJson(`use shop
+db.products.insertMany([{_id: 1, name: 'pen', price: 1.5}, {_id: 2, name: 'ink', price: 7.25}])
+db.products.find({price: {$lt: 5}}).sort({price: -1})`);
+db.jsonPrompt();           // "shop> " — the current database, "(txn)" in a transaction
+SquealDb.help();           // JSON: the SQL reference, the !commands, the JSON method list
+```
+
+Statements are separated by `;` or line breaks (a line starting with `.`
+continues the one before it). Each returns one `Message` whose text is what
+the shell printed — documents as JSON, one per line. Collections are stored
+in the same store as the SQL tables (as `sqjson.*` store tables, so a SQL
+schema named `sqjson` would collide), and `snapshot()` saves both. The demo
+page has a SQL / JSON documents switch, a Help panel generated from
+`SquealDb.help()`, and runnable examples (`www/examples.js`).
+
 ## Loading a CSV
 
 `CREATE TABLE t AS COPY FROM @path` infers column names/types from a CSV's
@@ -98,3 +119,29 @@ console.log(db.execute('select * from t'));
 ```bash
 cargo test -p squeal-wasm
 ```
+
+## Checking the demo's examples against a real build
+
+Every example in `www/examples.js` (what the Help panel offers) and every
+JSON operator the Help panel's reference claims, run against the wasm
+build — fails if any doesn't work:
+
+```bash
+wasm-bindgen --target nodejs --out-dir /tmp/squeal-node \
+    target/wasm32-unknown-unknown/release/squeal_wasm.wasm
+node squeal-wasm/test-examples.mjs /tmp/squeal-node
+```
+
+## Deploying the demo
+
+`www/` is a static site, served by Cloudflare as the `squeal-db-demo`
+Worker (`www/wrangler.jsonc`; `www/.assetsignore` keeps config files out):
+
+```bash
+cargo build --target wasm32-unknown-unknown -p squeal-wasm --release
+wasm-bindgen --target web --out-dir squeal-wasm/www/pkg \
+    target/wasm32-unknown-unknown/release/squeal_wasm.wasm
+cd squeal-wasm/www && wrangler deploy
+```
+
+The `.wasm` must stay under Cloudflare's 25 MiB per-asset limit (it is ~13 MB).

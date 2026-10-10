@@ -191,6 +191,11 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
   orders count 32/45/73/84 -> 30/7.8/4.6/3.5. Note `cargo test
   --workspace` builds squeal-cli too, which turns tracking on for the
   whole build — measure per package.
+- [ ] squeal-sql runs a batch (several statements in one Statement) all
+  at once and produces SELECT rows lazily after: `begin; select ...;
+  rollback` reads the SELECT after the rollback (TransactionAlreadyFinished).
+  squeal-wasm now runs a batch a statement at a time; squeal-sql's own
+  batch API (and anything else using it) still has it.
 - [ ] The file is 12% bigger: 8 bytes of slot directory per tuple, on
   index pages too. u16 offsets/lengths would halve that for pages under
   64 KiB — a change to SlottedPage's layout, so a page format version.

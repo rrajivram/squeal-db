@@ -15,3 +15,10 @@ pub use client::{Client, Database, Session};
 pub use collection::{Collection, FindOneAndOptions, FindOptions, IndexInfo, IndexOptions, UpdateResult};
 pub use error::{Error, Result};
 pub use value::{Document, ObjectId, Value};
+
+/// What a `Client` (and its databases, collections, sessions) stores to by
+/// default: a file, or — on wasm32, which has no files — memory.
+#[cfg(not(target_arch = "wasm32"))]
+pub type DefaultFile = std::fs::File;
+#[cfg(target_arch = "wasm32")]
+pub type DefaultFile = store::memfile::MemFile;

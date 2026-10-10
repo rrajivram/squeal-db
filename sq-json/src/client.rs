@@ -35,7 +35,7 @@ const CATALOG_TABLE: &str = "sqjson.catalog";
 const TABLE_NUMBERS: &str = "sqjson.tables";
 
 /// A document database in one store database file.
-pub struct Client<F: DBFile<Item = F> + 'static = std::fs::File> {
+pub struct Client<F: DBFile<Item = F> + 'static = crate::DefaultFile> {
     pub(crate) inner: Arc<Inner<F>>,
 }
 
@@ -171,7 +171,7 @@ impl<F: DBFile<Item = F> + 'static> Client<F> {
 }
 
 /// A namespace of collections.
-pub struct Database<F: DBFile<Item = F> + 'static = std::fs::File> {
+pub struct Database<F: DBFile<Item = F> + 'static = crate::DefaultFile> {
     inner: Arc<Inner<F>>,
     name: String,
 }
@@ -361,7 +361,7 @@ fn load_state<F: DBFile<Item = F> + 'static>(
 ///
 /// As in MongoDB, an operation that fails inside a transaction aborts the
 /// whole transaction.
-pub struct Session<F: DBFile<Item = F> + 'static = std::fs::File>(pub(crate) Arc<SessionInner<F>>);
+pub struct Session<F: DBFile<Item = F> + 'static = crate::DefaultFile>(pub(crate) Arc<SessionInner<F>>);
 
 impl<F: DBFile<Item = F> + 'static> Clone for Session<F> {
     fn clone(&self) -> Self {

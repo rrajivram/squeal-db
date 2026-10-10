@@ -1,0 +1,5 @@
+.wrangler
+.gitignore
+.assetsignore
+wrangler.jsonc
+pkg/*.d.ts

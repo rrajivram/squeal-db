@@ -79,6 +79,9 @@ impl Projection {
     pub(crate) fn parse(doc: &Document) -> Result<Option<Projection>> {
         let mut include = None;
         let mut id = true;
+        // `{_id: 1}` alone is a projection (just the _id), not no
+        // projection: tell it apart from `{}`.
+        let mut id_given = false;
         let mut fields = Tree::default();
         for (path, v) in doc.iter() {
             let on = match v {
@@ -93,6 +96,7 @@ impl Projection {
             };
             if path == "_id" {
                 id = on;
+                id_given = true;
                 continue;
             }
             match include {
@@ -107,7 +111,9 @@ impl Projection {
             fields.add(path);
         }
         Ok(match include {
-            None if id => None,
+            None if id && !id_given => None,
+            // `{_id: 1}`: include nothing but _id.
+            None if id => Some(Projection { include: true, fields, id }),
             None => Some(Projection { include: false, fields, id }),
             Some(include) => Some(Projection { include, fields, id }),
         })
@@ -221,6 +227,8 @@ mod tests {
             r#"{"_id":1,"name":"x","a":{"c":2},"items":[{"s":1,"t":2},{"s":3},5]}"#
         );
         assert_eq!(project(r#"{"_id":0}"#, r#"{"_id":1,"a":2}"#), r#"{"a":2}"#);
+        // `{_id: 1}` alone keeps just the _id, as MongoDB does.
+        assert_eq!(project(r#"{"_id":1}"#, r#"{"_id":1,"a":2}"#), r#"{"_id":1}"#);
         assert!(Projection::parse(&Document::parse(r#"{"a":1,"b":0}"#).unwrap()).is_err());
         assert!(Projection::parse(&Document::parse(r#"{"a":1,"b":{"$slice":1}}"#).unwrap()).is_err());
         assert!(Projection::parse(&Document::parse(r#"{}"#).unwrap()).unwrap().is_none());

@@ -132,7 +132,7 @@ struct Planned {
     sorted: bool,
 }
 
-pub struct Collection<F: DBFile<Item = F> + 'static = std::fs::File> {
+pub struct Collection<F: DBFile<Item = F> + 'static = crate::DefaultFile> {
     inner: Arc<Inner<F>>,
     ns: String,
     session: Option<Session<F>>,
