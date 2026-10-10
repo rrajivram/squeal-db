@@ -1587,6 +1587,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "postcard",
+ "rusqlite",
  "serde",
  "thiserror",
  "web-time",

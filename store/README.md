@@ -308,6 +308,78 @@ The other `unsafe` blocks in the crate are inside tests.
 - **`examples/wal_dump`.** Prints a WAL's records.
 - **`benches/`.** Criterion micro-benchmarks for pages and page locks.
 
+## Comparing with SQLite
+
+The store alone against SQLite 3.53 used as a key-value store: the same
+keyed 100-byte values and the same operations, with each phase's results
+compared (they agree in all of them). This measures the engine without a
+SQL layer on top; squeal-sql's README has the comparison with one.
+
+Two tables of 200,000 rows:
+- **`kv`:** an integer key. In SQLite, `INTEGER PRIMARY KEY`.
+- **`ordered`:** a two-integer key `(grp, seq)` with 100 rows a group,
+  the shape an index has. In SQLite, `PRIMARY KEY (grp, seq) WITHOUT
+  ROWID`.
+
+Both are on disk and equally durable: every commit waits for a full
+flush (`F_FULLFSYNC` on macOS; SQLite in WAL mode with
+`synchronous=FULL` and `fullfsync` on). SQLite runs a prepared statement
+per operation, where the store is called directly. Reads run inside one
+read transaction on both, except where noted.
+
+Measured 2026-10-10 on an Apple M4 Max, release build, median of three
+runs. Times are per operation. The last column is SQLite's time divided
+by the store's, so above 1 means the store is faster.
+
+| phase | store | SQLite | store vs SQLite |
+|---|---:|---:|---:|
+| Insert, integer keys, one transaction | 1.73 µs | 943 ns | 0.55x |
+| Insert, composite keys in order, one transaction | 3.66 µs | 971 ns | 0.27x |
+| Checkpoint after the load | 87.13 ms | 15.99 ms | 0.18x |
+| Point lookup, integer key | 589 ns | 703 ns | **1.19x** |
+| Point lookup, a transaction each | 2.96 µs | 1.39 µs | 0.47x |
+| Point lookup, composite key | 1.37 µs | 941 ns | 0.69x |
+| Full scan, per row | 19 ns | 46 ns | **2.42x** |
+| Prefix scan of 100 rows, per scan | 10.56 µs | 6.89 µs | 0.65x |
+| Range scan of 1% of the table, per row | 90 ns | 53 ns | 0.59x |
+| Update one row and commit | 4.45 ms | 4.30 ms | **0.97x** |
+| Insert one row and commit | 4.26 ms | 4.10 ms | **0.96x** |
+| Update, 100 rows a transaction, per row | 61.54 µs | 74.25 µs | **1.21x** |
+| Delete, one transaction, per row | 5.58 µs | 860 ns | 0.15x |
+| Point lookups on 4 threads, per lookup | 378 ns | 855 ns | **2.26x** |
+
+What the numbers say:
+
+- **Ahead on a full scan, and on concurrent reads.** A table scan lends
+  each row from its page without decoding it. Readers take no locks, so
+  four threads each read at the single-thread cost, where SQLite's slow
+  down.
+- **Slightly ahead on a point lookup by integer key; about 30% behind
+  on a composite key**, whose values are compared field by field.
+- **Behind on range and prefix scans**, by about 40%. These walk the
+  index and fetch each row from its data page, where a table scan reads
+  data pages straight through.
+- **Level on durable commits.** Both are bound by the disk flush. With
+  100 updates a transaction the flush still dominates.
+- **Behind when every lookup is its own transaction.** Beginning and
+  committing a read transaction costs about 2.4 µs, against a 0.6 µs
+  lookup.
+- **Behind on inserts in bulk, by 2-4x.** Each insert writes a WAL
+  record (through a channel to the log thread), a version record, a data
+  page and an index entry.
+- **Well behind on deletes**, at 5.6 µs a row. Not yet profiled.
+- **Checkpoints are slower.** Every dirty page is copied, then written
+  with its checksum.
+- **On disk:** 59 MB against SQLite's 48 MB after a checkpoint.
+
+To run it:
+
+```bash
+cargo run --release -p store --example kv_vs_sqlite -- 200000 4
+```
+
+The arguments are the rows per table and the number of reader threads.
+
 ## History
 
 The root design notes record how this got here, and some describe designs

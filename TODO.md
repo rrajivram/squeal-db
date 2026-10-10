@@ -51,6 +51,27 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
   against SQLite's per-row probe), join + GROUP BY 1.2x, single-row
   autocommit INSERT and UPDATE level (both bound by fsync).
 
+### The store alone (2026-10-10)
+
+`cargo run --release -p store --example kv_vs_sqlite -- 200000 4`: the
+store against SQLite as a key-value store (results in store/README.md).
+It separates the layers: a store point lookup is 0.59 us (SQLite 0.70),
+a SQL one 8 us — so the SQL benchmark's 6x lookup gap is squeal-sql's
+per-statement work, not the engine. Where the engine itself trails:
+
+- [ ] **Delete: 5.6 us a row** (SQLite 0.86). Not profiled yet.
+- [ ] **Bulk insert: 1.7 us a row by integer key, 3.7 by composite key**
+  (SQLite 0.9-1.0).
+- [ ] **A read transaction's begin + commit: ~2.4 us** — four times the
+  lookup inside it. What squeal-sql pays per autocommit statement.
+- [ ] **Range and prefix scans: 90 ns a row** (SQLite 53; a full table
+  scan here is 19). Each row is fetched from its data page through the
+  index entry; the same cost squeal-sql's IndexLookup pays more of.
+- [ ] **Composite-key lookup: 1.37 us** against 0.59 for an integer key.
+- [ ] **Checkpoint: 87 ms** for the 400k-row load (SQLite 16).
+- Ahead: full scan 2.4x, point lookups on 4 threads 2.3x, integer-key
+  lookup 1.2x. Level: durable single-row commits.
+
 ### Found on the way (store, fixed)
 
 - **A commit could return before its record was durable.** It waited for
