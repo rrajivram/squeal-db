@@ -416,6 +416,9 @@ pub(crate) struct Page {
     // on every access — only a page actually being considered for
     // eviction ever looks at this.
     referenced: AtomicBool,
+    // What the page cache counted this page as when it last installed it
+    // (see PageBuffer::install); 0 while not counted.
+    pub(crate) accounted: std::sync::atomic::AtomicUsize,
 }
 
 // A page's tuples, read from a snapshot of its content (see PageInner).
@@ -544,6 +547,7 @@ impl Page {
             lsn: RwLock::new(LsnId(0)),
             flags: AtomicU16::new(flags),
             referenced: AtomicBool::new(false),
+            accounted: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -799,6 +803,17 @@ impl Page {
 
     // A snapshot of the page's content, as iter() reads it: what a reader
     // lends tuples from once the page's lock is let go.
+    /// Bytes this page holds in memory: what the page cache counts it as.
+    pub(crate) fn mem_bytes(&self) -> usize {
+        let content = self.inner.read().data.mem_bytes();
+        std::mem::size_of::<Self>()
+            + if content > 0 {
+                content
+            } else {
+                self.page_data_size as usize
+            }
+    }
+
     pub(crate) fn content(&self) -> Arc<dyn PageTuple> {
         Arc::clone(&self.inner.read().data)
     }
@@ -1112,6 +1127,7 @@ impl Page {
             flags: AtomicU16::new(header.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(header.lsn),
             referenced: AtomicBool::new(false),
+            accounted: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -1260,6 +1276,7 @@ impl From<PageDto> for Page {
             flags: AtomicU16::new(value.flags & !HAS_OVERFLOW),
             lsn: RwLock::new(value.lsn),
             referenced: AtomicBool::new(false),
+            accounted: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -1297,6 +1314,41 @@ impl From<Page> for PageDto {
     }
 }
 
+impl Page {
+    /// A copy that shares this page's content rather than copying it: the
+    /// content is copy-on-write (see PageInner::data_mut), so a writer that
+    /// changes this page afterwards copies it then, and only then. What a
+    /// checkpoint captures each dirty page as: a deep copy of every dirty
+    /// page doubled the cache's dirty memory for the length of the write.
+    pub(crate) fn snapshot(&self) -> Self {
+        let inner = self.inner.read();
+        Self {
+            inner: RwLock::new(PageInner {
+                data: inner.data.clone(),
+                page_used_size: inner.page_used_size,
+                has_overflow: inner.has_overflow,
+                next_page: inner.next_page,
+                high_key: inner.high_key.clone(),
+                overflow_page_count: inner.overflow_page_count,
+            }),
+            dirty_version: AtomicU64::new(
+                self.dirty_version.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            flushed_version: AtomicU64::new(
+                self.flushed_version.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            page_data_size: self.page_data_size,
+            page_overhead: self.page_overhead,
+            record_size: self.record_size,
+            content_kind: self.content_kind,
+            flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
+            lsn: RwLock::new(*self.lsn.read()),
+            referenced: AtomicBool::new(false),
+            accounted: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 impl Clone for Page {
     fn clone(&self) -> Self {
         // Deep-copy, not a shared pointer: independent Page values (e.g. a
@@ -1328,6 +1380,7 @@ impl Clone for Page {
             flags: AtomicU16::new(self.flags.load(std::sync::atomic::Ordering::Relaxed)),
             lsn: RwLock::new(*self.lsn.read()),
             referenced: AtomicBool::new(self.referenced.load(std::sync::atomic::Ordering::Relaxed)),
+            accounted: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }

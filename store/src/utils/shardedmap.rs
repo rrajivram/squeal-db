@@ -102,6 +102,32 @@ where
     pub(crate) fn len(&self) -> usize {
         self.shards.iter().map(|s| s.read().len()).sum()
     }
+
+    pub(crate) fn contains_key(&self, key: &K) -> bool {
+        self.shard_for(key).read().contains_key(key)
+    }
+
+    // Reads the value for `key` in place: `get` without the clone (which,
+    // for a value like a transaction's whole write list, is the cost).
+    pub(crate) fn with<R>(&self, key: &K, f: impl FnOnce(Option<&V>) -> R) -> R {
+        f(self.shard_for(key).read().get(key))
+    }
+
+    // Gives back the memory of shards mostly emptied since they grew: a
+    // HashMap keeps its peak capacity until told otherwise, so a map that
+    // once held a million entries holds their room for good.
+    pub(crate) fn shrink_sparse(&self) {
+        for shard in &self.shards {
+            let mut s = shard.write();
+            if s.capacity() > 64 && s.len() * 4 < s.capacity() {
+                s.shrink_to_fit();
+            }
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.shards.iter().map(|s| s.read().capacity()).sum()
+    }
 }
 
 #[cfg(test)]

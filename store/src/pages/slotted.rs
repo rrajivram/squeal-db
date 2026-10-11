@@ -162,7 +162,7 @@ fn write_slot_entry_at(buf: &mut [u8], idx: usize, e: SlotEntry) {
 // slot_count=0 and the given declared_capacity. Shared by `new`, `clear`,
 // and `shrink_to_normal` (all three want "a blank page of some length").
 fn blank_buffer(len: usize, declared_capacity: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; len.max(HEADER_BYTES)];
+    let mut buf = crate::utils::bufpool::zeroed(len.max(HEADER_BYTES));
     write_u32(&mut buf, 0, 0);
     write_u32(&mut buf, SLOT_COUNT_BYTES, declared_capacity as u32);
     buf
@@ -198,10 +198,17 @@ pub struct SlottedPage {
     id_ends: Vec<u32>,
 }
 
+// The buffer goes back to the pool for the next page (see utils::bufpool).
+impl Drop for SlottedPage {
+    fn drop(&mut self) {
+        crate::utils::bufpool::give(std::mem::take(&mut self.buf));
+    }
+}
+
 impl Clone for SlottedPage {
     fn clone(&self) -> Self {
         Self {
-            buf: self.buf.clone(),
+            buf: crate::utils::bufpool::copy_of(&self.buf),
             heap_start: self.heap_start,
             dead_heap_bytes: self.dead_heap_bytes,
             prefixes: self.prefixes.clone(),
@@ -240,7 +247,7 @@ impl SlottedPage {
                 bytes.len()
             )));
         }
-        let buf = bytes.to_vec();
+        let buf = crate::utils::bufpool::copy_of(bytes);
         let slot_count = read_u32(&buf, 0) as usize;
         let dir_end = dir_offset(slot_count);
         if dir_end > buf.len() {
@@ -503,7 +510,7 @@ impl SlottedPage {
         debug_assert_eq!(self.slot_count(), 0, "grow_to_fit is only for an empty page");
         let declared_capacity = self.declared_capacity();
         let new_len = HEADER_BYTES + SLOT_ENTRY_BYTES + tuple_len;
-        self.buf = blank_buffer(new_len, declared_capacity);
+        crate::utils::bufpool::give(std::mem::replace(&mut self.buf, blank_buffer(new_len, declared_capacity)));
         self.heap_start = self.buf.len();
         self.dead_heap_bytes = 0;
     }
@@ -517,7 +524,7 @@ impl SlottedPage {
         if self.buf.len() == declared_capacity {
             return;
         }
-        self.buf = blank_buffer(declared_capacity, declared_capacity);
+        crate::utils::bufpool::give(std::mem::replace(&mut self.buf, blank_buffer(declared_capacity, declared_capacity)));
         self.heap_start = self.buf.len();
         self.dead_heap_bytes = 0;
     }
@@ -599,6 +606,15 @@ impl SlottedPage {
 impl PageTuple for SlottedPage {
     fn deep_clone(&self) -> Box<dyn PageTuple> {
         Box::new(self.clone())
+    }
+
+    // The buffer, and the per-slot search arrays beside it: on a page of
+    // short keys (an index leaf) the arrays are near the buffer's size.
+    fn mem_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.buf.capacity()
+            + self.prefixes.capacity() * std::mem::size_of::<u128>()
+            + self.id_ends.capacity() * std::mem::size_of::<u32>()
     }
 
     fn count(&self) -> Result<usize, StoreError> {
@@ -782,7 +798,7 @@ impl PageTuple for SlottedPage {
 
     fn clear(&mut self) -> Result<(), StoreError> {
         let declared_capacity = self.declared_capacity();
-        self.buf = blank_buffer(declared_capacity, declared_capacity);
+        crate::utils::bufpool::give(std::mem::replace(&mut self.buf, blank_buffer(declared_capacity, declared_capacity)));
         self.heap_start = self.buf.len();
         self.dead_heap_bytes = 0;
         self.prefixes.clear();

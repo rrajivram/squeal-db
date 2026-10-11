@@ -66,13 +66,13 @@ returns what a database is running with.
 
 | `OpenConfig` | default | |
 |---|---|---|
-| `page_cache_bytes` | 128 MiB | how much of the database stays in memory |
+| `page_cache_bytes` | 128 MiB | how much of the database stays in memory, counted in the bytes the cached pages actually hold |
 | `temp_cache_bytes` | 64 MiB | memory for query scratch pages before they spill to `<db>.tmp` |
 | `query_memory_bytes` | 64 MiB | what one query may hold before its operators spill; the store keeps it, the layer running queries enforces it |
 | `lock_timeout` | 1 s | how long a page lock is waited for |
 | `checkpoint_log_bytes` | 16 MiB | WAL growth that triggers a checkpoint |
 | `checkpoint_dirty_pages` | half the cache | dirty pages that trigger a checkpoint |
-| `snapshot_limits` | 256 MiB, 1M versions | what a long transaction may pin before it is aborted |
+| `snapshot_limits` | 256 MiB, 1M versions | what committed history a long reader may pin before it is aborted |
 | `maintenance_interval` | 10 ms | how often background maintenance runs when idle |
 
 **A page must hold four index entries.** A full tree page splits in two,
@@ -200,6 +200,17 @@ microseconds, so a timeout is a bug detector, not a contention knob.
 `PageBuffer` caches pages in memory, sharded by page id (16 shards, each its
 own lock).
 
+- **Bounded by bytes, not pages.** Each cached page is charged what it
+  really holds (`Page::mem_bytes`: its buffer, slot prefixes and offsets,
+  not just its on-disk size), and pages are evicted until the total is
+  within `page_cache_bytes`. A page whose content grows is re-charged when
+  it is installed again.
+- **Page buffers are reused.** Eviction drops a page's buffer and a read
+  allocates one. A small process-wide pool (`utils::bufpool`, up to
+  8 MiB) hands freed page-sized buffers to the next read, so churn
+  through the cache does not leave the allocator holding freed memory
+  it won't return.
+
 - **Eviction is CLOCK (second chance).**
   - A FIFO ring holds the eviction candidates.
   - Each cache hit sets the page's `referenced` bit, which is one atomic
@@ -213,6 +224,9 @@ own lock).
   them. Data reaches disk only through checkpoints, which is what makes the
   WAL rule simple to uphold (see below). The cache also checkpoints when too
   many dirty pages are waiting, which bounds memory.
+  A checkpoint captures the dirty pages by sharing their content
+  (`Page::snapshot`), not copying it; a writer that changes one meanwhile
+  copies it then, as below.
 - **Copy-on-write pages.** A page's content is an `Arc<dyn PageTuple>`.
   - A reader clones the `Arc` and walks a stable snapshot, holding no lock.
   - A writer copies the content only if a reader still holds the old
@@ -251,6 +265,15 @@ The short version is in [TXN_MODEL.md](../TXN_MODEL.md).
   points at the previous version, held in an in-memory `VersionStore`. A
   reader that can't see the newest version walks back to one it can.
   Deletes are tombstone versions, purged once no reader can see the row.
+  - **Only updates and deletes keep a pre-image.** An insert has no older
+    version for a reader to walk back to, and rolling it back needs only
+    its key. A transaction's writes are a compact log (postcard-encoded
+    `Inserted{table, key}` or `Replaced(lsn)`), a few bytes an insert.
+  - **A committed transaction's inserts are forgotten at once**; only its
+    pre-images wait for the horizon. A bulk load leaves nothing behind.
+  - **The maps shrink.** Once vacuum leaves a version map mostly empty,
+    its capacity is given back, so one large transaction doesn't leave
+    its peak allocated.
 - **Write conflicts: first committer wins.** Overwriting a row whose writer
   hadn't committed before you began is a `WriteConflict`. Per transaction,
   you choose (`ConflictPolicy`) whether that fails just the operation or
@@ -266,6 +289,11 @@ The short version is in [TXN_MODEL.md](../TXN_MODEL.md).
   - **Long-lived transactions:** these would pin history, so they are capped
     (`SnapshotLimits`). Past the cap, the oldest is aborted with
     `SnapshotTooOld` rather than letting memory or log grow without bound.
+    The caps count what is pinned for others — pre-images kept for
+    committed transactions, and WAL kept for a reader — not a writer's own
+    work: a transaction may write any number of rows, and the oldest
+    active transaction is spared the WAL cap if it has written, since that
+    WAL is its own undo.
 - **Everything is observable.** `Db::stats()` reports:
   - active, retained and aborting transactions
   - version records
@@ -439,10 +467,10 @@ What the numbers say:
   committing a read transaction costs about 2.4 µs, against a 0.6 µs
   lookup.
 - **Behind on inserts in bulk, by 2-4x.** Each insert writes a WAL
-  record (through a channel to the log thread), a version record, a data
+  record (through a channel to the log thread), a write-log entry, a data
   page and an index entry.
 - **Well behind on deletes**, at 5.6 µs a row. Not yet profiled.
-- **Checkpoints are slower.** Every dirty page is copied, then written
+- **Checkpoints are slower.** Every dirty page is encoded and written
   with its checksum.
 - **On disk:** 59 MB against SQLite's 48 MB after a checkpoint.
 

@@ -66,6 +66,12 @@ pub trait PageTuple: Send + Sync {
     /// `Page`'s lock.
     fn deep_clone(&self) -> Box<dyn PageTuple>;
 
+    /// Bytes this content holds in memory, by capacity — what the page
+    /// cache counts it as. 0: not known (the page's data size is used).
+    fn mem_bytes(&self) -> usize {
+        0
+    }
+
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError>;
 
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError>;

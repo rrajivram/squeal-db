@@ -243,6 +243,14 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // for pages that were evicted but not yet dropped (and gets pruned
     // lazily, on the next failed upgrade() for that page in get_page).
     strong_count: AtomicUsize,
+    // What the cache may hold, in bytes of the pages' real memory (see
+    // Page::mem_bytes), and what it holds: pages are not all page_size —
+    // an index leaf's search arrays nearly double it — so a bound in pages
+    // let a 128 MiB cache hold 180 MiB. Each resident page's share is
+    // recorded in it (Page::accounted) when installed, and given back when
+    // evicted or replaced.
+    max_bytes: AtomicUsize,
+    resident_bytes: AtomicUsize,
     #[cfg(not(target_arch = "wasm32"))]
     write_tx: Sender<BufMsg>,
     // None once shutdown() has taken it to join the thread — Drop uses that
@@ -324,6 +332,8 @@ where
             page_overhead,
             max_entries,
             strong_count: AtomicUsize::new(0),
+            max_bytes: AtomicUsize::new(max_entries.saturating_mul(page_size as usize)),
+            resident_bytes: AtomicUsize::new(0),
             write_epochs: (0..BUFFER_SHARD_COUNT).map(|_| AtomicU64::new(0)).collect(),
             buffer: (0..BUFFER_SHARD_COUNT)
                 .map(|_| RwLock::new(PageMap::default()))
@@ -855,7 +865,7 @@ where
                     out.push(CapturedPage {
                         page_num: *page_num,
                         version: arc.dirty_version(),
-                        copy: Arc::new((**arc).clone()),
+                        copy: Arc::new(arc.snapshot()),
                         live: arc.clone(),
                     });
                 }
@@ -1303,6 +1313,12 @@ where
                 }
                 page.mark_referenced();
                 published();
+                // The page replaced gives back its share; this one counts
+                // what it holds now (the same Arc, grown, as often as not).
+                let old = arc.accounted.swap(0, std::sync::atomic::Ordering::AcqRel);
+                self.resident_bytes
+                    .fetch_sub(old, std::sync::atomic::Ordering::AcqRel);
+                self.account(&page);
                 guard.insert(page_num, PageEntry::Strong(page.clone()));
                 return Some(page);
             }
@@ -1310,7 +1326,11 @@ where
             // so it needs an access_map entry and, if the cache is already
             // full, a victim evicted first.
             if !force_insert
-                && self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries
+                && (self.strong_count.load(std::sync::atomic::Ordering::Relaxed) >= self.max_entries
+                    || self.resident_bytes.load(std::sync::atomic::Ordering::Relaxed)
+                        + page.mem_bytes()
+                        > self.max_bytes.load(std::sync::atomic::Ordering::Relaxed))
+                && self.strong_count.load(std::sync::atomic::Ordering::Relaxed) > 0
             {
                 drop(guard);
                 match self.evict_one() {
@@ -1327,6 +1347,7 @@ where
             }
             self.strong_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.account(&page);
             self.access_map.push(page_num);
             page.mark_referenced();
             published();
@@ -1388,6 +1409,9 @@ where
                         guard.insert(victim, PageEntry::Weak(weak));
                         self.strong_count
                             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        let share = arc.accounted.swap(0, std::sync::atomic::Ordering::AcqRel);
+                        self.resident_bytes
+                            .fetch_sub(share, std::sync::atomic::Ordering::AcqRel);
                         return Evicted::Yes;
                     }
                     // Stale entry: victim is already Weak or absent in its
@@ -1424,6 +1448,31 @@ where
     /// How many pages the cache holds before it evicts.
     pub(crate) fn capacity_pages(&self) -> usize {
         self.max_entries
+    }
+
+    /// Bounds the cache by the pages' real memory (see max_bytes).
+    pub(crate) fn set_max_bytes(&self, bytes: usize) {
+        self.max_bytes
+            .store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The memory of the pages cached now.
+    pub(crate) fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // Counts `page` as resident at what it holds now.
+    fn account(&self, page: &Page) {
+        let bytes = page.mem_bytes();
+        page.accounted
+            .store(bytes, std::sync::atomic::Ordering::Release);
+        self.resident_bytes
+            .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
     }
 
     pub(crate) fn clock(&self) -> Arc<LsnClock> {
@@ -1822,12 +1871,15 @@ fn read_page(
         // serialized data. Single pread, not pread_exact: if the async writer
         // hasn't flushed yet the file may be shorter than page_size; the
         // zero-initialized buffer acts as padding.
-        let mut bytes = vec![0u8; page_size as usize];
+        let mut bytes = crate::utils::bufpool::zeroed(page_size as usize);
         file.pread(&mut bytes, page_offset(page_id, page_size, first_offset))?;
         if header.checksum != header.checksum_of(&bytes[page_overhead..]) {
+            crate::utils::bufpool::give(bytes);
             return Err(StoreError::PageChecksumMismatch(page_id));
         }
-        Ok(Page::from_bytes(&bytes, content_registry, page_overhead)?)
+        let page = Page::from_bytes(&bytes, content_registry, page_overhead);
+        crate::utils::bufpool::give(bytes);
+        Ok(page?)
     }
 }
 

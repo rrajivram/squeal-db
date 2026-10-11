@@ -50,7 +50,7 @@ use crate::txn::TxnSink;
 use crate::utils::shardedmap::ShardedMap;
 use crate::valueitem::IndexKey;
 use crate::version::Tombstone;
-use crate::version::VersionStore;
+use crate::version::{Undo, VersionStore};
 use log::LevelFilter;
 use log::info;
 use parking_lot::ArcRwLockReadGuard;
@@ -622,6 +622,8 @@ pub struct DbStats {
     /// Page writes the writer thread is holding back.
     /// Pages cache-resident right now.
     pub cached_pages: usize,
+    /// Memory the cached pages hold, bounded by OpenConfig::page_cache_bytes.
+    pub cached_bytes: usize,
     /// Total pages the database file has (as tracked live, not the header).
     pub page_count: u64,
     /// Tables currently loaded.
@@ -1283,6 +1285,7 @@ where
                 .load(std::sync::atomic::Ordering::Relaxed),
             log_bytes: self.log_file.get_metadata().map(|m| m.len).unwrap_or(0),
             cached_pages: self.buffer.cached_pages(),
+            cached_bytes: self.buffer.resident_bytes(),
             page_count: self.page_count(),
             tables: self.tables.read().len(),
             temp: self.temp.stats(),
@@ -1549,7 +1552,18 @@ where
             if committed.contains(txn) {
                 continue;
             }
-            self.revert_one(&record.operation, txn)?;
+            let undo = match &record.operation {
+                Operation::Add { post, .. } => Undo::Remove {
+                    table_id: post.table_id,
+                    key: post.tuple.id.clone(),
+                },
+                Operation::Mod { pre, .. } | Operation::Del { pre, .. } => Undo::Restore {
+                    table_id: pre.table_id,
+                    pre: pre.tuple.clone(),
+                },
+                _ => continue,
+            };
+            self.revert_one(&undo, txn)?;
         }
         let _ = &by_txn;
 
@@ -1724,27 +1738,26 @@ where
                 "test: revert failure injected".into(),
             ));
         }
-        for op in self.versions.ops_of(&id).iter().rev() {
-            self.revert_one(op, &id)?;
+        for undo in self.versions.undo_of(&id).iter().rev() {
+            self.revert_one(undo, &id)?;
         }
         Ok(())
     }
 
-    fn revert_one(&self, op: &Operation, id: &TransactionId) -> Result<(), StoreError> {
-        match op {
-            Operation::Add { post, .. } => {
-                // STORE_AUDIT.md T17: the table may have been dropped since;
-                // nothing to revert against a table that no longer exists.
-                if let Some(table) = self.table_by_id_or_dropped(post.table_id)? {
-                    table.remove_if_txn(post.tuple.id.clone(), id)?;
+    fn revert_one(&self, undo: &Undo, id: &TransactionId) -> Result<(), StoreError> {
+        // STORE_AUDIT.md T17: the table may have been dropped since;
+        // nothing to revert against a table that no longer exists.
+        match undo {
+            Undo::Remove { table_id, key } => {
+                if let Some(table) = self.table_by_id_or_dropped(*table_id)? {
+                    table.remove_if_txn(key.clone(), id)?;
                 }
             }
-            Operation::Del { pre, .. } | Operation::Mod { pre, .. } => {
-                if let Some(table) = self.table_by_id_or_dropped(pre.table_id)? {
-                    table.update_if_txn(pre.tuple.clone(), id)?;
+            Undo::Restore { table_id, pre } => {
+                if let Some(table) = self.table_by_id_or_dropped(*table_id)? {
+                    table.update_if_txn(pre.clone(), id)?;
                 }
             }
-            _ => {}
         }
         Ok(())
     }
@@ -1859,8 +1872,20 @@ where
     fn enforce_snapshot_limits(&self) -> Result<(), StoreError> {
         let limits = self.snapshot_limits();
         let wal = self.logger.retained_wal_bytes();
-        let records = self.versions.records_len();
-        let over = if wal > limits.max_retained_wal_bytes {
+        // What committed transactions keep for older readers — not a
+        // running transaction's own writes, however many: a big load is no
+        // long reader.
+        let records = self.versions.retained_len();
+        // The oldest active transaction pins the log from its start. If it
+        // has written, that log is its own undo — what a rollback or crash
+        // recovery reverts it from — so it is not aborted for the log's
+        // size: a load of millions of rows in one transaction is no
+        // forgotten reader. (It still is for the pre-images it pins.)
+        let oldest_wrote = self
+            .tx_mgr
+            .oldest_active()
+            .is_some_and(|id| self.versions.has_writes(&TransactionId(id)));
+        let over = if wal > limits.max_retained_wal_bytes && !oldest_wrote {
             Some(format!(
                 "retained WAL {wal} bytes exceeds the cap of {} bytes",
                 limits.max_retained_wal_bytes
@@ -2496,19 +2521,8 @@ where
             // discarded concurrently once its rows are reverted. If we
             // can't walk further, treat the row as ambiguous rather than
             // panicking or silently asserting it has no ancestor.
-            let Some(op) = self.versions.find(lsn) else {
+            let Some(next_tuple) = self.versions.find(lsn) else {
                 return Ok(Walk::MissingUndoRecord);
-            };
-            let next_tuple = match op {
-                Operation::Add { post, .. } => post.tuple,
-                Operation::Mod { pre, .. } => pre.tuple,
-                Operation::Del { pre, .. } => pre.tuple,
-                // A record without a usable pre-image (a "redo-only" Mod,
-                // or a Commit/Rollback marker) should never be what a
-                // pre_lsn points at — defensive fallback, matching the old
-                // code's leniency (it mapped every Add/Del/Mod to a tuple
-                // unconditionally).
-                _ => return Ok(Walk::MissingUndoRecord),
             };
             let Some(next_txn) = next_tuple.txn_id else {
                 return Ok(Walk::NoAncestor);
@@ -2857,6 +2871,7 @@ where
             content_registry,
         )?);
         buffer.set_lock_timeout(config.lock_timeout);
+        buffer.set_max_bytes(usize::try_from(config.page_cache_bytes).unwrap_or(usize::MAX));
         let nm = NeededObjects {
             buffer,
             logger: Arc::new(logger),
@@ -3176,7 +3191,7 @@ where
     /// The page cache's size in bytes: what a planner can assume stays in
     /// memory once read.
     pub fn cache_bytes(&self) -> usize {
-        self.buffer.capacity_pages() * self.header.page_size as usize
+        self.buffer.max_bytes()
     }
 
     pub fn get_page_data_size(&self) -> usize {
@@ -3531,6 +3546,99 @@ mod tests {
                 (other, _) => panic!("page {page_size}, key {key}: {:?}", other.map(|_| ())),
             }
         }
+    }
+
+    // A writer's own writes are not what the version-record cap guards (it
+    // is for readers pinning history): one transaction may write far more
+    // rows than the cap, and keeps no copy of the rows it inserts.
+    #[test]
+    fn test_one_transaction_may_write_more_rows_than_the_version_cap() {
+        let (db, tid) = make_db_with_table();
+        db.set_snapshot_limits(super::SnapshotLimits {
+            max_retained_wal_bytes: u64::MAX,
+            max_version_records: 1_000,
+        });
+        let t = db.begin().unwrap();
+        for i in 0..5_000u64 {
+            db.insert(tid, row(i, b"v"), &t).unwrap();
+        }
+        assert_eq!(db.stats().version_records, 0, "inserts keep no image");
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 0);
+        db.commit(t).unwrap();
+        let r = db.begin().unwrap();
+        assert!(db.find(tid, id(4_999), &r).unwrap().is_some());
+        // Updates keep their pre-images while the writer runs, and none of
+        // them count against the cap until it commits.
+        let t = db.begin().unwrap();
+        for i in 0..3_000u64 {
+            db.update(tid, row(i, b"w"), &t).unwrap();
+        }
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 0);
+        db.commit(t).unwrap();
+    }
+
+    // The page cache holds what page_cache_bytes says, counted by what its
+    // pages really hold (search arrays included), not in pages.
+    #[test]
+    fn test_the_page_cache_stays_within_its_bytes() {
+        let config = CreateConfig::default()
+            .open(OpenConfig::default().page_cache_bytes(2 << 20));
+        let db = TestDB::create_with("cache_bytes.db", &config).unwrap();
+        let t = db.create_table("t".into()).unwrap();
+        for chunk in 0..10u64 {
+            let txn = db.begin().unwrap();
+            for k in chunk * 5_000..(chunk + 1) * 5_000 {
+                db.insert(t, Tuple::new(k, &[1u8; 60]), &txn).unwrap();
+            }
+            db.commit(txn).unwrap();
+        }
+        db.checkpoint().unwrap();
+        let txn = db.begin().unwrap();
+        for k in (0..50_000u64).step_by(3) {
+            assert!(db.find(t, DBIdType::Int(k), &txn).unwrap().is_some());
+        }
+        let s = db.stats();
+        // One page's slack: the page being installed when the bound is hit.
+        assert!(
+            s.cached_bytes <= (2 << 20) + 64 * 1024,
+            "{} bytes cached in a 2 MiB cache",
+            s.cached_bytes
+        );
+        assert!(s.cached_bytes > 1 << 20, "{} bytes: the cache is used", s.cached_bytes);
+    }
+
+    // The retained-WAL cap aborts a reader that pins the log, not a writer
+    // whose log is its own undo.
+    #[test]
+    fn test_the_wal_cap_spares_a_writer_and_stops_a_reader() {
+        let (db, tid) = make_db_with_table();
+        db.maintenance.set_paused(true);
+        db.set_snapshot_limits(super::SnapshotLimits {
+            max_retained_wal_bytes: 64 * 1024,
+            max_version_records: usize::MAX,
+        });
+        let writer = db.begin().unwrap();
+        for i in 0..3_000u64 {
+            db.insert(tid, row(i, &[7u8; 100]), &writer).unwrap();
+        }
+        db.checkpoint().unwrap();
+        assert!(db.stats().wal_retained_bytes > 64 * 1024);
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 0, "a writer is spared");
+        db.commit(writer).unwrap();
+
+        let reader = db.begin().unwrap();
+        for i in 0..3_000u64 {
+            let t = db.begin().unwrap();
+            db.update(tid, row(i, &[8u8; 100]), &t).unwrap();
+            db.commit(t).unwrap();
+        }
+        db.checkpoint().unwrap();
+        db.maintenance_pass().unwrap();
+        assert_eq!(db.stats().snapshot_too_old_aborts, 1, "a reader pinning the log is not");
+        assert!(matches!(db.commit(reader), Err(StoreError::SnapshotTooOld(_))));
     }
 
     // checkpoint_log_bytes is what the maintenance thread checkpoints at.
@@ -7746,16 +7854,14 @@ mod tests {
             let t = db.begin().unwrap();
             db.update(tid, row(1, b"dropped"), &t).unwrap();
             db.insert(tid, row(2, b"dropped"), &t).unwrap();
-            assert_eq!(db.stats().version_records, 3);
+            // The update's pre-image; inserts keep none (see version.rs).
+            assert_eq!(db.stats().version_records, 1);
             // dropped here
         }
         let s = db.stats();
         assert_eq!(s.aborting_transactions, 0, "nothing parked");
         assert_eq!(s.active_transactions, 0);
-        assert_eq!(
-            s.version_records, 1,
-            "only the committed insert's record remains"
-        );
+        assert_eq!(s.version_records, 0, "the aborted update's pre-image is gone");
         let t = db.begin().unwrap();
         assert_eq!(
             db.find(tid, id(1), &t).unwrap().unwrap().data.to_vec(),
@@ -10671,10 +10777,17 @@ mod tests {
             max_retained_wal_bytes: u64::MAX,
             max_version_records: 10,
         });
+        let t = db.begin().unwrap();
+        for i in 0..20u64 {
+            db.insert(tid, row(i, b"v"), &t).unwrap();
+        }
+        db.commit(t).unwrap();
+        // A reader that began before the updates pins what they replaced.
+        // (Inserts leave nothing to pin: no reader walks back past one.)
         let pin = db.begin().unwrap();
         for i in 0..20u64 {
             let t = db.begin().unwrap();
-            db.insert(tid, row(i, b"v"), &t).unwrap();
+            db.update(tid, row(i, b"w"), &t).unwrap();
             db.commit(t).unwrap();
         }
         assert!(
