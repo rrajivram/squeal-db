@@ -146,6 +146,9 @@ impl From<StoreError> for SchemaError {
             // a message naming the actual sizes involved.
             StoreError::TupleTooLarge(_, _) => Self::UserError(value.to_string()),
             StoreError::InvalidConfig(_) => Self::UserError(value.to_string()),
+            // A key too wide for the database's page size: the table's
+            // definition (or the page size) is the caller's to change.
+            StoreError::IndexEntryTooLarge { .. } => Self::UserError(value.to_string()),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),
             StoreError::WriteConflict(dbid_type) => Self::WriteConflict(dbid_type),

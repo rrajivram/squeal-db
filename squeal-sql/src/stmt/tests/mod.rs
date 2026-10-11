@@ -4242,3 +4242,75 @@ fn test_an_invalid_config_is_a_user_error() {
         "{err}"
     );
 }
+
+// Whatever key a database accepts, its pages hold enough of: the widest
+// one (max_index_key_size) takes rows, at the smallest page size that
+// allows it. A wider key, or a page size too small for the key size asked
+// for, is refused up front, saying which.
+#[test]
+fn test_the_widest_key_a_database_accepts_fits_its_pages() {
+    use crate::CreateConfig;
+
+    for (page_size, key) in [(4096u64, 512u32), (8192, 1024), (16 * 1024, 2048)] {
+        let config = CreateConfig::default()
+            .page_size(page_size)
+            .max_index_key_size(key as u64);
+        let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::with_config(config));
+        let c = mgr.create_and_connect("widest_key_db").unwrap();
+        c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+        // The key's bytes are its declared length plus its framing (9).
+        let width = key - 9;
+        run(
+            &c,
+            &format!("create table wide (k varchar({width}) not null, primary key(k))"),
+        )
+        .unwrap();
+        // The widest index: its key is the column and the row's key (an
+        // integer here, 9 bytes more).
+        let indexed = width - 9;
+        run(
+            &c,
+            &format!("create table ix (id integer not null, v varchar({indexed}), primary key(id))"),
+        )
+        .unwrap();
+        run(&c, "create index ix_v on ix (v)").unwrap();
+        for i in (0..60).rev() {
+            let k = format!("{i:0>w$}", w = width as usize);
+            run(&c, &format!("insert into wide values ('{k}')"))
+                .unwrap_or_else(|e| panic!("page {page_size}, key {key}, row {i}: {e}"));
+            let v = format!("{i:0>w$}", w = indexed as usize);
+            run(&c, &format!("insert into ix values ({i}, '{v}')"))
+                .unwrap_or_else(|e| panic!("page {page_size}, key {key}, index row {i}: {e}"));
+        }
+        for sql in ["select count(*) from wide where k > ''", "select count(*) from ix where v > ''"] {
+            assert_eq!(
+                partition_diff::outcome(&c, sql).unwrap(),
+                vec![vec![ValueItem::Integer(60)]],
+                "{sql}"
+            );
+        }
+        // One byte wider is refused, as a key too wide for this database.
+        let err = run(
+            &c,
+            &format!("create table wider (k varchar({}) not null, primary key(k))", width + 1),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, SchemaError::UserError(m) if m.contains("max index key size")),
+            "{err}"
+        );
+    }
+    // A page size that can't hold four of the keys asked for: no database.
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let err = mgr
+        .create_and_connect_with(
+            "too_small_db",
+            &CreateConfig::default().page_size(4096).max_index_key_size(1024),
+        )
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(&err, SchemaError::UserError(m) if m.contains("too small for max_index_key_size")),
+        "{err}"
+    );
+}

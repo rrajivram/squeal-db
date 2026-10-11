@@ -85,6 +85,17 @@ pub enum StoreError {
     ReservedTableName(String),
     #[error("Unknown error {0}")]
     UnknownError(String),
+    // A table whose index entries are too big for this database's pages to
+    // hold enough of (see config::max_index_entry_size).
+    #[error(
+        "index entries of {entry} bytes are too large for {page_size}-byte pages: a page must hold \
+         several, so an entry may be at most {max} bytes; shorten the key or use a larger page size"
+    )]
+    IndexEntryTooLarge {
+        entry: DBSizeType,
+        max: DBSizeType,
+        page_size: DBSizeType,
+    },
     // A CreateConfig/OpenConfig no database could run with (see config.rs).
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),

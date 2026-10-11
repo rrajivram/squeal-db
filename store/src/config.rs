@@ -43,6 +43,35 @@ pub const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(10);
 pub const DEFAULT_MAX_RETAINED_WAL_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_MAX_VERSION_RECORDS: usize = 1_000_000;
 
+/// How many index entries of a table's largest size a page must hold. A
+/// full page splits at its midpoint, and each half must then take another
+/// entry: with fewer than four to a page that can't be promised, and the
+/// tree fails an insert ("No space in page") after two or three rows.
+pub const MIN_ENTRIES_PER_PAGE: u64 = 4;
+
+/// What an index entry takes beyond its key's own bytes, at most: the
+/// key's framing, the transaction fields, the pointer to its row, and the
+/// allowance layers above add when they size a table's entries (64 in
+/// squeal-sql and sq-json). A database's pages must hold
+/// MIN_ENTRIES_PER_PAGE entries of `max_index_key_size` plus this.
+pub const INDEX_ENTRY_FRAMING: DBSizeType = 96;
+
+/// The largest index entry (a key with its framing — a table's
+/// `index_entry_size`) a database of this page size can hold
+/// MIN_ENTRIES_PER_PAGE of in a page: what is left of a page after its
+/// header (which reserves `max_index_key_size` for a high key) and the
+/// slot directory, in four. 0 when a page has no room at all.
+pub fn max_index_entry_size(page_size: DBSizeType, max_index_key_size: DBSizeType) -> DBSizeType {
+    // The slotted page's own header, and a slot per entry.
+    const PAGE_CONTENT_HEADER: DBSizeType = 8;
+    const SLOT: DBSizeType = crate::pages::slotted::SLOT_ENTRY_BYTES as DBSizeType;
+    let usable = page_size
+        .saturating_sub(crate::page::page_overhead(max_index_key_size) as DBSizeType)
+        .saturating_sub(crate::page::USABLE_DATA_MARGIN)
+        .saturating_sub(PAGE_CONTENT_HEADER);
+    (usable / MIN_ENTRIES_PER_PAGE).saturating_sub(SLOT)
+}
+
 // The page cache holds at least this many pages, whatever is asked for: a
 // descent holds a page per level, a split three more, and a cache that
 // can't hold them makes no progress.
@@ -184,8 +213,9 @@ impl OpenConfig {
 pub struct CreateConfig {
     /// Bytes a page: 4 KiB to 1 MiB. Default 16 KiB.
     pub page_size: DBSizeType,
-    /// The largest index key, in bytes: 64 to 8 KiB, and at most a quarter
-    /// of a page. Default 512.
+    /// The largest index key, in bytes: 64 to 8 KiB, and small enough that
+    /// a page holds four entries of it (see max_index_entry_size).
+    /// Default 512.
     pub max_index_key_size: DBSizeType,
     /// How the database runs once created.
     pub open: OpenConfig,

@@ -61,7 +61,7 @@ returns what a database is running with.
 | `CreateConfig` | default | |
 |---|---|---|
 | `page_size` | 16 KiB | bytes a page: a power of two, 4 KiB to 1 MiB |
-| `max_index_key_size` | 512 | largest index key: a power of two, 64 to 8 KiB, at most a quarter page |
+| `max_index_key_size` | 512 | largest index key: a power of two, 64 to 8 KiB, small enough for the page size (below) |
 | `open` | | an `OpenConfig`, below |
 
 | `OpenConfig` | default | |
@@ -74,6 +74,19 @@ returns what a database is running with.
 | `checkpoint_dirty_pages` | half the cache | dirty pages that trigger a checkpoint |
 | `snapshot_limits` | 256 MiB, 1M versions | what a long transaction may pin before it is aborted |
 | `maintenance_interval` | 10 ms | how often background maintenance runs when idle |
+
+**A page must hold four index entries.** A full tree page splits in two,
+and each half must still take another entry. With fewer than four entries
+to a page the tree fails an insert after two or three rows. So:
+- **A database is refused** when its pages can't hold four entries of its
+  own `max_index_key_size`: 4 KiB pages take keys up to 512 bytes, 8 KiB
+  up to 1 KiB, 16 KiB up to 2 KiB.
+- **A table is refused** when it asks for index entries bigger than
+  `Db::max_index_entry_size()`, with `IndexEntryTooLarge` naming the
+  largest that fits.
+
+Row payloads are not limited this way: a row bigger than a page gets a
+page of its own with an overflow chain.
 
 A config no database could run with is refused with
 `StoreError::InvalidConfig`: a zero size, or a page size that isn't a

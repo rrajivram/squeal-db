@@ -133,7 +133,7 @@ const FULL_SLACK: u64 = 16;
 // usable/2 + one entry; for either half to then take another entry, a
 // page must hold at least four largest-size ones. A table whose pages
 // hold fewer keeps a count cap as well (see BPlusTree::count_cap).
-const MIN_ENTRIES_PER_PAGE: u64 = 4;
+use crate::config::MIN_ENTRIES_PER_PAGE;
 
 // Whether the row on the page is already the version a redo record would
 // write: the same data and tombstone flag, written by the same

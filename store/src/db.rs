@@ -716,10 +716,21 @@ where
             MIN_MAX_INDEX_KEY_SIZE,
             MAX_MAX_INDEX_KEY_SIZE,
         )?;
-        if config.max_index_key_size > config.page_size / 4 {
+        // A tree needs MIN_ENTRIES_PER_PAGE entries a page (see
+        // config::max_index_entry_size): the default table's, and ones as
+        // big as the largest key this database says it will take.
+        let fits = crate::config::max_index_entry_size(config.page_size, config.max_index_key_size);
+        let needs = (config.max_index_key_size + crate::config::INDEX_ENTRY_FRAMING)
+            .max(bplustree::MAX_ENTRY_BYTES);
+        if fits < needs {
             return Err(StoreError::InvalidConfig(format!(
-                "max_index_key_size {} must be at most a quarter of page_size {}",
-                config.max_index_key_size, config.page_size
+                "page_size {} is too small for max_index_key_size {}: a page must hold {} index \
+                 entries (a key and {} bytes of framing each), so one may be at most {fits} \
+                 bytes; use a larger page_size or a smaller max_index_key_size",
+                config.page_size,
+                config.max_index_key_size,
+                crate::config::MIN_ENTRIES_PER_PAGE,
+                crate::config::INDEX_ENTRY_FRAMING
             )));
         }
         Self::create_unchecked(name, config)
@@ -1226,6 +1237,13 @@ where
     /// threaten `PAGE_OVERHEAD`'s reservation.
     pub fn max_index_key_size(&self) -> u64 {
         self.header.max_index_key_size
+    }
+
+    /// The largest `index_entry_size` a table of this database may be
+    /// created with: a page must hold several entries for a tree to work
+    /// (see config::max_index_entry_size).
+    pub fn max_index_entry_size(&self) -> DBSizeType {
+        crate::config::max_index_entry_size(self.header.page_size, self.header.max_index_key_size)
     }
 
     /// See `DbStats`. Safe to call from any thread at any time.
@@ -2650,6 +2668,16 @@ where
         name: String,
         index_entry_size: DBSizeType,
     ) -> Result<TableIdType, StoreError> {
+        // A tree whose pages can't hold a few entries can't split: it would
+        // be created and then fail its second or third insert.
+        let max = self.max_index_entry_size();
+        if index_entry_size > max {
+            return Err(StoreError::IndexEntryTooLarge {
+                entry: index_entry_size,
+                max,
+                page_size: self.header.page_size,
+            });
+        }
         let table_id = {
             let _writer = self.buffer.writer_permit();
             self.validate_table_name(&name)?;
@@ -3302,7 +3330,7 @@ mod tests {
             (CreateConfig::default().max_index_key_size(32), "max_index_key_size"),
             (
                 CreateConfig::default().page_size(4096).max_index_key_size(2048),
-                "quarter",
+                "too small for max_index_key_size",
             ),
             (
                 CreateConfig::default().open(OpenConfig::default().page_cache_bytes(0)),
@@ -3418,6 +3446,89 @@ mod tests {
                     &value(k, version[k as usize]),
                     "page {page_size}, cache {cache_pages}: key {k} at the end"
                 );
+            }
+        }
+    }
+
+    // A page must hold MIN_ENTRIES_PER_PAGE index entries: a table that
+    // asks for bigger ones is refused when created — not created and then
+    // unable to take its second row — and the biggest allowed works.
+    #[test]
+    fn test_a_table_whose_index_entries_cannot_fit_a_page_is_refused() {
+        for page_size in [4096u64, 16 * 1024] {
+            let config = CreateConfig::default().page_size(page_size);
+            let db = TestDB::create_with(format!("entry_fit_{page_size}.db"), &config).unwrap();
+            let max = db.max_index_entry_size();
+            assert_eq!(max, crate::config::max_index_entry_size(page_size, 512));
+            // Half a page each used to be accepted ("count = 2"), and the
+            // second insert then failed with "No space in page".
+            for too_big in [max + 1, page_size / 2, page_size] {
+                match db.create_table_with_index_entry_size("big".into(), too_big) {
+                    Err(StoreError::IndexEntryTooLarge { entry, max: m, page_size: p }) => {
+                        assert_eq!((entry, m, p), (too_big, max, page_size));
+                    }
+                    other => panic!("entry {too_big} on {page_size}-byte pages: {other:?}"),
+                }
+            }
+            assert!(db.table_id_by_name("big").unwrap().is_none());
+
+            // The biggest allowed, with keys that fill it: rows go in, in
+            // any order, and come back.
+            let t = db.create_table_with_index_entry_size("fits".into(), max).unwrap();
+            let key = |k: u64| {
+                let probe = |pad: usize| {
+                    DBIdType::Rec(
+                        crate::valueitem::IndexKey::new_from(&[
+                            crate::valueitem::ValueItem::Integer(k as i64),
+                            crate::valueitem::ValueItem::Str(("k".repeat(pad), pad as u32)),
+                        ])
+                        .unwrap(),
+                    )
+                };
+                // As long a key as leaves the entry (key + its pointer and
+                // framing) within the budget.
+                probe(max as usize - 64)
+            };
+            let txn = db.begin().unwrap();
+            let mut order: Vec<u64> = (0..300).collect();
+            order.reverse();
+            order.rotate_left(97);
+            for k in &order {
+                db.insert(t, Tuple::new_with(key(*k), b"v", None, None), &txn)
+                    .unwrap_or_else(|e| panic!("page {page_size}, key {k}: {e}"));
+            }
+            db.commit(txn).unwrap();
+            let txn = db.begin().unwrap();
+            for k in 0..300 {
+                assert!(db.find(t, key(k), &txn).unwrap().is_some(), "page {page_size}, key {k}");
+            }
+        }
+    }
+
+    // A database whose pages could not hold four of its own largest keys
+    // is refused when created.
+    #[test]
+    fn test_a_page_size_too_small_for_the_largest_key_is_refused() {
+        for (page_size, key, ok) in [
+            (4096u64, 512u64, true),
+            (4096, 1024, false),
+            (8192, 1024, true),
+            (8192, 2048, false),
+            (16 * 1024, 2048, true),
+            (64 * 1024, 8192, true),
+        ] {
+            let config = CreateConfig::default().page_size(page_size).max_index_key_size(key);
+            let made = TestDB::create_with(format!("key_fit_{page_size}_{key}.db"), &config);
+            match (made, ok) {
+                (Ok(db), true) => {
+                    assert!(db.max_index_entry_size() >= key + crate::config::INDEX_ENTRY_FRAMING);
+                    // The default table can always be made.
+                    db.create_table("t".into()).unwrap();
+                }
+                (Err(StoreError::InvalidConfig(m)), false) => {
+                    assert!(m.contains("too small for max_index_key_size"), "{m}")
+                }
+                (other, _) => panic!("page {page_size}, key {key}: {:?}", other.map(|_| ())),
             }
         }
     }
