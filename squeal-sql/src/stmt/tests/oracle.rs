@@ -146,7 +146,11 @@ fn text_columns(table: &str) -> &'static [&'static str] {
 }
 
 fn setup() -> (Arc<Connection<MemFile>>, rusqlite::Connection) {
-    let c = conn();
+    setup_on(conn())
+}
+
+// The tables, in the database `c` is connected to.
+fn setup_on(c: Arc<Connection<MemFile>>) -> (Arc<Connection<MemFile>>, rusqlite::Connection) {
     let lite = rusqlite::Connection::open_in_memory().unwrap();
     let both = |sql: String| {
         lite.execute_batch(&sql)
@@ -684,7 +688,15 @@ fn check(
 }
 
 fn run_oracle(seeds: &[u64], count: usize, subqueries: bool) -> Tally {
-    let (c, lite) = setup();
+    run_oracle_on(setup(), seeds, count, subqueries)
+}
+
+fn run_oracle_on(
+    (c, lite): (Arc<Connection<MemFile>>, rusqlite::Connection),
+    seeds: &[u64],
+    count: usize,
+    subqueries: bool,
+) -> Tally {
     let mut tally = Tally::default();
     for seed in seeds {
         check(&c, &lite, *seed, count, subqueries, &mut tally);
@@ -753,4 +765,40 @@ fn test_random_subqueries_agree_with_sqlite_and_across_partitioning() {
         tally.findings[..tally.findings.len().min(15)].join("\n")
     );
     assert!(tally.agreed * 10 >= seeds.len() * count * 7, "{tally:?}");
+}
+
+// The same queries in a database opened with almost no memory (see
+// store::config::OpenConfig): a query budget and scratch cache of a few
+// pages, a page cache of 64 — so sorts, hash joins and grouping spill,
+// and pages are evicted, where the runs above never do either.
+#[test]
+fn test_random_queries_agree_with_sqlite_when_everything_spills() {
+    use crate::{CreateConfig, OpenConfig};
+
+    let count = std::env::var("SQ_ORACLE_QUERIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
+    let config = CreateConfig::default().page_size(4096).open(
+        OpenConfig::default()
+            .page_cache_bytes(64 * 4096)
+            .temp_cache_bytes(8 * 4096)
+            .query_memory_bytes(4 * 4096),
+    );
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::with_config(config));
+    let c = mgr.create_and_connect("oracle_tiny_memory").unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    let (c, lite) = setup_on(c);
+    let mut tally = Tally::default();
+    for (seed, subqueries) in [(9, false), (10, false), (11, true), (12, true)] {
+        check(&c, &lite, seed, count, subqueries, &mut tally);
+    }
+    println!("agreed {}, findings {}", tally.agreed, tally.findings.len());
+    assert!(
+        tally.findings.is_empty(),
+        "{} findings:\n{}",
+        tally.findings.len(),
+        tally.findings[..tally.findings.len().min(15)].join("\n")
+    );
+    assert!(tally.agreed * 10 >= 4 * count * 7, "{tally:?}");
 }

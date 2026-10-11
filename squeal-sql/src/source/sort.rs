@@ -247,20 +247,15 @@ where
             InitialBuild::InMemory(sorted) => return Ok(BuildOutcome::InMemory(sorted)),
             InitialBuild::Spilled(runs) => runs,
         };
-        // merge_runs is strictly 2-way (see its own pairwise pop loop), so
-        // reducing `run.runs.len()` initial runs down to 1 always takes
-        // ceil(log2(run.runs.len())) rounds — computed directly from the
-        // actual run count build_initial_runs just returned, not
-        // re-derived from `count`/`mem.len()` (mem.len() tracks pages
-        // reserved for buffering, frozen once the memory budget is first
-        // exhausted, which has no fixed relationship to how many runs
-        // that ends up producing).
-        let num_passes = (run.runs.len() as f64).log2().ceil() as usize;
-        for _ in 0..num_passes {
+        // merge_runs is strictly 2-way (see its own pairwise pop loop): each
+        // round halves the runs, until one is left.
+        while run.runs.len() > 1 {
             run = self.merge_runs(run, record_size)?;
         }
-        assert!(run.runs.len() == 1);
-        let mut cursor = run.runs.pop().unwrap().cursor()?;
+        let Some(last) = run.runs.pop() else {
+            return Ok(BuildOutcome::Empty);
+        };
+        let mut cursor = last.cursor()?;
         let iter = cursor
             .next()?
             .map(|t| Self::from_tuple(t).map(|v| v.into_iter()))
@@ -360,14 +355,13 @@ where
             };
             out.push(item);
             if out.len() == records_per_page {
-                run.set_content(&to_allocvec(&out)?)?;
-                run.new_page()?;
+                Self::write_rows(&mut run, &out, false)?;
                 out.clear();
             }
         }
 
         if !out.is_empty() {
-            run.set_content(&to_allocvec(&out)?)?;
+            Self::write_rows(&mut run, &out, true)?;
         }
 
         Ok(run)
@@ -490,6 +484,11 @@ where
             )?;
             runs.push(run);
         }
+        // No rows at all, with no memory to be had from the start (so not
+        // caught above): empty all the same, not a spill of no runs.
+        if runs.is_empty() {
+            return Ok(InitialBuild::Empty);
+        }
 
         Ok(InitialBuild::Spilled(SortedRuns {
             runs,
@@ -514,14 +513,40 @@ where
         let sorted = Self::sort_rows(sort_fields, std::mem::take(rows));
         let chunks: Vec<&[IndexKey]> = sorted.chunks(records_per_page.max(1)).collect();
         for (i, chunk) in chunks.iter().enumerate() {
-            let data = to_allocvec(&chunk.to_vec())?;
-            assert!(data.len() <= run.data_size() as usize);
-            run.set_content(&data)?;
-            if i + 1 < chunks.len() {
-                run.new_page()?;
-            }
+            Self::write_rows(run, chunk, i + 1 == chunks.len())?;
         }
         Ok(())
+    }
+
+    // Writes `rows` as `run`'s current page, and unless they are its `last`
+    // starts the next. records_per_page comes from the columns' declared
+    // sizes, which is only an estimate of what rows serialize to (a
+    // projected expression's declared type is a placeholder; a string's
+    // length prefix isn't counted): rows that come to more than a page
+    // holds are written as two pages, and so on down, in order — a reader
+    // takes whatever number of rows each page has. This used to be an
+    // assertion, which a sort that spilled rows wider than the estimate
+    // failed.
+    fn write_rows(run: &mut Run<F>, rows: &[IndexKey], last: bool) -> Result<(), SchemaError> {
+        let data = to_allocvec(&rows.to_vec())?;
+        if data.len() <= run.data_size() as usize {
+            run.set_content(&data)?;
+            if !last {
+                run.new_page()?;
+            }
+            return Ok(());
+        }
+        if rows.len() < 2 {
+            return Err(SchemaError::UserError(format!(
+                "a row of {} bytes is too big to sort out of memory (a scratch page holds {}); \
+                 raise the query memory",
+                data.len(),
+                run.data_size()
+            )));
+        }
+        let (first, rest) = rows.split_at(rows.len() / 2);
+        Self::write_rows(run, first, false)?;
+        Self::write_rows(run, rest, last)
     }
 
     // Sorts `rows` as one whole batch (not per chunk — see

@@ -378,7 +378,7 @@ fn test_execute_select_group_by_collapses_correctly_at_a_scale_spanning_multiple
     // internally sorted but consecutive pages within the same run were
     // never ordered relative to each other.
     //
-    // At this data size (well within DEFAULT_QUERY_MEMORY_LIMIT's 64 MiB
+    // At this data size (well within the default 64 MiB query memory
     // budget) that bug can no longer reproduce here at all: SortSource now
     // sorts a build this small entirely in memory (one plain Vec, no Run,
     // no page split — see build_initial_runs' own doc comment), so this
@@ -4163,5 +4163,82 @@ fn test_update_then_delete_leave_the_table_in_the_expected_final_state() {
                 ValueItem::Integer(26)
             ],
         ]
+    );
+}
+
+// --- CreateConfig / OpenConfig, through a ConnectionManager ---
+
+// A manager's config is what its databases are created with — CREATE
+// DATABASE's too — and a query's memory is the database's
+// query_memory_bytes: a small one makes a sort spill to scratch pages, and
+// the answer is the same.
+#[test]
+fn test_a_managers_config_reaches_its_databases_and_their_queries() {
+    use crate::{CreateConfig, OpenConfig};
+
+    let sorted = |query_memory: u64| {
+        let config = CreateConfig::default().page_size(8 * 1024).open(
+            OpenConfig::default()
+                .page_cache_bytes(4 << 20)
+                .query_memory_bytes(query_memory),
+        );
+        let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::with_config(config.clone()));
+        let c = mgr.create_and_connect("configured_db").unwrap();
+        c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+        let db = c.database.read().db.clone();
+        assert_eq!(db.page_size(), 8 * 1024);
+        assert_eq!(db.cache_bytes(), 4 << 20);
+        assert_eq!(db.config(), &config.open);
+
+        run(&c, "create table t (id integer not null, pad varchar(100), primary key(id))").unwrap();
+        let rows: Vec<String> = (0..5000)
+            .map(|i| format!("({}, 'row {i:0>90}')", (i * 7919) % 5000))
+            .collect();
+        for chunk in rows.chunks(500) {
+            run(&c, &format!("insert into t values {}", chunk.join(", "))).unwrap();
+        }
+        // Scratch pages live while the sorted result is being read.
+        let mut stmt = c
+            .clone()
+            .create_statement("select id from t order by pad desc")
+            .unwrap();
+        stmt.execute().unwrap();
+        let Some(Some(ResultType::StreamingResult(mut stream))) = stmt.results.pop() else {
+            panic!("no streaming result");
+        };
+        let mut out = vec![stream.next_result().unwrap().expect("a row").values().to_vec()];
+        let spilled = db.stats().temp.live_pages;
+        while let Some(row) = stream.next_result().unwrap() {
+            out.push(row.values().to_vec());
+        }
+        drop(stream);
+
+        // CREATE DATABASE has no clause for any of it: the manager's config.
+        run(&c, "create database second_db").unwrap();
+        assert_eq!(c.database.read().db.page_size(), 8 * 1024);
+        assert_eq!(c.database.read().db.config(), &config.open);
+        (out, spilled)
+    };
+    let (roomy, roomy_spill) = sorted(64 << 20);
+    let (tight, tight_spill) = sorted(64 << 10);
+    assert_eq!(roomy.len(), 5000);
+    assert_eq!(roomy, tight);
+    assert_eq!(roomy_spill, 0, "64 MiB sorts 5000 rows in memory");
+    assert!(tight_spill > 0, "64 KiB must spill");
+}
+
+// An invalid config is the caller's to fix, and says what.
+#[test]
+fn test_an_invalid_config_is_a_user_error() {
+    use crate::CreateConfig;
+
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let err = mgr
+        .create_and_connect_with("bad_config_db", &CreateConfig::default().page_size(1000))
+        .err()
+        .expect("refused");
+    assert!(
+        matches!(&err, SchemaError::UserError(m) if m.contains("page_size")),
+        "{err}"
     );
 }

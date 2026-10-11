@@ -76,6 +76,37 @@ Database ─ Schema ─ SqlTable ─ Partition ─ store tables
 - **`stmt`.** `Statement` / `PreparedStatement`: execute a parsed
   statement, stream the results.
 
+## Configuration
+
+A database is created and opened with the store's `CreateConfig` and
+`OpenConfig` (re-exported here; see the
+[store README](../store/README.md#configuration) for every setting):
+
+```rust
+use squeal_sql::{CreateConfig, OpenConfig};
+
+let config = CreateConfig::default().page_size(8 * 1024).open(
+    OpenConfig::default()
+        .page_cache_bytes(256 << 20)
+        .query_memory_bytes(16 << 20),
+);
+// For every database this manager creates or opens, CREATE DATABASE and
+// USE DATABASE included (SQL has no clause for it):
+let mgr = Arc::new(ConnectionManager::<std::fs::File>::with_config(config));
+let conn = mgr.create_and_connect("shop.db")?;
+// Or for one call:
+let conn = mgr.connect_with("shop.db", &OpenConfig::default().page_cache_bytes(32 << 20))?;
+```
+
+Two of the settings shape queries:
+
+- **`query_memory_bytes`** is each query's budget. Sorts, hash joins and
+  grouping reserve against it and spill to scratch pages past it. A
+  small budget changes how a query runs, not its answer.
+- **`page_cache_bytes`** is what the optimizer treats as cached. A table
+  that fits is charged cached lookups for index fetches; a bigger one is
+  charged page reads.
+
 ## How SQL maps onto the store
 
 Every table is one or more **partitions**, and an unpartitioned table has

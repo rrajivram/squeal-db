@@ -19,3 +19,6 @@ pub mod table;
 pub(crate) mod temp;
 #[cfg(test)]
 pub(crate) mod testhook;
+
+/// What a database is created and opened with: see [`store::config`].
+pub use store::config::{CreateConfig, OpenConfig};

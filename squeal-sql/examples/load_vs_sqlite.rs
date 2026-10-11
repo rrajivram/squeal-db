@@ -1,7 +1,10 @@
 //! One workload, run against squeal-db (squeal-sql on a file) and SQLite
 //! (rusqlite, bundled), phase by phase, with each phase's answers compared.
 //!
-//!   cargo run --release -p squeal-sql --example load_vs_sqlite -- [orders] [threads]
+//!   cargo run --release -p squeal-sql --example load_vs_sqlite -- [orders] [threads] [--setting value ...]
+//!
+//! The settings are squeal-db's (see store::config; `--help` lists them):
+//! `--page-size 4k --query-memory-bytes 1m`, say.
 //!
 //! Both are on disk and equally durable: every commit waits for a full
 //! flush to stable storage. squeal-db's commit is `File::sync_data`, which
@@ -58,8 +61,11 @@ impl Digest {
     }
 }
 
-fn sq_conn(path: &str) -> (Arc<ConnectionManager<std::fs::File>>, Sq) {
-    let mgr = Arc::new(ConnectionManager::<std::fs::File>::new());
+fn sq_conn(
+    path: &str,
+    config: squeal_sql::CreateConfig,
+) -> (Arc<ConnectionManager<std::fs::File>>, Sq) {
+    let mgr = Arc::new(ConnectionManager::<std::fs::File>::with_config(config));
     let c = mgr.create_and_connect(path).expect("create squeal db");
     c.use_schema("default").expect("default schema");
     (mgr, c)
@@ -218,9 +224,22 @@ fn queries(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let orders: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
-    let threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("{e}\n\nusage: load_vs_sqlite [orders] [threads] [--setting value ...]\n");
+        eprint!("{}", store::config::settings_help(true));
+        std::process::exit(2);
+    };
+    let (args, settings) =
+        store::config::split_args(std::env::args().skip(1)).unwrap_or_else(|e| fail(&e));
+    if settings.iter().any(|(n, _)| n == "help") {
+        fail(&"load_vs_sqlite: squeal-db against SQLite, one workload");
+    }
+    let config = squeal_sql::CreateConfig::from_settings(
+        settings.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+    )
+    .unwrap_or_else(|e| fail(&e));
+    let orders: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let threads: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
     let customers = (orders / 10).max(10);
     let days = 365u64;
 
@@ -228,7 +247,7 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let sq_path = dir.join("bench.sq").to_string_lossy().into_owned();
     let lite_path = dir.join("bench.sqlite").to_string_lossy().into_owned();
-    let (mgr, s) = sq_conn(&sq_path);
+    let (mgr, s) = sq_conn(&sq_path, config);
     let l = lite_conn(&lite_path);
 
     println!(

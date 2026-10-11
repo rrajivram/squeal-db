@@ -145,6 +145,7 @@ impl From<StoreError> for SchemaError {
             // surfaced as an opaque "Internal Store Error" instead of
             // a message naming the actual sizes involved.
             StoreError::TupleTooLarge(_, _) => Self::UserError(value.to_string()),
+            StoreError::InvalidConfig(_) => Self::UserError(value.to_string()),
             StoreError::DuplicateKey(dbid_type) => Self::DuplicateKey(dbid_type),
             StoreError::KeyNotFound(dbid_type) => Self::KeyNotFound(dbid_type),
             StoreError::WriteConflict(dbid_type) => Self::WriteConflict(dbid_type),

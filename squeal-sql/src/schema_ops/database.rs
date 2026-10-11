@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use parking_lot::RwLock;
 use postcard::{from_bytes, to_allocvec};
+use store::config::{CreateConfig, OpenConfig};
 use store::{
     cursor::Cursor,
     db::{DBFile, Db},
@@ -83,7 +84,14 @@ where
     F: DBFile<Item = F>,
 {
     pub fn create(name: String) -> Result<Arc<Self>, SchemaError> {
-        let db = Db::create(&name)?;
+        Self::create_with(name, &CreateConfig::default())
+    }
+
+    /// Creates a database with everything that can be chosen for one (see
+    /// store::config): its page size and largest index key, fixed in the
+    /// file, and how this process runs it.
+    pub fn create_with(name: String, config: &CreateConfig) -> Result<Arc<Self>, SchemaError> {
+        let db = Db::create_with(&name, config)?;
         let schemas_table = db.create_table(SYSTEM_SCHEMAS_TABLE.into())?;
         let database = Arc::new(Self {
             name,
@@ -97,14 +105,39 @@ where
     }
 
     pub fn open(name: String) -> Result<Arc<Self>, SchemaError> {
-        Self::from_db(name.clone(), Db::open(&name)?)
+        Self::open_with(name, &OpenConfig::default())
+    }
+
+    /// Opens a database, run as `config` says: the page cache, query
+    /// memory and the other settings a process chooses each time. What was
+    /// fixed at creation comes from the file.
+    pub fn open_with(name: String, config: &OpenConfig) -> Result<Arc<Self>, SchemaError> {
+        Self::from_db(name.clone(), Db::open_with(&name, config)?)
     }
 
     /// Opens a database from already-open data and log files (see
     /// `Db::open_using`) — e.g. an in-memory database restored from a
     /// saved snapshot.
     pub fn open_using(name: String, file: F, log_file: F) -> Result<Arc<Self>, SchemaError> {
-        Self::from_db(name.clone(), Db::open_using(&name, file, log_file)?)
+        Self::open_using_with(name, file, log_file, &OpenConfig::default())
+    }
+
+    /// `open_using`, run as `config` says (see `open_with`).
+    pub fn open_using_with(
+        name: String,
+        file: F,
+        log_file: F,
+        config: &OpenConfig,
+    ) -> Result<Arc<Self>, SchemaError> {
+        Self::from_db(
+            name.clone(),
+            Db::open_using_with(&name, file, log_file, config)?,
+        )
+    }
+
+    /// What this process runs the database with (see store::config).
+    pub fn config(&self) -> &OpenConfig {
+        self.db.config()
     }
 
     fn from_db(name: String, db: Arc<Db<F>>) -> Result<Arc<Self>, SchemaError> {

@@ -16,7 +16,6 @@ use store::{clock::Instant, db::DBFile, txn::Transaction};
 
 use crate::{
     conn::connection::{Connection, DerivedSource, TableRef},
-    constant::DEFAULT_QUERY_MEMORY_LIMIT,
     datatype::DataType,
     error::SchemaError,
     optim::{
@@ -2551,8 +2550,16 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    let mut visitor = QueryVisitor::new(conn, QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT))?;
+    let mem = QueryMemory::new(query_memory_limit(&conn));
+    let mut visitor = QueryVisitor::new(conn, mem)?;
     subquery::resolve_all(&mut visitor, exprs, tables)
+}
+
+// What one query may hold in memory before its operators spill: what the
+// connection's database was opened with (OpenConfig::query_memory_bytes).
+fn query_memory_limit<F: DBFile + 'static>(conn: &Arc<Connection<F>>) -> usize {
+    let bytes = conn.database.read().db.config().query_memory_bytes;
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 impl<F> LogicalPlan<F>
@@ -2561,7 +2568,8 @@ where
     F: DBFile<Item = F>,
 {
     pub(crate) fn new(conn: Arc<Connection<F>>) -> Self {
-        Self::with_memory_limit(conn, DEFAULT_QUERY_MEMORY_LIMIT)
+        let limit = query_memory_limit(&conn);
+        Self::with_memory_limit(conn, limit)
     }
 
     pub(crate) fn with_memory_limit(conn: Arc<Connection<F>>, limit: usize) -> Self {
@@ -2576,7 +2584,7 @@ where
 
     pub(crate) fn build(conn: Arc<Connection<F>>, query: &Query) -> Result<Self, SchemaError> {
         let start = Instant::now();
-        let mem = QueryMemory::new(DEFAULT_QUERY_MEMORY_LIMIT);
+        let mem = QueryMemory::new(query_memory_limit(&conn));
         let mut visitor = QueryVisitor::new(conn.clone(), mem.clone())?;
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);

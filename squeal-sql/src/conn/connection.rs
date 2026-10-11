@@ -3,7 +3,11 @@ use std::{collections::HashMap, collections::HashSet, sync::Arc};
 use std::{fs::File, sync::LazyLock};
 
 use parking_lot::RwLock;
-use store::{db::DBFile, txn::Transaction};
+use store::{
+    config::{CreateConfig, OpenConfig},
+    db::DBFile,
+    txn::Transaction,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -39,6 +43,11 @@ pub type ConMgr<F> = Arc<ConnectionManager<F>>;
 pub struct ConnectionManager<F: DBFile + 'static> {
     active_conns: RwLock<HashSet<Arc<Connection<F>>>>,
     open_databases: RwLock<HashMap<String, Arc<Database<F>>>>,
+    // What a database is created with, and (its `open` part) opened with,
+    // when the caller doesn't say: `connect`, `create_and_connect`, and
+    // the SQL statements CREATE DATABASE / USE DATABASE, which have no
+    // way to. See store::config.
+    config: CreateConfig,
 }
 
 pub struct Connection<F: DBFile + 'static> {
@@ -82,16 +91,39 @@ where
     // squeal-cli building a NamedMemFile-backed manager for an
     // in-memory session.
     pub fn new() -> Self {
+        Self::with_config(CreateConfig::default())
+    }
+
+    /// A manager whose databases are created and opened with `config`
+    /// unless a call says otherwise (the `_with` methods).
+    pub fn with_config(config: CreateConfig) -> Self {
         Self {
             active_conns: RwLock::new(HashSet::new()),
             open_databases: RwLock::new(HashMap::new()),
+            config,
         }
+    }
+
+    /// What this manager creates and opens databases with by default.
+    pub fn config(&self) -> &CreateConfig {
+        &self.config
     }
 
     // Opens (or reuses an already-open) database and hands back a new
     // connection to it.
     pub fn connect(self: &Arc<Self>, db_name: &str) -> Result<Arc<Connection<F>>, SchemaError> {
-        let database = self.open_or_get_database(db_name)?;
+        self.connect_with(db_name, &self.config.open)
+    }
+
+    /// `connect`, opening the database as `config` says. A database this
+    /// manager already has open keeps what it was opened with: the config
+    /// only applies to the open that happens here.
+    pub fn connect_with(
+        self: &Arc<Self>,
+        db_name: &str,
+        config: &OpenConfig,
+    ) -> Result<Arc<Connection<F>>, SchemaError> {
+        let database = self.open_or_get_database(db_name, config)?;
         Ok(self.new_connection(database))
     }
 
@@ -100,7 +132,17 @@ where
         self: &Arc<Self>,
         db_name: &str,
     ) -> Result<Arc<Connection<F>>, SchemaError> {
-        let database = self.create_database(db_name)?;
+        self.create_and_connect_with(db_name, &self.config)
+    }
+
+    /// `create_and_connect`, creating the database as `config` says: its
+    /// page size and largest index key, and how it is run.
+    pub fn create_and_connect_with(
+        self: &Arc<Self>,
+        db_name: &str,
+        config: &CreateConfig,
+    ) -> Result<Arc<Connection<F>>, SchemaError> {
+        let database = self.create_database(db_name, config)?;
         Ok(self.new_connection(database))
     }
 
@@ -113,10 +155,22 @@ where
         file: F,
         log_file: F,
     ) -> Result<Arc<Connection<F>>, SchemaError> {
+        self.connect_using_with(db_name, file, log_file, &self.config.open)
+    }
+
+    /// `connect_using`, opening the database as `config` says.
+    pub fn connect_using_with(
+        self: &Arc<Self>,
+        db_name: &str,
+        file: F,
+        log_file: F,
+        config: &OpenConfig,
+    ) -> Result<Arc<Connection<F>>, SchemaError> {
         if self.open_databases.read().contains_key(db_name) {
             return Err(SchemaError::DatabaseInUseError(db_name.to_string()));
         }
-        let database = Database::<F>::open_using(db_name.to_string(), file, log_file)?;
+        let database =
+            Database::<F>::open_using_with(db_name.to_string(), file, log_file, config)?;
         self.open_databases
             .write()
             .insert(db_name.to_string(), database.clone());
@@ -129,22 +183,30 @@ where
         conn
     }
 
-    fn open_or_get_database(&self, name: &str) -> Result<Arc<Database<F>>, SchemaError> {
+    fn open_or_get_database(
+        &self,
+        name: &str,
+        config: &OpenConfig,
+    ) -> Result<Arc<Database<F>>, SchemaError> {
         if let Some(db) = self.open_databases.read().get(name) {
             return Ok(db.clone());
         }
-        let db = Database::<F>::open(name.to_string())?;
+        let db = Database::<F>::open_with(name.to_string(), config)?;
         self.open_databases
             .write()
             .insert(name.to_string(), db.clone());
         Ok(db)
     }
 
-    fn create_database(&self, name: &str) -> Result<Arc<Database<F>>, SchemaError> {
+    fn create_database(
+        &self,
+        name: &str,
+        config: &CreateConfig,
+    ) -> Result<Arc<Database<F>>, SchemaError> {
         if self.open_databases.read().contains_key(name) {
             return Err(SchemaError::DatabaseInUseError(name.to_string()));
         }
-        let db = Database::<F>::create(name.to_string())?;
+        let db = Database::<F>::create_with(name.to_string(), config)?;
         self.open_databases
             .write()
             .insert(name.to_string(), db.clone());
@@ -170,13 +232,6 @@ impl ConnectionManager<File> {
 }
 
 impl Connection<store::memfile::MemFile> {
-    /// The store database this connection runs on — for another front-end
-    /// to share it (squeal-wasm runs sq-json's document collections on the
-    /// same store, so one snapshot holds both).
-    pub fn store(&self) -> Arc<store::db::Db<store::memfile::MemFile>> {
-        self.database.read().db.clone()
-    }
-
     /// The current database's committed state as (data file, log file) —
     /// see `Db::<MemFile>::synced_snapshot`. Feed both to
     /// `ConnectionManager::connect_using` to reopen it.
@@ -354,6 +409,14 @@ where
         Ok(())
     }
 
+    /// The store database this connection runs on — for another front-end
+    /// to share it (squeal-wasm runs sq-json's document collections on the
+    /// same store, so one snapshot holds both), or to read what it runs
+    /// with (`Db::config`, `Db::page_size`).
+    pub fn store(&self) -> Arc<store::db::Db<F>> {
+        self.database.read().db.clone()
+    }
+
     pub fn create_schema(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
         reject_temp_schema_name(name)?;
         let schema = self.database.read().create_schema(name)?;
@@ -365,7 +428,8 @@ where
     // opened) database — the current schema selection belonged to the
     // old database, so it's cleared, not carried over.
     pub(crate) fn use_database(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
-        let database = self.mgr.open_or_get_database(name)?;
+        // USE DATABASE has no way to say how: as the manager opens them.
+        let database = self.mgr.open_or_get_database(name, &self.mgr.config.open)?;
         *self.database.write() = database;
         self.current_schema.write().take();
         self.temp_tables.clear();
@@ -375,7 +439,8 @@ where
     // Like use_database, but creates a brand-new database rather than
     // opening an existing one.
     pub(crate) fn create_database(self: &Arc<Self>, name: &str) -> Result<(), SchemaError> {
-        let database = self.mgr.create_database(name)?;
+        // CREATE DATABASE has no way to say how: as the manager creates them.
+        let database = self.mgr.create_database(name, &self.mgr.config)?;
         *self.database.write() = database;
         self.current_schema.write().take();
         self.temp_tables.clear();
