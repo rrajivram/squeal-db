@@ -18,8 +18,8 @@
 //! `#[sql_parser(body_only)]` generates the same parser as an inherent
 //! `fn body_parser(args)` and skips the trait impl — used by the recursion
 //! handle types themselves (`Query`), whose trait impl instead returns the
-//! handle out of the context, while the knot-tier feeds `body_parser` into
-//! `Recursive::define`.
+//! handle out of the context, while the knot-tier (`SqlCtx::build`) builds
+//! each root from `body_parser` with chumsky's `recursive()`.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -105,8 +105,8 @@ pub fn derive_parser(inp: TokenStream) -> TokenStream {
         quote! {
             impl #name {
                 /// The derived field-sequence parser, used by the recursion
-                /// knot-tier (`SqlCtx::build`) to `define` this type's
-                /// `Recursive` handle.
+                /// knot-tier (`SqlCtx::build`) to build this type's
+                /// `Recursive` root.
                 pub fn body_parser<'src, I, E>(
                     args: ::sql_parser::parser::SqlCtx<'src, I, E>,
                 ) -> impl ::chumsky::Parser<'src, I, Self, E> + Clone

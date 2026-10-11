@@ -13,7 +13,7 @@ use chumsky::{
     input::{ExactSizeInput, Input, ValueInput},
     label::LabelError,
     prelude::any,
-    recursive::{Indirect, Recursive},
+    recursive::{Direct, Recursive, recursive},
     util::MaybeRef,
 };
 use either::Either;
@@ -95,22 +95,26 @@ where
 }
 
 /// The shared recursion context threaded through every derived parser as its
-/// args. It holds the `Recursive` handles for the two mutually recursive
-/// grammar roots — expressions and queries — so that `Expr -> Query -> Expr`
-/// cycles (subqueries) reference one shared definition instead of recursing
-/// at parser-construction time.
+/// args. It holds the `Recursive` handles for the mutually recursive grammar
+/// roots — expressions, queries and statements — so that `Expr -> Query ->
+/// Expr` cycles (subqueries) reference one shared definition instead of
+/// recursing at parser-construction time.
 ///
-/// [`SqlCtx::build`] declares both handles, then defines each body with the
-/// context (so the bodies see the handles), and returns the tied knot.
+/// [`SqlCtx::build`] ties the knot. A handle given to a grammar body must not
+/// own what it points at: a body owning its own root is a reference cycle,
+/// and every grammar built would leak (13.7 KB a parse, with chumsky's
+/// `declare`/`define`). So the roots are nested `recursive()` calls —
+/// statements own queries, queries own expressions — and a body's handles
+/// to itself and to the roots enclosing it are chumsky's weak ones.
 pub struct SqlCtx<'src, I, E>
 where
     I: Input<'src>,
     E: ParserExtra<'src, I>,
 {
-    pub expr: Recursive<Indirect<'src, 'src, I, crate::expr::Expr, E>>,
-    pub query: Recursive<Indirect<'src, 'src, I, crate::query::Query, E>>,
+    pub expr: Recursive<Direct<'src, 'src, I, crate::expr::Expr, E>>,
+    pub query: Recursive<Direct<'src, 'src, I, crate::query::Query, E>>,
     /// Statements recurse too: `EXPLAIN <statement>`.
-    pub stmt: Recursive<Indirect<'src, 'src, I, crate::statement::Statement, E>>,
+    pub stmt: Recursive<Direct<'src, 'src, I, crate::statement::Statement, E>>,
 }
 
 // Derived Clone would demand I: Clone + E: Clone; the handles themselves are
@@ -135,19 +139,49 @@ where
     E: ParserExtra<'src, I> + 'src,
     E::Error: LabelError<'src, I, String>,
 {
+    /// The grammar, with owning handles to all three roots: the statement
+    /// root owns the rest, so a parser holding it holds the whole grammar,
+    /// and dropping the last one frees it.
     pub fn build() -> Self {
-        let mut expr = Recursive::declare();
-        let mut query = Recursive::declare();
-        let mut stmt = Recursive::declare();
-        let ctx = Self {
-            expr: expr.clone(),
-            query: query.clone(),
-            stmt: stmt.clone(),
-        };
-        expr.define(crate::expr::expr_body(ctx.clone()));
-        query.define(crate::query::Query::body_parser(ctx.clone()));
-        stmt.define(crate::statement::Statement::body_parser(ctx.clone()));
-        ctx
+        // Owning handles to the expression and query roots, taken out of
+        // the nesting that builds them.
+        let mut roots = None;
+        let stmt = recursive(|stmt| {
+            let mut owned_expr = None;
+            let query = recursive(|query| {
+                let expr = recursive(|expr| {
+                    crate::expr::expr_body(Self {
+                        expr,
+                        query: query.clone(),
+                        stmt: stmt.clone(),
+                    })
+                });
+                owned_expr = Some(expr.clone());
+                crate::query::Query::body_parser(Self {
+                    expr,
+                    query,
+                    stmt: stmt.clone(),
+                })
+            });
+            let expr = owned_expr.expect("built with the query grammar");
+            roots = Some((expr.clone(), query.clone()));
+            crate::statement::Statement::body_parser(Self { expr, query, stmt })
+        });
+        let (expr, query) = roots.expect("built with the statement grammar");
+        Self { expr, query, stmt }
+    }
+
+    /// Wraps `parser` so that it owns the whole grammar: the expression and
+    /// query roots' handles to the roots enclosing them are weak, so a
+    /// parser holding only `expr` or `query` must keep `stmt` alive too.
+    pub(crate) fn owning<O>(
+        self,
+        parser: impl Parser<'src, I, O, E> + Clone,
+    ) -> impl Parser<'src, I, O, E> + Clone {
+        parser.map(move |out| {
+            let _keep = &self.stmt;
+            out
+        })
     }
 }
 

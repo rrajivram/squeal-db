@@ -283,7 +283,9 @@ where
     E::Error: LabelError<'src, I, String>,
 {
     fn parser(_args: ()) -> impl Parser<'src, I, Self, E> + Clone {
-        SqlCtx::build().expr
+        let ctx = SqlCtx::build();
+        let expr = ctx.expr.clone();
+        ctx.owning(expr)
     }
 }
 
