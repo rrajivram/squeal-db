@@ -6,6 +6,7 @@ use store::{
     cursor::KeyRange,
     cursor::{Cursor, RangeCursor},
     db::{DBFile, Db},
+    table::TableIdType,
     tuple::DBIdType,
     txn::Transaction,
     valueitem::{IndexKey, ValueItem},
@@ -63,6 +64,18 @@ impl<F> IndexSource<F>
 where
     F: DBFile<Item = F> + 'static,
 {
+    // Index `index`'s tree in partition `part`. A PRIMARY KEY has none (see
+    // SqlIndex::has_tree): the planner reads the rows tree for it instead.
+    fn tree(table: &SqlTable, part: usize, index: usize) -> Result<TableIdType, SchemaError> {
+        if !table.indices[index].has_tree() {
+            return Err(SchemaError::InternalSchemaError(format!(
+                "the primary key of table {:?} has no index tree of its own",
+                table.name
+            )));
+        }
+        Ok(table.partitions[part].index(index))
+    }
+
     /// The entries of `index` in the table's partition `part` within
     /// `ranges` (see optim::picker's IndexSeek/IndexLookup), expected to be
     /// `rows` many; `lookup` fetches each entry's row from the partition.
@@ -80,11 +93,8 @@ where
     ) -> Result<Self, SchemaError> {
         let db = conn.database.read().db.clone();
         let seek = ranges.clone();
-        let cursor = db.key_ranges_scan(
-            table.partitions[part].index(index),
-            txn.map(|t| t.id()),
-            ranges,
-        )?;
+        let cursor =
+            db.key_ranges_scan(Self::tree(table, part, index)?, txn.map(|t| t.id()), ranges)?;
         let mut source = Self::with_cursor(table, part, index, cursor, stats)?;
         source.seek = Some((seek, rows));
         source.lookup = lookup.then_some(db);
@@ -100,7 +110,7 @@ where
         stats: Option<ComputedTableStat>,
     ) -> Result<Self, SchemaError> {
         let db = &db.database.read().db;
-        let tree = table.partitions[part].index(index);
+        let tree = Self::tree(table, part, index)?;
         let cursor = match txn {
             Some(tx) => db.range_scan_bounds_in_txn(
                 tree,

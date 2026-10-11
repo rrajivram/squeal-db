@@ -254,8 +254,23 @@ fn test_the_version_2_catalog_row_fixture_decodes_and_its_shape_is_byte_stable()
     }
     // Re-encoding reproduces the captured bytes exactly.
     assert_eq!(t.encode_catalog_row().unwrap(), row);
-    // And it is what the same statements produce today.
-    assert_eq!(build_partitioned_table().encode_catalog_row().unwrap(), row);
+    // And the same statements produce the same shape today — every field
+    // but the trees: a PRIMARY KEY no longer gets a tree of its own (see
+    // SqlIndex::has_tree), so its slot holds none and the other trees'
+    // ids moved down.
+    let today = build_partitioned_table();
+    let today = SqlTable::decode_catalog_row(&today.encode_catalog_row().unwrap()).unwrap();
+    assert_eq!(today.name, t.name);
+    assert_eq!(today.partitioning, t.partitioning);
+    assert_eq!(today.next_partition_id, t.next_partition_id);
+    assert_eq!(today.indices.len(), t.indices.len());
+    for (a, b) in today.indices.iter().zip(&t.indices) {
+        assert_eq!((&a.name, a.is_primary, a.is_unique), (&b.name, b.is_primary, b.is_unique));
+    }
+    for (a, b) in today.partitions.iter().zip(&t.partitions) {
+        assert_eq!((&a.name, a.id, &a.bound), (&b.name, b.id, &b.bound));
+        assert_eq!(a.index(0), store::table::TableIdType::none(), "no tree for the PRIMARY KEY");
+    }
 }
 
 // The real loader, end to end: a partitioned table, its partitions' trees

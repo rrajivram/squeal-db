@@ -433,12 +433,11 @@ fn test_conditions_a_seek_reads_exactly_are_not_rechecked() {
     assert!(explain(&c, sql).contains("Filter"), "{}", explain(&c, sql));
 }
 
-// The cost model counts a row at the schema's width, whatever its table's
-// tree was sized for (a row table's tree entries hold just its key — see
-// SqlTable::row_entry_size): a count over a primary key range reads the
-// narrow primary key index, not the rows.
+// A count over a primary key range seeks the rows tree, which is keyed by
+// the primary key: there is no narrower primary key index to read instead
+// (see SqlIndex::has_tree).
 #[test]
-fn test_a_key_range_count_reads_the_primary_key_index() {
+fn test_a_key_range_count_seeks_the_rows_tree() {
     let c = conn();
     run(
         &c,
@@ -454,7 +453,7 @@ fn test_a_key_range_count_reads_the_primary_key_index() {
     run(&c, "analyze table o").unwrap();
     let sql = "select count(*) from o where order_id >= 'ORD0000500' and order_id < 'ORD0001200'";
     let plan = explain(&c, sql);
-    assert!(plan.contains("IndexSeek o using primary key"), "{plan}");
+    assert!(plan.contains("TableSeek o"), "{plan}");
     assert_eq!(select_rows(&c, sql).1, vec![vec![ValueItem::Integer(700)]]);
 }
 

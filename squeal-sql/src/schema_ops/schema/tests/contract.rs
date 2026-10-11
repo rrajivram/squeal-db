@@ -145,7 +145,8 @@ fn test_schema_state_survives_close_and_reopen() {
     assert_eq!(after.indices.len(), 2);
     assert_eq!(before.index_tree(0), after.index_tree(0));
     assert_eq!(before.index_tree(1), after.index_tree(1));
-    assert!(s2.db.table_id_by_name("default.users0").unwrap().is_some());
+    // The PRIMARY KEY has no tree of its own (see SqlIndex::has_tree).
+    assert!(s2.db.table_id_by_name("default.users0").unwrap().is_none());
     assert!(s2.db.table_id_by_name("default.users1").unwrap().is_some());
 
     NamedMemFile::delete(&path);
@@ -270,29 +271,35 @@ fn test_create_table_with_no_indices_creates_no_backing_store_tables() {
 fn test_index_backing_table_naming() {
     struct Case {
         sql: &'static str,
-        // (index position, expected schema-qualified backing store table
-        // name, expected index.name)
-        expected: &'static [(usize, &'static str, Option<&'static str>)],
+        // (index position, the schema-qualified backing store table name
+        // it would have, whether it has one, expected index.name). A
+        // PRIMARY KEY has none: the rows tree is keyed by it (see
+        // SqlIndex::has_tree).
+        expected: &'static [(usize, &'static str, bool, Option<&'static str>)],
     }
     let cases = [
         // A single unnamed index falls back to format!("{table}{count}"),
         // then gets schema-qualified for the actual store-level name.
         Case {
-            sql: "create table t (id integer not null, primary key(id))",
-            expected: &[(0, "default.t0", None)],
+            sql: "create table t (id integer not null, unique(id))",
+            expected: &[(0, "default.t0", true, None)],
         },
         // Multiple unnamed indices get distinct, incrementing fallback
         // names, in declaration order (table-level constraints first).
         Case {
             sql: "create table t (id integer not null, email varchar(50) not null, \
                   primary key(id), unique(email))",
-            expected: &[(0, "default.t0", None), (1, "default.t1", None)],
+            expected: &[(0, "default.t0", false, None), (1, "default.t1", true, None)],
         },
         // An explicit constraint name is used (still schema-qualified)
         // for the backing table instead of the auto-generated fallback.
         Case {
+            sql: "create table t (id integer not null, constraint my_uq unique(id))",
+            expected: &[(0, "default.my_uq", true, Some("my_uq"))],
+        },
+        Case {
             sql: "create table t (id integer not null, constraint my_pk primary key(id))",
-            expected: &[(0, "default.my_pk", Some("my_pk"))],
+            expected: &[(0, "default.my_pk", false, Some("my_pk"))],
         },
     ];
     for c in cases {
@@ -301,7 +308,7 @@ fn test_index_backing_table_naming() {
         let s = conn.current_schema().unwrap();
         let t = s.get_table("t").unwrap();
         assert_eq!(t.indices.len(), c.expected.len(), "for `{}`", c.sql);
-        for &(i, backing_name, index_name) in c.expected {
+        for &(i, backing_name, has_tree, index_name) in c.expected {
             assert_eq!(
                 t.indices[i].name,
                 index_name.map(String::from),
@@ -311,7 +318,7 @@ fn test_index_backing_table_naming() {
             let found = s.db.table_id_by_name(backing_name).unwrap();
             assert_eq!(
                 found,
-                Some(t.index_tree(i)),
+                has_tree.then(|| t.index_tree(i)),
                 "backing table {backing_name:?} for `{}`",
                 c.sql
             );
@@ -366,7 +373,7 @@ fn test_colliding_index_name_rejects_create_table_and_leaks_nothing() {
     // *other* failure (see the test below, which exercises that path —
     // a collision can no longer reach it, per this test).
     //
-    // t1 claims the name "shared_name" for its primary key's backing
+    // t1 claims the name "shared_name" for its unique index's backing
     // table. t2 declares two indices — "idx_a" then "shared_name" (the
     // one that collides with t1's) — in declaration order. Both names
     // are checked before either is created, so "idx_a" must never be
@@ -374,14 +381,14 @@ fn test_colliding_index_name_rejects_create_table_and_leaks_nothing() {
     let conn = conn();
     execute(
         &conn,
-        "create table t1 (id integer not null, constraint shared_name primary key(id))",
+        "create table t1 (id integer not null, constraint shared_name unique(id))",
     )
     .unwrap();
 
     let err = execute(
         &conn,
         "create table t2 (id integer not null, val varchar(20) not null, \
-         constraint idx_a unique(val), constraint shared_name primary key(id))",
+         constraint idx_a unique(val), constraint shared_name unique(id))",
     )
     .unwrap_err();
     assert!(matches!(err, SchemaError::BadTableName(_)), "got {err:?}");
@@ -437,7 +444,7 @@ fn test_create_table_steps_around_a_store_table_no_table_refers_to() {
 
     execute(
         &conn,
-        "create table t (id integer not null, constraint taken primary key(id))",
+        "create table t (id integer not null, constraint taken unique(id))",
     )
     .unwrap();
     let t = s.get_table("t").unwrap();
@@ -485,7 +492,10 @@ fn test_a_created_table_is_durable_with_its_real_store_ids_before_any_clean_clos
         assert_eq!(disk.rows_tree(), live.rows_tree(), "{name}");
         assert_eq!(disk.indices.len(), live.indices.len(), "{name}");
         for i in 0..disk.indices.len() {
-            assert_ne!(disk.index_tree(i), store::table::TableIdType::none(), "{name} index");
+            // A PRIMARY KEY has no tree (see SqlIndex::has_tree).
+            if disk.indices[i].has_tree() {
+                assert_ne!(disk.index_tree(i), store::table::TableIdType::none(), "{name} index");
+            }
             assert_eq!(disk.index_tree(i), live.index_tree(i), "{name} index");
         }
     }

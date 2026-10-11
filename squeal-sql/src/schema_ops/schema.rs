@@ -282,12 +282,14 @@ where
     }
 
     // The store names to create a partition's trees under: its rows tree,
-    // then one per index of the table. An error if one is in use.
+    // then one per index of the table — None for the PRIMARY KEY, which has
+    // no tree of its own (see SqlIndex::has_tree). An error if one is in
+    // use.
     fn tree_names(
         &self,
         table: &SqlTable,
         part: &Partition,
-    ) -> Result<(String, Vec<String>), SchemaError> {
+    ) -> Result<(String, Vec<Option<String>>), SchemaError> {
         let suffix = Self::partition_suffix(table, part);
         let rows = self
             .free_tree_name(&self.qualify(&format!("{}{suffix}", table.name)))?
@@ -295,14 +297,18 @@ where
                 SchemaError::BadTableName(format!("Table name {} is already in use", table.name))
             })?;
         let mut indices = vec![];
-        for i in 0..table.indices.len() {
+        for (i, index) in table.indices.iter().enumerate() {
+            if !index.has_tree() {
+                indices.push(None);
+                continue;
+            }
             let base = Self::index_base_name(table, i);
-            indices.push(
+            indices.push(Some(
                 self.free_tree_name(&self.qualify(&format!("{base}{suffix}")))?
                     .ok_or_else(|| {
                         SchemaError::BadTableName(format!("Index name {base} is already in use"))
                     })?,
-            );
+            ));
         }
         Ok((rows, indices))
     }
@@ -315,7 +321,7 @@ where
         &self,
         table: &SqlTable,
         part: &mut Partition,
-        names: &(String, Vec<String>),
+        names: &(String, Vec<Option<String>>),
         created: &mut Vec<String>,
     ) -> Result<(), SchemaError> {
         let identity_size = table.identity_size();
@@ -325,6 +331,7 @@ where
         created.push(names.0.clone());
         part.set_rows(rows);
         for (i, (index, name)) in table.indices.iter().zip(&names.1).enumerate() {
+            let Some(name) = name else { continue };
             let id = self.db.create_table_with_index_entry_size(
                 name.clone(),
                 index.size(identity_size) as u64,
@@ -345,9 +352,12 @@ where
         txn: &Transaction,
     ) -> Result<bool, SchemaError> {
         // Whether it's there, not what it holds: lent (find_with) and not
-        // looked at, rather than copied out and dropped.
+        // looked at, rather than copied out and dropped. A PRIMARY KEY's
+        // entries are the rows themselves, under the same key.
+        let has_tree = table.indices[index].has_tree();
         for part in &table.partitions {
-            if self.db.find_with(part.index(index), key, txn, |_| ())?.is_some() {
+            let tree = if has_tree { part.index(index) } else { part.rows() };
+            if self.db.find_with(tree, key, txn, |_| ())?.is_some() {
                 return Ok(true);
             }
         }
@@ -389,7 +399,7 @@ where
         // operation the way insert/update/remove are).
         // One set of trees per partition (see crate::partition): its rows
         // tree, then one per index.
-        let tree_names: Vec<(String, Vec<String>)> = table
+        let tree_names: Vec<(String, Vec<Option<String>>)> = table
             .partitions
             .iter()
             .map(|p| self.tree_names(&table, p))
@@ -640,33 +650,33 @@ where
         // The partition the row's own values put it in: its rows tree and
         // its index trees are the ones written.
         let part = &table.partitions[table.partition_for(&row)?];
+        // Every index entry's key, built while `row` is still borrowed.
+        let mut index_keys = vec![];
         for (i, index) in table.indices.iter().enumerate() {
+            if !index.has_tree() {
+                continue;
+            }
             let mut values = table.extract_field_values(&index.fields, &row);
-            // A PRIMARY KEY/UNIQUE index's own declared fields are
-            // already unique by definition — that's what makes the
-            // backing BPlusTree's own duplicate-key rejection enforce
-            // the constraint. A plain index has no such guarantee, so
-            // its key has to carry the row's own identity too, or two
-            // rows sharing the same indexed value would collide as
-            // the same physical key (see Schema::create_index's own
-            // doc comment, which this has to stay in lockstep with).
-            if !index.is_primary && !index.is_unique {
+            // A UNIQUE index's own declared fields are already unique by
+            // definition — that's what makes the backing BPlusTree's own
+            // duplicate-key rejection enforce the constraint. A plain
+            // index has no such guarantee, so its key has to carry the
+            // row's own identity too, or two rows sharing the same indexed
+            // value would collide as the same physical key (see
+            // Schema::create_index's own doc comment, which this has to
+            // stay in lockstep with).
+            if !index.is_unique {
                 values.extend_from_slice(identity.values());
             }
-            let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-            self.db.insert(
-                part.index(i),
-                Tuple::new_with(index_key, &to_allocvec(&identity)?, Some(txn.id()), None),
-                txn,
-            )?;
+            index_keys.push((i, DBIdType::Rec(IndexKey::new_from(&values)?)));
         }
 
-        // Stamped with the table's CURRENT version — every new
-        // insert is always written in the table's latest shape;
-        // only rows written before an ALTER TABLE carry an older
-        // version (see VersionedRow, SqlTable::reproject). Moves
-        // `row` (see new_from_owned) — must be the last thing that
-        // touches it.
+        // The row first: the rows tree is keyed by the PRIMARY KEY, so a
+        // duplicate one fails here, before any index entry is written.
+        // Stamped with the table's CURRENT version — every new insert is
+        // always written in the table's latest shape; only rows written
+        // before an ALTER TABLE carry an older version (see VersionedRow,
+        // SqlTable::reproject). Moves `row` (see new_from_owned).
         let row = IndexKey::new_from_owned(row)?;
         let row_data = table.encode_row(&row)?;
         self.db.insert(
@@ -674,6 +684,14 @@ where
             Tuple::new_with(row_key.clone(), &row_data, Some(txn.id()), None),
             txn,
         )?;
+        let identity = to_allocvec(&identity)?;
+        for (i, index_key) in index_keys {
+            self.db.insert(
+                part.index(i),
+                Tuple::new_with(index_key, &identity, Some(txn.id()), None),
+                txn,
+            )?;
+        }
         // Best-effort, matching SchemaStats' own approximate nature
         // (bloom-filter uniqueness, a skippable send — see log_stat's
         // own doc comment): logged right after this row's own insert
@@ -719,8 +737,11 @@ where
         // insert_one_row_in_txn).
         let part = &table.partitions[table.partition_for(row)?];
         for (i, index) in table.indices.iter().enumerate() {
+            if !index.has_tree() {
+                continue;
+            }
             let mut values = table.extract_field_values(&index.fields, row);
-            if !index.is_primary && !index.is_unique {
+            if !index.is_unique {
                 values.extend_from_slice(identity.values());
             }
             let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);

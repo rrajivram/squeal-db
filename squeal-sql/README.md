@@ -115,9 +115,14 @@ one. Each partition has:
 - **A rows tree.** Keyed by the primary key, as a composite
   `IndexKey`. A table without one gets an auto-increment row id from a
   store sequence. The payload is the encoded row.
-- **One tree per index.** Keyed by the indexed columns. For a non-unique
-  index, the row's key is appended, so equal values are still distinct
-  keys. The payload is the row's key.
+  - The primary key has no tree of its own: the rows tree is it. A
+    duplicate key is rejected by the rows tree, and the row is written
+    before any index entry, so a rejected row leaves none behind.
+    (Databases written before this have a primary key tree, which is no
+    longer read or written.)
+- **One tree per other index.** Keyed by the indexed columns. For a
+  non-unique index, the row's key is appended, so equal values are still
+  distinct keys. The payload is the row's key.
   - A `UNIQUE` or `PRIMARY KEY` constraint is enforced by the store's own
     duplicate-key check, with no extra lookup.
   - Indexes are local to each partition, so a unique key must include the

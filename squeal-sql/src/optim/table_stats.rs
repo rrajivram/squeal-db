@@ -800,7 +800,13 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
         let mut indices = vec![];
         for (i, index) in table.indices.iter().enumerate() {
             let unique = index.is_primary || index.is_unique;
-            let (levels, nodes_per_page, record_size) = deepest(&|p| p.index(i))?;
+            // A PRIMARY KEY has no tree of its own: it is the rows tree's
+            // key, and its entry is as wide as the key.
+            let (levels, nodes_per_page, record_size) = if index.has_tree() {
+                deepest(&|p| p.index(i))?
+            } else {
+                (levels, nodes_per_page, index.size(table.identity_size()))
+            };
             indices.push(IndexStat {
                 levels,
                 nodes_per_page,

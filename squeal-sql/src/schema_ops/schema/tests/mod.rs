@@ -49,6 +49,7 @@ mod dml;
 mod foreign_key;
 mod key_width;
 mod mapping;
+mod primary_key;
 mod stats;
 mod stats_resilience;
 

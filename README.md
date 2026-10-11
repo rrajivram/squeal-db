@@ -97,7 +97,7 @@ has no idea what a column, a document or a query is.
 
 Each SQL table becomes store tables:
 - one keyed by the primary key, holding the rows
-- one per index, holding index keys that point back to the row's key
+- one per other index, holding index keys that point back to the row's key
 
 Each partition has its own.
 

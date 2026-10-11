@@ -2015,6 +2015,15 @@ pub(crate) fn expr_to_value_item(
 }
 
 impl SqlIndex {
+    // Whether the index has a tree of its own. A PRIMARY KEY doesn't: the
+    // rows tree is keyed by it, and rejects a duplicate key itself, so a
+    // second tree of the same keys only doubled what each row cost.
+    // Databases written before this have one; it is no longer read or
+    // written.
+    pub(crate) fn has_tree(&self) -> bool {
+        !self.is_primary
+    }
+
     // Plus ENTRY_OVERHEAD_BYTES — see its own comment on SqlTable::
     // row_size. `identity_size` (SqlTable::identity_size's own return
     // value) only actually adds anything for a plain, non-unique index —

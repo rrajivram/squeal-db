@@ -26,44 +26,125 @@ disk, against SQLite's 57 MB. The page cache is bounded by bytes, so each
 cached megabyte holds about a sixth of the rows SQLite's does. The cost
 multiplies through the cache, the WAL and I/O.
 
-The orders table, loaded step by step:
+Where an order row's ~300 B goes, measured by loading step by step, with
+the per-field breakdown taken from the code:
 
-| | size | per row |
-|---|---:|---:|
-| table with no primary key | 100 MB | 100 B |
-| adding `primary key(id)` | +54 MB | +54 B |
-| each single-integer secondary index | +73 MB | +73 B |
+| | per row | why |
+|---|---:|---|
+| row tree | ~100 B | the row body (~57–74 B fixed-width), MVCC header and slot ≈ 94 B on a data page, plus a ~21 B leaf entry pointing at it |
+| primary-key tree | ~54 B | a second copy of what the row tree already is |
+| each secondary index | ~73 B | key + payload on a data page, and the key again in a leaf; leaves ~69% full |
 
-SQLite needs roughly 12–15 B for an index entry.
+SQLite needs about 50 B for the same row and indexes.
 
-- [ ] **The primary key gets its own index tree.** The row tree is already
-  keyed by the primary key, so this duplicates it: 54 B a row. Where:
-  `squeal-sql/src/table.rs` (`inline_indices` and the table-level
-  constraint, `is_primary: true`), and `insert_one_row_in_txn` in
+The causes:
+- **The primary key gets its own index tree.** The row tree is already
+  keyed by the primary key, and already rejects a duplicate one. Only
+  three things read the extra tree: foreign-key probes, covering scans
+  of a primary-key range, and stats.
+  Where: `squeal-sql/src/table.rs` (`is_primary: true`), and
+  `insert_one_row_in_txn` / `delete_one_row_in_txn` in
   `squeal-sql/src/schema_ops/schema.rs`.
-- [ ] **An index entry stores the row's primary key twice**: appended to
-  the key (`values.extend_from_slice(identity.values())`) and again as
-  the payload (`to_allocvec(&identity)`). Where:
-  `insert_one_row_in_txn`.
-- [ ] **Rows are fixed-width.** Where: `RowLayout` / `column_width` in
-  `squeal-sql/src/table.rs`, and `write_to` in `store/src/valueitem.rs`.
-  - Every integer and double takes 9 bytes; SQLite's varints take 1–9.
-  - A string takes 9 bytes plus its declared width: `varchar(12)` holding
-    "pen" takes 21 bytes. `TEXT` defaults to a width of 32.
+- **Every store tree keeps each entry twice**, index trees included: the
+  key in the leaf, and the key plus payload on a separate data page
+  (`write_version` / `write_data`, `store/src/tables/bplustree.rs`).
+- **An index entry stores the row's primary key twice**: appended to the
+  key, and again as the payload.
+- **Rows are fixed-width** (`RowLayout` in `squeal-sql/src/table.rs`).
+  - Integers take 9 B.
+  - A string takes 9 B plus its declared width.
   - A NULL takes its column's full width.
-  - Every row starts with an 8-byte value count.
-- [ ] **Every stored tuple carries MVCC fields**: a transaction id, a
-  previous-version LSN and flags, plus an 8-byte slot entry. That is
-  about 20 B a row and a further 20 B an index entry. Some could be
-  dropped once a row is older than every snapshot.
+  - Each row starts with an 8-byte count.
 
-The suggested direction:
-1. Drop the primary-key tree.
-2. Drop the duplicate primary key from index entries.
-3. Use variable-width rows with varint integers and unpadded strings.
+  Keys and index payloads are already compact; only row bodies are
+  padded.
+- **`CREATE INDEX` inserts in primary-key order**, so the index keys
+  arrive at random and the leaves settle about 69% full.
+- **Every tuple carries MVCC fields forever.** These are a transaction
+  id, a previous-version LSN and flags, plus an 8-byte slot. Every page
+  also reserves 608 B for a high key, data pages included.
 
-Together these should bring the data within about 2x of SQLite's, and let
-the same cache hold proportionally more rows.
+### Plan
+
+Each step is its own commit, checked by:
+- the size probe;
+- the full test suite;
+- the SQLite comparison tests;
+- crash soaks for the store steps (4, 5 and 6);
+- the bench.
+
+Old databases stay readable throughout: each new format has its own flag
+or is unambiguous.
+
+- [x] **Step 1. Stop materializing the primary-key tree** (squeal-sql).
+  Done 2026-10-11.
+  - The `is_primary` entry stays in `table.indices` (`SqlIndex::has_tree`
+    is false for it), so positions, the catalog, `SHOW TABLE INDEX` and
+    the ALTER guards are unchanged.
+  - The row is written before any index entry, so a duplicate primary
+    key still fails before anything is written.
+  - Foreign-key checks probe the row tree with the same key.
+  - The planner never offers the primary key as an index.
+  - In existing databases the tree is no longer read or written. Its
+    pages stay allocated until reclaiming them is added.
+  - Measured on the size probe, 1M orders:
+
+    | | before | after |
+    |---|---:|---:|
+    | table only | 154.5 MB | 104.5 MB (−50 B a row) |
+    | with 2 indexes | 300.0 MB | 251.4 MB |
+
+  - A/B on the 1M-order bench:
+
+    | | before | after |
+    |---|---:|---:|
+    | bulk load, per row | 4.5 µs | 2.6 µs |
+    | `UPDATE` 100 a txn, per row | 140 µs | 125 µs |
+    | peak memory | 441 MiB | 405–412 MiB |
+    | memory at the end | 383 MiB | 338–349 MiB |
+    | reads | | unchanged |
+
+  - The trade-off: a `count(*)` over a primary-key range reads the rows
+    tree instead of the narrower primary-key tree, about 12% slower
+    (83 → 93 ms for half of 1M rows). A full `count(*)` got 10% faster.
+- [ ] **Step 2. Variable-width rows** (squeal-sql `table.rs`). Saves about
+  40–50 B a row; an orders row goes from ~74 B to ~25.
+  - Integers become varints.
+  - Strings and blobs are unpadded, with a length prefix.
+  - A null bitmap replaces full-width NULLs.
+  - A new flag bit marks the format, so old rows still read.
+  - Columns are found by skipping forward. Add an offset table only if
+    WHERE pushdown regresses.
+- [ ] **Step 3. No duplicate primary key in index entries.** Saves about
+  6 B an entry.
+  - A non-unique index writes an empty payload.
+  - Its readers take the identity from the end of the key.
+  - An empty payload is unambiguous, so old entries still read.
+- [ ] **Step 4. Build `CREATE INDEX` sorted, in bulk.** Saves about 10 B an
+  entry.
+  - Leaves fill to about 95% instead of 69%.
+  - Also fixes the 3.7 s an index at 1M rows (SQLite: 0.18 s).
+- [ ] **Step 5. Keep entries in the leaf** (store B+tree; needs the
+  author's go-ahead). Saves about 30 B an index entry.
+  - A tree created as index-only keeps each whole entry in its leaf, with
+    no data page.
+  - The same mode could later hold short rows in the row tree: −21 B a
+    row, and one page read fewer per lookup.
+- [ ] **Step 6. Shrink the tuple header** (store page format v3). Saves
+  about 10–20 B a row.
+  - Drop the transaction id and previous-version LSN once a tuple is
+    older than every reader.
+  - 4-byte slots instead of 8.
+  - No high-key reservation on data pages.
+
+Expected, per order row with the table and its 3 trees:
+
+| | per row |
+|---|---:|
+| today | ~300 B |
+| after steps 1–4 | ~150 B |
+| after step 5 | ~100 B |
+| SQLite | ~50 B |
 
 ## 2. Allocator fragmentation: about half the footprint at the peaks (measured)
 
@@ -241,8 +322,8 @@ hold more rows.
 
 ## Suggested order
 
-1. **Density** (section 1): the biggest lever, since it multiplies through
-   the cache, the WAL and I/O.
+1. **Density** (section 1, with its own plan): the biggest lever, since it
+   multiplies through the cache, the WAL and I/O.
 2. **Search arrays** (3) and **the unbounded maps** (4).
 3. **Per-insert and per-row churn** (6): this is what drives the
    fragmentation.

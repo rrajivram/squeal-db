@@ -101,15 +101,13 @@ fn test_a_range_partitioned_table_stores_each_row_in_its_bounds_partition() {
     assert_eq!(t.partitions[1].bound, PartitionBound::LessThan(Integer(20)));
     // A bound is exclusive: day 10 is mid's, day 20 late's.
     assert_eq!(counts(&c, "events"), [2, 2, 2]);
-    // Each partition has trees of its own, for its rows and for each index.
-    let mut trees: Vec<_> = t
-        .partitions
-        .iter()
-        .flat_map(|p| [p.rows(), p.index(0)])
-        .collect();
+    // Each partition has a tree of its own for its rows, keyed by the
+    // primary key (which has no tree of its own: see SqlIndex::has_tree).
+    assert!(!t.indices[0].has_tree());
+    let mut trees: Vec<_> = t.partitions.iter().map(|p| p.rows()).collect();
     trees.sort();
     trees.dedup();
-    assert_eq!(trees.len(), 6);
+    assert_eq!(trees.len(), 3);
     assert_eq!(ints(&c, "select id from events"), [1, 2, 3, 4, 5, 6]);
 }
 

@@ -100,9 +100,10 @@ pub(super) fn storage_problems(c: &Arc<Connection<MemFile>>, name: &str) -> Vec<
                 DBIdType::Rec(ik) => ik.clone(),
                 DBIdType::Int(n) => IndexKey::new_from(&[Integer(*n as i64)]).unwrap(),
             };
-            for (i, index) in table.indices.iter().enumerate() {
+            // A PRIMARY KEY has no tree: its entries are the rows.
+            for (i, index) in table.indices.iter().enumerate().filter(|(_, x)| x.has_tree()) {
                 let mut values = table.extract_field_values(&index.fields, row.values());
-                if !index.is_primary && !index.is_unique {
+                if !index.is_unique {
                     values.extend_from_slice(identity.values());
                 }
                 let key = DBIdType::Rec(IndexKey::new_from(&values).unwrap());
@@ -115,7 +116,7 @@ pub(super) fn storage_problems(c: &Arc<Connection<MemFile>>, name: &str) -> Vec<
                 }
             }
         }
-        for (i, index) in table.indices.iter().enumerate() {
+        for (i, index) in table.indices.iter().enumerate().filter(|(_, x)| x.has_tree()) {
             let mut entries = 0usize;
             let mut cursor = db.table_scan_in_txn(part.index(i), &txn).unwrap();
             while cursor.next().unwrap().is_some() {

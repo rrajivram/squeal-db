@@ -451,7 +451,8 @@ pub(crate) fn pick_access(
         for (i, index) in table.indices.iter().enumerate() {
             let key = columns_of(index);
             if let Some((ranges, used)) = key_ranges(&key, &sets)
-                && (index.is_primary || index.is_unique)
+                && index.has_tree()
+                && index.is_unique
                 && used == key.len()
                 && ranges.iter().all(|r| r.prefix.len() == key.len())
             {
@@ -566,8 +567,12 @@ pub(crate) fn pick_access(
         used: 0,
     });
     for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
+        // A PRIMARY KEY is the rows tree's key: TableSeek above.
+        if !index.has_tree() {
+            continue;
+        }
         let key = columns_of(index);
-        let unique = index.is_primary || index.is_unique;
+        let unique = index.is_unique;
         let covered: BTreeSet<usize> = key.iter().chain(&pk_columns).copied().collect();
         let covering = needs.columns.is_subset(&covered);
         let entry = stat.row_size + identity_bytes;
@@ -889,8 +894,8 @@ pub(crate) fn pick_join_seek(
         );
     }
     for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
-        if index.is_primary {
-            continue; // the table's own tree is the better way in
+        if !index.has_tree() {
+            continue; // the PRIMARY KEY: the table's own tree, above
         }
         let entry = stat.row_size + identity_bytes;
         consider(
