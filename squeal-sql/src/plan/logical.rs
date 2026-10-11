@@ -1337,21 +1337,26 @@ where
                     ..WantedOrder::default()
                 })
             });
-            let grouped_source: Box<dyn Source> = if key_positions.is_empty() || already_grouped {
-                for_proj
+            if key_positions.is_empty() || already_grouped {
+                // One group, or groups arriving one after another: stream.
+                let group = GroupSource::new(for_proj, projected_fields.clone(), key_positions);
+                Box::new(match having {
+                    Some(having) => group.with_having(having),
+                    None => group,
+                })
             } else {
-                Box::new(SortSource::with_fields(
+                // Hash the groups, holding one accumulator set each rather
+                // than sorting every row (see source::hashgroup); it falls
+                // back to sorting if they outgrow the query's memory.
+                Box::new(crate::source::hashgroup::HashGroupSource::new(
                     for_proj,
+                    projected_fields.clone(),
+                    key_positions,
+                    having,
                     self.conn.database.read().db.clone(),
                     self.mem.clone(),
-                    &key_positions,
-                )?)
-            };
-            let group = GroupSource::new(grouped_source, projected_fields.clone(), key_positions);
-            Box::new(match having {
-                Some(having) => group.with_having(having),
-                None => group,
-            })
+                ))
+            }
         } else {
             Box::new(Projection::new(for_proj, projected_fields.clone()))
         };

@@ -380,11 +380,34 @@ where
     // continuing the existing page/run-budgeted accumulation — from that
     // point on this is unchanged from before this in-memory fast path
     // existed.
+    // A row's memory while held for sorting (see build_initial_runs): its
+    // values' array and reference counts, and every string's or blob's
+    // declared capacity, as an upper bound on its contents.
+    fn row_memory(&self) -> usize {
+        let fields = self.source.fields();
+        let heap: usize = fields
+            .iter()
+            .map(|f| match f.field.datatype {
+                crate::datatype::DataType::Str(n) | crate::datatype::DataType::Blob(n) => n as usize,
+                _ => 0,
+            })
+            .sum();
+        2 * std::mem::size_of::<usize>()
+            + fields.len() * std::mem::size_of::<store::valueitem::ValueItem>()
+            + heap
+    }
+
     fn build_initial_runs(&mut self, record_size: usize) -> Result<InitialBuild<F>, SchemaError> {
         let mut run = self.db.create_run()?;
         let mut runs = vec![];
         let mut mems = vec![];
         let records_per_page = run.data_size() as usize / record_size;
+        // What a page's worth of rows takes while they are held in memory to
+        // be sorted, charged to the query's budget per page: each row an
+        // array of ValueItems behind a reference count, strings and blobs
+        // on top. Charging the bytes they take on a page instead (what this
+        // did) let a 64 MiB budget hold several times that.
+        let chunk_bytes = records_per_page.max(1) * self.row_memory();
         let mut page_count_in_run = 0;
         let mut pages_per_run = 0;
         let mut total_count = 0;
@@ -409,7 +432,7 @@ where
         // operator holds the budget (the sort join sorts both its sides at
         // once against one) — sort out of memory, a page per run, from the
         // start, rather than fail.
-        match self.mem.try_reserve(run.data_size() as usize) {
+        match self.mem.try_reserve(chunk_bytes) {
             Ok(mem) => mems.push(mem),
             Err(SchemaError::QueryMemoryExceeded { .. }) => {
                 mem_filled = true;
@@ -442,7 +465,7 @@ where
                     run = self.db.create_run()?;
                 }
             } else {
-                let new_mem = self.mem.try_reserve(run.data_size() as usize);
+                let new_mem = self.mem.try_reserve(chunk_bytes);
                 if let Err(_e) = new_mem {
                     mem_filled = true;
                     // reached max buffers , create a new run

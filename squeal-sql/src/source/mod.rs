@@ -9,6 +9,7 @@ use crate::{
 pub mod aggr;
 pub(crate) mod append;
 pub(crate) mod group;
+pub(crate) mod hashgroup;
 pub mod hash;
 pub mod index;
 pub(crate) mod join;

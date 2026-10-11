@@ -251,14 +251,19 @@ Execution is a pull-based tree of `Source`s:
 - filter, projection and limit
 - sort (external, spilling sorted runs and merging them)
 - hash, sort-merge and nested-loop joins
-- group and aggregate
+- group and aggregate: by hashing (one set of accumulators per group,
+  output in key order), falling back to sort-then-group if the groups
+  outgrow the query's memory; streaming when the input is already in
+  group order
 - set operations
 - appending partitions
 
 Streaming operators hold O(1) rows. Blocking ones (sort, hash build,
 grouping) reserve memory from the query's budget and spill to store
 scratch runs past it, so a query's memory is bounded, not proportional to
-its input.
+its input. A sort charges each row what it holds in memory (its values and
+their strings), not its encoded size, so the budget is what the process
+actually uses.
 
 ## Known gaps
 

@@ -3045,7 +3045,7 @@ fn test_explain_shows_having() {
             &c,
             "select cat, count(*) as n from t1 group by cat having count(*) > 2"
         ),
-        "GroupAggregate by cat: cat, count(*) AS n having (count(*) > 2)\n  Sort cat ASC NULLS FIRST\n    TableScan t1 (~5 rows)"
+        "HashAggregate by cat: cat, count(*) AS n having (count(*) > 2)\n  TableScan t1 (~5 rows)"
     );
 }
 
@@ -3058,7 +3058,7 @@ fn test_explain_shows_aggregation_grouping_and_distinct() {
     );
     assert_eq!(
         explain(&c, "select cat, count(*) as n from t1 group by cat"),
-        "GroupAggregate by cat: cat, count(*) AS n\n  Sort cat ASC NULLS FIRST\n    TableScan t1 (~5 rows)"
+        "HashAggregate by cat: cat, count(*) AS n\n  TableScan t1 (~5 rows)"
     );
     assert_eq!(
         explain(&c, "select distinct cat from t1"),
@@ -4313,4 +4313,36 @@ fn test_the_widest_key_a_database_accepts_fits_its_pages() {
         matches!(&err, SchemaError::UserError(m) if m.contains("too small for max_index_key_size")),
         "{err}"
     );
+}
+
+// GROUP BY hashes its groups (see source::hashgroup); with more groups
+// than the query's memory holds it rewinds and groups by sorting instead,
+// spilling — the same answer, in the same (key) order, either way.
+#[test]
+fn test_hash_grouping_falls_back_to_sorting_when_groups_outgrow_memory() {
+    use crate::{CreateConfig, OpenConfig};
+
+    let grouped = |query_memory: u64| {
+        let config = CreateConfig::default()
+            .open(OpenConfig::default().query_memory_bytes(query_memory));
+        let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::with_config(config));
+        let c = mgr.create_and_connect("hash_group_db").unwrap();
+        c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+        run(&c, "create table t (id integer not null, g integer, v integer, primary key(id))").unwrap();
+        let rows: Vec<String> = (0..20_000).map(|i| format!("({i}, {}, {})", (i * 7919) % 5000, i % 13)).collect();
+        for chunk in rows.chunks(1000) {
+            run(&c, &format!("insert into t values {}", chunk.join(", "))).unwrap();
+        }
+        let sql = "select g, count(*), sum(v), max(v) from t group by g having count(*) > 3";
+        let plan = explain(&c, sql);
+        assert!(plan.contains("HashAggregate"), "{plan}");
+        partition_diff::ordered(&c, sql).unwrap()
+    };
+    let roomy = grouped(64 << 20);
+    // 5000 groups at ~1 KiB each don't fit 256 KiB: it falls back.
+    let tight = grouped(256 << 10);
+    assert_eq!(roomy.len(), 5000);
+    assert_eq!(roomy, tight);
+    // Key order, as sort-based grouping gives.
+    assert!(roomy.windows(2).all(|w| w[0][0] < w[1][0]));
 }

@@ -193,12 +193,12 @@ fn test_grouping_by_the_join_key_needs_no_sort() {
         "select b.k, count(*) from a join b on a.k = b.k group by b.k",
     );
     assert!(!plan.contains("Sort "), "{plan}");
-    // Not the join key: sorted as usual.
+    // Not the join key: grouped by hashing, as usual.
     let plan = explain(
         &c,
         "select a.id, count(*) from a join b on a.k = b.k group by a.id",
     );
-    assert!(plan.contains("Sort "), "{plan}");
+    assert!(plan.contains("HashAggregate"), "{plan}");
 }
 
 // ORDER BY the join key with a LIMIT: merging stops after LIMIT rows, which
