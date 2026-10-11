@@ -51,17 +51,14 @@ data needs. So at 200k rows, which fit every engine's default cache except
 SQLite's and Turso's, `large` mostly changes the two SQLite engines. The
 larger runs (1M orders, 2M key-value rows) are where the caches differ.
 
-**Bulk loads are 100,000 rows a transaction for every engine.** squeal-db
-keeps a version record for each row a transaction writes until it commits,
-and aborts a transaction holding more than a million of them
-(`max_version_records`, a guard against long transactions pinning
-history). So one transaction can't load a million rows; see "Memory" below.
+**Bulk loads are one transaction for every engine**: all the customers
+and orders in one, and each key-value table in one.
 
 ## Results
 
-Measured 2026-10-10 on an Apple M4 Max (48 GB, macOS 27), release build.
-The full reports, every phase and every memory reading, are in
-[`results/`](results/):
+Measured 2026-10-10 on an Apple M4 Max (48 GB, macOS 27), release build,
+after the memory fixes described below. The full reports, every phase and
+every memory reading, are in [`results/`](results/):
 
 | report | size | runs |
 |---|---|---|
@@ -71,6 +68,8 @@ The full reports, every phase and every memory reading, are in
 | [`kv_2m.md`](results/kv_2m.md) | 2M rows a table | 1 |
 
 Every engine returned the same answers in every read phase of every run.
+The single-run reports are noisier: a rerun of squeal-db's 1M `large`
+point lookup gave 10.5 µs, not the report's 38.8.
 
 ### SQL: squeal-db, SQLite, Turso (200k orders)
 
@@ -78,39 +77,41 @@ Time per operation, `default` / `large` profile:
 
 | phase | squeal-db | SQLite | Turso |
 |---|---:|---:|---:|
-| Bulk load, per row | 4.96 µs / 4.97 µs | 569 ns / 566 ns | 1.07 µs / 1.06 µs |
-| Create an index | 518 ms / 511 ms | 34 ms / 36 ms | 82 ms / 81 ms |
-| Point lookup by primary key | 7.71 µs / 7.75 µs | 1.30 µs / 1.02 µs | 1.69 µs / 1.43 µs |
-| Secondary-index lookup + aggregate | 20.7 µs / 19.9 µs | 9.5 µs / 6.0 µs | 7.9 µs / 4.4 µs |
-| Index range (1 week) + aggregate | 3.7 ms / 3.7 ms | 1.8 ms / 0.80 ms | 1.9 ms / 0.93 ms |
-| Full scan with `GROUP BY` | 66 ms / 66 ms | 46 ms / 44 ms | 40 ms / 31 ms |
-| Join + `GROUP BY` | **117 ms** / 116 ms | 135 ms / **80 ms** | 160 ms / 87 ms |
-| Join, filtered, `ORDER BY` + `LIMIT` | 1.3 ms / 1.3 ms | 0.42 ms / 0.22 ms | 0.45 ms / 0.30 ms |
-| Sort the whole table | 94 ms / 93 ms | 64 ms / 60 ms | 66 ms / 56 ms |
-| `IN (subquery)` | 32 ms / 32 ms | 21 ms / 9.8 ms | 25 ms / 13 ms |
-| Correlated `EXISTS` | 28 ms / 29 ms | 26 ms / 14 ms | 24 ms / 18 ms |
-| Correlated `NOT EXISTS` | **15 ms / 15 ms** | 66 ms / 32 ms | 42 ms / 37 ms |
-| `UPDATE` one row, autocommit | 4.6 ms / 4.7 ms | 4.0 ms / 4.0 ms | 4.0 ms / 3.2 ms |
-| `INSERT` one row, autocommit | 4.2 ms / 4.2 ms | 4.0 ms / 4.1 ms | 4.1 ms / 3.4 ms |
-| `UPDATE`, 100 rows a transaction, per row | 90 µs / 85 µs | 79 µs / 73 µs | 77 µs / 64 µs |
-| Point lookups on 4 threads | 3.67 µs / 3.76 µs | 1.41 µs / 1.39 µs | **812 ns / 821 ns** |
+| Bulk load, one transaction, per row | 8.38 µs / 5.05 µs | 554 ns / 563 ns | 1.11 µs / 1.18 µs |
+| Create an index | 715 ms / 619 ms | 37 ms / 45 ms | 99 ms / 95 ms |
+| Point lookup by primary key | 9.52 µs / 9.73 µs | 1.52 µs / 1.26 µs | 2.04 µs / 1.66 µs |
+| Secondary-index lookup + aggregate | 29.9 µs / 27.9 µs | 11.2 µs / 7.2 µs | 9.9 µs / 5.8 µs |
+| Index range (1 week) + aggregate | 5.2 ms / 5.2 ms | 2.2 ms / 1.0 ms | 2.4 ms / 1.2 ms |
+| Full scan with `GROUP BY` | 46 ms / 47 ms | 50 ms / 51 ms | 46 ms / **39 ms** |
+| Join + `GROUP BY` | **107 ms / 106 ms** | 157 ms / 99 ms | 194 ms / 119 ms |
+| Join, filtered, `ORDER BY` + `LIMIT` | 1.8 ms / 1.7 ms | 0.48 ms / 0.26 ms | 0.54 ms / 0.37 ms |
+| Sort the whole table | 114 ms / 111 ms | 72 ms / 71 ms | 70 ms / 67 ms |
+| `IN (subquery)` | 35 ms / 35 ms | 24 ms / 12 ms | 32 ms / 16 ms |
+| Correlated `EXISTS` | 34 ms / 34 ms | 30 ms / 17 ms | 30 ms / 22 ms |
+| Correlated `NOT EXISTS` | **17 ms / 17 ms** | 80 ms / 39 ms | 58 ms / 48 ms |
+| `UPDATE` one row, autocommit | 4.6 ms / 4.7 ms | 4.1 ms / 4.1 ms | 4.1 ms / 4.1 ms |
+| `INSERT` one row, autocommit | 4.3 ms / 4.1 ms | 4.1 ms / 4.1 ms | 4.1 ms / 4.1 ms |
+| `UPDATE`, 100 rows a transaction, per row | 78 µs / 80 µs | 72 µs / 71 µs | 82 µs / 69 µs |
+| Point lookups on 4 threads | 5.75 µs / 5.77 µs | 1.80 µs / 1.75 µs | **1.09 µs / 992 ns** |
 
 Memory (physical footprint), `default` / `large`:
 
 | | squeal-db | SQLite | Turso |
 |---|---:|---:|---:|
-| after the load | 316 / 329 MiB | 35 / 22 MiB | 42 / 45 MiB |
-| at the end | 322 / 323 MiB | 46 / 61 MiB | 78 / 73 MiB |
-| peak | 426 / 420 MiB | 46 / 61 MiB | 78 / 73 MiB |
+| after the load | 163 / 163 MiB | 35 / 22 MiB | 48 / 49 MiB |
+| at the end | 161 / 161 MiB | 47 / 62 MiB | 88 / 88 MiB |
+| peak | 223 / 224 MiB | 47 / 62 MiB | 88 / 88 MiB |
 
-At 1M orders ([`sql_1m.md`](results/sql_1m.md)) the picture holds:
-- **squeal-db** stays ahead on correlated `NOT EXISTS` (95 ms against
-  457 and 526 ms) and correlated `EXISTS`.
-- **SQLite and Turso** gain the most from the large cache, which the data
-  now outgrows at their defaults.
-- **squeal-db's memory** peaks at 1.4 GB on the default profile and 2.0 GB
-  on the large one, against SQLite's 140 / 223 MiB and Turso's
-  206 / 392 MiB.
+At 1M orders ([`sql_1m.md`](results/sql_1m.md)):
+- **squeal-db leads on the blocking queries.** Correlated `NOT EXISTS`
+  takes 172 ms against 599 and 723 ms. Join + `GROUP BY` takes 756 ms
+  against 1.2 and 1.5 s on the default profile.
+- **Its lookups need the large cache.** The default 128 MiB no longer
+  holds the indexes, and a secondary-index lookup takes 167 µs (34 µs
+  with 1 GiB).
+- **Its memory peaks at 459 MiB on the default profile and 1.07 GB on
+  the large one**, within its limits (a 1 GiB cache, plus 512 MiB a
+  query). SQLite peaks at 140 / 224 MiB and Turso at 230 / 398 MiB.
 
 ### Key-value: the store, SQLite, redb (200k rows a table)
 
@@ -118,61 +119,86 @@ Time per operation, `default` / `large`:
 
 | phase | store | SQLite | redb |
 |---|---:|---:|---:|
-| Insert, per row | 2.37 µs / 2.33 µs | 716 ns / 598 ns | 894 ns / 872 ns |
-| Point lookup, integer key | 538 ns / 513 ns | 753 ns / 400 ns | **202 ns / 201 ns** |
-| Point lookup, a transaction each | 2.90 µs / 2.84 µs | 1.38 µs / 994 ns | 469 ns / 464 ns |
-| Point lookup, composite key | 1.11 µs / 1.09 µs | 954 ns / 497 ns | 274 ns / 275 ns |
-| Full scan, per row | **19 ns / 19 ns** | 42 ns / 29 ns | 22 ns / 22 ns |
-| Prefix scan of 100 rows | 10.1 µs / 9.9 µs | 6.7 µs / 4.9 µs | 3.5 µs / 3.5 µs |
-| Range scan, per row | 86 ns / 86 ns | 50 ns / 36 ns | 24 ns / 25 ns |
-| Update one row and commit | 4.2 ms / 3.4 ms | 4.0 ms / 3.1 ms | 4.6 ms / 3.7 ms |
-| Update, 100 rows a transaction, per row | 64 µs / 55 µs | 64 µs / 50 µs | 78 µs / 63 µs |
-| Delete, per row | 6.09 µs / 6.00 µs | 816 ns / 647 ns | 712 ns / 632 ns |
-| Point lookups on 4 threads | 388 ns / 403 ns | 1.24 µs / 1.50 µs | **68 ns / 62 ns** |
+| Insert, one transaction, per row | 3.31 µs / 2.69 µs | 679 ns / 654 ns | 756 ns / 693 ns |
+| Point lookup, integer key | 734 ns / 745 ns | 920 ns / 518 ns | **262 ns / 271 ns** |
+| Point lookup, a transaction each | 3.38 µs / 3.50 µs | 1.69 µs / 1.25 µs | 602 ns / 609 ns |
+| Point lookup, composite key | 1.60 µs / 1.59 µs | 1.23 µs / 637 ns | 384 ns / 374 ns |
+| Full scan, per row | **21 ns / 21 ns** | 134 ns / 33 ns | 26 ns / 27 ns |
+| Prefix scan of 100 rows | 11.7 µs / 11.9 µs | 7.8 µs / 5.9 µs | 3.9 µs / 3.8 µs |
+| Range scan, per row | 100 ns / 101 ns | 59 ns / 41 ns | 30 ns / 29 ns |
+| Update one row and commit | 3.7 ms / 4.2 ms | 4.1 ms / 4.0 ms | 4.3 ms / 3.8 ms |
+| Update, 100 rows a transaction, per row | 59 µs / 62 µs | 66 µs / 65 µs | 85 µs / 81 µs |
+| Delete, per row | 6.54 µs / 6.54 µs | 750 ns / 595 ns | 663 ns / 651 ns |
+| Point lookups on 4 threads | 348 ns / 326 ns | 1.57 µs / 1.72 µs | **102 ns / 101 ns** |
 
-Memory, `default` / `large`: the store peaks at 216 / 218 MiB, SQLite at
+Memory, `default` / `large`: the store peaks at 101 / 100 MiB, SQLite at
 21 / 177 MiB, redb at 72 / 72 MiB.
 
 At 2M rows a table ([`kv_2m.md`](results/kv_2m.md)) the data no longer fits
 the store's default 128 MiB cache:
-- **Its lookups slow down 4-8x** (4.56 µs a point lookup), and recover
-  with the 1 GiB cache (1.14 µs).
-- **Its memory:** the store reaches 1.68 GB with the 1 GiB cache, against
-  SQLite's 620 MiB and redb's 612 MiB.
+- **Its lookups slow down about 10x** (7.7 µs a point lookup), and
+  recover with the 1 GiB cache (1.4 µs).
+- **Its memory:** the store peaks at 273 MiB on the default profile and
+  849 MiB with the 1 GiB cache. SQLite peaks at 21 MiB and 1.5 GB, and
+  redb at 626 MiB on both.
 
 ### What it says about squeal-db
 
 - **Level** on durable commits, which are bound by the disk flush.
-- **Ahead** on correlated `NOT EXISTS`, which becomes a hash anti-join,
-  and on the store's full scans.
+- **Ahead** on the blocking SQL queries: correlated `NOT EXISTS` (a hash
+  anti-join) and join + `GROUP BY` (hash grouping). Also ahead on the
+  store's full scans.
+- **Behind** on lookups and bulk writes, by 2-6x, in both the SQL layer
+  and the store.
 - **redb is the fastest key-value store here**, by 2-3x on lookups and
   more on concurrent reads.
 - **Turso is close to SQLite throughout**, ahead on concurrent reads.
-- **Memory is squeal-db's weakest point.** It uses several times what the
-  others do, and goes over its own page-cache limit. See below.
+- **Memory now stays within its limits**, but is still 2-4x SQLite's at
+  the defaults.
 
-### Memory: where squeal-db's goes
+### Memory: what was fixed
 
-Measured on the store alone, loading 200k rows (27 MB of pages) in one
-transaction (with the store's `alloc-tracking` feature):
+Before is the previous reports, whose loads used 100,000-row transactions
+because one transaction could not write a million rows. After is this run:
 
-| | footprint | live heap | version records |
-|---|---:|---:|---:|
-| before the commit | 196 MiB | 119 MiB | 200,000 |
-| just after the commit | 238 MiB | 119 MiB | 200,000 |
-| after cleanup | 118 MiB | 94 MiB | 0 |
+| | before | after |
+|---|---:|---:|
+| SQL, 200k orders: after the load / peak | 316 / 426 MiB | 163 / 223 MiB |
+| SQL, 1M orders, peak: `default` / `large` | 1.4 / 2.0 GB | 459 MiB / 1.07 GB |
+| Store, 200k rows a table, peak | 216 MiB | 101 MiB |
+| Store, 2M rows a table, 1 GiB cache, peak | 1.68 GB | 849 MiB |
 
-Three things over the page cache:
-1. **Version records.** One per row a transaction writes, about 450 bytes
-   each, kept until it commits and no reader needs them. This is also
-   what caps a transaction at a million writes.
-2. **The version store's hash maps keep their peak capacity** once
-   emptied: about 67 MB here, which is most of the live heap after
-   cleanup.
-3. **The allocator keeps freed memory**: the gap between footprint and
-   live heap.
+A side-by-side run of both builds showed the reads unchanged or faster.
+A full-scan `GROUP BY` went from 77 to 50 ms, and the SQL footprint after
+the load from 309 to 161 MiB.
 
-On top of those, a checkpoint copies every dirty page before writing it
-(see the store README), so its peak is briefly twice the dirty pages.
+What changed (see the [store](../store/README.md) and
+[squeal-sql](../squeal-sql/README.md) READMEs):
 
-These are in [TODO.md](../TODO.md).
+1. **No version record for an insert.**
+   - Only updates and deletes keep a pre-image.
+   - A transaction's writes are a compact log: a few bytes an insert,
+     where each one used to keep about 450 bytes.
+   - A committed transaction's inserts are forgotten at once.
+   - The version maps shrink once emptied.
+2. **One transaction may write any number of rows.** The snapshot caps
+   count only what is pinned for others, so a large load is no longer
+   aborted with `SnapshotTooOld`.
+3. **The page cache is bounded by the bytes its pages hold**, not by a
+   page count times the page size. A decoded page is larger than its
+   on-disk form.
+4. **Page buffers are pooled.** The macOS allocator keeps freed memory
+   rather than returning it, so reusing buffers is what keeps eviction
+   churn from growing the footprint.
+5. **A checkpoint shares the pages it writes** rather than copying them.
+6. **`GROUP BY` hashes** where it used to sort every input row. Its
+   memory is proportional to the groups, and it falls back to sorting
+   when they outgrow the query's budget.
+7. **A sort charges a row's real in-memory size** against the query
+   budget, so it spills before it overruns it.
+
+The cost of honest accounting is that the default 128 MiB holds fewer
+pages than before. Lookups on data larger than that cache, and
+whole-table sorts, are slower than they were at 1M rows.
+
+What's left is in [TODO.md](../TODO.md).

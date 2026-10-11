@@ -61,11 +61,9 @@ trait Engine {
     fn parallel_get(&self, per_thread: &[Vec<u64>]) -> Digest;
 }
 
-// The load's transactions: 100,000 rows each. The store keeps a version
-// record per row a transaction writes until it commits, capped at a
-// million by default, so one transaction can't load a million rows.
+// The load: one transaction a table.
 fn chunks(rows: u64) -> impl Iterator<Item = std::ops::Range<u64>> {
-    (0..rows).step_by(100_000).map(move |s| s..(s + 100_000).min(rows))
+    std::iter::once(0..rows)
 }
 
 // A value: 100 bytes that depend on its key and a version.
@@ -612,7 +610,7 @@ impl Rng {
 fn workload(e: &mut dyn Engine, rows: u64, threads: usize) {
     let groups = rows / GROUP;
     phase("after open", 0, || None);
-    phase("Insert, both tables, 100k rows a transaction (per row)", 2 * rows, || {
+    phase("Insert, both tables, one transaction each (per row)", 2 * rows, || {
         e.load(rows);
         None
     });

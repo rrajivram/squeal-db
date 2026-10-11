@@ -386,17 +386,12 @@ fn workload(e: &mut dyn Engine, orders: u64, threads: usize) {
         .collect();
     drop((customer_rows, order_rows));
 
-    // 100,000 rows (200 INSERTs) a transaction. squeal-db keeps a version
-    // record per row a transaction writes until it commits, capped at a
-    // million by default, so one transaction can't load a million rows.
-    phase("Bulk load, 100k rows a transaction (per row)", customers + orders, || {
-        for chunk in inserts.chunks(200) {
-            e.run("begin");
-            for i in chunk {
-                e.run(i);
-            }
-            e.run("commit");
+    phase("Bulk load, one transaction (per row)", customers + orders, || {
+        e.run("begin");
+        for i in &inserts {
+            e.run(i);
         }
+        e.run("commit");
         None
     });
     drop(inserts);

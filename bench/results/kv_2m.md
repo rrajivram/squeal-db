@@ -10,29 +10,29 @@ size 2000000, 4 reader threads, median of 1 run(s), each engine in its own proce
 
 | phase | store | sqlite | redb | same answers |
 |---|---:|---:|---:|---|
-| Insert, both tables, 100k rows a transaction (per row) | 2.44 µs | 603 ns | 954 ns | — |
-| Checkpoint after the load | 13.9 ms | 164.12 µs | 333 ns | — |
-| Point lookup, integer key | 4.56 µs | 997 ns | 383 ns | yes |
-| Point lookup, a transaction each | 6.03 µs | 1.67 µs | 679 ns | yes |
-| Point lookup, composite key | 7.64 µs | 1.55 µs | 462 ns | yes |
-| Full scan (per row) | 51 ns | 44 ns | 24 ns | yes |
-| Prefix scan of 100 rows (per scan) | 25.73 µs | 7.57 µs | 3.85 µs | yes |
-| Range scan of 1% of the table (per row) | 125 ns | 52 ns | 25 ns | yes |
-| Update one row and commit | 4.1 ms | 4.1 ms | 4.8 ms | — |
-| Insert one row and commit | 4.1 ms | 4.0 ms | 4.5 ms | — |
-| Update, 100 rows a transaction (per row) | 66.83 µs | 65.69 µs | 97.57 µs | — |
-| Delete, one transaction (per row) | 5.50 µs | 693 ns | 663 ns | — |
-| Check: both tables after the writes (per row) | 67 ns | 47 ns | 26 ns | yes |
-| Point lookups on 4 threads (per lookup) | 1.83 µs | 1.29 µs | 110 ns | yes |
+| Insert, both tables, one transaction each (per row) | 3.13 µs | 706 ns | 763 ns | — |
+| Checkpoint after the load | 26.4 ms | 3.6 ms | 250 ns | — |
+| Point lookup, integer key | 7.70 µs | 2.06 µs | 504 ns | yes |
+| Point lookup, a transaction each | 8.75 µs | 2.01 µs | 859 ns | yes |
+| Point lookup, composite key | 12.53 µs | 2.19 µs | 597 ns | yes |
+| Full scan (per row) | 57 ns | 50 ns | 28 ns | yes |
+| Prefix scan of 100 rows (per scan) | 69.57 µs | 8.73 µs | 4.57 µs | yes |
+| Range scan of 1% of the table (per row) | 220 ns | 60 ns | 30 ns | yes |
+| Update one row and commit | 4.0 ms | 4.1 ms | 4.2 ms | — |
+| Insert one row and commit | 4.2 ms | 4.1 ms | 4.4 ms | — |
+| Update, 100 rows a transaction (per row) | 72.20 µs | 70.38 µs | 89.97 µs | — |
+| Delete, one transaction (per row) | 5.86 µs | 646 ns | 710 ns | — |
+| Check: both tables after the writes (per row) | 75 ns | 52 ns | 30 ns | yes |
+| Point lookups on 4 threads (per lookup) | 3.32 µs | 1.79 µs | 132 ns | yes |
 
 | memory | store | sqlite | redb |
 |---|---:|---:|---:|
 | after open | 2 MiB | 1 MiB | 2 MiB |
-| after load | 661 MiB | 4 MiB | 601 MiB |
-| after reads | 342 MiB | 7 MiB | 605 MiB |
-| after writes | 423 MiB | 8 MiB | 608 MiB |
-| at end | 423 MiB | 21 MiB | 612 MiB |
-| peak | 710 MiB | 21 MiB | 612 MiB |
+| after load | 195 MiB | 4 MiB | 618 MiB |
+| after reads | 250 MiB | 7 MiB | 619 MiB |
+| after writes | 272 MiB | 8 MiB | 623 MiB |
+| at end | 273 MiB | 21 MiB | 626 MiB |
+| peak | 273 MiB | 21 MiB | 626 MiB |
 
 ## Profile `large`: 1 GiB of cache each
 
@@ -42,27 +42,27 @@ size 2000000, 4 reader threads, median of 1 run(s), each engine in its own proce
 
 | phase | store | sqlite | redb | same answers |
 |---|---:|---:|---:|---|
-| Insert, both tables, 100k rows a transaction (per row) | 2.44 µs | 582 ns | 887 ns | — |
-| Checkpoint after the load | 11.8 ms | 162.62 µs | 8.62 µs | — |
-| Point lookup, integer key | 1.14 µs | 712 ns | 395 ns | yes |
-| Point lookup, a transaction each | 3.26 µs | 1.29 µs | 704 ns | yes |
-| Point lookup, composite key | 1.80 µs | 835 ns | 470 ns | yes |
-| Full scan (per row) | 21 ns | 30 ns | 24 ns | yes |
-| Prefix scan of 100 rows (per scan) | 11.14 µs | 5.54 µs | 3.92 µs | yes |
-| Range scan of 1% of the table (per row) | 90 ns | 37 ns | 25 ns | yes |
-| Update one row and commit | 3.5 ms | 4.1 ms | 4.8 ms | — |
-| Insert one row and commit | 3.5 ms | 4.1 ms | 4.5 ms | — |
-| Update, 100 rows a transaction (per row) | 54.78 µs | 67.29 µs | 99.46 µs | — |
-| Delete, one transaction (per row) | 5.86 µs | 697 ns | 632 ns | — |
-| Check: both tables after the writes (per row) | 23 ns | 32 ns | 26 ns | yes |
-| Point lookups on 4 threads (per lookup) | 494 ns | 2.24 µs | 111 ns | yes |
+| Insert, both tables, one transaction each (per row) | 3.18 µs | 561 ns | 558 ns | — |
+| Checkpoint after the load | 26.9 ms | 3.0 ms | 84 ns | — |
+| Point lookup, integer key | 1.40 µs | 828 ns | 532 ns | yes |
+| Point lookup, a transaction each | 3.86 µs | 1.62 µs | 841 ns | yes |
+| Point lookup, composite key | 2.57 µs | 1.13 µs | 525 ns | yes |
+| Full scan (per row) | 22 ns | 33 ns | 28 ns | yes |
+| Prefix scan of 100 rows (per scan) | 13.35 µs | 6.10 µs | 4.78 µs | yes |
+| Range scan of 1% of the table (per row) | 102 ns | 42 ns | 30 ns | yes |
+| Update one row and commit | 4.3 ms | 4.2 ms | 4.3 ms | — |
+| Insert one row and commit | 4.0 ms | 4.0 ms | 4.3 ms | — |
+| Update, 100 rows a transaction (per row) | 69.89 µs | 68.35 µs | 97.18 µs | — |
+| Delete, one transaction (per row) | 18.95 µs | 691 ns | 1.44 µs | — |
+| Check: both tables after the writes (per row) | 62 ns | 33 ns | 95 ns | yes |
+| Point lookups on 4 threads (per lookup) | 643 ns | 4.95 µs | 1.09 µs | yes |
 
 | memory | store | sqlite | redb |
 |---|---:|---:|---:|
 | after open | 2 MiB | 1 MiB | 2 MiB |
-| after load | 1671 MiB | 590 MiB | 602 MiB |
-| after reads | 1671 MiB | 593 MiB | 605 MiB |
-| after writes | 1680 MiB | 594 MiB | 609 MiB |
-| at end | 1682 MiB | 620 MiB | 612 MiB |
-| peak | 1682 MiB | 1515 MiB | 612 MiB |
+| after load | 833 MiB | 590 MiB | 618 MiB |
+| after reads | 836 MiB | 592 MiB | 620 MiB |
+| after writes | 848 MiB | 593 MiB | 624 MiB |
+| at end | 849 MiB | 615 MiB | 626 MiB |
+| peak | 849 MiB | 1509 MiB | 626 MiB |
 

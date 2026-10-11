@@ -55,24 +55,40 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
 
 `cargo run --release -p bench --bin sql|kv` compares squeal-db with SQLite,
 Turso and redb, each in its own process with its memory measured (results
-in bench/README.md). squeal-db uses several times their memory and goes
-past its own page-cache limit: 1.7 GB with a 1 GiB cache on 2M key-value
-rows; 1.4 GB with the default 128 MiB cache on 1M orders.
+in bench/README.md). It found squeal-db using several times their memory,
+and going past its own page-cache limit: 1.7 GB with a 1 GiB cache on 2M
+key-value rows, and 1.4 GB with the default 128 MiB cache on 1M orders.
+Now 849 MiB and 459 MiB.
 
-- [ ] **Version records: ~450 bytes for every row a transaction writes**,
-  until it commits and no reader needs them — an insert's whole row
-  included, where rolling one back needs only its key and no older reader
-  can see it. Also why one transaction can't write more than a million
-  rows (`max_version_records` aborts it with SnapshotTooOld — a guard
-  meant for long readers, catching a big writer). Ideas: keep no image
-  for an Add; count a transaction's own writes apart from what it pins.
-- [ ] **The version store's maps keep their peak capacity** once emptied:
-  ~67 MB after a 200k-row load. Shrink them when vacuum leaves them mostly
-  empty.
-- [ ] **A checkpoint copies every dirty page** before writing it: twice the
-  dirty pages at its peak.
-- [ ] **CREATE INDEX: 2.9 s an index at 1M orders** (SQLite 0.15 s, Turso
-  0.5 s). Still a row at a time; a sorted bulk build.
+- [x] **Version records: ~450 bytes for every row a transaction writes.**
+  An insert keeps no image now, only a few bytes in its transaction's
+  write log, and a committed one is forgotten at once. The snapshot caps
+  count what is pinned for others, so one transaction may write any
+  number of rows.
+- [x] **The version store's maps kept their peak capacity**: vacuum
+  shrinks them.
+- [x] **A checkpoint copied every dirty page**: it shares them now
+  (copy-on-write).
+- [x] **The page cache counted pages, not bytes**: a decoded page holds
+  more than its page size. It is charged what it holds now.
+- [x] **Eviction churn grew the footprint** (the macOS allocator keeps
+  freed memory): page buffers are pooled.
+- [x] **GROUP BY sorted every input row**: it hashes, falling back to the
+  sort when the groups outgrow the query's memory.
+- [x] **A sort charged a row's encoded size**, not what it holds in memory.
+- [ ] **Still 2-4x SQLite's footprint at the defaults** (SQL at 200k
+  orders: 161 against 47 MiB; mostly the 128 MiB cache SQLite doesn't
+  have). Over the live heap, the allocator keeps freed variable-sized
+  allocations (search arrays, statement text). After a 1M-row load, the
+  stats channel briefly holds ~39 MB.
+- [ ] **The store at 2M rows on the default cache: 273 MiB** for a
+  128 MiB cache. Not yet broken down.
+- [ ] **Honest accounting costs lookups on data past the cache.** At 1M
+  orders on the default profile, a secondary-index lookup takes 167 µs
+  (34 with 1 GiB), and a whole-table sort spills (1.4 s against
+  SQLite's 0.4).
+- [ ] **CREATE INDEX: 3.7 s an index at 1M orders** (SQLite 0.18 s, Turso
+  0.6 s). Still a row at a time; a sorted bulk build.
 
 ### The store alone (2026-10-10)
 
