@@ -76,6 +76,8 @@ Now 849 MiB and 459 MiB.
 - [x] **GROUP BY sorted every input row**: it hashes, falling back to the
   sort when the groups outgrow the query's memory.
 - [x] **A sort charged a row's encoded size**, not what it holds in memory.
+- See [MEMORY_ISSUES.md](MEMORY_ISSUES.md) for the full audit (2026-10-11)
+  of what remains, measured and prioritized.
 - [ ] **Still 2-4x SQLite's footprint at the defaults** (SQL at 200k
   orders: 161 against 47 MiB; mostly the 128 MiB cache SQLite doesn't
   have). Over the live heap, the allocator keeps freed variable-sized
