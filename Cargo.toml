@@ -1,5 +1,5 @@
 [workspace]
-members=["macros", "sq-json", "sql-parser", "squeal-cli","squeal-sql","squeal-wasm","store","ws-napi"]
+members=["bench", "macros", "sq-json", "sql-parser", "squeal-cli","squeal-sql","squeal-wasm","store","ws-napi"]
 resolver="3"
 
 [profile.release]

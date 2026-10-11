@@ -1,0 +1,19 @@
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Comparisons with other embedded databases (see README.md). Kept out of the
+# engine crates so they don't depend on any of these.
+[dependencies]
+squeal-sql = { path = "../squeal-sql" }
+store = { path = "../store" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+# default-features off: the default installs mimalloc as the global
+# allocator, which would change every engine's memory in the process.
+turso = { version = "=0.8.2", default-features = false }
+redb = "4.3.0"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

@@ -54,6 +54,7 @@ squeal-db keeps them apart:
 | [`squeal-cli`](squeal-cli/README.md) | A terminal SQL REPL |
 | [`squeal-wasm`](squeal-wasm/README.md) | The browser build (wasm-bindgen): SQL and JSON, persisted to IndexedDB; the live demo |
 | [`ws-napi`](ws-napi/README.md) | A Node.js addon (napi-rs): native, or WASI with a real persistent file |
+| [`bench`](bench/README.md) | Comparisons with SQLite, Turso and redb: speed and memory, under default and large memory settings |
 
 ```
   squeal-cli   squeal-wasm   ws-napi          front ends
