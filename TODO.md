@@ -72,6 +72,34 @@ per-statement work, not the engine. Where the engine itself trails:
 - Ahead: full scan 2.4x, point lookups on 4 threads 2.3x, integer-key
   lookup 1.2x. Level: durable single-row commits.
 
+### Found by making the cache and query memory configurable (2026-10-10, fixed)
+
+Until `OpenConfig`, the page cache was fixed at 8192 pages and a query's
+memory at 64 MiB, so eviction and spilling only ran on databases over
+128 MiB and queries over 64 MiB — which no test was. Small settings
+reached them at once:
+
+- **store: lost updates through a checkpoint.** A checkpoint marked each
+  dirty page clean when it captured its copy, before the copy was
+  written; the cache could evict the page in between, and the next
+  reader loaded the old image from disk. Pages now stay dirty (so
+  unevictable) until their copy is written and fsynced.
+- **store: a stale page cached over a newer one.** A reader that loaded
+  a page from disk and was then held up could cache its copy after the
+  page had been changed, checkpointed and evicted. A disk read is now
+  cached only if no writer published into its shard meanwhile.
+- **store: a live page dropped from the cache.** Pruning a dead cache
+  entry removed whatever was under that page number by then, a newly
+  cached (even dirty) page included.
+- **squeal-sql: a spilling sort panicked** when rows serialized larger
+  than the estimate from their declared types (a projection's types are
+  placeholders), and on an empty input with no memory to reserve.
+
+Now covered: a crash soak with a 24-page cache (`crash --cache-pages
+24`: failing within 50 seeds before, 750 clean after), store tests with
+caches smaller than their tables, and the SQLite oracle run with a few
+pages of query memory and cache.
+
 ### Found on the way (store, fixed)
 
 - **A commit could return before its record was durable.** It waited for

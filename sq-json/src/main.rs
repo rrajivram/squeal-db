@@ -1,22 +1,40 @@
-//! `sq-json <file>`: a mongosh-style shell over a database file (created if
-//! it doesn't exist). Type `help` for the statements.
+//! `sq-json <file> [--setting value ...]`: a mongosh-style shell over a
+//! database file (created if it doesn't exist). Type `help` for the
+//! statements; `sq-json --help x` lists the settings (see store::config).
 
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use sq_json::Client;
+use sq_json::{Client, CreateConfig, OpenConfig};
 use sq_json::shell::{Outcome, Shell};
 
 const HISTORY_FILE: &str = ".sq-json-history";
 
+fn usage() -> ! {
+    eprintln!("usage: sq-json <database file> [--setting value ...]\n");
+    eprint!("{}", store::config::settings_help(true));
+    std::process::exit(2);
+}
+
 fn main() {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: sq-json <database file>");
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("{e}");
         std::process::exit(2);
     };
-    let client = if std::path::Path::new(&path).exists() {
-        Client::<std::fs::File>::open(&path)
+    let (positional, settings) = store::config::split_args(std::env::args().skip(1))
+        .unwrap_or_else(|e| fail(&e));
+    if settings.iter().any(|(name, _)| name == "help") {
+        usage();
+    }
+    let [path] = &positional[..] else { usage() };
+    let settings = settings.iter().map(|(n, v)| (n.as_str(), v.as_str()));
+    // An existing file is opened — with the settings a database can be
+    // opened with; a new one is created, with any of them.
+    let client = if std::path::Path::new(path).exists() {
+        let config = OpenConfig::from_settings(settings).unwrap_or_else(|e| fail(&e));
+        Client::<std::fs::File>::open_with(path, &config)
     } else {
-        Client::<std::fs::File>::create(&path)
+        let config = CreateConfig::from_settings(settings).unwrap_or_else(|e| fail(&e));
+        Client::<std::fs::File>::create_with(path, &config)
     };
     let client = client.unwrap_or_else(|e| {
         eprintln!("failed to open {path:?}: {e}");

@@ -59,6 +59,25 @@ schema named `sqjson` would collide), and `snapshot()` saves both. The demo
 page has a SQL / JSON documents switch, a Help panel generated from
 `SquealDb.help()`, and runnable examples (`www/examples.js`).
 
+## Options
+
+`new SquealDb(name)` uses the defaults. To choose the settings (see the
+[store README](../store/README.md#configuration)), pass a JSON object:
+
+```js
+const db = SquealDb.withOptions('demo', JSON.stringify({
+  pageSize: '8k',            // fixed for this database, and its snapshots
+  pageCacheBytes: 33554432,  // numbers or text; sizes take k, m, g
+  queryMemoryBytes: '4m',
+}));
+const again = SquealDb.fromSnapshotWithOptions(bytes, '{"pageCacheBytes": "16m"}');
+db.config();            // JSON: what it is running with
+SquealDb.settings();    // JSON: every setting, with a description
+```
+
+A snapshot carries its page size, so `fromSnapshotWithOptions` takes only
+the settings a database is opened with.
+
 ## Loading a CSV
 
 `CREATE TABLE t AS COPY FROM @path` infers column names/types from a CSV's

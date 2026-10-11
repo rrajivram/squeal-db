@@ -16,10 +16,27 @@ enum Backend {
     Memory,
 }
 
+fn usage() -> ! {
+    eprintln!("usage: squeal-cli [database file] [--setting value ...]\n");
+    eprint!("{}", store::config::settings_help(true));
+    std::process::exit(2);
+}
+
 fn main() -> Result<()> {
-    let db_path = std::env::args()
-        .nth(1)
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("{e}");
+        std::process::exit(2);
+    };
+    let (positional, settings) =
+        store::config::split_args(std::env::args().skip(1)).unwrap_or_else(|e| fail(&e));
+    if settings.iter().any(|(name, _)| name == "help") || positional.len() > 1 {
+        usage();
+    }
+    let db_path = positional
+        .first()
+        .cloned()
         .unwrap_or_else(|| "/Users/rajiv/dev/rust/squeal_db/test_data/squeal.db".to_string());
+    let settings = || settings.iter().map(|(n, v)| (n.as_str(), v.as_str()));
     let mut rl = DefaultEditor::new()?;
 
     // Asked interactively rather than via a CLI flag — a flag has to be
@@ -38,28 +55,34 @@ fn main() -> Result<()> {
         }
     };
 
+    // How the database is created and run (see store::config). An existing
+    // file is opened, so only what a database can be opened with may be
+    // set; a new file, or memory, is created, with any of it.
+    let existing = matches!(backend, Backend::File) && std::path::Path::new(&db_path).exists();
+    let config = if existing {
+        squeal_sql::OpenConfig::from_settings(settings()).map(squeal_sql::CreateConfig::from)
+    } else {
+        squeal_sql::CreateConfig::from_settings(settings())
+    }
+    .unwrap_or_else(|e| fail(&e));
+
     let result = match backend {
         Backend::File => {
-            // File-backed connections share the process-wide singleton
-            // (see ConnectionManager::<File>::get_manager) rather than a
-            // fresh manager, so re-running `connect` for a name already
-            // open in this process reuses it instead of reopening the
-            // file out from under itself.
-            let mgr = ConnectionManager::get_manager();
+            let mgr: Arc<ConnectionManager<std::fs::File>> =
+                Arc::new(ConnectionManager::with_config(config));
             run_repl(rl, connect_or_create(&mgr, &db_path), &db_path)
         }
         Backend::Memory => {
-            // A fresh, non-singleton manager is fine here — NamedMemFile
-            // itself (unlike plain MemFile) already persists a name's
-            // buffer across separate open() calls via its own
-            // process-wide registry, so nothing is lost by not sharing
-            // one manager instance.
+            // A fresh manager is fine here — NamedMemFile itself (unlike
+            // plain MemFile) already persists a name's buffer across
+            // separate open() calls via its own process-wide registry.
             //
             // Always created, never opened: memory starts empty each run,
             // and opening a name NamedMemFile has never seen fails reading
             // its header (an I/O error, not not-found — see NamedMemFile),
             // which connect_or_create would report rather than create.
-            let mgr: Arc<ConnectionManager<NamedMemFile>> = Arc::new(ConnectionManager::new());
+            let mgr: Arc<ConnectionManager<NamedMemFile>> =
+                Arc::new(ConnectionManager::with_config(config));
             let conn = mgr.create_and_connect(&db_path).unwrap_or_else(|e| {
                 eprintln!("failed to create database {db_path:?}: {e}");
                 std::process::exit(1);

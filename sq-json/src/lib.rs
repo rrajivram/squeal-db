@@ -16,6 +16,9 @@ pub use collection::{Collection, FindOneAndOptions, FindOptions, IndexInfo, Inde
 pub use error::{Error, Result};
 pub use value::{Document, ObjectId, Value};
 
+/// What a database is created and opened with: see [`store::config`].
+pub use store::config::{CreateConfig, OpenConfig};
+
 /// What a `Client` (and its databases, collections, sessions) stores to by
 /// default: a file, or — on wasm32, which has no files — memory.
 #[cfg(not(target_arch = "wasm32"))]

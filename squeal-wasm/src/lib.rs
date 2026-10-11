@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use squeal_sql::{
+    CreateConfig, OpenConfig,
     conn::connection::{Connection, ConnectionManager},
     rslt::resultset::{ResultSet, ResultType, StreamingResultSet},
     source::QueryStats,
@@ -83,8 +84,27 @@ impl SquealDb {
     /// comment on why there's nothing to persist to yet).
     #[wasm_bindgen(constructor)]
     pub fn new(name: &str) -> Result<SquealDb, JsError> {
-        let mgr: Arc<ConnectionManager<MemFile>> = Arc::new(ConnectionManager::new());
-        let conn = mgr.create_and_connect(name).map_err(to_js_error)?;
+        Self::create(name, CreateConfig::default()).map_err(|e| JsError::new(&e))
+    }
+
+    /// `new SquealDb(name)`, created with `options`: a JSON object of
+    /// settings, any of those a database is created or opened with (see
+    /// `SquealDb.settings()`), named in camelCase or snake_case, each a
+    /// number or text — `{"pageSize": "8k", "pageCacheBytes": 33554432,
+    /// "queryMemoryBytes": "4m"}`.
+    #[wasm_bindgen(js_name = withOptions)]
+    pub fn with_options(name: &str, options: &str) -> Result<SquealDb, JsError> {
+        let settings = settings_from_json(options).map_err(|e| JsError::new(&e))?;
+        let config =
+            CreateConfig::from_settings(settings.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+                .map_err(|e| JsError::new(&e.to_string()))?;
+        Self::create(name, config).map_err(|e| JsError::new(&e))
+    }
+
+    fn create(name: &str, config: CreateConfig) -> Result<SquealDb, String> {
+        let mgr: Arc<ConnectionManager<MemFile>> =
+            Arc::new(ConnectionManager::with_config(config));
+        let conn = mgr.create_and_connect(name).map_err(|e| e.to_string())?;
         // Lands on a usable schema immediately, matching squeal-cli's own
         // bootstrap — CREATE TABLE etc. work right away without the JS
         // side needing to know to issue USE SCHEMA first. Not fatal if
@@ -104,7 +124,58 @@ impl SquealDb {
     /// with.
     #[wasm_bindgen(js_name = fromSnapshot)]
     pub fn from_snapshot(bytes: &[u8]) -> Result<SquealDb, JsError> {
-        restore(bytes).map_err(|e| JsError::new(&e))
+        restore(bytes, OpenConfig::default()).map_err(|e| JsError::new(&e))
+    }
+
+    /// `fromSnapshot`, opened with `options`: a JSON object as
+    /// `withOptions` takes, of the settings a database is opened with —
+    /// its page size came with the snapshot.
+    #[wasm_bindgen(js_name = fromSnapshotWithOptions)]
+    pub fn from_snapshot_with_options(bytes: &[u8], options: &str) -> Result<SquealDb, JsError> {
+        let settings = settings_from_json(options).map_err(|e| JsError::new(&e))?;
+        let config =
+            OpenConfig::from_settings(settings.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+                .map_err(|e| JsError::new(&e.to_string()))?;
+        restore(bytes, config).map_err(|e| JsError::new(&e))
+    }
+
+    /// The settings `withOptions` and `fromSnapshotWithOptions` take, as
+    /// JSON: `{create: [{name, kind, description}], open: [...]}` — those
+    /// under `create` only when creating.
+    pub fn settings() -> String {
+        let list = |settings: &[(&str, &str, &str)]| -> Vec<serde_json::Value> {
+            settings
+                .iter()
+                .map(|(name, kind, what)| {
+                    serde_json::json!({"name": camel(name), "kind": kind, "description": what})
+                })
+                .collect()
+        };
+        serde_json::json!({
+            "create": list(store::config::CREATE_SETTINGS),
+            "open": list(store::config::OPEN_SETTINGS),
+        })
+        .to_string()
+    }
+
+    /// What this database runs with, as JSON: its page size and the
+    /// settings it was created or opened with.
+    pub fn config(&self) -> String {
+        let db = self.conn.store();
+        let c = db.config();
+        serde_json::json!({
+            "pageSize": db.page_size(),
+            "maxIndexKeySize": db.max_index_key_size(),
+            "pageCacheBytes": db.cache_bytes(),
+            "tempCacheBytes": c.temp_cache_bytes,
+            "queryMemoryBytes": c.query_memory_bytes,
+            "lockTimeoutMs": c.lock_timeout.as_millis() as u64,
+            "checkpointLogBytes": c.checkpoint_log_bytes,
+            "maxRetainedWalBytes": c.snapshot_limits.max_retained_wal_bytes,
+            "maxVersionRecords": c.snapshot_limits.max_version_records,
+            "maintenanceIntervalMs": c.maintenance_interval.as_millis() as u64,
+        })
+        .to_string()
     }
 
     /// The database's committed state as one byte array: its data file
@@ -364,7 +435,42 @@ fn snapshot_bytes(db: &SquealDb) -> Result<Vec<u8>, String> {
     postcard::to_allocvec(&snapshot).map_err(|e| format!("failed to encode snapshot: {e}"))
 }
 
-fn restore(bytes: &[u8]) -> Result<SquealDb, String> {
+// A JSON object of settings as (name, value-as-text) pairs: what
+// CreateConfig/OpenConfig::from_settings take. Values are numbers or text.
+fn settings_from_json(options: &str) -> Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(options).map_err(|e| format!("options are not JSON: {e}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("options must be a JSON object".into());
+    };
+    object
+        .iter()
+        .map(|(name, v)| match v {
+            serde_json::Value::String(s) => Ok((name.clone(), s.clone())),
+            serde_json::Value::Number(n) => Ok((name.clone(), n.to_string())),
+            other => Err(format!("option {name}: {other} is neither a number nor text")),
+        })
+        .collect()
+}
+
+// page_cache_bytes -> pageCacheBytes.
+fn camel(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut upper = false;
+    for ch in name.chars() {
+        if ch == '_' {
+            upper = true;
+        } else if upper {
+            out.push(ch.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn restore(bytes: &[u8], config: OpenConfig) -> Result<SquealDb, String> {
     let snapshot: Snapshot =
         postcard::from_bytes(bytes).map_err(|e| format!("not a squeal snapshot: {e}"))?;
     if snapshot.version != SNAPSHOT_VERSION {
@@ -380,7 +486,8 @@ fn restore(bytes: &[u8]) -> Result<SquealDb, String> {
     for (path, bytes) in snapshot.wal {
         disk.add_sibling_from_bytes(&path, bytes);
     }
-    let mgr: Arc<ConnectionManager<MemFile>> = Arc::new(ConnectionManager::new());
+    let mgr: Arc<ConnectionManager<MemFile>> =
+        Arc::new(ConnectionManager::with_config(config.into()));
     let conn = mgr
         .connect_using(&snapshot.name, data, disk)
         .map_err(|e| e.to_string())?;
@@ -777,7 +884,7 @@ mod tests {
         db.execute("create table t (id integer not null, primary key(id)); insert into t values (7)")
             .unwrap();
         json(&db, "db.notes.insertOne({_id: 1, text: 'hello', tags: ['a', 'b']})");
-        let db = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        let db = restore(&snapshot_bytes(&db).unwrap(), OpenConfig::default()).unwrap();
         assert_eq!(
             json(&db, "db.notes.findOne({_id: 1})"),
             ["{\"_id\":1,\"text\":\"hello\",\"tags\":[\"a\",\"b\"]}"]
@@ -925,7 +1032,7 @@ mod tests {
         let bytes = snapshot_bytes(&db).unwrap();
         drop(db);
 
-        let db = restore(&bytes).unwrap();
+        let db = restore(&bytes, OpenConfig::default()).unwrap();
         let rows = exec(&db, "select id, name from t order by id");
         assert_eq!(
             rows[0]["rows"],
@@ -934,7 +1041,7 @@ mod tests {
         // Still writable, and a snapshot of the restored database
         // round-trips too.
         db.execute("insert into t values (3, 'carol')").unwrap();
-        let db = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        let db = restore(&snapshot_bytes(&db).unwrap(), OpenConfig::default()).unwrap();
         let rows = exec(&db, "select count(*) from t");
         assert_eq!(rows[0]["rows"], serde_json::json!([["3"]]));
     }
@@ -947,7 +1054,7 @@ mod tests {
         db.execute("insert into t values (1)").unwrap();
         db.execute("begin").unwrap();
         db.execute("insert into t values (2)").unwrap();
-        let db2 = restore(&snapshot_bytes(&db).unwrap()).unwrap();
+        let db2 = restore(&snapshot_bytes(&db).unwrap(), OpenConfig::default()).unwrap();
         let rows = exec(&db2, "select id from t");
         assert_eq!(rows[0]["rows"], serde_json::json!([["1"]]));
     }
@@ -964,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_garbage_is_refused_as_a_snapshot() {
-        let err = restore(b"definitely not a snapshot").err().unwrap();
+        let err = restore(b"definitely not a snapshot", OpenConfig::default()).err().unwrap();
         assert!(err.contains("snapshot"), "{err}");
     }
 
@@ -1073,5 +1180,81 @@ mod tests {
             "{text}"
         );
     }
-}
 
+    // Off wasm32 a JsError can't be made (see this module's own note), so
+    // these go through the functions the #[wasm_bindgen] methods wrap.
+    fn with_options(name: &str, options: &str) -> Result<SquealDb, String> {
+        let settings = settings_from_json(options)?;
+        let config =
+            CreateConfig::from_settings(settings.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+                .map_err(|e| e.to_string())?;
+        SquealDb::create(name, config)
+    }
+
+    #[test]
+    fn test_options_create_the_database_and_a_snapshot_reopens_with_its_own() {
+        let db = with_options(
+            "opt1",
+            r#"{"pageSize": "8k", "pageCacheBytes": 4194304, "query_memory_bytes": "1m"}"#,
+        )
+        .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&db.config()).unwrap();
+        assert_eq!(config["pageSize"], 8192);
+        assert_eq!(config["pageCacheBytes"], 4194304);
+        assert_eq!(config["queryMemoryBytes"], 1048576);
+        exec(&db, "create table t (id integer not null, primary key(id)); insert into t values (1), (2)");
+
+        // Reopened with a different cache; the page size came with it.
+        let bytes = snapshot_bytes(&db).unwrap();
+        drop(db);
+        let open = OpenConfig::from_settings([("pageCacheBytes", "2m")]).unwrap();
+        let again = restore(&bytes, open).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&again.config()).unwrap();
+        assert_eq!(config["pageSize"], 8192);
+        assert_eq!(config["pageCacheBytes"], 2097152);
+        let rows = exec(&again, "select count(*) from t");
+        assert_eq!(rows[0]["rows"][0][0], "2");
+    }
+
+    #[test]
+    fn test_bad_options_say_what_is_wrong() {
+        for (options, what) in [
+            ("[1]", "must be a JSON object"),
+            ("{pageSize: 1}", "not JSON"),
+            (r#"{"pageSize": true}"#, "neither a number nor text"),
+            (r#"{"pageSize": 5000}"#, "power of two"),
+            (r#"{"pageCash": 1}"#, "unknown setting"),
+        ] {
+            let err = with_options("opt_bad", options).err().expect(options);
+            assert!(err.contains(what), "{options}: {err}");
+        }
+        // A setting fixed at creation can't be an open option.
+        let settings = settings_from_json(r#"{"pageSize": 8192}"#).unwrap();
+        let err = OpenConfig::from_settings(settings.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fixed when a database is created"), "{err}");
+    }
+
+    #[test]
+    fn test_settings_lists_every_setting_in_camel_case() {
+        let settings: serde_json::Value = serde_json::from_str(&SquealDb::settings()).unwrap();
+        let names = |key: &str| -> Vec<String> {
+            settings[key]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| s["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names("create"), ["pageSize", "maxIndexKeySize"]);
+        assert!(names("open").contains(&"pageCacheBytes".to_string()));
+        assert!(names("open").contains(&"queryMemoryBytes".to_string()));
+        // Each is a name withOptions takes.
+        for name in names("create").iter().chain(&names("open")) {
+            let value = if name.ends_with("Timeout") || name.ends_with("Interval") { "1s" } else { "4096" };
+            let mut c = CreateConfig::default();
+            c.set(name, value).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+    }
+}

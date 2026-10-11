@@ -28,6 +28,24 @@ sql>> explain select * from t where id = 2;
   directory.
 - **Results** print as tables, with the row count and time.
 
+## Settings
+
+Any of the store's settings (see the
+[store README](../store/README.md#configuration)) can follow the path, as
+`--name value` or `--name=value`:
+
+```bash
+squeal-cli my.db --page-size 8k --page-cache-bytes 256m   # creating my.db
+squeal-cli my.db --query-memory-bytes 16m                 # opening it
+squeal-cli --help                                         # lists them
+```
+
+The page size and largest index key are fixed when a database is
+created, so they are refused for a file that already exists. The others
+apply to each run. Sizes take `k`, `m` or `g`; durations take `ms` or `s`.
+
+## Commands
+
 | command | |
 |---|---|
 | `!help` | the SQL cheat sheet and these commands |

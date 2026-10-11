@@ -43,6 +43,20 @@ orders.with_session(&session).delete_many(d(r#"{"qty": 0}"#))?;
 session.commit_transaction()?;
 ```
 
+## Configuration
+
+`Client::create_with(path, &CreateConfig)` and `Client::open_with(path,
+&OpenConfig)` take the store's configuration (re-exported here; see the
+[store README](../store/README.md#configuration)): the page size when
+creating, and the page cache and other run-time settings on every open.
+The shell takes the same settings as flags:
+
+```
+$ sq-json shop.db --page-size 8k --page-cache-bytes 256m   # creating
+$ sq-json shop.db --page-cache-bytes 32m                   # opening
+$ sq-json --help
+```
+
 ## What's there
 
 - **Documents** keep their field order. They read and write MongoDB extended

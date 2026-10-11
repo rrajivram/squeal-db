@@ -30,6 +30,7 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use serde::Serialize;
 use squeal_sql::{
+    CreateConfig,
     conn::connection::{Connection, ConnectionManager},
     rslt::resultset::{ResultSet, ResultType, StreamingResultSet},
     source::QueryStats,
@@ -95,19 +96,58 @@ impl SquealDb {
     /// Opens `path` if it already exists, otherwise creates it fresh.
     /// Lands on a usable schema immediately (same bootstrap as
     /// squeal-cli/squeal-wasm) so CREATE TABLE etc. work right away.
+    ///
+    /// `options`, if given, is a JSON object of settings (see
+    /// store::config), named in camelCase or snake_case, each a number
+    /// or text: `{"pageSize": "8k", "pageCacheBytes": "64m"}`. The ones a
+    /// database is opened with (the page cache, query memory, ...) apply
+    /// every time. The ones fixed when it is created (`pageSize`,
+    /// `maxIndexKeySize`) apply when this call creates it; given for a
+    /// database that already exists they must be what it was created
+    /// with — so an app can pass the same options on every start.
     #[napi(constructor)]
-    pub fn new(path: String) -> Result<SquealDb> {
-        let mgr: Arc<ConnectionManager<F>> = Arc::new(ConnectionManager::new());
-        let conn = mgr
-            .connect(&path)
-            .or_else(|e| {
-                if e.is_not_found() {
-                    mgr.create_and_connect(&path)
-                } else {
-                    Err(e)
+    pub fn new(path: String, options: Option<String>) -> Result<SquealDb> {
+        let settings = match &options {
+            Some(json) => settings_from_json(json).map_err(Error::from_reason)?,
+            None => vec![],
+        };
+        let config =
+            CreateConfig::from_settings(settings.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+                .map_err(|e| Error::from_reason(e.to_string()))?;
+        let mgr: Arc<ConnectionManager<F>> =
+            Arc::new(ConnectionManager::with_config(config.clone()));
+        let conn = match mgr.connect(&path) {
+            Ok(conn) => {
+                // Opened, not created: what is fixed in the file must be
+                // what was asked for, if it was asked for.
+                let db = conn.store();
+                let default = CreateConfig::default();
+                for (name, asked, has, was_default) in [
+                    (
+                        "pageSize",
+                        config.page_size,
+                        db.page_size(),
+                        config.page_size == default.page_size,
+                    ),
+                    (
+                        "maxIndexKeySize",
+                        config.max_index_key_size,
+                        db.max_index_key_size(),
+                        config.max_index_key_size == default.max_index_key_size,
+                    ),
+                ] {
+                    if asked != has && !was_default {
+                        return Err(Error::from_reason(format!(
+                            "{path} was created with {name} {has}, not {asked}: \
+                             it is fixed when a database is created"
+                        )));
+                    }
                 }
-            })
-            .map_err(to_napi_error)?;
+                conn
+            }
+            Err(e) if e.is_not_found() => mgr.create_and_connect(&path).map_err(to_napi_error)?,
+            Err(e) => return Err(to_napi_error(e)),
+        };
         let _ = conn.use_schema(DEFAULT_SCHEMA);
         Ok(SquealDb {
             conn: Mutex::new(Some(conn)),
@@ -286,6 +326,24 @@ fn drain_streaming(stream: &mut StreamingResultSet) -> SqlResult<(Vec<String>, V
         rows.push(row);
     }
     Ok((columns, rows))
+}
+
+// A JSON object of settings as (name, value-as-text) pairs: what
+// CreateConfig::from_settings takes. Values are numbers or text.
+fn settings_from_json(options: &str) -> std::result::Result<Vec<(String, String)>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(options).map_err(|e| format!("options are not JSON: {e}"))?;
+    let Some(object) = value.as_object() else {
+        return Err("options must be a JSON object".into());
+    };
+    object
+        .iter()
+        .map(|(name, v)| match v {
+            serde_json::Value::String(s) => Ok((name.clone(), s.clone())),
+            serde_json::Value::Number(n) => Ok((name.clone(), n.to_string())),
+            other => Err(format!("option {name}: {other} is neither a number nor text")),
+        })
+        .collect()
 }
 
 fn to_napi_error(e: squeal_sql::error::SchemaError) -> Error {

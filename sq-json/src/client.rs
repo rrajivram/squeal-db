@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use store::cursor::Cursor;
+use store::config::{CreateConfig, OpenConfig};
 use store::db::{DBFile, Db};
 use store::error::StoreError;
 use store::table::TableIdType;
@@ -87,12 +88,25 @@ struct IndexEntry {
 impl<F: DBFile<Item = F> + 'static> Client<F> {
     /// Creates a new database file at `path`.
     pub fn create(path: &str) -> Result<Self> {
-        Self::start(Db::create(path)?)
+        Self::create_with(path, &CreateConfig::default())
+    }
+
+    /// Creates a new database file at `path` with everything that can be
+    /// chosen for one (see store::config): its page size, fixed in the
+    /// file, and how this process runs it.
+    pub fn create_with(path: &str, config: &CreateConfig) -> Result<Self> {
+        Self::start(Db::create_with(path, config)?)
     }
 
     /// Opens an existing database file.
     pub fn open(path: &str) -> Result<Self> {
-        Self::start(Db::open(path)?)
+        Self::open_with(path, &OpenConfig::default())
+    }
+
+    /// Opens an existing database file, run as `config` says: the page
+    /// cache and the other settings a process chooses each time.
+    pub fn open_with(path: &str, config: &OpenConfig) -> Result<Self> {
+        Self::start(Db::open_with(path, config)?)
     }
 
     /// Wraps a store database already open (e.g. one on MemFile).

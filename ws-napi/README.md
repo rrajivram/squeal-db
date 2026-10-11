@@ -97,6 +97,24 @@ db.close();
 
 Run it again — the table and row are still there.
 
+## Options
+
+The constructor takes an optional second argument: a JSON object of
+settings (see the [store README](../store/README.md#configuration)).
+
+```js
+const db = new SquealDb('./my-app.db', JSON.stringify({
+  pageSize: '8k',           // used when this call creates the file
+  pageCacheBytes: '64m',    // applied on every open
+  queryMemoryBytes: '16m',
+}));
+```
+
+An app can pass the same options on every start. The run-time settings
+apply each time. `pageSize` and `maxIndexKeySize` are fixed when the file
+is created: for a file that already exists they must match what it was
+created with, or the constructor throws, naming both values.
+
 ## Loading a CSV
 
 Both forms work here (Node has a real filesystem, WASI included):
