@@ -65,6 +65,10 @@ pub struct CrashConfig {
     pub checkpoint_every_ms: Option<(u64, u64)>,
     /// Page size for the database (small forces splits/overflow quickly).
     pub page_size: u64,
+    /// The page cache, in pages (None: the default, far more than a run
+    /// touches). A few dozen makes pages evict and reload under the
+    /// workload, and checkpoints run by dirty-page count as well.
+    pub cache_pages: Option<u64>,
     /// Where to save the failing snapshot's files, if anywhere.
     pub dump_dir: Option<String>,
     /// Phase 6: readers that hold one transaction open for the whole round,
@@ -87,6 +91,7 @@ impl Default for CrashConfig {
             cut_after_ms: (30, 120),
             checkpoint_every_ms: Some((20, 60)),
             page_size: 4096,
+            cache_pages: None,
             dump_dir: None,
             long_readers: 1,
         }
@@ -178,8 +183,17 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
     let mut report = CrashReport::default();
     let name = format!("crash_harness_{}", cfg.seed);
 
-    let db = Db::<MemFile>::create_with_page_size(&name, cfg.page_size)
-        .map_err(|e| format!("create: {e}"))?;
+    let open = match cfg.cache_pages {
+        Some(pages) => crate::config::OpenConfig::default().page_cache_bytes(pages * cfg.page_size),
+        None => crate::config::OpenConfig::default(),
+    };
+    let db = Db::<MemFile>::create_with(
+        &name,
+        &crate::config::CreateConfig::default()
+            .page_size(cfg.page_size)
+            .open(open.clone()),
+    )
+    .map_err(|e| format!("create: {e}"))?;
     let mut table_ids = Vec::new();
     for i in 0..cfg.tables {
         table_ids.push(
@@ -324,7 +338,7 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
         };
 
         // --- recovery ---
-        let reopened = match Db::<MemFile>::open_using(&name, data_snap, log_snap) {
+        let reopened = match Db::<MemFile>::open_using_with(&name, data_snap, log_snap, &open) {
             Ok(db) => db,
             Err(e) => {
                 let mut msg = format!("seed {} round {round}: reopen failed: {e}", cfg.seed);

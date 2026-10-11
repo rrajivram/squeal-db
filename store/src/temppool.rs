@@ -37,7 +37,7 @@ use crate::{
 pub(crate) const TEMP_PAGE_OVERHEAD: usize = 64;
 
 /// Default in-memory budget of a pool, in bytes.
-pub const DEFAULT_TEMP_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub use crate::config::DEFAULT_TEMP_CACHE_BYTES;
 
 const STRIPES: usize = 16;
 

@@ -1,5 +1,10 @@
 #![allow(private_bounds)]
 use crate::buffer::PageBuffer;
+use crate::config::{CreateConfig, OpenConfig};
+pub(crate) use crate::config::{
+    DEFAULT_MAX_INDEX_KEY_SIZE, MAX_MAX_INDEX_KEY_SIZE, MAX_PAGE_SIZE,
+    MIN_MAX_INDEX_KEY_SIZE, MIN_PAGE_SIZE,
+};
 use crate::constant::FIRST_USER_PAGE;
 use crate::constant::FREE_PAGE_TABLE_PAGE;
 use crate::constant::GENERATOR_TABLE_PAGE;
@@ -33,7 +38,7 @@ use crate::tables::bplustree;
 use crate::tables::bplustree::BPlusTree;
 use crate::tables::bplustree::Decision;
 use crate::tables::bplustree::Written;
-use crate::temppool::{DEFAULT_TEMP_CACHE_BYTES, TempPool, TempStats};
+use crate::temppool::{TempPool, TempStats};
 use crate::tuple::DBIdType;
 use crate::tuple::{Tuple, TupleRef};
 use crate::txn::ConflictPolicy;
@@ -74,27 +79,21 @@ use std::sync::atomic::AtomicU64;
 const RDB_MAGIC: u16 = 0x5365;
 const MAGIC: [u8; 2] = [0x53, 0x65];
 const ZERO_PAGE_SIZE: DBSizeType = 8 * 1024;
-const DEFAULT_PAGE_SIZE: DBSizeType = 16 * 1024;
 // Cap on pages the writer thread will hold in memory awaiting durable redo
 // before applying backpressure to callers (see PageBuffer's writer). Not
 // persisted — purely a runtime memory/throughput knob, safe to pick freshly
 // on every open. Matches PageBuffer's existing page-cache size (max_entries)
 // as a reasonable default order of magnitude.
 // How often the maintenance thread runs a pass when nothing wakes it.
-const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 // WAL growth that triggers a checkpoint (checked by the maintenance thread).
-const CHECKPOINT_LOG_BYTES: u64 = 16 * 1024 * 1024;
 // Phase 5: how many times the maintenance thread retries an abort whose
 // revert failed before the engine goes Degraded.
 const ABORT_RETRY_BUDGET: u32 = 3;
 // Phase 6: dirty pages reach disk only at a checkpoint, so the cache also
 // checkpoints once this many are waiting (bounds memory between
 // checkpoints independently of WAL growth).
-const CHECKPOINT_DIRTY_PAGES: usize = 4096;
 // Phase 7: what a long-lived transaction may pin before the engine aborts
 // it with SnapshotTooOld (see `Db::set_snapshot_limits`).
-const DEFAULT_MAX_RETAINED_WAL_BYTES: u64 = 256 * 1024 * 1024;
-const DEFAULT_MAX_VERSION_RECORDS: usize = 1_000_000;
 
 /// How `Db::commit_with` waits for durability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,16 +207,11 @@ impl<T> DBFile for T where
 // mechanism would be belt-and-suspenders on top of that, not something
 // closing a live bug, so it's deferred (see audit-progress.md).
 const HEADER_FORMAT_VERSION: u32 = 4;
-const MIN_PAGE_SIZE: DBSizeType = 4 * 1024;
-const MAX_PAGE_SIZE: DBSizeType = 1024 * 1024;
 // Persistence versioning Stage 3: the database-wide, per-file cap on a
 // B-link tree page's `high_key` (see PageHeader — the one variable-size
 // field in the page header, bounded by a column's declared capacity via
 // ValueItem::validate, summed across an index's key columns). Chosen at
 // creation time like page_size, persisted here, validated below.
-pub(crate) const DEFAULT_MAX_INDEX_KEY_SIZE: DBSizeType = 512;
-const MIN_MAX_INDEX_KEY_SIZE: DBSizeType = 64;
-const MAX_MAX_INDEX_KEY_SIZE: DBSizeType = 8 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct Header {
@@ -565,6 +559,12 @@ pub struct Db<F: DBFile + 'static> {
     // temppool.rs. Kept out of `buffer` so scratch data never touches the WAL,
     // checkpoints, the persisted free list or the core cache.
     temp: Arc<TempPool<F>>,
+    // How this process runs the database (see config.rs): what it was
+    // created or opened with.
+    config: OpenConfig,
+    // The dirty-page count that triggers a checkpoint (see
+    // OpenConfig::dirty_page_limit).
+    dirty_page_limit: usize,
     #[cfg(test)]
     fail_reverts: std::sync::atomic::AtomicBool,
 }
@@ -687,31 +687,73 @@ where
     F: DBFile<Item = F>,
 {
     pub fn create<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
-        Self::create_with_page_size(name, DEFAULT_PAGE_SIZE)
+        Self::create_unchecked(name, &CreateConfig::default())
     }
 
+    /// Creates a database with everything that can be chosen for one: what
+    /// is fixed in its file (page size, largest index key) and how this
+    /// process runs it (see config.rs). Refuses a page or key size outside
+    /// what a database may have — a file made with one could not be opened
+    /// again.
+    pub fn create_with<S: AsRef<str>>(
+        name: S,
+        config: &CreateConfig,
+    ) -> Result<Arc<Self>, StoreError> {
+        config.validate()?;
+        let size = |what: &str, v: DBSizeType, lo: DBSizeType, hi: DBSizeType| {
+            if v.is_power_of_two() && (lo..=hi).contains(&v) {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidConfig(format!(
+                    "{what} {v} must be a power of two in [{lo}, {hi}]"
+                )))
+            }
+        };
+        size("page_size", config.page_size, MIN_PAGE_SIZE, MAX_PAGE_SIZE)?;
+        size(
+            "max_index_key_size",
+            config.max_index_key_size,
+            MIN_MAX_INDEX_KEY_SIZE,
+            MAX_MAX_INDEX_KEY_SIZE,
+        )?;
+        if config.max_index_key_size > config.page_size / 4 {
+            return Err(StoreError::InvalidConfig(format!(
+                "max_index_key_size {} must be at most a quarter of page_size {}",
+                config.max_index_key_size, config.page_size
+            )));
+        }
+        Self::create_unchecked(name, config)
+    }
+
+    /// `create_with`, with the given page size and every other default.
+    /// Takes page sizes below what `create_with` allows: tests use tiny
+    /// pages to reach splits and overflows with few rows, and never reopen
+    /// them.
     pub fn create_with_page_size<S: AsRef<str>>(
         name: S,
         page_size: DBSizeType,
     ) -> Result<Arc<Self>, StoreError> {
-        Self::create_with_page_size_and_max_index_key_size(
-            name,
-            page_size,
-            DEFAULT_MAX_INDEX_KEY_SIZE,
-        )
+        Self::create_unchecked(name, &CreateConfig::default().page_size(page_size))
     }
 
-    // Persistence versioning Stage 3: lets a caller override the database-
-    // wide cap on an index key's worst-case serialized size (see
-    // DEFAULT_MAX_INDEX_KEY_SIZE) at creation time, the same way
-    // create_with_page_size overrides page_size. create/create_with_page_size
-    // both funnel through here with the default.
     pub fn create_with_page_size_and_max_index_key_size<S: AsRef<str>>(
         name: S,
         page_size: DBSizeType,
         max_index_key_size: DBSizeType,
     ) -> Result<Arc<Self>, StoreError> {
-        let sf = Self::create_core_db(name.as_ref().to_string(), page_size, max_index_key_size)?;
+        Self::create_unchecked(
+            name,
+            &CreateConfig::default()
+                .page_size(page_size)
+                .max_index_key_size(max_index_key_size),
+        )
+    }
+
+    fn create_unchecked<S: AsRef<str>>(
+        name: S,
+        config: &CreateConfig,
+    ) -> Result<Arc<Self>, StoreError> {
+        let sf = Self::create_core_db(name.as_ref().to_string(), config)?;
         sf.generator.attach_logger(sf.logger.clone());
         sf.create_system_tables()?;
         // Durable before it is returned: the system pages are only in the
@@ -724,11 +766,25 @@ where
         Ok(db)
     }
 
+    /// Opens the database in `file` (its WAL found through `log_file`), run
+    /// with the defaults (see OpenConfig).
     pub fn open_using<S: AsRef<str>>(
         name: S,
         file: F,
         log_file: F,
     ) -> Result<Arc<Self>, StoreError> {
+        Self::open_using_with(name, file, log_file, &OpenConfig::default())
+    }
+
+    /// `open_using`, run as `config` says. The page size and everything
+    /// else fixed at creation come from the file.
+    pub fn open_using_with<S: AsRef<str>>(
+        name: S,
+        file: F,
+        log_file: F,
+        config: &OpenConfig,
+    ) -> Result<Arc<Self>, StoreError> {
+        config.validate()?;
         let mut bytes = vec![0u8; size_of::<Header>()];
         let mut file = file;
         file.seek(SeekFrom::Start(0))?;
@@ -791,14 +847,16 @@ where
             file.do_clone()?,
             name.as_ref().to_string(),
             wal,
+            config,
         )?;
         // Wipes any `<name>.tmp` left by a crash: scratch data never survives
         // a restart.
+        let cache_pages = nm.buffer.capacity_pages();
         let temp = Arc::new(TempPool::new(
             name.as_ref(),
             file.do_clone()?,
             header.page_size,
-            DEFAULT_TEMP_CACHE_BYTES,
+            config.temp_cache_bytes,
         )?);
         let sf = Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
@@ -820,22 +878,21 @@ where
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
             versions: VersionStore::new(),
-            maintenance: Maintenance::new(MAINTENANCE_INTERVAL),
+            maintenance: Maintenance::new(config.maintenance_interval),
             table_locks: ShardedMap::new(16),
             snapshot_mutex: parking_lot::Mutex::new(()),
             checkpoint_mutex: parking_lot::Mutex::new(()),
             degraded: RwLock::new(None),
             abort_attempts: parking_lot::Mutex::new(HashMap::new()),
             lock_timeouts: std::sync::atomic::AtomicU64::new(0),
-            snapshot_limits: RwLock::new(SnapshotLimits {
-                max_retained_wal_bytes: DEFAULT_MAX_RETAINED_WAL_BYTES,
-                max_version_records: DEFAULT_MAX_VERSION_RECORDS,
-            }),
+            snapshot_limits: RwLock::new(config.snapshot_limits),
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             temp,
+            dirty_page_limit: config.dirty_page_limit(cache_pages),
+            config: config.clone(),
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         };
@@ -1052,6 +1109,16 @@ where
     }
 
     pub fn open<S: AsRef<str>>(name: S) -> Result<Arc<Self>, StoreError> {
+        Self::open_with(name, &OpenConfig::default())
+    }
+
+    /// Opens the database at `name`, run as `config` says: the settings a
+    /// process may choose each time (memory, timeouts, checkpointing — see
+    /// OpenConfig). What was fixed when it was created comes from the file.
+    pub fn open_with<S: AsRef<str>>(
+        name: S,
+        config: &OpenConfig,
+    ) -> Result<Arc<Self>, StoreError> {
         let f = OpenOptions::new()
             .create(false)
             .read(true)
@@ -1068,7 +1135,7 @@ where
             }
             None => f.do_clone()?,
         };
-        Self::open_using(name, f, log_file)
+        Self::open_using_with(name, f, log_file, config)
     }
 
     /*
@@ -1755,8 +1822,8 @@ where
             }
             self.versions.requeue_tombstones(retry);
         }
-        if self.logger.segment_bytes() > CHECKPOINT_LOG_BYTES
-            || self.buffer.dirty_pages() > CHECKPOINT_DIRTY_PAGES
+        if self.logger.segment_bytes() > self.config.checkpoint_log_bytes
+            || self.buffer.dirty_pages() > self.dirty_page_limit
         {
             self.checkpoint()?;
             stats
@@ -2734,6 +2801,7 @@ where
         file: F,
         name: String,
         wal: OpenedWal<F>,
+        config: &OpenConfig,
     ) -> Result<NeededObjects<F>, StoreError> {
         let mut logger = Logger::new();
         logger.set_db(
@@ -2750,15 +2818,17 @@ where
         // expose a way for a caller to supply custom kinds; that's a
         // natural follow-up once something actually needs to register one.
         let content_registry = Arc::new(crate::pages::content::PageContentRegistry::builtin());
+        let cache_pages = config.cache_pages(header.page_size);
         let buffer = Arc::new(PageBuffer::new(
             header.page_size,
             page_counter,
             file,
             header,
-            8192,
+            cache_pages,
             clock.clone(),
             content_registry,
         )?);
+        buffer.set_lock_timeout(config.lock_timeout);
         let nm = NeededObjects {
             buffer,
             logger: Arc::new(logger),
@@ -2767,11 +2837,9 @@ where
         Ok(nm)
     }
 
-    fn create_core_db(
-        name: String,
-        page_size: DBSizeType,
-        max_index_key_size: DBSizeType,
-    ) -> Result<Self, StoreError> {
+    fn create_core_db(name: String, config: &CreateConfig) -> Result<Self, StoreError> {
+        config.validate()?;
+        let (page_size, max_index_key_size) = (config.page_size, config.max_index_key_size);
         // STORE_AUDIT.md S4: create(true) opens-or-creates, so Db::create
         // on an already-existing path silently reopened it, then
         // unconditionally overwrote its header with page_count=0 and
@@ -2821,13 +2889,15 @@ where
             f.do_clone()?,
             name.clone(),
             wal,
+            &config.open,
         )?;
 
+        let cache_pages = nm.buffer.capacity_pages();
         let temp = Arc::new(TempPool::new(
             &name,
             f.do_clone()?,
             header.page_size,
-            DEFAULT_TEMP_CACHE_BYTES,
+            config.open.temp_cache_bytes,
         )?);
         Ok(Self {
             last_checkpoint: AtomicU128::new(header.last_checkpoint),
@@ -2842,22 +2912,21 @@ where
             tx_mgr: nm.txn_mgr,
             buffer: nm.buffer,
             versions: VersionStore::new(),
-            maintenance: Maintenance::new(MAINTENANCE_INTERVAL),
+            maintenance: Maintenance::new(config.open.maintenance_interval),
             table_locks: ShardedMap::new(16),
             snapshot_mutex: parking_lot::Mutex::new(()),
             checkpoint_mutex: parking_lot::Mutex::new(()),
             degraded: RwLock::new(None),
             abort_attempts: parking_lot::Mutex::new(HashMap::new()),
             lock_timeouts: std::sync::atomic::AtomicU64::new(0),
-            snapshot_limits: RwLock::new(SnapshotLimits {
-                max_retained_wal_bytes: DEFAULT_MAX_RETAINED_WAL_BYTES,
-                max_version_records: DEFAULT_MAX_VERSION_RECORDS,
-            }),
+            snapshot_limits: RwLock::new(config.open.snapshot_limits),
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             temp,
+            dirty_page_limit: config.open.dirty_page_limit(cache_pages),
+            config: config.open.clone(),
             #[cfg(test)]
             fail_reverts: std::sync::atomic::AtomicBool::new(false),
         })
@@ -3064,6 +3133,18 @@ where
         Ok(())
     }
 
+    /// What this process runs the database with: the OpenConfig it was
+    /// created or opened with. (`set_lock_timeout`, `set_snapshot_limits`
+    /// and `set_temp_cache_bytes` change the running engine, not this.)
+    pub fn config(&self) -> &OpenConfig {
+        &self.config
+    }
+
+    /// The page size this database was created with.
+    pub fn page_size(&self) -> DBSizeType {
+        self.header.page_size
+    }
+
     /// The page cache's size in bytes: what a planner can assume stays in
     /// memory once read.
     pub fn cache_bytes(&self) -> usize {
@@ -3159,7 +3240,8 @@ mod tests {
 
     use crate::{
         cursor::Cursor,
-        db::{DEFAULT_PAGE_SIZE, Db, FileDB, Opener, ZERO_PAGE_SIZE},
+        config::DEFAULT_PAGE_SIZE,
+        db::{Db, FileDB, Opener, ZERO_PAGE_SIZE},
         error::StoreError,
         logger::{LogHeader, list_segments},
         memfile::MemFile,
@@ -3170,6 +3252,203 @@ mod tests {
     };
     use std::fs::File;
     type TestDB = Db<MemFile>;
+
+    // --- CreateConfig / OpenConfig (config.rs) ---
+
+    use crate::config::{CreateConfig, OpenConfig};
+
+    // What is fixed at creation is read back from the file; what a process
+    // chooses is whatever each open says.
+    #[test]
+    fn test_create_with_fixes_the_page_size_and_open_with_chooses_the_rest() {
+        let made = CreateConfig::default()
+            .page_size(8 * 1024)
+            .max_index_key_size(256)
+            .open(OpenConfig::default().page_cache_bytes(64 * 8 * 1024));
+        let db = TestDB::create_with("config_roundtrip.db", &made).unwrap();
+        assert_eq!(db.page_size(), 8 * 1024);
+        assert_eq!(db.max_index_key_size(), 256);
+        assert_eq!(db.cache_bytes(), 64 * 8 * 1024);
+        assert_eq!(db.config(), &made.open);
+        let t = db.create_table("t".into()).unwrap();
+        let txn = db.begin().unwrap();
+        db.insert(t, Tuple::new(1, b"one"), &txn).unwrap();
+        db.commit(txn).unwrap();
+        let (f, l) = db.close().unwrap();
+
+        let opened = OpenConfig::default()
+            .page_cache_bytes(32 * 8 * 1024)
+            .query_memory_bytes(1 << 20)
+            .lock_timeout(Duration::from_millis(250));
+        let db = TestDB::open_using_with("config_roundtrip.db", f, l, &opened).unwrap();
+        // From the file, not from the config.
+        assert_eq!(db.page_size(), 8 * 1024);
+        assert_eq!(db.max_index_key_size(), 256);
+        // From this open.
+        assert_eq!(db.cache_bytes(), 32 * 8 * 1024);
+        assert_eq!(db.config().query_memory_bytes, 1 << 20);
+        assert_eq!(db.config().lock_timeout, Duration::from_millis(250));
+        let txn = db.begin().unwrap();
+        let t = db.table_id_by_name("t").unwrap().expect("table t");
+        assert_eq!(&*db.find(t, DBIdType::Int(1), &txn).unwrap().unwrap().data, b"one");
+    }
+
+    #[test]
+    fn test_create_with_refuses_what_could_not_be_opened_again() {
+        for (bad, what) in [
+            (CreateConfig::default().page_size(1024), "page_size"),
+            (CreateConfig::default().page_size(12 * 1024), "page_size"),
+            (CreateConfig::default().page_size(2 * 1024 * 1024), "page_size"),
+            (CreateConfig::default().max_index_key_size(32), "max_index_key_size"),
+            (
+                CreateConfig::default().page_size(4096).max_index_key_size(2048),
+                "quarter",
+            ),
+            (
+                CreateConfig::default().open(OpenConfig::default().page_cache_bytes(0)),
+                "page_cache_bytes",
+            ),
+        ] {
+            match TestDB::create_with("config_refused.db", &bad) {
+                Err(StoreError::InvalidConfig(msg)) => assert!(msg.contains(what), "{msg}"),
+                Err(e) => panic!("{bad:?}: {e}"),
+                Ok(_) => panic!("{bad:?} was accepted"),
+            }
+        }
+        let db = TestDB::create("config_open_refused.db").unwrap();
+        let (f, l) = db.close().unwrap();
+        let bad = OpenConfig::default().lock_timeout(Duration::ZERO);
+        assert!(matches!(
+            TestDB::open_using_with("config_open_refused.db", f, l, &bad),
+            Err(StoreError::InvalidConfig(_))
+        ));
+    }
+
+    // A cache far smaller than the data still reads and writes all of it:
+    // pages are evicted, and dirty ones checkpointed first.
+    #[test]
+    fn test_a_small_page_cache_holds_a_table_bigger_than_itself() {
+        let config = CreateConfig::default()
+            .page_size(4096)
+            .open(OpenConfig::default().page_cache_bytes(32 * 4096));
+        let db = TestDB::create_with("config_small_cache.db", &config).unwrap();
+        assert_eq!(db.cache_bytes(), 32 * 4096);
+        let t = db.create_table("t".into()).unwrap();
+        let value = [7u8; 200];
+        for chunk in 0..20u64 {
+            let txn = db.begin().unwrap();
+            for k in chunk * 500..(chunk + 1) * 500 {
+                db.insert(t, Tuple::new(k, &value), &txn).unwrap();
+            }
+            db.commit(txn).unwrap();
+        }
+        // ~2 MB of rows through a 128 KiB cache.
+        assert!(db.page_count() > 32 * 4, "{}", db.page_count());
+        let txn = db.begin().unwrap();
+        for k in (0..10_000u64).step_by(37) {
+            let row = db.find(t, DBIdType::Int(k), &txn).unwrap().expect("row");
+            assert_eq!(&*row.data, &value);
+        }
+        let mut c = db.table_scan_in_txn(t, &txn).unwrap();
+        let mut n = 0;
+        while c.next().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10_000);
+    }
+
+    // Updates survive a cache much smaller than the table: a page that is
+    // evicted and read back has every write made to it.
+    #[test]
+    fn test_updates_survive_eviction_from_a_small_page_cache() {
+        for (page_size, cache_pages) in [(4096u64, 512u64), (4096, 64), (16 * 1024, 32)] {
+            let config = CreateConfig::default()
+                .page_size(page_size)
+                .open(OpenConfig::default().page_cache_bytes(cache_pages * page_size));
+            let name = format!("config_evict_{page_size}_{cache_pages}.db");
+            let db = TestDB::create_with(&name, &config).unwrap();
+            let t = db.create_table("t".into()).unwrap();
+            let rows = 20_000u64;
+            let value = |k: u64, v: u8| {
+                let mut b = [v; 100];
+                b[..8].copy_from_slice(&k.to_le_bytes());
+                b
+            };
+            let txn = db.begin().unwrap();
+            for k in 0..rows {
+                db.insert(t, Tuple::new(k, &value(k, 0)), &txn).unwrap();
+            }
+            db.commit(txn).unwrap();
+            db.checkpoint().unwrap();
+            // The version each key was last written with.
+            let mut version = vec![0u8; rows as usize];
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % rows
+            };
+            for round in 1..=30u8 {
+                let txn = db.begin().unwrap();
+                for _ in 0..100 {
+                    let k = next();
+                    db.update(t, Tuple::new(k, &value(k, round)), &txn).unwrap();
+                    version[k as usize] = round;
+                }
+                db.commit(txn).unwrap();
+                // Reads between the writes move pages in and out.
+                let txn = db.begin().unwrap();
+                for _ in 0..500 {
+                    let k = next();
+                    let row = db.find(t, DBIdType::Int(k), &txn).unwrap().expect("row");
+                    assert_eq!(
+                        &*row.data,
+                        &value(k, version[k as usize]),
+                        "page {page_size}, cache {cache_pages}: key {k} after round {round}"
+                    );
+                }
+                db.commit(txn).unwrap();
+            }
+            let txn = db.begin().unwrap();
+            for k in 0..rows {
+                let row = db.find(t, DBIdType::Int(k), &txn).unwrap().expect("row");
+                assert_eq!(
+                    &*row.data,
+                    &value(k, version[k as usize]),
+                    "page {page_size}, cache {cache_pages}: key {k} at the end"
+                );
+            }
+        }
+    }
+
+    // checkpoint_log_bytes is what the maintenance thread checkpoints at.
+    #[test]
+    fn test_a_small_checkpoint_threshold_checkpoints_sooner() {
+        let checkpoints = |log_bytes: u64| {
+            let config = CreateConfig::default()
+                .open(OpenConfig::default().checkpoint_log_bytes(log_bytes));
+            let db = TestDB::create_with(format!("config_ckpt_{log_bytes}.db"), &config).unwrap();
+            let t = db.create_table("t".into()).unwrap();
+            let count = |db: &TestDB| {
+                db.maintenance
+                    .stats
+                    .checkpoints
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            };
+            let before = count(&db);
+            for k in 0..2_000u64 {
+                let txn = db.begin().unwrap();
+                db.insert(t, Tuple::new(k, &[1u8; 100]), &txn).unwrap();
+                db.commit(txn).unwrap();
+            }
+            thread::sleep(Duration::from_millis(100));
+            count(&db) - before
+        };
+        // ~400 KB of log: several checkpoints at 32 KiB, none at 16 MiB.
+        assert!(checkpoints(32 * 1024) >= 3);
+        assert_eq!(checkpoints(16 * 1024 * 1024), 0);
+    }
 
     fn make_db_with_table() -> (Arc<TestDB>, TableIdType) {
         let db = TestDB::create("txn_test.db").unwrap();

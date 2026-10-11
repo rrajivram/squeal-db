@@ -4,7 +4,10 @@
 //! costs, where squeal-sql's `load_vs_sqlite` example measures the engine
 //! plus parsing, planning and row encoding.
 //!
-//!   cargo run --release -p store --example kv_vs_sqlite -- [rows] [threads]
+//!   cargo run --release -p store --example kv_vs_sqlite -- [rows] [threads] [--setting value ...]
+//!
+//! The settings are the store's (see store::config; `--help` lists them):
+//! `--page-size 4k --page-cache-bytes 32m`, say.
 //!
 //! Two tables, `rows` rows each, 100-byte values:
 //! - `kv`: an integer key (the store's `DBIdType::Int`; SQLite's `INTEGER
@@ -145,9 +148,22 @@ fn phase(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let rows: u64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(200_000);
-    let threads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(4);
+    let fail = |e: &dyn std::fmt::Display| -> ! {
+        eprintln!("{e}\n\nusage: kv_vs_sqlite [rows] [threads] [--setting value ...]\n");
+        eprint!("{}", store::config::settings_help(true));
+        std::process::exit(2);
+    };
+    let (args, settings) =
+        store::config::split_args(std::env::args().skip(1)).unwrap_or_else(|e| fail(&e));
+    if settings.iter().any(|(n, _)| n == "help") {
+        fail(&"kv_vs_sqlite: the store against SQLite as a key-value store");
+    }
+    let config = store::config::CreateConfig::from_settings(
+        settings.iter().map(|(n, v)| (n.as_str(), v.as_str())),
+    )
+    .unwrap_or_else(|e| fail(&e));
+    let rows: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    let threads: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
     let groups = rows / GROUP;
 
     let dir = std::env::temp_dir().join(format!("store_vs_sqlite_{}", std::process::id()));
@@ -155,7 +171,7 @@ fn main() {
     let store_path = dir.join("kv.store").to_string_lossy().into_owned();
     let lite_path = dir.join("kv.sqlite").to_string_lossy().into_owned();
 
-    let db: Store = Db::<std::fs::File>::create(&store_path).unwrap();
+    let db: Store = Db::<std::fs::File>::create_with(&store_path, &config).unwrap();
     let kv = db.create_table("kv".into()).unwrap();
     let ordered = db
         .create_table_with_index_entry_size("ordered".into(), 96)
@@ -174,6 +190,14 @@ fn main() {
         rusqlite::version()
     );
     println!("both on disk, every commit fully flushed (F_FULLFSYNC); dir {}\n", dir.display());
+    if !settings.is_empty() {
+        println!(
+            "store: page size {}, page cache {} MiB; {:?}\n",
+            db.page_size(),
+            db.cache_bytes() >> 20,
+            settings
+        );
+    }
     println!(
         "| phase | ops | store per op | store rate | SQLite per op | SQLite rate | store speed vs SQLite | same answers |"
     );

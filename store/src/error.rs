@@ -85,6 +85,9 @@ pub enum StoreError {
     ReservedTableName(String),
     #[error("Unknown error {0}")]
     UnknownError(String),
+    // A CreateConfig/OpenConfig no database could run with (see config.rs).
+    #[error("Invalid configuration: {0}")]
+    InvalidConfig(String),
     // do_lock() found the database already open elsewhere — another
     // process (or another open handle in this one) holds its exclusive
     // lock. Its own variant, not UnknownError, so the message says what

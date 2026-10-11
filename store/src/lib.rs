@@ -28,6 +28,7 @@ pub mod alloc;
 pub mod arclock;
 mod buffer;
 pub mod clock;
+pub mod config;
 mod constant;
 pub mod db;
 pub mod error;

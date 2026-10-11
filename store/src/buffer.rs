@@ -146,7 +146,7 @@ enum PageEntry {
 const BUFFER_SHARD_COUNT: usize = 16;
 
 /// Phase 5: see `PageBuffer::set_lock_timeout`.
-pub(crate) const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) use crate::config::DEFAULT_LOCK_TIMEOUT;
 
 // The outcome of trying to free exactly one Strong slot. Distinct from a
 // bare `Option<(PageId, Arc<Page>)>` because "evicted a clean page" (no
@@ -204,6 +204,16 @@ impl std::hash::Hasher for PageIdHasher {
 
 type PageMap = HashMap<PageId, PageEntry, std::hash::BuildHasherDefault<PageIdHasher>>;
 
+/// A dirty page as a checkpoint captured it (see PageBuffer::
+/// capture_dirty_pages): the copy to write, and the cached page it was
+/// taken from, to mark clean as of `version` once the copy is on disk.
+pub(crate) struct CapturedPage {
+    page_num: PageId,
+    copy: Arc<Page>,
+    live: Arc<Page>,
+    version: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // STORE_AUDIT.md P2 survey follow-up: sharded (Vec of independent
@@ -215,6 +225,11 @@ pub(crate) struct PageBuffer<F: DBFile + 'static> {
     // stays unsharded-in-spirit — it already shards itself) stays correct
     // without ever needing to hold two shards' locks at once.
     buffer: Vec<RwLock<PageMap>>,
+    // Per shard: how many times a writer has published a page into it
+    // (install with InstallMode::Overwrite), changed and read under the
+    // shard's lock. What a reader that loaded a page from disk checks
+    // before caching it: see get_page.
+    write_epochs: Vec<AtomicU64>,
     header: Arc<Header>,
     page_size: DBSizeType,
     // Persistence versioning Stage 3: denormalized off `header` the same
@@ -309,6 +324,7 @@ where
             page_overhead,
             max_entries,
             strong_count: AtomicUsize::new(0),
+            write_epochs: (0..BUFFER_SHARD_COUNT).map(|_| AtomicU64::new(0)).collect(),
             buffer: (0..BUFFER_SHARD_COUNT)
                 .map(|_| RwLock::new(PageMap::default()))
                 .collect(),
@@ -346,11 +362,20 @@ where
         self.strong_count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn shard_for(&self, page_num: &PageId) -> &RwLock<PageMap> {
+    fn shard_index(&self, page_num: &PageId) -> usize {
         // A different multiplier from PageIdHasher's: the pages of one
         // shard must not all land in the same buckets of its map.
         let h = page_num.0.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> 32;
-        &self.buffer[h as usize % self.buffer.len()]
+        h as usize % self.buffer.len()
+    }
+
+    fn shard_for(&self, page_num: &PageId) -> &RwLock<PageMap> {
+        &self.buffer[self.shard_index(page_num)]
+    }
+
+    // See write_epochs. Read with the shard's lock held.
+    fn write_epoch(&self, page_num: &PageId) -> u64 {
+        self.write_epochs[self.shard_index(page_num)].load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn shutdown(mut self) -> Result<(), StoreError> {
@@ -514,7 +539,7 @@ where
             _level,
         } = handle;
         self.handle_large_page_size(page_num, &page)?;
-        self.install(page_num, page, InstallMode::Overwrite);
+        self.install(page_num, page, InstallMode::Overwrite, None);
         drop(lock);
         drop(_level);
         Ok(())
@@ -807,11 +832,19 @@ where
         self.write_gate.read()
     }
 
-    /// Copies every dirty cached page and marks the original clean. Must be
-    /// called with writers excluded; the copies are one consistent instant
-    /// of the tree and are written by `write_captured` after the log that
-    /// explains them is durable.
-    pub(crate) fn capture_dirty_pages(&self) -> Result<Vec<(PageId, Arc<Page>)>, StoreError> {
+    /// Copies every dirty cached page. Must be called with writers
+    /// excluded; the copies are one consistent instant of the tree and are
+    /// written by `write_captured` after the log that explains them is
+    /// durable.
+    ///
+    /// The originals stay dirty — so never evicted — until `write_captured`
+    /// has their copies on disk. Marking them clean here, as this used to,
+    /// let the cache evict one between the capture and the write; the next
+    /// reader then loaded the page's OLD image from disk, and a write built
+    /// on that lost every update the captured copy held. (It took a cache
+    /// smaller than the data to evict at all, so it showed only once the
+    /// cache's size could be set.)
+    pub(crate) fn capture_dirty_pages(&self) -> Result<Vec<CapturedPage>, StoreError> {
         let mut out = Vec::new();
         for shard in self.buffer.iter() {
             let shard = shard.read();
@@ -819,28 +852,28 @@ where
                 if let PageEntry::Strong(arc) = entry
                     && arc.is_dirty()
                 {
-                    let version = arc.dirty_version();
-                    out.push((*page_num, Arc::new((**arc).clone())));
-                    arc.mark_flushed_up_to(version);
+                    out.push(CapturedPage {
+                        page_num: *page_num,
+                        version: arc.dirty_version(),
+                        copy: Arc::new((**arc).clone()),
+                        live: arc.clone(),
+                    });
                 }
             }
-        }
-        // Clean again: back on the eviction candidate list.
-        let parked: Vec<PageId> = std::mem::take(&mut *self.parked_dirty.lock());
-        for page_num in parked {
-            self.access_map.push(page_num);
         }
         Ok(out)
     }
 
-    /// Writes captured pages to the data file and fsyncs it.
-    pub(crate) fn write_captured(&self, pages: Vec<(PageId, Arc<Page>)>) -> Result<(), StoreError> {
+    /// Writes captured pages to the data file and fsyncs it; only then are
+    /// the pages they were captured from clean (as of what was captured: a
+    /// page written again since is still dirty) and evictable.
+    pub(crate) fn write_captured(&self, pages: Vec<CapturedPage>) -> Result<(), StoreError> {
         {
             let file = self.self_file.read();
-            for (page_num, page) in &pages {
+            for captured in &pages {
                 write_page_with_bounded_retry(
-                    *page_num,
-                    page,
+                    captured.page_num,
+                    &captured.copy,
                     &*file,
                     self.header.page_size,
                     self.header.first_page_offset,
@@ -851,6 +884,14 @@ where
         // Past the OS page cache: the log segments that could redo these
         // pages are deleted right after the checkpoint returns.
         self.self_file.write().do_sync()?;
+        for captured in &pages {
+            captured.live.mark_flushed_up_to(captured.version);
+        }
+        // Clean again: back on the eviction candidate list.
+        let parked: Vec<PageId> = std::mem::take(&mut *self.parked_dirty.lock());
+        for page_num in parked {
+            self.access_map.push(page_num);
+        }
         Ok(())
     }
 
@@ -1077,50 +1118,70 @@ where
         // this read guard held while the arms below try to re-acquire the
         // same shard's lock via cache_strong/write() — a self-deadlock
         // with no other thread involved.
-        let existing = self.shard_for(&page_num).read().get(&page_num).cloned();
-        match existing {
-            Some(PageEntry::Strong(arc)) => {
-                // STORE_AUDIT.md P3: a plain relaxed bool store — no lock,
-                // no timestamp, no heap/priority-queue update. See Page::
-                // mark_referenced's own comment.
-                arc.mark_referenced();
-                return Ok(arc);
-            }
-            Some(PageEntry::Weak(weak)) => {
-                if let Some(arc) = weak.upgrade() {
-                    // Still alive — reuse it, but via get_or_install so we don't
-                    // clobber a concurrent writer's newer Strong with our
-                    // upgraded (possibly stale) copy.
-                    return Ok(self.get_or_install(page_num, arc));
+        loop {
+            // The entry, and the shard's write epoch as of the same moment.
+            let (existing, epoch) = {
+                let guard = self.shard_for(&page_num).read();
+                match guard.get(&page_num) {
+                    // The hot path: cached.
+                    Some(PageEntry::Strong(arc)) => {
+                        // STORE_AUDIT.md P3: a plain relaxed bool store — no
+                        // lock, no timestamp, no heap/priority-queue update.
+                        // See Page::mark_referenced's own comment.
+                        arc.mark_referenced();
+                        return Ok(arc.clone());
+                    }
+                    other => (other.cloned(), self.write_epoch(&page_num)),
                 }
-                // Dead: the writer already dropped its copy, which only
-                // happens after the file write completed, so the backing
-                // file is now guaranteed current. Prune the stale tombstone
-                // while we're here rather than leaving it around forever.
-                self.shard_for(&page_num).write().remove(&page_num);
+            };
+            match existing {
+                Some(PageEntry::Strong(_)) => unreachable!("returned above"),
+                Some(PageEntry::Weak(weak)) => {
+                    if let Some(arc) = weak.upgrade() {
+                        // Still alive — reuse it, but via get_or_install so we don't
+                        // clobber a concurrent writer's newer Strong with our
+                        // upgraded (possibly stale) copy.
+                        return Ok(self.get_or_install(page_num, arc));
+                    }
+                    // Dead: evicted clean and since dropped, so the file has
+                    // it. Prune the tombstone — if it is still that: another
+                    // thread may have cached the page (even written it)
+                    // since the look above, and removing whatever is there
+                    // dropped that page, a dirty one included, from the cache.
+                    let mut guard = self.shard_for(&page_num).write();
+                    if matches!(guard.get(&page_num), Some(PageEntry::Weak(w)) if w.strong_count() == 0)
+                    {
+                        guard.remove(&page_num);
+                    }
+                }
+                None => {}
             }
-            None => {}
+            let file = self.self_file.read();
+            let page = read_page(
+                page_num,
+                &*file,
+                self.header.page_size,
+                self.header.first_page_offset,
+                self.page_overhead,
+                &self.content_registry,
+            )?;
+            drop(file);
+            // Cached only if no writer has published into this shard since
+            // the look above. Without that check, this thread could read
+            // the page from disk, be held up while another loaded it,
+            // changed it, had a checkpoint write it and the cache evict it
+            // — and then cache its own, by now stale, copy as the page. On
+            // a change (rare: a write to the same shard within a disk
+            // read), read again.
+            if let Some(page) = self.install(
+                page_num,
+                Arc::new(page),
+                InstallMode::ReuseIfPresent,
+                Some(epoch),
+            ) {
+                return Ok(page);
+            }
         }
-        // cache_strong handles both the access_map update and the buffer
-        // insert under one write lock — the old two-step was racy.
-        let file = self.self_file.read();
-        let page = read_page(
-            page_num,
-            &*file,
-            self.header.page_size,
-            self.header.first_page_offset,
-            self.page_overhead,
-            &self.content_registry,
-        )?;
-        drop(file);
-        // Adopt the freshly-loaded page into this database's WAL clock before it
-        // can be mutated (set_dirty stamps from it; clones inherit it).
-        let page = Arc::new(page);
-        // get_or_install, not cache_strong: a concurrent writer may have installed
-        // a newer Strong while we were reading from disk; don't overwrite it with
-        // the older on-disk copy.
-        let page = self.get_or_install(page_num, page);
-        Ok(page)
     }
 
     /// Lock `page_num` for a read-modify-write. `level` is what the caller
@@ -1170,7 +1231,7 @@ where
     // which hold the per-page lock and are the authority on the page's
     // latest contents — always overwrites.
     fn cache_strong(&self, page_num: PageId, page: Arc<Page>) -> Result<(), StoreError> {
-        self.install(page_num, page, InstallMode::Overwrite);
+        self.install(page_num, page, InstallMode::Overwrite, None);
         Ok(())
     }
 
@@ -1179,7 +1240,8 @@ where
     // fresher version) beats our freshly-loaded/upgraded one, since a slow
     // reader must never clobber a concurrent writer's newer write.
     fn get_or_install(&self, page_num: PageId, page: Arc<Page>) -> Arc<Page> {
-        self.install(page_num, page, InstallMode::ReuseIfPresent)
+        self.install(page_num, page, InstallMode::ReuseIfPresent, None)
+            .expect("an unconditional install installs")
     }
 
     // The shared engine behind cache_strong/get_or_install. Installs `page`
@@ -1204,7 +1266,22 @@ where
     //
     // `mode` exists because the two callers need genuinely different
     // "page_num is already Strong" behavior — see InstallMode's own comment.
-    fn install(&self, page_num: PageId, page: Arc<Page>, mode: InstallMode) -> Arc<Page> {
+    //
+    // `unless_written_since`: a shard write epoch (see write_epochs); the
+    // page is installed only while the shard's is still that, else None.
+    fn install(
+        &self,
+        page_num: PageId,
+        page: Arc<Page>,
+        mode: InstallMode,
+        unless_written_since: Option<u64>,
+    ) -> Option<Arc<Page>> {
+        let published = || {
+            if matches!(mode, InstallMode::Overwrite) {
+                self.write_epochs[self.shard_index(&page_num)]
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        };
         // Set once evict_one() reports the access_map genuinely has nothing
         // left to offer — forces the next pass to insert past max_entries
         // rather than retrying eviction forever. See Evicted::Exhausted.
@@ -1212,6 +1289,9 @@ where
         loop {
             let shard = self.shard_for(&page_num);
             let mut guard = shard.write();
+            if unless_written_since.is_some_and(|epoch| self.write_epoch(&page_num) != epoch) {
+                return None;
+            }
             let existing_strong = match guard.get(&page_num) {
                 Some(PageEntry::Strong(arc)) => Some(arc.clone()),
                 _ => None,
@@ -1219,11 +1299,12 @@ where
             if let Some(arc) = existing_strong {
                 if matches!(mode, InstallMode::ReuseIfPresent) {
                     arc.mark_referenced();
-                    return arc;
+                    return Some(arc);
                 }
                 page.mark_referenced();
+                published();
                 guard.insert(page_num, PageEntry::Strong(page.clone()));
-                return page;
+                return Some(page);
             }
             // page_num isn't Strong yet — this is a genuinely new resident,
             // so it needs an access_map entry and, if the cache is already
@@ -1248,8 +1329,9 @@ where
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.access_map.push(page_num);
             page.mark_referenced();
+            published();
             guard.insert(page_num, PageEntry::Strong(page.clone()));
-            return page;
+            return Some(page);
         }
     }
 

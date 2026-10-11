@@ -32,6 +32,7 @@ fn main() {
             "--max-ops" => cfg.max_ops_per_txn = next().parse().expect("--max-ops"),
             "--commit-pct" => cfg.commit_probability_pct = next().parse().expect("--commit-pct"),
             "--page-size" => cfg.page_size = next().parse().expect("--page-size"),
+            "--cache-pages" => cfg.cache_pages = Some(next().parse().expect("--cache-pages")),
             "--cut-ms" => {
                 let v = next();
                 let (a, b) = v.split_once('-').expect("--cut-ms LO-HI");
@@ -40,7 +41,7 @@ fn main() {
             "--no-checkpoints" => cfg.checkpoint_every_ms = None,
             "--dump-dir" => cfg.dump_dir = Some(next()),
             "--help" | "-h" => {
-                println!("crash [--seed N] [--seeds N] [--threads N] [--tables N] [--keys N] [--rounds N] [--max-ops N] [--commit-pct N] [--page-size N] [--cut-ms LO-HI] [--no-checkpoints]");
+                println!("crash [--seed N] [--seeds N] [--threads N] [--tables N] [--keys N] [--rounds N] [--max-ops N] [--commit-pct N] [--page-size N] [--cache-pages N] [--cut-ms LO-HI] [--no-checkpoints]");
                 return;
             }
             other => {

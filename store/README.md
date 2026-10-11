@@ -28,6 +28,67 @@ let row = db.find(orders, DBIdType::Int(42), &txn)?;  // Some(tuple), as of txn'
 let mut scan = db.table_scan(orders)?;                // or range_scan / prefix_scan
 ```
 
+## Configuration
+
+What a database is created and opened with is two structs
+(`store::config`), split by when a setting can be chosen:
+
+- **`CreateConfig`** holds what is fixed in the file when the database is
+  created, plus an `OpenConfig` for running it. Every later open reads the
+  fixed part from the file.
+- **`OpenConfig`** holds how this process runs the database. It is chosen
+  on every open, written nowhere, and changes nothing in the file. The
+  same database can be opened with a small cache on one machine and a
+  large one on another.
+
+```rust
+use store::config::{CreateConfig, OpenConfig};
+
+let run = OpenConfig::default()
+    .page_cache_bytes(256 << 20)
+    .query_memory_bytes(32 << 20);
+let db = Db::<std::fs::File>::create_with(
+    "orders.db",
+    &CreateConfig::default().page_size(8 * 1024).open(run.clone()),
+)?;
+// ... later, in any process:
+let db = Db::<std::fs::File>::open_with("orders.db", &run)?;
+```
+
+`Db::create`, `open` and `open_using` use the defaults. `Db::config()`
+returns what a database is running with.
+
+| `CreateConfig` | default | |
+|---|---|---|
+| `page_size` | 16 KiB | bytes a page: a power of two, 4 KiB to 1 MiB |
+| `max_index_key_size` | 512 | largest index key: a power of two, 64 to 8 KiB, at most a quarter page |
+| `open` | | an `OpenConfig`, below |
+
+| `OpenConfig` | default | |
+|---|---|---|
+| `page_cache_bytes` | 128 MiB | how much of the database stays in memory |
+| `temp_cache_bytes` | 64 MiB | memory for query scratch pages before they spill to `<db>.tmp` |
+| `query_memory_bytes` | 64 MiB | what one query may hold before its operators spill; the store keeps it, the layer running queries enforces it |
+| `lock_timeout` | 1 s | how long a page lock is waited for |
+| `checkpoint_log_bytes` | 16 MiB | WAL growth that triggers a checkpoint |
+| `checkpoint_dirty_pages` | half the cache | dirty pages that trigger a checkpoint |
+| `snapshot_limits` | 256 MiB, 1M versions | what a long transaction may pin before it is aborted |
+| `maintenance_interval` | 10 ms | how often background maintenance runs when idle |
+
+A config no database could run with is refused with
+`StoreError::InvalidConfig`: a zero size, or a page size that isn't a
+power of two in range.
+
+**Settings by name.** Every setting also has a text form, for command
+lines and JSON options: `CreateConfig::set("page_size", "8k")`, or
+`OpenConfig::from_settings([("pageCacheBytes", "256m")])`.
+- **Names** are accepted in snake_case, kebab-case or camelCase.
+- **Sizes** take `k`, `m` or `g`.
+- **Durations** take `us`, `ms`, `s` or `m`.
+- **Fixed settings:** one that is fixed at creation is refused on open,
+  with a message saying so.
+- **The list:** `OPEN_SETTINGS` and `CREATE_SETTINGS`, with descriptions.
+
 ## Keys and values
 
 A key is a `DBIdType`. It is either `Int(u64)` (a generated row id) or
