@@ -1268,15 +1268,10 @@ mod tests {
         assert_eq!(vals, vec!["1-1", "1-2", "2-1", "3-1"]);
     }
 
-    // DBIdType::cmp for Rec can say Equal for ids that are `!=` under
-    // PartialEq (see IndexKey::partial_cmp's own documented ties). Unlike
-    // AnyTuplePage's Vec-bucket, this stores both as adjacent slots in the
-    // same cmp-tied run — confirm both stay independently reachable via
-    // PartialEq disambiguation within that run (see find_exact_in), rather
-    // than one silently shadowing the other or `add`'s duplicate check
-    // wrongly rejecting the second as a dup of the first.
+    // A key and a longer one it begins are two keys, the shorter first:
+    // both are kept, and found and removed apart.
     #[test]
-    fn test_rec_ids_that_tie_under_ord_but_differ_under_partial_eq_both_survive() {
+    fn test_a_key_and_a_longer_one_it_begins_are_distinct_and_in_order() {
         use crate::valueitem::{IndexKey, ValueItem};
 
         let mut p = make_page();
@@ -1285,10 +1280,10 @@ mod tests {
             DBIdType::Rec(IndexKey::new_from(&[ValueItem::Integer(1), ValueItem::Integer(2)]).unwrap());
         assert_eq!(
             short.cmp(&long),
-            std::cmp::Ordering::Equal,
-            "sanity: a prefix key ties under Ord with the longer key it prefixes"
+            std::cmp::Ordering::Less,
+            "a key sorts before a longer one it begins (see DBIdType's Ord)"
         );
-        assert_ne!(short, long, "but they are NOT the same id under PartialEq");
+        assert_ne!(short, long);
 
         p.add(Tuple::new_with(short.clone(), b"short", None, None)).unwrap();
         p.add(Tuple::new_with(long.clone(), b"long", None, None)).unwrap();
@@ -1300,7 +1295,7 @@ mod tests {
         let removed_short = p.remove(short.clone()).unwrap();
         assert_eq!(removed_short.data.to_vec(), b"short");
         assert!(!p.contains(&short).unwrap());
-        assert!(p.contains(&long).unwrap(), "removing one tied id must not remove the other");
+        assert!(p.contains(&long).unwrap(), "removing one must not remove the other");
     }
 
     #[test]

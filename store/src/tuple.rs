@@ -81,34 +81,27 @@ impl<'de> Deserialize<'de> for DBIdType {
     }
 }
 
-// Int orders by `hashed()` rather than structurally, so that comparisons
-// here agree with `AnyTuplePage`'s (now id-keyed, see its own comment)
-// storage/iteration order — the B+ tree's navigation and split logic rely
-// on `<`/`>` matching iteration order.
+// The order of keys: the order their keycode bytes have (see keycode.rs),
+// so that a tree whose pages hold keys as those bytes and one whose pages
+// hold them as values agree, and nothing above a page needs to know which
+// it is reading.
 //
-// Rec is the one exception: it orders structurally (field-by-field via
-// IndexKey::partial_cmp) instead. A hashed comparison — by design — loses
-// any relationship to the actual field values, which defeats the entire
-// point of a multi-key index: a range query over (customer_id, order_date)
-// needs "close values" to sort "close together" in the tree, and no hash
-// function can preserve that (it has to scramble to avoid collisions,
-// which is the opposite of what ordering needs). Confirmed as a real,
-// reachable problem, not just theoretical, in cursor.rs's range_scan
-// tests: a range meant to select a contiguous span of small integer keys
-// returned almost none of them once the ids were wrapped in a
-// single-field IndexKey and ordered by hash.
+//   - Two row ids order by value.
+//   - Two record keys order field by field (ValueItem's order); one that
+//     runs out first — a prefix of the other — sorts before it.
+//   - A record key sorts below a row id. A tree holds one kind or the
+//     other; what relies on this is Int(MAX), the last entry of an inner
+//     page, which must sort above every key of either kind.
 //
-// RISK: for Int, this still intentionally diverges from `Eq`/`PartialEq`,
-// which stay exact — two distinct ids whose hashes collide compare as
-// `Ordering::Equal` here while still being `!=` under `PartialEq`/`Hash`.
-// For Rec, the analogous (much narrower) risk is IndexKey::partial_cmp's
-// own documented quirks: a Str/Blob field whose reserved capacity differs
-// compares Equal despite being `!=` under PartialEq, and a key that is a
-// strict field-wise prefix of a longer key compares Equal to it despite
-// having a different field count. Either way, `Ordering::Equal` here does
-// NOT imply true equality — `AnyTuplePage` already has to tolerate that
-// (see its own doc comment on why it buckets by full `DBIdType`, not just
-// `.hashed()`).
+// Equal under this order is equal under `==`, with ValueItem's own two
+// exceptions: a string's or blob's reserved capacity is ignored by both,
+// and a double compares by total_cmp here and by its bits there, which
+// agree.
+//
+// (Before keycode, a row id against a record key compared by a 32-bit hash
+// of the key, and a prefix compared Equal to its extensions. No tree's
+// order depended on either beyond the Int(MAX) entry, which sorted last
+// then as now.)
 impl PartialOrd for DBIdType {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -117,18 +110,7 @@ impl PartialOrd for DBIdType {
 
 impl Ord for DBIdType {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match (self, other) {
-            (Self::Rec(a), Self::Rec(b)) => {
-                // IndexKey::partial_cmp only ever returns None if a field's
-                // own PartialOrd does (see ValueItem — it panics instead of
-                // returning None for any comparison it can't make sense of,
-                // e.g. Blob), so this never actually falls back in practice;
-                // it's here so Ord's contract (a total order) still holds
-                // if that ever changes.
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            _ => self.hashed().cmp(&other.hashed()),
-        }
+        IdRef::of(self).cmp(&IdRef::of(other))
     }
 }
 
@@ -482,19 +464,20 @@ impl<'a> IdRef<'a> {
         }
     }
 
-    // DBIdType's order (see its Ord): field by field between two column
-    // keys — a key that runs out first ties — and by hashed() otherwise.
+    // DBIdType's order (see its Ord).
     pub(crate) fn cmp(&self, other: &IdRef) -> std::cmp::Ordering {
-        if let (Id::Owned(a), Id::Owned(b)) = (self.0, other.0) {
-            return a.cmp(b);
-        }
+        use std::cmp::Ordering;
         match (self.key_values(), other.key_values()) {
-            (Some(a), Some(b)) => a
-                .zip(b)
-                .map(|(a, b)| a.cmp(&b))
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal),
-            _ => self.hashed().cmp(&other.hashed()),
+            (Some(a), Some(b)) => {
+                let (a_len, b_len) = (a.len(), b.len());
+                a.zip(b)
+                    .map(|(a, b)| a.cmp(&b))
+                    .find(|o| o.is_ne())
+                    .unwrap_or_else(|| a_len.cmp(&b_len))
+            }
+            (None, None) => self.as_int().cmp(&other.as_int()),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
         }
     }
 

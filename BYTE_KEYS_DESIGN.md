@@ -74,27 +74,56 @@ the persistence convention (PERSISTENCE_VERSIONING_PROGRESS.md):
 
 - [x] **1. The encoding** (`keycode.rs`). Nothing uses it yet, and nothing
   on disk changes.
-- [ ] **2. Pages hold keys as these bytes.**
-  - A tree created from now on stores each tuple's key as its `keycode`
-    bytes. The tree says so in its catalog entry, and its pages in their
-    content kind. A tree is all one format, because high keys and
-    separators cross pages.
-  - Comparisons inside the store route through one seam:
-    - `IdRef::cmp` / `eq`
-    - `Ord for DBIdType`
-    - `order_prefix_of` / `prefix_order`
-    - `wire::Reader`'s id functions
+- [x] **2a. One order for keys, everywhere.** `DBIdType`'s `Ord` (and
+  `IdRef`'s) is now the order the keycode bytes have:
+  - two row ids by value;
+  - two record keys field by field, a prefix before its extensions;
+  - a record key below a row id.
 
-    For a new tree these are byte comparisons. The per-slot prefix becomes
-    the key's first 16 bytes, with no decoding.
-  - Trees written before keep their format and their code path.
-  - The WAL keeps carrying keys as values: a record is replayed into
-    whatever format its tree has.
-  - Checked by the store's tests run against both formats, the crash
-    soaks, and the SQLite comparison tests.
-- [ ] **3. Scans on bytes.** A `KeyRange` becomes a pair of byte bounds
-  (`prefix_end` gives the upper one). A cursor compares bytes, and stops
-  decoding each key to test it.
+  Nothing on disk changes, and no real tree's order does: same-length
+  record keys and row ids compared this way already. The hash is no
+  longer part of ordering. The keycode tests check bytes against this
+  order for every kind of pair, and that equal bytes are equal keys.
+- [ ] **2b. Tuples on pages carry their key as these bytes.** On-disk
+  change: brought for approval before it is committed.
+  - **The form.** A tuple's id starts with a tag: 0 is a row id, 1 a record
+    key as postcard values. Tag 2 is new: a length, then the record key's
+    keycode bytes. Every record key written from now on uses it, in every
+    tree, with two exceptions:
+    - **Row ids keep tag 0.** They already compare without decoding, and
+      the new form would cost two bytes more a row.
+    - **A key holding a 00 byte in a string or blob keeps tag 1 for now.**
+      Tag-2 keys then hold no escapes, so their strings are lent from the
+      page as they are. Such keys stay correct, on the slower path.
+  - **No tree-wide switch.** Both forms have the same order (2a), so they
+    can share a page. That means no catalog flag, no new page kind, and no
+    migration: an old database's tuples take the new form as they are
+    rewritten.
+  - **Comparing.**
+    - Two tag-2 keys compare as bytes.
+    - An old-form key against anything compares by decoding, as now.
+    - The per-slot prefix is the first 16 bytes of a key's keycode bytes,
+      for both forms: different prefixes decide, equal ones fall to the
+      full compare.
+    - A search encodes its probe once.
+  - **Size.** `Tuple::size()` measures the page's encoding, since pages
+    budget by it.
+  - **Scans.** A `KeyRange` is turned into byte bounds once (`prefix_end`
+    gives the end of "begins with these fields"). A cursor tests tag-2
+    keys against them as bytes, and old-form keys field by field as now.
+    Without this, every scanned key would be decoded to test it.
+  - **The WAL** keeps carrying keys as values: a record is replayed into
+    whatever a page holds.
+  - **Checked by:**
+    - a fixture of a page of old-form tuples that still reads, searches
+      and takes new-form tuples beside them;
+    - the store's tests;
+    - the crash soaks;
+    - the SQLite comparison tests.
+- [ ] **3. Nothing above the store decodes a key to use it.**
+  - squeal-sql's index-only scan and identity reads take key fields
+    straight from the bytes.
+  - Seeks and bounds are built as bytes.
 - [ ] **4. Sorting on bytes.** `CREATE INDEX` writes each entry's key bytes
   once into one buffer, sorts positions by comparing bytes, and hands the
   bytes to the bulk loader. No row of values per entry, and no second

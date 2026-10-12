@@ -571,17 +571,11 @@ mod tests {
         assert_eq!(vals, vec!["1-1", "1-2", "2-1", "3-1"]);
     }
 
-    // DBIdType::cmp for Rec can say Equal for ids that are `!=` under
-    // PartialEq (see IndexKey::partial_cmp's own documented ties: same
-    // content with a different Str/Blob reserved capacity, or a key that's
-    // a strict field-wise prefix of a longer one). Keying the map by
-    // DBIdType (Ord) rather than a separately-hashed u64 makes this the
-    // SAME kind of "collision" the old hash-keyed scheme already had to
-    // tolerate — confirm the Vec-bucketing + PartialEq disambiguation
-    // still correctly keeps both entries distinct and independently
-    // reachable, rather than one silently shadowing the other.
+    // A key and a longer one it begins (index columns alone, and with a
+    // row's identity after them) are two keys, the shorter first: both are
+    // kept, and found and removed apart.
     #[test]
-    fn test_rec_ids_that_tie_under_ord_but_differ_under_partial_eq_both_survive() {
+    fn test_a_key_and_a_longer_one_it_begins_are_distinct_and_in_order() {
         use crate::valueitem::{IndexKey, ValueItem};
 
         let mut p = make_page();
@@ -591,10 +585,10 @@ mod tests {
         );
         assert_eq!(
             short.cmp(&long),
-            std::cmp::Ordering::Equal,
-            "sanity: a prefix key ties under Ord with the longer key it prefixes"
+            std::cmp::Ordering::Less,
+            "a key sorts before a longer one it begins (see DBIdType's Ord)"
         );
-        assert_ne!(short, long, "but they are NOT the same id under PartialEq");
+        assert_ne!(short, long);
 
         p.add(Tuple::new_with(short.clone(), b"short", None, None))
             .unwrap();
@@ -610,7 +604,7 @@ mod tests {
         assert!(!p.contains(&short).unwrap());
         assert!(
             p.contains(&long).unwrap(),
-            "removing one tied id must not remove the other"
+            "removing one must not remove the other"
         );
     }
 

@@ -40,10 +40,9 @@
 //! fields": the empty string's bytes begin those of a string that starts
 //! with a 00.
 //!
-//! Where this order differs from DBIdType's own: a key that is a prefix of
-//! another sorts before it (they compared Equal), and every record key
-//! sorts below every row id (they compared by a hash) — below Int(MAX)
-//! above all, the last entry of an inner page.
+//! This is DBIdType's own order (see its Ord): a key that is a prefix of
+//! another sorts before it, and every record key sorts below every row id
+//! — below Int(MAX) above all, the last entry of an inner page.
 use std::borrow::Cow;
 
 use crate::{
@@ -432,23 +431,40 @@ mod tests {
         assert!(matches!(&key.values()[0], ValueItem::Str((_, 2))));
     }
 
-    // The point of it: the bytes of keys of the same shape compare as the
-    // keys do — every pair of one field, and of two with either leading.
+    // The point of it: the bytes of two keys compare as the keys do —
+    // every pair of one field, of two with either leading, of different
+    // lengths, and with a row id on either side.
     #[test]
     fn test_bytes_order_as_the_keys_do() {
         let pool = pool();
         let check = |x: &DBIdType, y: &DBIdType| {
             assert_eq!(bytes_of(x).cmp(&bytes_of(y)), x.cmp(y), "{x:?} against {y:?}");
+            // And equal bytes are equal keys, bit for bit.
+            assert_eq!(bytes_of(x) == bytes_of(y), same(x, y), "{x:?} against {y:?}");
         };
+        let ids = [0u64, 1, 300, u64::MAX];
         for a in &pool {
             for b in &pool {
                 check(&rec(std::slice::from_ref(a)), &rec(std::slice::from_ref(b)));
+                // A key against a longer one, beginning with it or not.
+                check(&rec(std::slice::from_ref(a)), &rec(&[b.clone(), a.clone()]));
+                check(&rec(&[a.clone(), b.clone()]), &rec(std::slice::from_ref(b)));
                 for c in pool.iter().step_by(7) {
                     check(&rec(&[a.clone(), c.clone()]), &rec(&[b.clone(), c.clone()]));
                     check(&rec(&[c.clone(), a.clone()]), &rec(&[c.clone(), b.clone()]));
                     // The first field decides before the second is looked at.
                     check(&rec(&[a.clone(), c.clone()]), &rec(&[b.clone(), a.clone()]));
                 }
+            }
+            for n in ids {
+                check(&rec(std::slice::from_ref(a)), &DBIdType::Int(n));
+                check(&DBIdType::Int(n), &rec(&[a.clone(), a.clone()]));
+            }
+            check(&rec(&[]), &rec(std::slice::from_ref(a)));
+        }
+        for a in ids {
+            for b in ids {
+                check(&DBIdType::Int(a), &DBIdType::Int(b));
             }
         }
     }
