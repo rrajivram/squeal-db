@@ -148,11 +148,11 @@ fn test_decode_row_reads_what_versioned_row_writes() {
     }
 }
 
-// A row is written fixed-width (see table.rs's RowLayout): the same bytes
-// long whatever its strings' lengths and wherever its NULLs are, each
-// column where the schema says, read without the others.
+// A row is written packed (see table.rs's Packed): each value in the
+// bytes it needs, each column read without the others. A row an older
+// build wrote fixed-width (see RowLayout) reads the same.
 #[test]
-fn test_rows_are_fixed_width_and_read_by_column() {
+fn test_rows_are_packed_and_read_by_column() {
     let c = setup();
     let table = c.current_schema().unwrap().get_table("t").unwrap();
     let key = |v: Vec<ValueItem>| IndexKey::new_from(&v).unwrap();
@@ -160,30 +160,35 @@ fn test_rows_are_fixed_width_and_read_by_column() {
     let sparse = vec![ValueItem::Integer(8), ValueItem::Null, ValueItem::Null, s("", 200)];
     let full_bytes = table.encode_row(&key(full.clone())).unwrap();
     let sparse_bytes = table.encode_row(&key(sparse.clone())).unwrap();
-    assert_eq!(full_bytes.len(), sparse_bytes.len());
-    assert_eq!(table.decode_row(&full_bytes, None).unwrap().values(), &full[..]);
+    let fixed_bytes = table.encode_fixed_row(&key(full.clone())).unwrap();
+    assert!(full_bytes.len() < 30, "{} bytes", full_bytes.len());
+    assert!(fixed_bytes.len() > 250, "{} bytes", fixed_bytes.len());
+    for bytes in [&full_bytes, &fixed_bytes] {
+        assert_eq!(table.decode_row(bytes, None).unwrap().values(), &full[..]);
+        assert_eq!(
+            table
+                .decode_row(bytes, Some(&[false, false, true, true]))
+                .unwrap()
+                .values(),
+            &[ValueItem::Null, ValueItem::Null, s("c", 20), s("a note", 200)]
+        );
+    }
     assert_eq!(table.decode_row(&sparse_bytes, None).unwrap().values(), &sparse[..]);
-    assert_eq!(
-        table
-            .decode_row(&full_bytes, Some(&[false, false, true, true]))
-            .unwrap()
-            .values(),
-        &[ValueItem::Null, ValueItem::Null, s("c", 20), s("a note", 200)]
-    );
     // A string comes back with its column's capacity, whatever it was
     // written with.
     let odd = vec![ValueItem::Integer(9), s("n", 3), ValueItem::Null, s("x", 1)];
     let odd_bytes = table.encode_row(&key(odd)).unwrap();
-    assert_eq!(odd_bytes.len(), full_bytes.len());
     assert_eq!(
         table.decode_row(&odd_bytes, None).unwrap().values(),
         &[ValueItem::Integer(9), s("n", 20), ValueItem::Null, s("x", 200)]
     );
     // A reader of the old layout refuses such a row rather than misread
-    // the NULLs' padding; cut short anywhere, it is an error.
+    // it; cut short anywhere, it is an error.
     assert!(postcard::from_bytes::<VersionedRow>(&sparse_bytes).is_err());
-    for cut in 0..sparse_bytes.len() {
-        assert!(table.decode_row(&sparse_bytes[..cut], None).is_err(), "cut at {cut}");
+    for bytes in [&full_bytes, &sparse_bytes, &fixed_bytes] {
+        for cut in 0..bytes.len() {
+            assert!(table.decode_row(&bytes[..cut], None).is_err(), "cut at {cut}");
+        }
     }
 }
 
@@ -209,7 +214,7 @@ fn test_a_row_that_does_not_fit_its_columns_is_written_the_old_way() {
 #[test]
 fn test_rows_passed_over_before_they_are_built_are_the_ones_where_drops() {
     let c = conn();
-    for t in ["fixed", "walked"] {
+    for t in ["packed", "fixed", "walked"] {
         run(
             &c,
             &format!(
@@ -221,14 +226,16 @@ fn test_rows_passed_over_before_they_are_built_are_the_ones_where_drops() {
     }
     let schema = c.current_schema().unwrap();
     let walked = schema.get_table("walked").unwrap();
+    let fixed = schema.get_table("fixed").unwrap();
     let db = c.database.read().db.clone();
     let txn = db.begin().unwrap();
     for i in 0..40i64 {
         let n = if i % 7 == 0 { "null".to_string() } else { (i % 5).to_string() };
         let sv = if i % 6 == 0 { "null".to_string() } else { format!("'s{}'", i % 4) };
         let b = if i % 9 == 0 { "null" } else if i % 2 == 0 { "true" } else { "false" };
-        run(&c, &format!("insert into fixed values ({i}, {n}, {sv}, {b}, {}.5)", i % 3)).unwrap();
-        // The same row, as a build before fixed-width rows wrote it.
+        run(&c, &format!("insert into packed values ({i}, {n}, {sv}, {b}, {}.5)", i % 3)).unwrap();
+        // The same row, as a build before packed rows wrote it, and as one
+        // before fixed-width rows did.
         let values = vec![
             ValueItem::Integer(i),
             if i % 7 == 0 { ValueItem::Null } else { ValueItem::Integer(i % 5) },
@@ -244,6 +251,13 @@ fn test_rows_passed_over_before_they_are_built_are_the_ones_where_drops() {
         let key = store::tuple::DBIdType::Rec(IndexKey::new_from(&values[..1]).unwrap());
         db.insert(
             walked.rows_tree(),
+            store::tuple::Tuple::new_with(key.clone(), &data, None, None),
+            &txn,
+        )
+        .unwrap();
+        let data = fixed.encode_fixed_row(&IndexKey::new_from(&values).unwrap()).unwrap();
+        db.insert(
+            fixed.rows_tree(),
             store::tuple::Tuple::new_with(key, &data, None, None),
             &txn,
         )
@@ -257,11 +271,12 @@ fn test_rows_passed_over_before_they_are_built_are_the_ones_where_drops() {
         "n is null", "n > 0 and b = false and s < 's3'",
     ] {
         let q = |t: &str| rows(&c, &format!("select id, n, s from {t} where {cond} order by id"));
-        let plan = explain(&c, &format!("select id from fixed where {cond}"));
-        assert!(plan.contains("TableScan fixed"), "{cond}: {plan}");
+        let plan = explain(&c, &format!("select id from packed where {cond}"));
+        assert!(plan.contains("TableScan packed"), "{cond}: {plan}");
+        assert_eq!(q("packed"), q("walked"), "{cond}");
         assert_eq!(q("fixed"), q("walked"), "{cond}");
     }
-    assert!(!rows(&c, "select id from fixed where n > 2").is_empty());
+    assert!(!rows(&c, "select id from packed where n > 2").is_empty());
 }
 
 // Which of WHERE's terms a row is tested on before it is built: a column

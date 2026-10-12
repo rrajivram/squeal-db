@@ -45,8 +45,9 @@ fsynced. The answers agreed in every phase. Where squeal-db trails most:
   leaf; skip the per-row guards under the cursor's own.
 - [ ] **Per-statement overhead.** Point lookup by PK: 119k/s (SQLite,
   prepared, 707k/s). Concurrent (4 threads): 275k/s against 836k/s.
-- [ ] **On disk**: 66 MB against SQLite's 18 MB (fixed-width rows, 16 KiB
-  pages half full after splits, retained WAL).
+- [ ] **On disk**: 66 MB against SQLite's 18 MB (fixed-width rows, since
+  packed — see MEMORY_ISSUES.md; 16 KiB pages half full after splits,
+  retained WAL).
 - Ahead or level: correlated NOT EXISTS 4.1x faster (hash anti-join
   against SQLite's per-row probe), join + GROUP BY 1.2x, single-row
   autocommit INSERT and UPDATE level (both bound by fsync).

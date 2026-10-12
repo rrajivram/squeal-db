@@ -128,13 +128,19 @@ one. Each partition has:
   - Indexes are local to each partition, so a unique key must include the
     partition column.
 
-**Rows are fixed-width when every column type has a width.** Each column
-takes its type's bytes whatever its value, with `VARCHAR(n)` padded to `n`.
-So:
-- a column is found at a fixed offset, without decoding the ones before it
-- an `UPDATE` never changes a row's size
+**Rows are packed.** Each value takes the bytes it needs, with no tag (the
+row's schema version says each column's type). Integers drop their high
+zero bytes, strings are unpadded, and a NULL costs a bit. The row starts
+with where each column ends, so:
+- a column is found by reading two offsets, without decoding the ones
+  before it
 - a `WHERE` test can run against a row's bytes in place, before the row is
   built (`ColumnTest`)
+
+An orders row of six columns takes about 30 bytes, where the fixed-width
+rows written before took 74. Fixed-width rows, and the older tagged ones,
+are still read. A value that isn't its column's type can't be packed, and
+its row is written the old, tagged way.
 
 **Schema changes don't rewrite rows.** A table keeps an append-only list of
 `SchemaVersion`s, and each row records the version it was written under.
@@ -336,8 +342,9 @@ What the numbers say:
 - **Well behind on bulk load and index builds.** Both insert a row at a
   time through the transactional path; index builds have no sorted bulk
   build yet.
-- **On disk:** 66 MB against SQLite's 18 MB. Rows are fixed-width, pages
-  are 16 KiB and half full after splits, and the WAL is retained until a
+- **On disk:** 66 MB against SQLite's 18 MB, when measured. Rows were
+  fixed-width then (they are packed now: see MEMORY_ISSUES.md), pages are
+  16 KiB and half full after splits, and the WAL is retained until a
   checkpoint.
 
 The open items are in [TODO.md](../TODO.md). To run it yourself:

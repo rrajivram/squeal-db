@@ -107,14 +107,48 @@ or is unambiguous.
   - The trade-off: a `count(*)` over a primary-key range reads the rows
     tree instead of the narrower primary-key tree, about 12% slower
     (83 → 93 ms for half of 1M rows). A full `count(*)` got 10% faster.
-- [ ] **Step 2. Variable-width rows** (squeal-sql `table.rs`). Saves about
-  40–50 B a row; an orders row goes from ~74 B to ~25.
-  - Integers become varints.
-  - Strings and blobs are unpadded, with a length prefix.
-  - A null bitmap replaces full-width NULLs.
-  - A new flag bit marks the format, so old rows still read.
-  - Columns are found by skipping forward. Add an offset table only if
-    WHERE pushdown regresses.
+- [x] **Step 2. Packed rows** (squeal-sql `table.rs`, `Packed`). Done
+  2026-10-11.
+  - Each value is untagged, its type taken from the row's schema version.
+    Integers drop their high zero bytes, strings and blobs are unpadded,
+    and NULLs are a bitmap present only when one is.
+  - The row starts with where each column ends (1, 2 or 4 bytes an
+    offset), so a column is still found with an offset read: the O(1)
+    access fixed-width rows gave.
+  - A one-byte marker that no older row can start with marks the format.
+    Fixed-width and tagged rows still read.
+  - On the size probe, 1M orders:
+
+    | | before | after |
+    |---|---:|---:|
+    | table only | 104.5 MB | 67.7 MB (−37 B a row) |
+    | with 2 indexes | 251.4 MB | 202.8 MB |
+
+  - A/B with everything cached (1 GiB cache), against fixed-width rows:
+    - **orders, 6 columns:** every query is within ±1% or faster.
+      Pushdown on an int is −7%, and pushdown on the last column +1%.
+    - **wide, 25 columns:** pushdown on any column is −63 to −71%, and
+      sums are −20 to −35%.
+    - **inserts:** −3 to −11%.
+    - **file:** −48%.
+  - Getting there took three changes:
+    - reading the tested column straight from the row bytes;
+    - returning an `Option` per column;
+    - jump-table integer reads.
+
+    The first version was up to 28% slower on pushdown.
+  - The 1M-order bench (default cache) against fixed-width rows:
+    - every phase is the same or faster: PK lookup −21%, filtered join
+      −33%, correlated `NOT EXISTS` −21%;
+    - memory after reads, after writes and at the end is −6 to −8%;
+    - live heap is lower throughout.
+  - The bench's "after load" and peak read higher: 379 against 180 MiB,
+    and 425 against 375. That is the allocator, not the rows:
+    - Both builds reach the same high-water mark during `CREATE INDEX`
+      (~370 MiB, 56% of it fragmentation).
+    - The fixed-width build's allocator happened to return ~160 MiB to the
+      system during `ANALYZE`; the packed build's didn't.
+    - See section 2.
 - [ ] **Step 3. No duplicate primary key in index entries.** Saves about
   6 B an entry.
   - A non-unique index writes an empty payload.
@@ -155,6 +189,19 @@ between live allocations charged to the process.
 The cause is churn of mixed-size allocations among long-lived 16 KiB
 pages. Sections 4 and 6 list the main sources. Cutting the churn is the
 fix. A different allocator is out (no mimalloc).
+
+- [ ] **`CREATE INDEX` leaves the heap 56% fragmented** (measured
+  2026-10-11, 1M orders).
+  - About 71 MB of it is freed large blocks ("Malloc Large (empty)"):
+    39 MB after the bulk load, 71 MB after the index builds.
+  - Whether the allocator later returns them is luck, and the bench's
+    "after load" and peak readings swing by ~200 MiB with it.
+  - Suspect: the per-transaction `WriteLog` (`store/src/version.rs`). It
+    is one `Vec<u8>` that doubles to ~16 MB for a million writes, leaving
+    each smaller copy freed. Unconfirmed.
+  - Writing it in fixed-size chunks would keep it out of the large-block
+    allocator.
+
 
 ## 3. Page search arrays as large as the pages (measured)
 

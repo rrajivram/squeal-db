@@ -169,7 +169,9 @@ impl RowLayout {
 
     // The row's bytes, or None if a value doesn't fit its column's width
     // (a type the column isn't, a string past its capacity): no fixed-
-    // width row can hold it.
+    // width row can hold it. Only tests write these now (see
+    // SqlTable::encode_fixed_row): rows are packed.
+    #[cfg(test)]
     fn encode(&self, fields: &[Arc<Field>], values: &[ValueItem]) -> Option<Vec<u8>> {
         if values.len() != self.columns() {
             return None;
@@ -206,6 +208,276 @@ impl RowLayout {
     }
 }
 
+// A packed row: each value in as few bytes as it needs, and where each
+// column ends, so a reader still goes straight to the columns it wants
+// (an offset read, as in a fixed-width row) without stepping over the
+// ones before them. What the fixed-width row (RowLayout) gave, without
+// every value taking its type's widest form: a fixed-width orders row of
+// six columns took 74 bytes, packed it takes about 30.
+//
+//   marker   1 byte   !(column count as u8): a row written any other way
+//                     starts with its column count, a u64, so its first
+//                     byte is the count's lowest — never this.
+//   header   1 byte   bits 0-1: how wide each end offset is (1, 2 or 4
+//                     bytes, the narrowest the data's length allows);
+//                     bit 2: a null bitmap follows.
+//   nulls    ceil(columns / 8) bytes, if bit 2: bit i set, column i NULL.
+//   ends     columns - 1 offsets into `data`, little-endian: where each
+//            column but the last ends (the last ends with the data).
+//   data     the values, each in its column's type — no tag, the
+//            SchemaVersion the row was written under says what it is:
+//              integer   zigzag, little-endian, high zero bytes dropped
+//                        (0 is no bytes)
+//              datetime  little-endian, high zero bytes dropped
+//              double    8 bytes
+//              boolean   1 byte
+//              string, blob  the bytes; the capacity is the column's
+//              NULL      no bytes (its bit in `nulls`)
+//
+// A value that isn't its column's type (see Packed::encode) can't be
+// packed: the row is then written the old way, each value tagged.
+const PACKED_WIDTH_MASK: u8 = 0b11;
+const PACKED_NULLS: u8 = 1 << 2;
+
+fn packed_marker(columns: usize) -> u8 {
+    !(columns as u8)
+}
+
+// A packed row's parts, borrowed from its bytes.
+struct Packed<'a> {
+    nulls: Option<&'a [u8]>,
+    ends: &'a [u8],
+    width: usize,
+    data: &'a [u8],
+    columns: usize,
+}
+
+impl<'a> Packed<'a> {
+    // The row's bytes, or None if a value isn't its column's type.
+    fn encode(fields: &[Arc<Field>], values: &[ValueItem]) -> Option<Vec<u8>> {
+        let columns = fields.len();
+        if values.len() != columns || columns == 0 {
+            return None;
+        }
+        let mut data = Vec::with_capacity(values.iter().map(ValueItem::size).sum());
+        let mut ends = Vec::with_capacity(columns);
+        let mut nulls = vec![0u8; columns.div_ceil(8)];
+        let mut any_null = false;
+        for (pos, (value, field)) in values.iter().zip(fields).enumerate() {
+            match (value, field.datatype) {
+                (ValueItem::Null, _) => {
+                    nulls[pos / 8] |= 1 << (pos % 8);
+                    any_null = true;
+                }
+                (ValueItem::Integer(i), DataType::Integer) => {
+                    push_trimmed(&mut data, ((*i << 1) ^ (*i >> 63)) as u64);
+                }
+                (ValueItem::Datetime(d), DataType::Datetime) => push_trimmed(&mut data, *d),
+                (ValueItem::Double(d), DataType::Double) => {
+                    data.extend_from_slice(&d.to_le_bytes())
+                }
+                (ValueItem::Boolean(b), DataType::Boolean) => data.push(*b as u8),
+                (ValueItem::Str((s, _)), DataType::Str(n)) if s.len() <= n as usize => {
+                    data.extend_from_slice(s.as_bytes())
+                }
+                (ValueItem::Blob((b, _)), DataType::Blob(n)) if b.len() <= n as usize => {
+                    data.extend_from_slice(b)
+                }
+                _ => return None,
+            }
+            ends.push(data.len());
+        }
+        ends.pop();
+        let (width, code) = match data.len() {
+            0..=0xFF => (1, 0),
+            0x100..=0xFFFF => (2, 1),
+            _ => (4, 2),
+        };
+        let header = code | if any_null { PACKED_NULLS } else { 0 };
+        let mut out = Vec::with_capacity(
+            2 + if any_null { nulls.len() } else { 0 } + ends.len() * width + data.len(),
+        );
+        out.push(packed_marker(columns));
+        out.push(header);
+        if any_null {
+            out.extend_from_slice(&nulls);
+        }
+        for end in ends {
+            out.extend_from_slice(&(end as u32).to_le_bytes()[..width]);
+        }
+        out.extend_from_slice(&data);
+        Some(out)
+    }
+
+    // Column `pos` of `row`, if it is a packed row of `columns` columns:
+    // what decode_row_if tests, read without the rest of the row. Some(None)
+    // for a damaged row.
+    #[inline(always)]
+    fn read_one(
+        row: &'a [u8],
+        columns: usize,
+        pos: usize,
+        datatype: DataType,
+    ) -> Option<Option<ValueRef<'a>>> {
+        match row {
+            [marker, header, rest @ ..] if *marker == packed_marker(columns) => {
+                let width = match header & PACKED_WIDTH_MASK {
+                    0 => 1,
+                    1 => 2,
+                    2 => 4,
+                    _ => return Some(None),
+                };
+                let (nulls, rest) = if header & PACKED_NULLS != 0 {
+                    match rest.split_at_checked(columns.div_ceil(8)) {
+                        Some((nulls, rest)) => (Some(nulls), rest),
+                        None => return Some(None),
+                    }
+                } else {
+                    (None, rest)
+                };
+                let Some((ends, data)) = rest.split_at_checked((columns - 1) * width) else {
+                    return Some(None);
+                };
+                let packed = Self {
+                    nulls,
+                    ends,
+                    width,
+                    data,
+                    columns,
+                };
+                let start = if pos == 0 { 0 } else { packed.end(pos - 1) };
+                Some(packed.value(pos, start, packed.end(pos), datatype))
+            }
+            _ => None,
+        }
+    }
+
+    // A packed row of `columns` columns, if `row` is one.
+    fn parse(row: &'a [u8], columns: usize) -> Option<Self> {
+        if columns == 0 {
+            return None;
+        }
+        let (&marker, rest) = row.split_first()?;
+        if marker != packed_marker(columns) {
+            return None;
+        }
+        let (&header, rest) = rest.split_first()?;
+        let width = match header & PACKED_WIDTH_MASK {
+            0 => 1,
+            1 => 2,
+            2 => 4,
+            _ => return None,
+        };
+        let (nulls, rest) = if header & PACKED_NULLS != 0 {
+            let (nulls, rest) = rest.split_at_checked(columns.div_ceil(8))?;
+            (Some(nulls), rest)
+        } else {
+            (None, rest)
+        };
+        let (ends, data) = rest.split_at_checked((columns - 1) * width)?;
+        Some(Self {
+            nulls,
+            ends,
+            width,
+            data,
+            columns,
+        })
+    }
+
+    // Where column `pos`'s bytes end in `data`.
+    #[inline(always)]
+    fn end(&self, pos: usize) -> usize {
+        if pos + 1 == self.columns {
+            return self.data.len();
+        }
+        let e = self.ends;
+        match self.width {
+            1 => e[pos] as usize,
+            2 => u16::from_le_bytes([e[2 * pos], e[2 * pos + 1]]) as usize,
+            _ => u32::from_le_bytes([e[4 * pos], e[4 * pos + 1], e[4 * pos + 2], e[4 * pos + 3]])
+                as usize,
+        }
+    }
+
+    #[inline(always)]
+    fn is_null(&self, pos: usize) -> bool {
+        self.nulls
+            .is_some_and(|n| n[pos / 8] & (1 << (pos % 8)) != 0)
+    }
+
+    // Column `pos`, read as the type `datatype` says it is.
+    #[cfg(test)]
+    fn column(&self, pos: usize, datatype: DataType) -> Result<ValueRef<'a>, SchemaError> {
+        let start = if pos == 0 { 0 } else { self.end(pos - 1) };
+        self.value(pos, start, self.end(pos), datatype)
+            .ok_or_else(damaged)
+    }
+
+    // Column `pos`, in data[start..end], read as `datatype` says it is;
+    // None if the row is damaged. An Option, not a Result: it stays in
+    // registers, and this runs for every column of every row read (see
+    // ValueRef::try_decode).
+    #[inline(always)]
+    fn value(
+        &self,
+        pos: usize,
+        start: usize,
+        end: usize,
+        datatype: DataType,
+    ) -> Option<ValueRef<'a>> {
+        if self.is_null(pos) {
+            return Some(ValueRef::Null);
+        }
+        let bytes = self.data.get(start..end)?;
+        Some(match datatype {
+            DataType::Integer => {
+                let z = trimmed(bytes)?;
+                ValueRef::Integer((z >> 1) as i64 ^ -((z & 1) as i64))
+            }
+            DataType::Datetime => ValueRef::Datetime(trimmed(bytes)?),
+            DataType::Double => match *bytes {
+                [a, b, c, d, e, f, g, h] => {
+                    ValueRef::Double(f64::from_le_bytes([a, b, c, d, e, f, g, h]))
+                }
+                _ => return None,
+            },
+            DataType::Boolean => ValueRef::Boolean(bytes.first().is_some_and(|b| *b != 0)),
+            DataType::Str(n) => ValueRef::Str(std::str::from_utf8(bytes).ok()?, n),
+            DataType::Blob(n) => ValueRef::Blob(bytes, n),
+            DataType::Null | DataType::Unsupported => ValueRef::Null,
+        })
+    }
+}
+
+fn damaged() -> SchemaError {
+    SchemaError::UnknownError(
+        "packed row damaged: a column runs past the row, or a value doesn't fit its type".into(),
+    )
+}
+
+// A number written by push_trimmed.
+#[inline(always)]
+fn trimmed(bytes: &[u8]) -> Option<u64> {
+    Some(match *bytes {
+        [] => 0,
+        [a] => a as u64,
+        [a, b] => u16::from_le_bytes([a, b]) as u64,
+        [a, b, c] => u32::from_le_bytes([a, b, c, 0]) as u64,
+        [a, b, c, d] => u32::from_le_bytes([a, b, c, d]) as u64,
+        [a, b, c, d, e] => u64::from_le_bytes([a, b, c, d, e, 0, 0, 0]),
+        [a, b, c, d, e, f] => u64::from_le_bytes([a, b, c, d, e, f, 0, 0]),
+        [a, b, c, d, e, f, g] => u64::from_le_bytes([a, b, c, d, e, f, g, 0]),
+        [a, b, c, d, e, f, g, h] => u64::from_le_bytes([a, b, c, d, e, f, g, h]),
+        _ => return None,
+    })
+}
+
+// `v` little-endian, without its high zero bytes.
+fn push_trimmed(out: &mut Vec<u8>, v: u64) {
+    let len = 8 - (v.leading_zeros() / 8) as usize;
+    out.extend_from_slice(&v.to_le_bytes()[..len]);
+}
+
 // One comparison a row is checked against before it is built (see
 // SqlTable::decode_row_if): column `pos` `op` a literal of the column's own
 // type. Only what a lent value answers exactly as WHERE would: integers,
@@ -216,6 +488,8 @@ impl RowLayout {
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnTest {
     pos: usize,
+    // The column's type: what a packed row's bytes are read as.
+    datatype: DataType,
     op: BinaryOp,
     value: ValueItem,
 }
@@ -260,6 +534,7 @@ impl ColumnTest {
         );
         (compares && typed).then(|| Self {
             pos,
+            datatype: fields[pos].datatype,
             op,
             value: value.clone(),
         })
@@ -269,6 +544,7 @@ impl ColumnTest {
     // where the comparison is certainly not true — a NULL compares as
     // NULL. A value of another type than the column's (it shouldn't hold
     // one) is left to WHERE.
+    #[inline(always)]
     fn passes(&self, column: ValueRef) -> bool {
         let literal = self.value.as_ref();
         if column == ValueRef::Null {
@@ -1301,6 +1577,25 @@ impl SqlTable {
         tests: &[ColumnTest],
     ) -> Result<Option<IndexKey>, SchemaError> {
         let row: StoredRow = postcard::from_bytes(data)?;
+        let columns = self.fields().len();
+        if !tests.is_empty() && row.version == self.version() && columns > 0 {
+            let mut packed = false;
+            for test in tests {
+                match Packed::read_one(row.values, columns, test.pos, test.datatype) {
+                    None => break,
+                    Some(None) => return Err(damaged()),
+                    Some(Some(value)) => {
+                        packed = true;
+                        if !test.passes(value) {
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+            if packed {
+                return self.decode_stored_row(&row, wanted).map(Some);
+            }
+        }
         if !tests.is_empty()
             && row.version == self.version()
             && RowLayout::fixed_count(row.values).is_some()
@@ -1322,6 +1617,11 @@ impl SqlTable {
         row: &StoredRow,
         wanted: Option<&[bool]>,
     ) -> Result<IndexKey, SchemaError> {
+        if let Some(fields) = self.fields_at(row.version)
+            && let Some(packed) = Packed::parse(row.values, fields.len())
+        {
+            return self.decode_packed_row(row, packed, wanted);
+        }
         if let Some(count) = RowLayout::fixed_count(row.values) {
             return self.decode_fixed_row(row, count, wanted);
         }
@@ -1396,16 +1696,78 @@ impl SqlTable {
         })
     }
 
+    /// A row's stored bytes as a build before packed rows wrote them:
+    /// fixed-width (see RowLayout), or None if a value doesn't fit.
+    #[cfg(test)]
+    pub(crate) fn encode_fixed_row(&self, row: &IndexKey) -> Option<Vec<u8>> {
+        let version = &self.versions[self.version() as usize];
+        let values = version.layout()?.encode(&version.fields, row.values())?;
+        postcard::to_allocvec(&StoredRow {
+            version: self.version(),
+            values: &values,
+        })
+        .ok()
+    }
+
+    // decode_row, of a packed row (see Packed): each wanted column read
+    // from where the row says it is.
+    fn decode_packed_row(
+        &self,
+        row: &StoredRow,
+        packed: Packed,
+        wanted: Option<&[bool]>,
+    ) -> Result<IndexKey, SchemaError> {
+        let fields = self.fields_at(row.version).ok_or_else(|| {
+            SchemaError::UnknownError(format!(
+                "row was written under schema version {} but table {:?} has no such version",
+                row.version, self.name
+            ))
+        })?;
+        let current = row.version == self.version();
+        let mut values = Vec::with_capacity(fields.len());
+        // Where the column before ends, if it was read: the next starts
+        // there.
+        let mut last_end = None;
+        for (pos, field) in fields.iter().enumerate() {
+            if let Some(w) = wanted
+                && current
+                && !w[pos]
+            {
+                values.push(ValueItem::Null);
+                last_end = None;
+                continue;
+            }
+            let start = match (pos, last_end) {
+                (0, _) => 0,
+                (_, Some(end)) => end,
+                (_, None) => packed.end(pos - 1),
+            };
+            let end = packed.end(pos);
+            let value = packed
+                .value(pos, start, end, field.datatype)
+                .ok_or_else(damaged)?;
+            values.push(value.to_owned());
+            last_end = Some(end);
+        }
+        let values = IndexKey::new_from_owned(values)?;
+        if current {
+            return Ok(values);
+        }
+        self.reproject(&VersionedRow {
+            version: row.version,
+            values,
+        })
+    }
+
     /// A row's stored bytes (a tuple's data), written under the current
-    /// version: fixed-width (see RowLayout) where its values fit their
-    /// columns, as they do unless something got past INSERT's typing —
-    /// and the old way, each value its own size, otherwise.
+    /// version: packed (see Packed) where each value is its column's type,
+    /// as it is unless something got past INSERT's typing — and the old
+    /// way, each value tagged, otherwise. Fixed-width rows (RowLayout) are
+    /// read, no longer written.
     pub(crate) fn encode_row(&self, row: &IndexKey) -> Result<Vec<u8>, SchemaError> {
         let version = &self.versions[self.version() as usize];
-        let values = version
-            .layout()
-            .and_then(|l| l.encode(&version.fields, row.values()))
-            .unwrap_or_else(|| row.to_bytes());
+        let values =
+            Packed::encode(&version.fields, row.values()).unwrap_or_else(|| row.to_bytes());
         Ok(postcard::to_allocvec(&StoredRow {
             version: self.version(),
             values: &values,
@@ -2084,4 +2446,212 @@ pub(crate) fn partition_name(def: &sql_parser::ddl::PartitionDef) -> Result<Stri
         )));
     }
     Ok(name)
+}
+
+#[cfg(test)]
+mod packed_tests {
+    use super::*;
+
+    fn fields(types: &[DataType]) -> Vec<Arc<Field>> {
+        types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Arc::new(Field::new(format!("c{i}"), *t, true, None).unwrap()))
+            .collect()
+    }
+
+    fn round_trip(types: &[DataType], values: &[ValueItem]) -> Vec<u8> {
+        let fields = fields(types);
+        let bytes = Packed::encode(&fields, values).expect("packs");
+        let packed = Packed::parse(&bytes, fields.len()).expect("parses");
+        for (pos, (value, field)) in values.iter().zip(&fields).enumerate() {
+            let read = packed.column(pos, field.datatype).unwrap().to_owned();
+            // A string or blob comes back with its column's capacity.
+            let want = match (value, field.datatype) {
+                (ValueItem::Str((s, _)), DataType::Str(n)) => ValueItem::Str((s.clone(), n)),
+                (ValueItem::Blob((b, _)), DataType::Blob(n)) => ValueItem::Blob((b.clone(), n)),
+                (v, _) => v.clone(),
+            };
+            assert_eq!(read, want, "column {pos}");
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_every_type_and_extreme_reads_back() {
+        let types = [
+            DataType::Integer,
+            DataType::Integer,
+            DataType::Integer,
+            DataType::Integer,
+            DataType::Integer,
+            DataType::Datetime,
+            DataType::Datetime,
+            DataType::Double,
+            DataType::Double,
+            DataType::Boolean,
+            DataType::Boolean,
+            DataType::Str(16),
+            DataType::Str(16),
+            DataType::Blob(8),
+        ];
+        for ints in [
+            [i64::MIN, -1, 0, 1, i64::MAX],
+            [-129, 128, 255, -256, 1 << 40],
+        ] {
+            let mut values: Vec<ValueItem> = ints.iter().map(|i| ValueItem::Integer(*i)).collect();
+            values.extend([
+                ValueItem::Datetime(0),
+                ValueItem::Datetime(u64::MAX),
+                ValueItem::Double(-0.0),
+                ValueItem::Double(f64::NAN.copysign(1.0)),
+                ValueItem::Boolean(true),
+                ValueItem::Boolean(false),
+                ValueItem::Str((String::new(), 3)),
+                ValueItem::Str(("héllo".into(), 16)),
+                ValueItem::Blob((Arc::from(&[0u8, 255, 7][..]), 8)),
+            ]);
+            // NaN isn't equal to itself: compare it apart.
+            let fields = fields(&types);
+            let bytes = Packed::encode(&fields, &values).unwrap();
+            let packed = Packed::parse(&bytes, fields.len()).unwrap();
+            for (pos, field) in fields.iter().enumerate() {
+                let read = packed.column(pos, field.datatype).unwrap().to_owned();
+                match (&read, &values[pos]) {
+                    (ValueItem::Double(a), ValueItem::Double(b)) => {
+                        assert_eq!(a.to_bits(), b.to_bits(), "column {pos}")
+                    }
+                    (ValueItem::Str((a, n)), ValueItem::Str((b, _))) => {
+                        assert_eq!((a, *n), (b, 16), "column {pos}")
+                    }
+                    (ValueItem::Blob((a, n)), ValueItem::Blob((b, _))) => {
+                        assert_eq!((a, *n), (b, 8), "column {pos}")
+                    }
+                    (a, b) => assert_eq!(a, b, "column {pos}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nulls_anywhere_read_back_and_cost_a_bitmap_only_when_present() {
+        let types = [
+            DataType::Integer,
+            DataType::Str(8),
+            DataType::Double,
+            DataType::Boolean,
+        ];
+        let full = [
+            ValueItem::Integer(5),
+            ValueItem::Str(("ab".into(), 8)),
+            ValueItem::Double(1.5),
+            ValueItem::Boolean(true),
+        ];
+        let without = round_trip(&types, &full);
+        for mask in 1..16u32 {
+            let values: Vec<ValueItem> = full
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if mask & (1 << i) != 0 {
+                        ValueItem::Null
+                    } else {
+                        v.clone()
+                    }
+                })
+                .collect();
+            let with = round_trip(&types, &values);
+            assert_eq!(with[1] & PACKED_NULLS, PACKED_NULLS, "mask {mask}");
+        }
+        assert_eq!(without[1] & PACKED_NULLS, 0);
+        // An empty string is not a NULL.
+        let empty = [
+            ValueItem::Integer(0),
+            ValueItem::Str((String::new(), 8)),
+            ValueItem::Null,
+            ValueItem::Null,
+        ];
+        round_trip(&types, &empty);
+    }
+
+    #[test]
+    fn test_offsets_widen_with_the_data() {
+        for (len, width) in [(10usize, 1usize), (300, 2), (70_000, 4)] {
+            let types = [
+                DataType::Blob(100_000),
+                DataType::Integer,
+                DataType::Blob(100_000),
+            ];
+            let values = [
+                ValueItem::Blob((Arc::from(vec![1u8; len]), 100_000)),
+                ValueItem::Integer(-7),
+                ValueItem::Blob((Arc::from(vec![2u8; 3]), 100_000)),
+            ];
+            let bytes = round_trip(&types, &values);
+            let packed = Packed::parse(&bytes, 3).unwrap();
+            assert_eq!(packed.width, width, "{len}");
+        }
+    }
+
+    // A row written any other way starts with its column count, a u64:
+    // its first byte is the count's lowest, never the packed marker.
+    #[test]
+    fn test_the_marker_is_never_an_older_rows_first_byte() {
+        for columns in 1..2000usize {
+            let first = (columns as u64).to_le_bytes()[0];
+            let fixed_first = (columns as u64 | FIXED_ROW).to_le_bytes()[0];
+            assert_ne!(packed_marker(columns), first, "{columns}");
+            assert_ne!(packed_marker(columns), fixed_first, "{columns}");
+        }
+    }
+
+    #[test]
+    fn test_a_value_not_of_its_columns_type_is_not_packed() {
+        let fields = fields(&[DataType::Integer, DataType::Str(4)]);
+        let ok = [ValueItem::Integer(1), ValueItem::Str(("abcd".into(), 4))];
+        assert!(Packed::encode(&fields, &ok).is_some());
+        for bad in [
+            [ValueItem::Double(1.0), ValueItem::Null],
+            [ValueItem::Integer(1), ValueItem::Str(("abcde".into(), 9))],
+            [ValueItem::Integer(1), ValueItem::Integer(2)],
+        ] {
+            assert!(Packed::encode(&fields, &bad).is_none(), "{bad:?}");
+        }
+    }
+
+    // Cut short, or its numbers too long, a packed row is an error, not a
+    // panic.
+    #[test]
+    fn test_a_damaged_row_is_an_error() {
+        let types = [DataType::Integer, DataType::Str(8), DataType::Integer];
+        let fields = fields(&types);
+        let values = [
+            ValueItem::Integer(300),
+            ValueItem::Str(("xyz".into(), 8)),
+            ValueItem::Null,
+        ];
+        let bytes = Packed::encode(&fields, &values).unwrap();
+        for cut in 0..bytes.len() {
+            if let Some(packed) = Packed::parse(&bytes[..cut], 3) {
+                for (pos, f) in fields.iter().enumerate() {
+                    let _ = packed.column(pos, f.datatype);
+                }
+            }
+        }
+        // An integer column claiming nine bytes.
+        let long = Packed::encode(
+            &fields,
+            &[
+                ValueItem::Integer(1),
+                ValueItem::Str(("123456789".into(), 8)),
+                ValueItem::Null,
+            ],
+        );
+        assert!(long.is_none(), "too long for its column");
+        let mut bad = bytes.clone();
+        bad[3] = 9; // the first column's end
+        if let Some(packed) = Packed::parse(&bad, 3) {
+            assert!(packed.column(0, DataType::Integer).is_err());
+        }
+    }
 }
