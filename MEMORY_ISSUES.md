@@ -345,15 +345,37 @@ Per row read or produced:
     | `select *` (streamed to the caller) | 7 | 2 |
     | `select item, qty where qty > 5` | 3.5 | 1 |
     | `ORDER BY price` | 4 | 1 |
-    | join + `GROUP BY`, per order row | 9.8 | 5.7 |
+    | join + `GROUP BY`, per order row | 9.8 | 5.7, then 1.3 |
+    | index range (`day = 7`), per matching row | 4.2 | 2.1 |
 
   - At 1M orders: full-scan `GROUP BY` −28%, `IN (subquery)` −17%, the
     totals check −21%, join + `GROUP BY` −7%. The live heap is unchanged.
   - Guarded by `squeal-sql/tests/row_allocations.rs`.
-  - **Still to convert:** the joins (hash, merge, nested-loop), sort, set
-    operations, `LIMIT`, `DISTINCT`, and index scans. These still pass
-    owned rows; the per-statement planning cost (~180 allocations a
-    point lookup) is separate.
+  - **Then the hash join, index scans, `LIMIT` and partition reads.**
+    - The hash join probes with its input's lent row (the matcher works on
+      value slices, its residual `ON` on a reused scratch row) and lends
+      its output from one reused buffer. Join + `GROUP BY` at 1M orders:
+      −24%.
+    - An index scan fills its row buffer from the key, or fetches the row
+      straight into it.
+    - `LIMIT`, and a partitioned table read partition after partition,
+      forward their input's lent rows. So does `JoinSource`, whose not
+      forwarding had hidden the join's gain at first: a wrapper that
+      doesn't forward lending makes everything under it hand out owned
+      rows.
+    - `next()` moves a lending source's values out rather than copying
+      them, so a consumer that keeps rows pays what it did before.
+  - **What is left per row:**
+    - the hash join's build side, which it keeps;
+    - an index entry's identity, deserialized to look the row up;
+    - rows a consumer keeps (sort, the result set).
+  - **Still to convert:** merge and nested-loop joins, sort output, set
+    operations, `DISTINCT`. The per-statement planning cost (~180
+    allocations a point lookup) is separate.
+  - **Noted, not changed:** the hash join builds its larger side on
+    purpose (measured ~3.5× faster on the retail 4-way join, per its
+    comment). That measurement predates lent rows, which made probing
+    cheaper, so it is worth re-measuring.
 - [ ] **Owned lookups and scan rows copy the tuple** (`Cursor::next`,
   `Db::find`). The lending paths (`next_ref`, `find_with`) don't.
 - [ ] **Unread columns are not decoded but the row is still full width.**

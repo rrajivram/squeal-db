@@ -259,7 +259,7 @@ where
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         Ok(match self.advance()? {
-            true => Some(IndexKey::new_from(&self.row)?),
+            true => Some(IndexKey::new_from_buffer(&mut self.row)?),
             false => None,
         })
     }

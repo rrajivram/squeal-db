@@ -58,6 +58,8 @@ pub struct IndexSource<F: DBFile + 'static> {
     last_id: Option<DBIdType>,
     stats: Option<ComputedTableStat>,
     next_time: u128,
+    // The current row, lent (see Source::row): refilled by each advance.
+    row: Vec<ValueItem>,
 }
 
 impl<F> IndexSource<F>
@@ -175,6 +177,7 @@ where
             last_id: None,
             stats,
             next_time: 0,
+            row: Vec::new(),
         })
     }
 
@@ -192,19 +195,20 @@ where
     // The table row an entry points to (its `id`, see row_id), at the
     // scan's snapshot. None if it isn't visible there, which the entry
     // being visible should rule out.
-    fn fetch_row(&mut self, db: &Arc<Db<F>>, id: DBIdType) -> Result<Option<IndexKey>, SchemaError> {
+    fn fetch_row(&mut self, db: &Arc<Db<F>>, id: DBIdType) -> Result<bool, SchemaError> {
         let rows = self.table.partitions[self.part].rows();
-        // Read in place (find_as_with): the row's bytes are decoded, not
-        // copied out first.
-        let wanted = self.wanted.as_deref();
-        let Some(row) = db.find_in(rows, &id, self.cursor.snapshot(), |row| {
-            self.table.decode_row(row.data(), wanted)
+        // Read in place (find_in): the row's bytes are decoded straight
+        // into the row buffer, not copied out first.
+        let (table, wanted, row) = (&self.table, self.wanted.as_deref(), &mut self.row);
+        let Some(found) = db.find_in(rows, &id, self.cursor.snapshot(), |found| {
+            table.decode_row_into(found.data(), wanted, &[], row)
         })?
         else {
-            return Ok(None);
+            return Ok(false);
         };
+        found?;
         self.last_id = Some(id);
-        Ok(Some(row?))
+        Ok(true)
     }
 
     // The table row id an index entry's data holds: the PRIMARY KEY's
@@ -283,13 +287,24 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        Ok(match self.advance()? {
+            true => Some(IndexKey::new_from_buffer(&mut self.row)?),
+            false => None,
+        })
+    }
+
+    fn lends(&self) -> bool {
+        true
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
         let start = self.timer.start();
         if let Some(db) = self.lookup.clone() {
             loop {
                 let Some(entry) = self.cursor.next_ref()? else {
                     self.last_id = None;
                     crate::source::timing::add(&mut self.next_time, start);
-                    return Ok(None);
+                    return Ok(false);
                 };
                 let id = match Self::row_id(entry.data(), self.pk_positions.is_some())? {
                     Ok(id) => id,
@@ -301,15 +316,15 @@ where
                         )));
                     }
                 };
-                if let Some(row) = self.fetch_row(&db, id)? {
+                if self.fetch_row(&db, id)? {
                     crate::source::timing::add(&mut self.next_time, start);
-                    return Ok(Some(row));
+                    return Ok(true);
                 }
             }
         }
         let Some(entry) = self.cursor.next_ref()? else {
             crate::source::timing::add(&mut self.next_time, start);
-            return Ok(None);
+            return Ok(false);
         };
         let Some(key) = entry.id().key_values() else {
             return Err(SchemaError::InternalSchemaError(format!(
@@ -318,12 +333,18 @@ where
             )));
         };
         let wanted = |pos: usize| self.wanted.as_ref().is_none_or(|w| w[pos]);
-        let mut row = vec![ValueItem::Null; self.fields.len()];
+        let row = &mut self.row;
+        row.resize(self.fields.len(), ValueItem::Null);
+        for slot in row.iter_mut() {
+            if *slot != ValueItem::Null {
+                *slot = ValueItem::Null;
+            }
+        }
         // zip stops at the indexed columns: a non-unique index's key goes
         // on to carry the row identity, which the data holds as well.
         for (value, &pos) in key.zip(&self.key_positions) {
             if wanted(pos) {
-                row[pos] = value.to_owned();
+                value.store_in(&mut row[pos]);
             }
         }
         if let Some(pk) = &self.pk_positions
@@ -334,12 +355,16 @@ where
             let identity = from_bytes::<IndexKey>(entry.data())?;
             for (value, &pos) in identity.values().iter().zip(pk) {
                 if wanted(pos) {
-                    row[pos] = value.clone();
+                    value.as_ref().store_in(&mut row[pos]);
                 }
             }
         }
         crate::source::timing::add(&mut self.next_time, start);
-        Ok(Some(IndexKey::new_from_owned(row)?))
+        Ok(true)
+    }
+
+    fn row(&self) -> &[ValueItem] {
+        &self.row
     }
 
     fn query_stats(&self) -> Option<Vec<(String, super::QueryStats)>> {

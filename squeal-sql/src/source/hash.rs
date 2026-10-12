@@ -21,14 +21,18 @@ use crate::{
     optim::table_stats::TableStat,
     plan::memory::{MemReservation, QueryMemory},
     source::{
-        ComputedTableStat, ProjectableField, QueryStats, Source, join::JoinType,
+        ComputedTableStat, ProjectableField, QueryStats, Rows, Source, join::JoinType,
         joinmatch::JoinMatcher, merge_stats,
     },
 };
 
 #[allow(unused)]
 pub(crate) struct HashedSource<F: DBFile + 'static> {
-    sources: Vec<Box<dyn Source>>,
+    // The build side, read whole into the table.
+    build: Box<dyn Source>,
+    // The probe side, read a row at a time and lent where it lends: a
+    // probe row is matched where it is, never kept.
+    probe: Rows,
     db: Arc<Db<F>>,
     // The build (left, post-swap) side's table: in memory (no Run, no
     // postcard) until it outgrows `mem`'s budget, at which point it
@@ -76,7 +80,9 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     // key used to overwrite a single stored match; multiple left rows
     // sharing a key used to only ever be checked one at a time).
     pending_matches: VecDeque<IndexKey>,
-    current_right: Option<IndexKey>,
+    // The current output row, lent (see Source::row): refilled match after
+    // match, moved out of — its allocation kept — by next.
+    out: Vec<ValueItem>,
     // Set once sources[1] (right) has been fully drained — next() then
     // switches from "pull + probe a right row" to (for LEFT/FULL only)
     // the unmatched-left sweep below; for INNER/RIGHT it just means done.
@@ -179,20 +185,20 @@ impl MemTable {
     fn probe(
         &mut self,
         matcher: &JoinMatcher,
-        right: &IndexKey,
+        right: &[ValueItem],
         hash: u64,
-    ) -> Result<VecDeque<IndexKey>, SchemaError> {
-        let mut matches = VecDeque::new();
+        matches: &mut VecDeque<IndexKey>,
+    ) -> Result<(), SchemaError> {
         let Some(positions) = self.index.get(&hash) else {
-            return Ok(matches);
+            return Ok(());
         };
         for &i in positions {
-            if matcher.matches(&self.entries[i].left_value, right)? {
+            if matcher.matches(self.entries[i].left_value.values(), right)? {
                 matches.push_back(self.entries[i].left_value.clone());
                 self.matched[i] = true;
             }
         }
-        Ok(matches)
+        Ok(())
     }
 }
 
@@ -273,11 +279,11 @@ impl<F: DBFile + 'static> RunTable<F> {
     fn probe(
         &mut self,
         matcher: &JoinMatcher,
-        right: &IndexKey,
+        right: &[ValueItem],
         hash: u64,
-    ) -> Result<VecDeque<IndexKey>, SchemaError> {
+        matches: &mut VecDeque<IndexKey>,
+    ) -> Result<(), SchemaError> {
         let start = (hash % self.capacity as u64) as usize;
-        let mut matches = VecDeque::new();
         let mut index = start;
         loop {
             let page_index = index / self.records_per_page;
@@ -285,7 +291,7 @@ impl<F: DBFile + 'static> RunTable<F> {
             match self.run.get_slot_at(page_index, row_index)? {
                 Some(bytes) => {
                     let v: HashValue = from_bytes(&bytes)?;
-                    if matcher.matches(&v.left_value, right)? {
+                    if matcher.matches(v.left_value.values(), right)? {
                         matches.push_back(v.left_value);
                         self.matched.set(index);
                     }
@@ -297,7 +303,7 @@ impl<F: DBFile + 'static> RunTable<F> {
                 break;
             }
         }
-        Ok(matches)
+        Ok(())
     }
 }
 
@@ -397,7 +403,8 @@ impl<F: DBFile + 'static> HashedSource<F> {
             right_source.fields().len(),
         )?;
         Ok(Self {
-            sources: vec![left_source, right_source],
+            build: left_source,
+            probe: Rows::new(right_source),
             fields,
             // No Run, no page, allocated yet — see BuildTable's own doc
             // comment. The overwhelmingly common case (a join whose build
@@ -416,7 +423,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             matcher,
             built: false,
             pending_matches: VecDeque::new(),
-            current_right: None,
+            out: Vec::new(),
             right_exhausted: false,
             sweep_page: 0,
             sweep_row: 0,
@@ -554,7 +561,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // capacity/load-factor concept at all; std HashMap grows on its own.)
     fn insert_left(&mut self, item: IndexKey) -> Result<(), SchemaError> {
         let start = Instant::now();
-        let hash = self.get_hash(&item, &self.left_fields);
+        let hash = Self::get_hash(item.values(), &self.left_fields);
         match &mut self.table {
             BuildTable::Mem(mt) => match mt.try_insert(
                 &self.mem,
@@ -647,15 +654,30 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // RunTable::probe for the matching itself (identical semantics either
     // way — every match found, not just the first, each marked as matched
     // for LEFT/FULL's later unmatched-left sweep).
-    fn probe_matches(&mut self, right: &IndexKey) -> Result<VecDeque<IndexKey>, SchemaError> {
+    // Every build row matching `right`'s key: probe_matches, for a row
+    // given here rather than the probe side's current one.
+    #[cfg(test)]
+    fn probe_matches_for(&mut self, right: &IndexKey) -> Result<VecDeque<IndexKey>, SchemaError> {
+        let hash = Self::get_hash(right.values(), &self.right_fields);
+        let mut matches = VecDeque::new();
+        match &mut self.table {
+            BuildTable::Mem(mt) => mt.probe(&self.matcher, right.values(), hash, &mut matches)?,
+            BuildTable::Run(rt) => rt.probe(&self.matcher, right.values(), hash, &mut matches)?,
+        };
+        Ok(matches)
+    }
+
+    // Into `pending_matches`, which holds none when this is called.
+    fn probe_matches(&mut self) -> Result<(), SchemaError> {
         let start_time = Instant::now();
-        let hash = self.get_hash(right, &self.right_fields);
-        let matches = match &mut self.table {
-            BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash)?,
-            BuildTable::Run(rt) => rt.probe(&self.matcher, right, hash)?,
+        let right = self.probe.row();
+        let hash = Self::get_hash(right, &self.right_fields);
+        match &mut self.table {
+            BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash, &mut self.pending_matches)?,
+            BuildTable::Run(rt) => rt.probe(&self.matcher, right, hash, &mut self.pending_matches)?,
         };
         self.probe_time += start_time.elapsed().as_nanos();
-        Ok(matches)
+        Ok(())
     }
 
     // A Double key holding an exact integer hashes as that Integer (see
@@ -663,8 +685,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // JoinMatcher::cmp_keys calls equal always land in the same bucket.
     // Keys with no Double in them (the common case) hash as-is, with no
     // allocation.
-    fn get_hash(&self, key: &IndexKey, fields: &[usize]) -> u64 {
-        let values = key.values();
+    fn get_hash(values: &[ValueItem], fields: &[usize]) -> u64 {
         if !fields
             .iter()
             .any(|f| matches!(values[*f], store::valueitem::ValueItem::Double(_)))
@@ -757,7 +778,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // strictly before any right-side probing starts, so `matched` never
     // needs replaying across a rehash — nothing has been matched yet.
     fn build_left(&mut self) -> Result<(), SchemaError> {
-        let mut row = self.sources[0].next()?;
+        let mut row = self.build.next()?;
         let start = Instant::now();
         // The build side's key values, per key column, while few: the probe
         // side needs no row matching none of them (see Source::
@@ -780,12 +801,12 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 }
             }
             self.insert_left(r)?;
-            row = self.sources[0].next()?;
+            row = self.build.next()?;
         }
         for (k, column) in keys.into_iter().zip(self.right_fields.clone()) {
             if let Some(set) = k {
                 let values: Vec<ValueItem> = set.into_iter().collect();
-                self.sources[1].keep_matching(column, &values);
+                self.probe.source_mut().keep_matching(column, &values);
             }
         }
         self.left_time += start.elapsed().as_nanos();
@@ -809,6 +830,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // require, which matters most right after a rehash (the fresh
     // capacity is ~2x the live count, so close to half of every page
     // used to be wasted decode work here).
+    // The next build row nothing matched; None when there are no more.
     fn next_unmatched_left(&mut self) -> Result<Option<IndexKey>, SchemaError> {
         let start = Instant::now();
         // Finds the next never-matched entry, if any, without calling back
@@ -862,26 +884,16 @@ impl<F: DBFile + 'static> HashedSource<F> {
             }
         };
         self.next_time += start.elapsed().as_nanos();
-        match found {
-            Some(left) => {
-                let right_null = self.matcher.right_null().clone();
-                Ok(Some(self.emit(&left, &right_null)?))
-            }
-            None => Ok(None),
-        }
+        Ok(found)
     }
 
     // `build` is a row from the physical left (hash-table) side, `probe`
     // from the physical right (streamed) side. The output is always in the
     // ORIGINAL left ++ right order the rest of the plan was built against:
     // if the sources were swapped, the probe side is the original left.
-    fn emit(&self, build: &IndexKey, probe: &IndexKey) -> Result<IndexKey, SchemaError> {
-        let (first, second) = if self.swapped {
-            (probe, build)
-        } else {
-            (build, probe)
-        };
-        self.matcher.combine(first, second)
+    fn emit(out: &mut Vec<ValueItem>, swapped: bool, build: &[ValueItem], probe: &[ValueItem]) {
+        let (first, second) = if swapped { (probe, build) } else { (build, probe) };
+        JoinMatcher::combine_into(first, second, out);
     }
 }
 
@@ -898,7 +910,7 @@ impl<F: DBFile + 'static> std::fmt::Debug for HashedSource<F> {
 
 impl<F: DBFile + 'static> Source for HashedSource<F> {
     fn plan(&self) -> PlanNode {
-        let (left, right) = (self.sources[0].fields(), self.sources[1].fields());
+        let (left, right) = (self.build.fields(), self.probe.source().fields());
         let name = |fields: &[ProjectableField], i: &usize| {
             fields
                 .get(*i)
@@ -939,8 +951,8 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         let swapped = if self.swapped { ", sides swapped" } else { "" };
         PlanNode::new("HashJoin")
             .detail(format!("{:?} on {keys}{swapped}", self.join_type))
-            .child(self.sources[0].plan().with_role("build"))
-            .child(self.sources[1].plan().with_role("probe"))
+            .child(self.build.plan().with_role("build"))
+            .child(self.probe.source().plan().with_role("probe"))
     }
 
     fn fields(&self) -> Arc<[super::ProjectableField]> {
@@ -948,52 +960,68 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
+        Ok(match self.advance()? {
+            true => Some(IndexKey::new_from_buffer(&mut self.out)?),
+            false => None,
+        })
+    }
+
+    fn lends(&self) -> bool {
+        true
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
         if !self.built {
             self.build_left()?;
             self.built = true;
         }
         loop {
+            // A pending match is of the probe row `probe` is still on.
             if let Some(left) = self.pending_matches.pop_front() {
-                let right = self
-                    .current_right
-                    .as_ref()
-                    .expect("pending_matches is only ever populated alongside current_right");
-                return Ok(Some(self.emit(&left, right)?));
+                Self::emit(&mut self.out, self.swapped, left.values(), self.probe.row());
+                return Ok(true);
             }
 
             if self.right_exhausted {
-                return self.next_unmatched_left();
+                return Ok(match self.next_unmatched_left()? {
+                    Some(left) => {
+                        let right_null = self.matcher.right_null().clone();
+                        Self::emit(&mut self.out, self.swapped, left.values(), right_null.values());
+                        true
+                    }
+                    None => false,
+                });
             }
 
-            match self.sources[1].next()? {
-                Some(right) => {
-                    let matches = self.probe_matches(&right)?;
-                    if matches.is_empty() {
-                        if self.matcher.keeps_unmatched_right() {
-                            return Ok(Some(self.emit(self.matcher.left_null(), &right)?));
-                        }
-                        // INNER/LEFT: an unmatched right row contributes
-                        // nothing — try the next right row.
-                        continue;
+            if self.probe.advance()? {
+                self.probe_matches()?;
+                if self.pending_matches.is_empty() {
+                    if self.matcher.keeps_unmatched_right() {
+                        let left_null = self.matcher.left_null().clone();
+                        Self::emit(&mut self.out, self.swapped, left_null.values(), self.probe.row());
+                        return Ok(true);
                     }
-                    self.pending_matches = matches;
-                    self.current_right = Some(right);
-                    // loop back around to pop the first pending match
+                    // INNER/LEFT: an unmatched right row contributes
+                    // nothing — try the next right row.
                 }
-                None => {
-                    self.right_exhausted = true;
-                    if !self.matcher.keeps_unmatched_left() {
-                        return Ok(None);
-                    }
-                    // loop back around; next_unmatched_left takes over
+                // loop back around to pop the first pending match
+            } else {
+                self.right_exhausted = true;
+                if !self.matcher.keeps_unmatched_left() {
+                    return Ok(false);
                 }
+                // loop back around; next_unmatched_left takes over
             }
         }
     }
 
+    fn row(&self) -> &[ValueItem] {
+        &self.out
+    }
+
     fn reset(&mut self) -> Result<(), SchemaError> {
-        self.sources[0].reset()?;
-        self.sources[1].reset()?;
+        self.build.reset()?;
+        self.probe.reset()?;
         // Back to Mem — the same starting state new() itself builds, so a
         // reset join gets the same in-memory-first chance the first build
         // did, rather than staying Run-backed (with its now-empty, already
@@ -1003,7 +1031,7 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         self.count = 0;
         self.built = false;
         self.pending_matches = VecDeque::new();
-        self.current_right = None;
+        self.out.clear();
         self.right_exhausted = false;
         self.sweep_page = 0;
         self.sweep_row = 0;
@@ -1022,9 +1050,8 @@ impl<F: DBFile + 'static> Source for HashedSource<F> {
         let this_stats = QueryStats { stats, level: 0 };
         let name = format!("HashJoin:({:?})", self.join_type);
         let mut res = vec![(name, this_stats)];
-        for s in &self.sources {
-            res = merge_stats(res, s.query_stats())
-        }
+        res = merge_stats(res, self.build.query_stats());
+        res = merge_stats(res, self.probe.source().query_stats());
         Some(res)
     }
 
@@ -1165,7 +1192,7 @@ mod tests {
 
         let probe_key =
             IndexKey::new_from_owned(vec![ValueItem::Integer(1), ValueItem::Integer(-1)]).unwrap();
-        let matches = source.probe_matches(&probe_key).unwrap();
+        let matches = source.probe_matches_for(&probe_key).unwrap();
         let mut vals: Vec<i64> = matches
             .iter()
             .map(|k| match k.values()[1] {
@@ -1188,7 +1215,7 @@ mod tests {
             .unwrap();
         let probe_key =
             IndexKey::new_from_owned(vec![ValueItem::Integer(99), ValueItem::Integer(-1)]).unwrap();
-        assert!(source.probe_matches(&probe_key).unwrap().is_empty());
+        assert!(source.probe_matches_for(&probe_key).unwrap().is_empty());
     }
 
     #[test]

@@ -54,6 +54,16 @@ fn test_scans_that_filter_aggregate_or_group_allocate_nothing_per_row() {
         run(&c, &format!("insert into t values {}", chunk.join(", ")));
     }
 
+    // The same rows, partitioned. (Not a join: a hash join keeps its build
+    // side's rows, whichever side the planner builds.)
+    run(
+        &c,
+        "create table p (id integer not null, n integer, item varchar(12), price double, \
+         primary key(id)) partition by range (id) (partition a values less than (7000), \
+         partition b values less than (14000), partition z values less than maxvalue)",
+    );
+    run(&c, "insert into p select id, n, item, price from t");
+
     for sql in [
         "select count(*) from t",
         "select sum(price) from t",
@@ -63,6 +73,9 @@ fn test_scans_that_filter_aggregate_or_group_allocate_nothing_per_row() {
         "select max(item), min(n) from t",
         "select item, count(*), sum(n) from t group by item",
         "select n, count(*) from t where item = 'clip' group by n",
+        // A partitioned table's partitions are read one after another.
+        "select count(*), sum(price) from p where item <> 'pen'",
+        "select item, count(*) from p group by item",
     ] {
         // Once first: the parse, anything built once and kept.
         run(&c, sql);

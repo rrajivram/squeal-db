@@ -201,6 +201,18 @@ impl<F: DBFile + 'static> Source for JoinSource<F> {
         self.source.next()
     }
 
+    fn lends(&self) -> bool {
+        self.source.lends()
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
+        self.source.advance()
+    }
+
+    fn row(&self) -> &[store::valueitem::ValueItem] {
+        self.source.row()
+    }
+
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.source.reset()
     }

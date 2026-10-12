@@ -72,6 +72,32 @@ impl Source for Limit {
         result
     }
 
+    // Lends its input's rows, if its input lends them.
+    fn lends(&self) -> bool {
+        self.source.lends()
+    }
+
+    fn advance(&mut self) -> Result<bool, crate::error::SchemaError> {
+        let start = self.timer.start();
+        while self.skipped < self.offset {
+            self.skipped += 1;
+            if !self.source.advance()? {
+                crate::source::timing::add(&mut self.time_spent, start);
+                return Ok(false);
+            }
+        }
+        let more = self.yielded < self.limit && self.source.advance()?;
+        if more {
+            self.yielded += 1;
+        }
+        crate::source::timing::add(&mut self.time_spent, start);
+        Ok(more)
+    }
+
+    fn row(&self) -> &[store::valueitem::ValueItem] {
+        self.source.row()
+    }
+
     fn reset(&mut self) -> Result<(), crate::error::SchemaError> {
         self.source.reset()?;
         self.yielded = 0;

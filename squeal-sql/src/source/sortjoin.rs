@@ -308,7 +308,7 @@ where
         self.end_group();
         let mut cur = self.right_cur.take();
         while let Some(row) = cur {
-            if self.matcher.cmp_keys(left, &row) != Ordering::Equal {
+            if self.matcher.cmp_keys(left.values(), row.values()) != Ordering::Equal {
                 self.right_cur = Some(row);
                 break;
             }
@@ -368,7 +368,7 @@ where
                 // either shares the key (and meets it too) or ends the group.
                 self.left_cur = self.pull_left()?;
                 let same_key = match (&self.left_cur, &self.group.first) {
-                    (Some(l), Some(g)) => self.matcher.cmp_keys(l, g) == Ordering::Equal,
+                    (Some(l), Some(g)) => self.matcher.cmp_keys(l.values(), g.values()) == Ordering::Equal,
                     _ => false,
                 };
                 if same_key {
@@ -385,8 +385,8 @@ where
                 // Equal NULL keys order together but never match (see
                 // JoinMatcher::keys_match): the left row goes by unmatched,
                 // and the right rows after it, as they come up behind.
-                (Some(l), Some(r)) => match self.matcher.cmp_keys(l, r) {
-                    Ordering::Equal if !self.matcher.keys_match(l, r) => Ordering::Less,
+                (Some(l), Some(r)) => match self.matcher.cmp_keys(l.values(), r.values()) {
+                    Ordering::Equal if !self.matcher.keys_match(l.values(), r.values()) => Ordering::Less,
                     order => order,
                 },
             };

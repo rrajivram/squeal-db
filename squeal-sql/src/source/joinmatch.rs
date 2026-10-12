@@ -29,6 +29,9 @@ pub(crate) struct JoinMatcher {
     // matcher's (right, left) when the algorithm swapped the sides — the
     // flag. In a cell because evaluating an expression needs it mutably.
     residual: Option<(std::cell::RefCell<EvalExpr>, bool)>,
+    // The joined row the residual condition is evaluated over: refilled
+    // pair after pair.
+    scratch: std::cell::RefCell<Vec<ValueItem>>,
 }
 
 #[allow(dead_code)]
@@ -48,6 +51,7 @@ impl JoinMatcher {
             left_null: IndexKey::new_from_owned(vec![ValueItem::Null; left_width])?,
             right_null: IndexKey::new_from_owned(vec![ValueItem::Null; right_width])?,
             residual: None,
+            scratch: Default::default(),
         })
     }
 
@@ -68,19 +72,20 @@ impl JoinMatcher {
     // keys_match alone — decides which pairs come out AND which rows count
     // as unmatched for an outer join: `a LEFT JOIN b ON a.k = b.k AND b.v =
     // 1` keeps a row of `a` whose only key matches have another `v`.
-    pub(crate) fn matches(&self, left: &IndexKey, right: &IndexKey) -> Result<bool, SchemaError> {
+    pub(crate) fn matches(&self, left: &[ValueItem], right: &[ValueItem]) -> Result<bool, SchemaError> {
         if !self.keys_match(left, right) {
             return Ok(false);
         }
         let Some((residual, swapped)) = &self.residual else {
             return Ok(true);
         };
-        let row = if *swapped {
-            self.combine(right, left)?
+        let mut row = self.scratch.borrow_mut();
+        if *swapped {
+            Self::combine_into(right, left, &mut row);
         } else {
-            self.combine(left, right)?
-        };
-        match *residual.borrow_mut().eval(row.values(), 0)? {
+            Self::combine_into(left, right, &mut row);
+        }
+        match *residual.borrow_mut().eval(&row, 0)? {
             ValueItem::Boolean(b) => Ok(b),
             ValueItem::Null => Ok(false),
             _ => Err(SchemaError::InternalSchemaError(
@@ -94,8 +99,8 @@ impl JoinMatcher {
     // NULL-extended). This is the one place every join algorithm decides a
     // match, so they all agree — including the index nested-loop join,
     // which never finds a NULL key by seeking.
-    pub(crate) fn keys_match(&self, left: &IndexKey, right: &IndexKey) -> bool {
-        let has_null = |row: &IndexKey, fields: &[usize]| {
+    pub(crate) fn keys_match(&self, left: &[ValueItem], right: &[ValueItem]) -> bool {
+        let has_null = |row: &[ValueItem], fields: &[usize]| {
             fields.iter().any(|&i| matches!(row[i], ValueItem::Null))
         };
         !has_null(left, &self.left_fields)
@@ -109,9 +114,9 @@ impl JoinMatcher {
     // exact rule a WHERE comparison uses — see crate::numeric), so a join
     // between an integer column and a double column matches `1` with `1.0`.
     // A NaN is ordered after every number, and so never matches one.
-    pub(crate) fn cmp_keys(&self, left: &IndexKey, right: &IndexKey) -> Ordering {
+    pub(crate) fn cmp_keys(&self, left: &[ValueItem], right: &[ValueItem]) -> Ordering {
         for (l, r) in self.left_fields.iter().zip(&self.right_fields) {
-            let (a, b) = (&left.values()[*l], &right.values()[*r]);
+            let (a, b) = (&left[*l], &right[*r]);
             let ord = match crate::numeric::cmp_mixed(a, b) {
                 Some(Some(ord)) => ord,
                 Some(None) if matches!(a, ValueItem::Double(_)) => Ordering::Greater,
@@ -152,9 +157,18 @@ impl JoinMatcher {
         left: &IndexKey,
         right: &IndexKey,
     ) -> Result<IndexKey, SchemaError> {
-        let mut values = left.values().to_vec();
-        values.extend_from_slice(right.values());
-        Ok(IndexKey::new_from_owned(values)?)
+        let mut values = Vec::with_capacity(left.values().len() + right.values().len());
+        Self::combine_into(left.values(), right.values(), &mut values);
+        Ok(IndexKey::new_from_buffer(&mut values)?)
+    }
+
+    // `left` then `right` into `out`, a buffer refilled row after row: a
+    // string going where one was keeps that one's allocation.
+    pub(crate) fn combine_into(left: &[ValueItem], right: &[ValueItem], out: &mut Vec<ValueItem>) {
+        out.resize(left.len() + right.len(), ValueItem::Null);
+        for (slot, value) in out.iter_mut().zip(left.iter().chain(right)) {
+            value.as_ref().store_in(slot);
+        }
     }
 
     // An unmatched left row, paired with NULLs for the right side.
@@ -185,28 +199,28 @@ mod tests {
     fn test_keys_match_and_cmp_agree_and_use_the_given_field_positions() {
         let m = matcher(JoinType::Inner);
         let (l, r) = (row(&[9, 5]), row(&[5, 0, 0]));
-        assert!(m.keys_match(&l, &r));
-        assert_eq!(m.cmp_keys(&l, &r), Ordering::Equal);
-        assert_eq!(m.cmp_keys(&row(&[0, 4]), &r), Ordering::Less);
-        assert_eq!(m.cmp_keys(&row(&[0, 6]), &r), Ordering::Greater);
-        assert!(!m.keys_match(&row(&[5, 4]), &r));
+        assert!(m.keys_match(l.values(), r.values()));
+        assert_eq!(m.cmp_keys(l.values(), r.values()), Ordering::Equal);
+        assert_eq!(m.cmp_keys(row(&[0, 4]).values(), r.values()), Ordering::Less);
+        assert_eq!(m.cmp_keys(row(&[0, 6]).values(), r.values()), Ordering::Greater);
+        assert!(!m.keys_match(row(&[5, 4]).values(), r.values()));
     }
 
     #[test]
     fn test_composite_keys_compare_left_to_right() {
         let m = JoinMatcher::new(JoinType::Inner, &[0, 1], &[0, 1], 2, 2).unwrap();
-        assert_eq!(m.cmp_keys(&row(&[1, 9]), &row(&[2, 0])), Ordering::Less);
-        assert_eq!(m.cmp_keys(&row(&[2, 1]), &row(&[2, 0])), Ordering::Greater);
-        assert!(m.keys_match(&row(&[2, 3]), &row(&[2, 3])));
+        assert_eq!(m.cmp_keys(row(&[1, 9]).values(), row(&[2, 0]).values()), Ordering::Less);
+        assert_eq!(m.cmp_keys(row(&[2, 1]).values(), row(&[2, 0]).values()), Ordering::Greater);
+        assert!(m.keys_match(row(&[2, 3]).values(), row(&[2, 3]).values()));
     }
 
     #[test]
     fn test_null_keys_match_nothing_and_sort_first() {
         let m = JoinMatcher::new(JoinType::Inner, &[0], &[0], 1, 1).unwrap();
         let null = IndexKey::new_from_owned(vec![ValueItem::Null]).unwrap();
-        assert!(!m.keys_match(&null, &null));
-        assert!(!m.keys_match(&null, &row(&[1])));
-        assert_eq!(m.cmp_keys(&null, &row(&[i64::MIN])), Ordering::Less);
+        assert!(!m.keys_match(null.values(), null.values()));
+        assert!(!m.keys_match(null.values(), row(&[1]).values()));
+        assert_eq!(m.cmp_keys(null.values(), row(&[i64::MIN]).values()), Ordering::Less);
     }
 
     #[test]

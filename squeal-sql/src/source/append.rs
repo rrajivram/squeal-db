@@ -225,6 +225,31 @@ impl Source for AppendSource {
         Ok(None)
     }
 
+    // Lends its partitions' rows when it reads them one after another and
+    // every partition's source lends; merging keeps each partition's next
+    // row, so it hands rows out owned.
+    fn lends(&self) -> bool {
+        self.order.is_none() && self.sources.iter().all(|s| s.lends())
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
+        while let Some(source) = self.sources.get_mut(self.current) {
+            if self.skip.get(self.current) == Some(&true) {
+                self.current += 1;
+                continue;
+            }
+            if source.advance()? {
+                return Ok(true);
+            }
+            self.current += 1;
+        }
+        Ok(false)
+    }
+
+    fn row(&self) -> &[ValueItem] {
+        self.sources.get(self.current).map_or(&[], |s| s.row())
+    }
+
     // The row just yielded came from the source read last.
     fn last_id(&self) -> Option<store::tuple::DBIdType> {
         self.sources.get(self.current)?.last_id()
