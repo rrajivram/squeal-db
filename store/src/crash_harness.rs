@@ -12,7 +12,10 @@
 //!    present or fully absent, and the set of such transactions that made it
 //!    is a prefix of each thread's commit order (durability is monotonic in
 //!    log order);
-//! 4. a table scan sees exactly the rows that should exist, each once.
+//! 4. a table scan sees exactly the rows that should exist, each once;
+//! 5. a bulk load (`Db::bulk_load`) whose commit returned — or was in flight
+//!    — is there whole: written as pages, not logged, it is made durable by
+//!    the checkpoint it ends with, before its commit.
 //!
 //! Every thread writes only its own keys, so the expected state of a key is
 //! a function of that thread's own commit history alone — no cross-thread
@@ -76,6 +79,11 @@ pub struct CrashConfig {
     /// the same values throughout (repeatable read), and its open
     /// transaction pins WAL segments instead of stalling checkpoints.
     pub long_readers: usize,
+    /// A thread bulk-loading new tables (`Db::bulk_load`) alongside the
+    /// workload, committing most and dropping the rest.
+    pub bulk_loads: bool,
+    /// Of those loads, the share rolled back and dropped (in percent).
+    pub bulk_drop_pct: u8,
 }
 
 impl Default for CrashConfig {
@@ -94,6 +102,8 @@ impl Default for CrashConfig {
             cache_pages: None,
             dump_dir: None,
             long_readers: 1,
+            bulk_loads: true,
+            bulk_drop_pct: 15,
         }
     }
 }
@@ -111,6 +121,8 @@ pub struct CrashReport {
     pub long_reader_violations: u64,
     /// The most WAL segments seen retained at once (long readers pin them).
     pub max_wal_segments: usize,
+    /// Bulk-loaded tables found whole after a recovery.
+    pub bulk_loads_verified: u64,
 }
 
 /// Tiny xorshift so the harness has no `rand` dependency and a seed
@@ -166,6 +178,19 @@ struct WorkerOut {
     history: Vec<TxnTrace>,
 }
 
+/// One bulk load the harness ran and kept (one it dropped isn't): the table
+/// it filled with keys 0..keys, and the sequence it drew once the load —
+/// ending in its checkpoint — returned.
+struct BulkLoad {
+    table: String,
+    keys: u64,
+    loaded: u64,
+}
+
+fn bulk_value(table: &str, key: u64) -> Vec<u8> {
+    format!("{table}|{key}").into_bytes()
+}
+
 fn encode(thread_idx: usize, seq: u64) -> Vec<u8> {
     format!("t{thread_idx}|c{seq}").into_bytes()
 }
@@ -208,6 +233,8 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
     // Per-thread committed state carried across rounds (what recovery was
     // verified to have kept).
     let mut baseline: Vec<State> = (0..cfg.threads).map(|_| State::new()).collect();
+    // Bulk-loaded tables verified whole, carried across rounds: (name, keys).
+    let mut bulk_baseline: Vec<(String, u64)> = vec![];
     let mut db = db;
 
     for round in 0..cfg.rounds {
@@ -229,6 +256,14 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
                 worker(t, seed, db, tables, stop, commit_seq, &cfg, start_state)
             }));
         }
+        let bulk = cfg.bulk_loads.then(|| {
+            let db = db.clone();
+            let stop = stop.clone();
+            let commit_seq = commit_seq.clone();
+            let seed = rng.next();
+            let drop_pct = cfg.bulk_drop_pct;
+            thread::spawn(move || bulk_loader(round, seed, drop_pct, db, stop, commit_seq))
+        });
         let readers: Vec<_> = (0..cfg.long_readers)
             .map(|r| {
                 let db = db.clone();
@@ -281,6 +316,10 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
         if let Some(h) = ckpt_thread {
             h.join().map_err(|_| "checkpoint thread panicked".to_string())?;
         }
+        let loads = match bulk {
+            Some(h) => h.join().map_err(|_| "bulk loader panicked".to_string())?,
+            None => vec![],
+        };
         let mut changes: Vec<String> = Vec::new();
         for h in readers {
             let (reads, violations, max_segments, seen) =
@@ -475,6 +514,26 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
             }
         }
 
+        // --- bulk loads: every one that returned before the cut is whole,
+        // committed or not (written as pages, not logged, it was made
+        // durable by its own checkpoint; and its entries are its
+        // transaction's, which after a restart is gone — "committed long
+        // ago"); earlier rounds' still are. One cut short is the caller's
+        // to drop, and isn't checked ---
+        for load in &loads {
+            if load.loaded < cut_seq {
+                bulk_baseline.push((load.table.clone(), load.keys));
+            }
+        }
+        for (table, keys) in &bulk_baseline {
+            if let Err(e) = check_bulk_table(&reopened, table, *keys) {
+                let mut msg = format!("seed {} round {round}: bulk-loaded table {table}: {e}", cfg.seed);
+                save_snapshot(&mut msg);
+                return Err(msg);
+            }
+            report.bulk_loads_verified += 1;
+        }
+
         table_ids = reopened_ids;
         db = reopened;
         report.rounds += 1;
@@ -482,6 +541,85 @@ pub fn run(cfg: &CrashConfig) -> Result<CrashReport, String> {
     // A clean close at the end must also succeed.
     db.close().map_err(|e| format!("final close: {e}"))?;
     Ok(report)
+}
+
+// Bulk-loads new tables until `stop`: each `b{round}_{n}`, keys 0..k for a
+// random k. Most are committed; the rest rolled back and dropped, as a
+// caller of Db::bulk_load must (see its doc).
+fn bulk_loader(
+    round: usize,
+    seed: u64,
+    drop_pct: u8,
+    db: Arc<Db<MemFile>>,
+    stop: Arc<AtomicBool>,
+    commit_seq: Arc<AtomicU64>,
+) -> Vec<BulkLoad> {
+    let mut rng = Rng::new(seed);
+    let mut loads = vec![];
+    for n in 0.. {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let table = format!("b{round}_{n}");
+        let Ok(tid) = db.create_table(table.clone()) else {
+            break;
+        };
+        let keys = rng.range(1, 3000);
+        let Ok(txn) = db.begin() else {
+            break;
+        };
+        let mut next = 0u64;
+        let loaded = db.bulk_load(tid, &txn, || -> Result<Option<Tuple>, StoreError> {
+            if next == keys {
+                return Ok(None);
+            }
+            let tuple = Tuple::new(next, &bulk_value(&table, next));
+            next += 1;
+            Ok(Some(tuple))
+        });
+        if loaded.is_err() || rng.pct() < drop_pct {
+            let _ = db.rollback(txn);
+            let _ = db.drop_table(&table);
+            continue;
+        }
+        let loaded = commit_seq.fetch_add(1, Ordering::SeqCst);
+        let _ = db.commit(txn);
+        loads.push(BulkLoad { table, keys, loaded });
+    }
+    loads
+}
+
+// `table` holds exactly keys 0..keys, each its bulk_value, through its
+// leaves (in order) and through its data pages.
+fn check_bulk_table(db: &Arc<Db<MemFile>>, table: &str, keys: u64) -> Result<(), String> {
+    let tid = db
+        .table_id_by_name(table)
+        .map_err(|e| e.to_string())?
+        .ok_or("missing after reopen")?;
+    let txn = db.begin().map_err(|e| e.to_string())?;
+    let mut walked = 0u64;
+    let mut cursor = db
+        .range_scan_bounds_in_txn(tid, &txn, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+        .map_err(|e| e.to_string())?;
+    while let Some(t) = cursor.next().map_err(|e| e.to_string())? {
+        if t.id != DBIdType::Int(walked) || *t.data != *bulk_value(table, walked) {
+            return Err(format!("the leaves hold {:?} where key {walked} was loaded", t.id));
+        }
+        walked += 1;
+    }
+    if walked != keys {
+        return Err(format!("the leaves hold {walked} of {keys} keys"));
+    }
+    let mut scanned = 0u64;
+    let mut cursor = db.table_scan_in_txn(tid, &txn).map_err(|e| e.to_string())?;
+    while cursor.next().map_err(|e| e.to_string())?.is_some() {
+        scanned += 1;
+    }
+    if scanned != keys {
+        return Err(format!("the data pages hold {scanned} of {keys} keys"));
+    }
+    db.commit(txn).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn read_key(db: &Arc<Db<MemFile>>, tables: &[TableIdType], key: Key) -> Result<Value, StoreError> {

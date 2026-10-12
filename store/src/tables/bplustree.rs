@@ -1761,6 +1761,162 @@ where
         Ok(())
     }
 
+    /// Fills this tree, which must be empty, with the tuples `next` yields
+    /// in ascending order of id — writing its pages directly, bottom-up,
+    /// instead of one insert at a time: each tuple onto the data pages, its
+    /// leaf entry into a leaf filled until a split would have been due, and
+    /// each level above built from the bounds of the one below, the root
+    /// last. Nothing is logged, so nothing of this is durable until a
+    /// checkpoint writes it (see Db::bulk_load). Returns how many tuples
+    /// went in.
+    ///
+    /// The tree must not be reachable by anyone else while this runs: no
+    /// page lock is held across the build, only around each page's write.
+    /// The writer permit is held around each step that allocates or writes
+    /// pages, as every tree write holds it, so a checkpoint never captures
+    /// a page counted but not yet installed — never across `next`, which
+    /// may sort for a while.
+    /// An id equal to the one before is DuplicateKey; one below it, an error
+    /// (the caller's order isn't the tree's).
+    pub(crate) fn bulk_load<E: From<StoreError>>(
+        &self,
+        mut next: impl FnMut() -> Result<Option<Tuple>, E>,
+        lsn: LsnId,
+    ) -> Result<u64, E> {
+        let root = self.buffer.get_page(self.table.first_index_page)?;
+        let record_size = root.record_size().ok_or_else(|| {
+            StoreError::UnknownError("bulk load: the tree's pages have no entry size".into())
+        })?;
+        if root.count()? != 0 || !root.is_flag_set(LEAF_NODE) {
+            return Err(StoreError::UnknownError("bulk load: the tree is not empty".into()).into());
+        }
+        drop(root);
+
+        // The leaves, as they fill: each published once the next is begun
+        // (its high key is the next one's first key, its next_page the
+        // next one's id). The first stays unpublished until a second is
+        // needed: if none is, it is the root.
+        let mut leaf = self.empty_index_page(record_size, LEAF_NODE)?;
+        let mut leaf_id: Option<PageId> = None;
+        // Each published leaf's bound (its high key; Int(MAX) for the last)
+        // and id: the entries of the level above.
+        let mut bounds: Vec<(DBIdType, PageId)> = vec![];
+        let mut last: Option<DBIdType> = None;
+        let mut loaded = 0u64;
+        while let Some(tuple) = next()? {
+            let _writer = self.buffer.writer_permit();
+            if let Some(prev) = &last {
+                match prev.cmp(&tuple.id) {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => {
+                        return Err(StoreError::DuplicateKey(tuple.id.clone()).into());
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(StoreError::UnknownError(format!(
+                            "bulk load: {:?} after {prev:?}, out of the tree's order",
+                            tuple.id
+                        ))
+                        .into());
+                    }
+                }
+            }
+            let data_page = self.write_data(&tuple, lsn)?;
+            let entry =
+                Tuple::new_with(tuple.id.clone(), &to_allocvec(&Node::Leaf(data_page)).map_err(StoreError::from)?, None, None);
+            if entry.size() as usize > record_size {
+                return Err(StoreError::TupleTooLarge(entry.size(), record_size).into());
+            }
+            if self.is_full(&leaf)? || !leaf.can_store(&entry) {
+                let this = match leaf_id {
+                    Some(id) => id,
+                    None => self.buffer.alloc_indexed_page(record_size)?,
+                };
+                let following = self.buffer.alloc_indexed_page(record_size)?;
+                leaf.set_high_key(Some(tuple.id.clone()))?;
+                leaf.set_next_page(following)?;
+                let full = std::mem::replace(&mut leaf, self.empty_index_page(record_size, LEAF_NODE)?);
+                self.publish_page(this, full, lsn)?;
+                bounds.push((tuple.id.clone(), this));
+                leaf_id = Some(following);
+            }
+            leaf.add_tuple(entry)?;
+            last = Some(tuple.id);
+            loaded += 1;
+        }
+        let _writer = self.buffer.writer_permit();
+        let Some(last_leaf) = leaf_id else {
+            // One leaf's worth: the root stays a leaf.
+            self.publish_page(self.table.first_index_page, leaf, lsn)?;
+            return Ok(loaded);
+        };
+        self.publish_page(last_leaf, leaf, lsn)?;
+        bounds.push((DBIdType::Int(DBSizeType::MAX), last_leaf));
+
+        // The levels above, until one fits in the root. An inner entry's key
+        // is its child's bound — the exclusive upper limit of the keys
+        // under it — and the last one's is Int(MAX): the fallthrough, as a
+        // split leaves it. A page other than a level's last is bounded by
+        // its own last key, and points at the next.
+        loop {
+            let entries = bounds
+                .iter()
+                .map(|(key, child)| {
+                    Ok(Tuple::new_with(key.clone(), &to_allocvec(&Node::Inner(*child))?, None, None))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()?;
+            let pages = self.pack(entries, record_size, INNER_NODE)?;
+            if let [only] = &pages[..] {
+                self.publish_page(self.table.first_index_page, only.clone(), lsn)?;
+                return Ok(loaded);
+            }
+            let ids = pages
+                .iter()
+                .map(|_| self.buffer.alloc_indexed_page(record_size))
+                .collect::<Result<Vec<_>, _>>()?;
+            bounds = vec![];
+            for (i, (page, id)) in pages.into_iter().zip(&ids).enumerate() {
+                let bound = page
+                    .iter()
+                    .last()
+                    .map(|t| t.id.clone())
+                    .ok_or_else(|| StoreError::UnknownError("bulk load: an empty inner page".into()))?;
+                if let Some(following) = ids.get(i + 1) {
+                    page.set_high_key(Some(bound.clone()))?;
+                    page.set_next_page(*following)?;
+                }
+                self.publish_page(*id, page, lsn)?;
+                bounds.push((bound, *id));
+            }
+        }
+    }
+
+    // `entries`, in order, on as many pages as they need, each filled until
+    // a split would have been due.
+    fn pack(&self, entries: Vec<Tuple>, record_size: usize, flags: usize) -> Result<Vec<Page>, StoreError> {
+        let mut pages = vec![self.empty_index_page(record_size, flags)?];
+        for entry in entries {
+            let page = pages.last().expect("one page at least");
+            if self.is_full(page)? || !page.can_store(&entry) {
+                pages.push(self.empty_index_page(record_size, flags)?);
+            }
+            pages.last().expect("just pushed").add_tuple(entry)?;
+        }
+        Ok(pages)
+    }
+
+    fn empty_index_page(&self, record_size: usize, flags: usize) -> Result<Page, StoreError> {
+        let page = Page::new_indexed(self.buffer.page_size(), record_size, self.buffer.page_overhead());
+        page.set_page_flags(flags)?;
+        Ok(page)
+    }
+
+    // `page` as page `id`'s content, in the cache and dirty.
+    fn publish_page(&self, id: PageId, page: Page, lsn: LsnId) -> Result<(), StoreError> {
+        let mut handle = self.buffer.get_page_mut(id, LockLevel::Index)?;
+        handle.page = Arc::new(page);
+        self.buffer.write_locked_page_with_lsn(handle, lsn)
+    }
+
     fn write_page(
         &self,
         handle: WritePageHandle,

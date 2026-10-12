@@ -2043,6 +2043,44 @@ where
             .map(|t| t.id()))
     }
 
+    /// Fills `id` — a tree just created, still empty, that no committed
+    /// catalog row names yet — with the tuples `next` yields, in ascending
+    /// order of id, as `txn`'s inserts: stamped with its id, so they are
+    /// seen as its writes are, by it and by everyone once it commits. They
+    /// are written as pages, bottom-up (see BPlusTree::bulk_load), not one
+    /// insert at a time: no WAL record and no version record each. So this
+    /// ends with a checkpoint, which makes them durable before the caller
+    /// can commit anything that names the tree.
+    ///
+    /// A caller that doesn't commit must drop the tree: a rollback has no
+    /// record of these to undo, and would leave them looking committed.
+    pub fn bulk_load<E: From<StoreError>>(
+        &self,
+        id: TableIdType,
+        txn: &Transaction,
+        mut next: impl FnMut() -> Result<Option<Tuple>, E>,
+    ) -> Result<u64, E> {
+        let tx_id = txn.id();
+        self.require_active(&tx_id)?;
+        let lsn = self.logger.next_lsn();
+        let loaded = {
+            let (table, _table_guard) = self.table_by_id_guarded(id)?;
+            table.bulk_load(
+                || -> Result<Option<Tuple>, E> {
+                    Ok(next()?.map(|mut tuple| {
+                        tuple.set_txn_id(tx_id);
+                        tuple.set_pre_lsn_none();
+                        tuple.clear_tombstone();
+                        tuple
+                    }))
+                },
+                lsn,
+            )?
+        };
+        self.checkpoint()?;
+        Ok(loaded)
+    }
+
     pub fn insert(
         &self,
         id: TableIdType,
@@ -3290,7 +3328,7 @@ mod tests {
         memfile::MemFile,
         table::TableIdType,
         tuple::{DBIdType, Tuple},
-        txn::{ConflictPolicy, TransactionId},
+        txn::{ConflictPolicy, Transaction, TransactionId},
         valueitem::ValueItem,
     };
     use std::fs::File;
@@ -10897,5 +10935,179 @@ mod tests {
             b"two"
         );
         assert!(db3.find(tid, id(1), &r).unwrap().is_none());
+    }
+
+    // ── bulk load ────────────────────────────────────────────────────────────
+
+    fn bulk(db: &Arc<TestDB>, tid: TableIdType, txn: &Transaction, tuples: Vec<Tuple>) -> Result<u64, StoreError> {
+        let mut it = tuples.into_iter();
+        db.bulk_load(tid, txn, || Ok::<_, StoreError>(it.next()))
+    }
+
+    // Every key (`keys`, ascending) `find`s; a walk of the leaves returns
+    // them all in order, and a scan of the data pages all of them.
+    fn check_loaded(db: &Arc<TestDB>, tid: TableIdType, keys: &[DBIdType]) {
+        let t = db.begin().unwrap();
+        for k in keys {
+            assert!(db.find(tid, k.clone(), &t).unwrap().is_some(), "{k:?} missing");
+        }
+        let mut cursor = db
+            .range_scan_bounds_in_txn(tid, &t, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .unwrap();
+        let mut walked = vec![];
+        while let Some(tuple) = cursor.next().unwrap() {
+            walked.push(tuple.id().clone());
+        }
+        assert_eq!(walked, keys, "the leaves hold every key, in order");
+        let mut cursor = db.table_scan_in_txn(tid, &t).unwrap();
+        let mut scanned = vec![];
+        while let Some(tuple) = cursor.next().unwrap() {
+            scanned.push(tuple.id().clone());
+        }
+        scanned.sort();
+        assert_eq!(scanned, keys, "the data pages hold every key");
+        db.commit(t).unwrap();
+    }
+
+    #[test]
+    fn test_a_bulk_loaded_tree_holds_every_key_at_every_size() {
+        for n in [0u64, 1, 40, 5_000, 60_000] {
+            let db = TestDB::create(&format!("bulk_sizes_{n}.db")).unwrap();
+            let tid = db.create_table("t".to_string()).unwrap();
+            let keys: Vec<DBIdType> = (0..n).map(|i| id(i * 2)).collect();
+            let t = db.begin().unwrap();
+            let loaded = bulk(&db, tid, &t, keys.iter().map(|k| Tuple::new_with(k.clone(), b"value", None, None)).collect()).unwrap();
+            assert_eq!(loaded, n);
+            db.commit(t).unwrap();
+            check_loaded(&db, tid, &keys);
+            let (levels, _, _) = db.btree_range_params(tid).unwrap();
+            if n == 60_000 {
+                assert!(levels >= 2, "{levels} levels for {n} keys");
+            }
+            // Ordinary writes on top: inserts between the loaded keys split
+            // its full pages, deletes take some away.
+            let t = db.begin().unwrap();
+            for i in (0..n).step_by(7) {
+                db.insert(tid, row(i * 2 + 1, b"between"), &t).unwrap();
+            }
+            for i in (0..n).step_by(5) {
+                db.remove(tid, id(i * 2), &t).unwrap();
+            }
+            db.commit(t).unwrap();
+            let mut want: Vec<DBIdType> = (0..n)
+                .filter(|i| i % 5 != 0)
+                .map(|i| id(i * 2))
+                .chain((0..n).step_by(7).map(|i| id(i * 2 + 1)))
+                .collect();
+            want.sort();
+            check_loaded(&db, tid, &want);
+        }
+    }
+
+    #[test]
+    fn test_a_bulk_load_of_composite_keys_matches_their_order() {
+        use crate::valueitem::{IndexKey, ValueItem};
+        let db = TestDB::create("bulk_rec.db").unwrap();
+        let tid = db.create_table_with_index_entry_size("t".to_string(), 128).unwrap();
+        let mut keys: Vec<DBIdType> = (0..20_000i64)
+            .map(|i| {
+                let s = if i % 13 == 0 { ValueItem::Null } else { ValueItem::Str((format!("k{}", (i * 7919) % 1000), 8)) };
+                DBIdType::Rec(IndexKey::new_from(&[s, ValueItem::Integer(i)]).unwrap())
+            })
+            .collect();
+        keys.sort();
+        let t = db.begin().unwrap();
+        bulk(&db, tid, &t, keys.iter().map(|k| Tuple::new_with(k.clone(), b"x", None, None)).collect()).unwrap();
+        db.commit(t).unwrap();
+        check_loaded(&db, tid, &keys);
+    }
+
+    #[test]
+    fn test_a_bulk_load_refuses_duplicates_disorder_and_a_tree_with_entries() {
+        let db = TestDB::create("bulk_refuses.db").unwrap();
+        let load = |keys: &[u64]| {
+            let tid = db.create_table(format!("t{}", keys.len() * 1000 + keys[0] as usize)).unwrap();
+            let t = db.begin().unwrap();
+            let r = bulk(&db, tid, &t, keys.iter().map(|k| row(*k, b"v")).collect());
+            db.rollback(t).unwrap();
+            r
+        };
+        assert!(matches!(load(&[1, 2, 2, 3]), Err(StoreError::DuplicateKey(_))));
+        assert!(load(&[1, 3, 2]).is_err());
+        let tid = db.create_table("full".to_string()).unwrap();
+        let t = db.begin().unwrap();
+        db.insert(tid, row(5, b"v"), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        assert!(bulk(&db, tid, &t, vec![row(1, b"v")]).is_err());
+        db.rollback(t).unwrap();
+    }
+
+    // Loaded as `txn`'s inserts: seen by it, by no one else until it
+    // commits, and then by readers that begin after.
+    #[test]
+    fn test_bulk_loaded_entries_are_seen_as_the_loading_transactions_writes() {
+        let db = TestDB::create("bulk_visible.db").unwrap();
+        let tid = db.create_table("t".to_string()).unwrap();
+        let before = db.begin().unwrap();
+        let t = db.begin().unwrap();
+        bulk(&db, tid, &t, (0..1000).map(|i| row(i, b"v")).collect()).unwrap();
+        assert!(db.find(tid, id(7), &t).unwrap().is_some(), "its own writes");
+        let during = db.begin().unwrap();
+        assert!(db.find(tid, id(7), &during).unwrap().is_none(), "not before it commits");
+        db.commit(t).unwrap();
+        assert!(db.find(tid, id(7), &before).unwrap().is_none(), "not to a reader that began before");
+        let after = db.begin().unwrap();
+        assert!(db.find(tid, id(7), &after).unwrap().is_some());
+        for t in [before, during, after] {
+            db.commit(t).unwrap();
+        }
+    }
+
+    // Nothing of a bulk load is logged; it is durable because it ends with
+    // a checkpoint. A power cut right after the commit keeps every entry.
+    #[test]
+    fn test_a_bulk_load_survives_a_power_cut_after_its_commit() {
+        let db = TestDB::create("bulk_power_cut.db").unwrap();
+        let tid = db.create_table("t".to_string()).unwrap();
+        let keys: Vec<DBIdType> = (0..30_000).map(id).collect();
+        let t = db.begin().unwrap();
+        bulk(&db, tid, &t, keys.iter().map(|k| Tuple::new_with(k.clone(), b"value", None, None)).collect()).unwrap();
+        db.commit(t).unwrap();
+        // And a write after it, recovered from the log on top.
+        let t = db.begin().unwrap();
+        db.insert(tid, row(1_000_000, b"later"), &t).unwrap();
+        db.commit(t).unwrap();
+        let (f, l) = db.synced_snapshot();
+        let db2 = TestDB::open_using("bulk_power_cut.db", f, l).unwrap();
+        let tid2 = db2.table_id_by_name("t").unwrap().unwrap();
+        let mut want = keys.clone();
+        want.push(id(1_000_000));
+        check_loaded(&db2, tid2, &want);
+    }
+
+    // Built bottom-up, pages are filled as a split would leave the left one:
+    // clearly fewer than the same keys inserted in random order take.
+    #[test]
+    fn test_a_bulk_loaded_tree_fills_its_pages() {
+        let n = 40_000u64;
+        let pages = |bulk_load: bool| {
+            let db = TestDB::create(&format!("bulk_fill_{bulk_load}.db")).unwrap();
+            let tid = db.create_table_with_index_entry_size("t".to_string(), 64).unwrap();
+            let start = db.page_count();
+            let t = db.begin().unwrap();
+            if bulk_load {
+                bulk(&db, tid, &t, (0..n).map(|i| row(i, b"v")).collect()).unwrap();
+            } else {
+                for i in 0..n {
+                    db.insert(tid, row((i * 7919) % n, b"v"), &t).unwrap();
+                }
+            }
+            db.commit(t).unwrap();
+            db.page_count() - start
+        };
+        let (loaded, inserted) = (pages(true), pages(false));
+        println!("pages: bulk loaded {loaded}, inserted {inserted}");
+        assert!(loaded * 10 < inserted * 9, "bulk loaded {loaded} pages, inserted {inserted}");
     }
 }

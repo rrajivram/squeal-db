@@ -368,6 +368,19 @@ impl SlottedPage {
         }
     }
 
+    // Whether `id` sorts after every slot's (true of an empty page).
+    fn after_last(&self, id: &DBIdType) -> Result<bool, StoreError> {
+        let Some(last) = self.prefixes.len().checked_sub(1) else {
+            return Ok(true);
+        };
+        let id = IdRef::of(id);
+        let ord = match prefix_order(self.prefixes[last], order_prefix_of(id)) {
+            Some(ord) => ord,
+            None => self.id_at(last)?.cmp(&id),
+        };
+        Ok(ord.is_lt())
+    }
+
     // The first slot for which `past` holds; it holds for every one after.
     // Most probes are decided by the inline prefixes alone (see
     // prefix_order); only a tie reads the slot's id.
@@ -647,11 +660,19 @@ impl PageTuple for SlottedPage {
     }
 
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError> {
-        let lo = self.lower_bound(&tuple.id)?;
-        let hi = self.upper_bound(&tuple.id)?;
-        if self.find_exact_in(&tuple.id, lo, hi)?.is_some() {
-            return Err(StoreError::DuplicateKey(tuple.id));
-        }
+        // Past the last id — what ascending keys and a bulk load's sorted
+        // ones all are — the place is the end, and it can't be a
+        // duplicate: one comparison instead of two searches.
+        let lo = if self.after_last(&tuple.id)? {
+            self.slot_count()
+        } else {
+            let lo = self.lower_bound(&tuple.id)?;
+            let hi = self.upper_bound(&tuple.id)?;
+            if self.find_exact_in(&tuple.id, lo, hi)?.is_some() {
+                return Err(StoreError::DuplicateKey(tuple.id));
+            }
+            lo
+        };
         let encoded = to_allocvec(&tuple)?;
         self.ensure_room(encoded.len())?;
         // ensure_room may have compacted (offsets change, order/count/ids

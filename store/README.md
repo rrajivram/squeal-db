@@ -187,6 +187,24 @@ arrives with an out-of-date route finds its key at or above the
 - **A data page's free space is found by a cached tail hint.** Sequential
   inserts are O(1) amortized rather than O(table size).
 
+**A new tree can be bulk-loaded** (`Db::bulk_load`), from tuples already
+sorted by key: `CREATE INDEX` does this. The tree is built bottom-up:
+- each tuple goes onto the data pages, and its entry into a leaf filled
+  until a split would have been due;
+- each level above is built from the bounds of the one below, with the
+  same `high_key`s, right-links and `Int(MAX)` fallthroughs a split leaves;
+- the root is written last.
+
+Nothing is logged per entry. The entries carry the loading transaction's
+id, so they are seen exactly as its inserts would be, and the load ends
+with a checkpoint, which makes them durable before the caller can commit
+anything that names the tree. A caller that doesn't commit drops the tree:
+a rollback has no record of the entries to undo. Only for a tree just
+created that nothing else can see yet.
+
+A page also appends without searching when a key sorts after its last
+one, which sorted loads and ascending inserts always do.
+
 **Page lock order** is checked at every acquisition, before waiting:
 - Index pages (top-down) come before data pages.
 - At most one data page is held at a time.
@@ -403,6 +421,9 @@ The other `unsafe` blocks in the crate are inside tests.
     - every uncommitted one is absent
     - an in-flight one is all-or-nothing
     - scans see each row exactly once
+    - every bulk load that returned before the cut is whole, through its
+      leaves and its data pages (a thread bulk-loads new tables alongside
+      the workload, committing most and dropping the rest)
 - **`examples/stress`.** A mixed concurrent workload with randomized
   commit/rollback and latency histograms, on both backends.
 - **`examples/perf`**, **`examples/bulk_load`.** Throughput reports and

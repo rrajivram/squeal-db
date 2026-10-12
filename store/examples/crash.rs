@@ -39,9 +39,11 @@ fn main() {
                 cfg.cut_after_ms = (a.parse().unwrap(), b.parse().unwrap());
             }
             "--no-checkpoints" => cfg.checkpoint_every_ms = None,
+            "--no-bulk-loads" => cfg.bulk_loads = false,
+            "--bulk-drop-pct" => cfg.bulk_drop_pct = next().parse().expect("--bulk-drop-pct"),
             "--dump-dir" => cfg.dump_dir = Some(next()),
             "--help" | "-h" => {
-                println!("crash [--seed N] [--seeds N] [--threads N] [--tables N] [--keys N] [--rounds N] [--max-ops N] [--commit-pct N] [--page-size N] [--cache-pages N] [--cut-ms LO-HI] [--no-checkpoints]");
+                println!("crash [--seed N] [--seeds N] [--threads N] [--tables N] [--keys N] [--rounds N] [--max-ops N] [--commit-pct N] [--page-size N] [--cache-pages N] [--cut-ms LO-HI] [--no-checkpoints] [--no-bulk-loads] [--bulk-drop-pct N]");
                 return;
             }
             other => {
@@ -56,9 +58,9 @@ fn main() {
         cfg.seed = first + s;
         match run(&cfg) {
             Ok(r) => println!(
-                "seed {} ok: rounds={} definite={} ambiguous={} (recovered {}) rolled_back={} checkpoints={} rows={}",
+                "seed {} ok: rounds={} definite={} ambiguous={} (recovered {}) rolled_back={} checkpoints={} rows={} bulk_loads={}",
                 cfg.seed, r.rounds, r.committed_definite, r.committed_ambiguous, r.ambiguous_recovered,
-                r.rolled_back, r.checkpoints, r.rows_verified
+                r.rolled_back, r.checkpoints, r.rows_verified, r.bulk_loads_verified
             ),
             Err(e) => {
                 eprintln!("FAIL\n{e}");
