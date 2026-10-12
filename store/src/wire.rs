@@ -11,7 +11,9 @@
 // is one byte, 0 or 1, then the value if 1; a tuple or struct is its fields
 // back to back. The tests pin each against postcard itself.
 
-use crate::{error::StoreError, logger::LsnId, txn::TransactionId, valueitem::ValueRef};
+use crate::{
+    error::StoreError, keycode::StoredKey, logger::LsnId, txn::TransactionId, valueitem::ValueRef,
+};
 
 fn malformed() -> StoreError {
     StoreError::UnknownError("malformed tuple bytes".into())
@@ -142,12 +144,14 @@ impl<'a> Reader<'a> {
         Some(())
     }
 
-    // A DBIdType (see its Serialize): tag 0 and a number, or tag 1 and an
+    // A DBIdType (see its Serialize): tag 0 and a number; tag 1 and an
     // IndexKey — a count, then that many values, stepped over (see
-    // skip_value): a tuple's key is located without being read.
+    // skip_value); or tag 2 and a record key's stored bytes, with their
+    // length. A tuple's key is located without being read.
     fn id(&mut self) -> Option<WireId<'a>> {
         match self.byte()? {
             0 => Some(WireId::Int(self.varint()?)),
+            2 => Some(WireId::Stored(StoredKey::new(self.sized()?))),
             1 => {
                 let count = self.varint()? as usize;
                 let start = self.pos;
@@ -170,6 +174,8 @@ impl<'a> Reader<'a> {
 pub(crate) enum WireId<'a> {
     Int(u64),
     Rec(WireKey<'a>),
+    // A record key as its keycode bytes (see keycode::stored).
+    Stored(StoredKey<'a>),
 }
 
 impl WireId<'_> {
@@ -180,6 +186,7 @@ impl WireId<'_> {
     pub(crate) unsafe fn assume_checked(self) -> Self {
         match self {
             WireId::Rec(k) => WireId::Rec(unsafe { k.assume_checked() }),
+            WireId::Stored(k) => WireId::Stored(unsafe { k.assume_checked() }),
             id => id,
         }
     }
@@ -357,6 +364,10 @@ fn id_ending(bytes: &[u8], id_end: usize) -> Option<WireId<'_>> {
                 checked: false,
             }))
         }
+        2 => {
+            r.varint()?;
+            Some(WireId::Stored(StoredKey::new(bytes.get(r.pos..id_end)?)))
+        }
         _ => None,
     }
 }
@@ -435,6 +446,14 @@ mod tests {
         let at = bytes.windows(2).position(|w| w == b"ab").unwrap();
         bytes[at] = 0xFF;
         let w = WireTuple::read(&bytes).unwrap();
+        let WireId::Stored(k) = w.id else { panic!() };
+        assert!(k.check().is_err());
+        // And a key in the older form (its values, tag 1), as written
+        // before keys were kept as keycode bytes: [1] a record key, [1] of
+        // one value, [4] a string, [2] long, "ab", [2] its capacity.
+        let mut old = vec![1, 1, 4, 2, 0xFF, b'b', 2];
+        old.extend_from_slice(&[0, 0, 0, 0]);
+        let w = WireTuple::read(&old).unwrap();
         let WireId::Rec(k) = w.id else { panic!() };
         assert!(k.check().is_err());
     }

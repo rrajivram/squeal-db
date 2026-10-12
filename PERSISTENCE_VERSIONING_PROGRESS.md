@@ -322,6 +322,28 @@ committing (each stage is its own commit).
       committing now leaves orphan store tables with NO catalog row (a leak),
       instead of a catalog row pointing at id 0 (a wrong answer).
 
+- [ ] **Stage 9 — record keys as keycode bytes (BYTE_KEYS_DESIGN.md
+      stage 2b) — DONE 2026-10-11, approved 2026-10-12.**
+      `DBIdType`'s wire form gains tag 2: a record key as its keycode
+      bytes (a length, then them), written for every record key none of
+      whose strings or blobs holds a 00. Tags 0 (row id) and 1 (a record
+      key as its values) are unchanged and still read; tag 1 is still
+      written for a key that holds a 00. No page, catalog or header
+      version changes: the tag is per id, and both record forms have one
+      order (stage 2a), so they share pages. Fixtures:
+      `slotted.rs::test_a_page_of_keys_from_before_keycode_reads_and_takes_new_ones`
+      (a 512-byte page captured from commit `1c486ba`, every key tag 1:
+      reads, finds, orders, refuses a duplicate, takes tag-2 keys among
+      its own, round-trips mixed);
+      `tuple.rs::test_a_record_key_is_written_as_keycode_bytes_unless_it_holds_a_zero`
+      (the three forms pinned; `[1,1,1,14]` still decodes);
+      `tuple.rs::test_a_tuple_encodes_as_postcard_would_and_counts_its_size`
+      (the one-pass encoder against postcard, byte for byte). The WAL
+      carries tuples through the same `Serialize`, so new segments hold
+      tag-2 ids; older segments read as before. A build before this
+      cannot read a tag-2 id (it reports an unknown `DBIdType` tag).
+      `cargo test --workspace` green; SQLite oracles; crash soaks.
+
 ## Where the policy stands
 
 Every persisted format in scope now has an explicit version or discriminator

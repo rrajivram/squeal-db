@@ -339,7 +339,7 @@ where
         }
         let sample = self
             .first_leaf_page()?
-            .with_entry(Entry::First, |e| e.id().key_values().map(|k| k.len()))?;
+            .with_entry(Entry::First, |e| e.id().key_values().map(|k| k.count()))?;
         let Some(sample) = sample else {
             return Ok(None);
         };

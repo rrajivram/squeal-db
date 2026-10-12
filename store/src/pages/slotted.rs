@@ -105,7 +105,7 @@
 // changed since load" case is a plain `Vec<u8>` clone — no per-tuple work
 // at all.
 
-use postcard::{from_bytes, to_allocvec};
+use postcard::from_bytes;
 
 use crate::{
     db::DBSizeType,
@@ -114,7 +114,7 @@ use crate::{
         PageTuple,
         anytuple::{order_prefix, order_prefix_of, prefix_order},
     },
-    tuple::{DBIdType, IdRef, Tuple, TupleRef},
+    tuple::{DBIdType, IdRef, Probe, Tuple, TupleRef},
     wire::{WireId, WireTuple, id_end, tuple_id_ending},
 };
 
@@ -279,8 +279,10 @@ impl SlottedPage {
             let record = &buf[off..off + len];
             let end = id_end(record)?;
             let id = tuple_id_ending(record, end)?;
-            if let WireId::Rec(k) = id {
-                k.check()?;
+            match id {
+                WireId::Rec(k) => k.check()?,
+                WireId::Stored(k) => k.check()?,
+                WireId::Int(_) => {}
             }
             prefixes.push(order_prefix_of(IdRef::wire(id)));
             id_ends.push(end as u32);
@@ -376,7 +378,7 @@ impl SlottedPage {
         let id = IdRef::of(id);
         let ord = match prefix_order(self.prefixes[last], order_prefix_of(id)) {
             Some(ord) => ord,
-            None => self.id_at(last)?.cmp(&id),
+            None => Probe::new(id).cmp_slot(self.id_at(last)?),
         };
         Ok(ord.is_lt())
     }
@@ -391,13 +393,14 @@ impl SlottedPage {
         past: impl Fn(std::cmp::Ordering) -> bool,
     ) -> Result<usize, StoreError> {
         let prefix = order_prefix_of(id);
+        let probe = Probe::new(id);
         let prefixes = &self.prefixes[..];
         let (mut lo, mut hi) = (0, prefixes.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let ord = match prefix_order(prefixes[mid], prefix) {
                 Some(ord) => ord,
-                None => self.id_at(mid)?.cmp(&id),
+                None => probe.cmp_slot(self.id_at(mid)?),
             };
             if past(ord) {
                 hi = mid;
@@ -436,6 +439,7 @@ impl SlottedPage {
     // being it (see this file's top comment, deviation #2), walked.
     fn find_exact_ref(&self, id: IdRef<'_>) -> Result<Option<usize>, StoreError> {
         let prefix = order_prefix_of(id);
+        let probe = Probe::new(id);
         let prefixes = &self.prefixes[..];
         let (mut lo, mut hi) = (0, prefixes.len());
         while lo < hi {
@@ -446,10 +450,10 @@ impl SlottedPage {
                 Some(ord) => ord,
                 None => {
                     let cand = self.id_at(mid)?;
-                    if cand.eq(&id) {
+                    if probe.is_slot(cand) {
                         return Ok(Some(mid));
                     }
-                    cand.cmp(&id)
+                    probe.cmp_slot(cand)
                 }
             };
             if ord.is_ge() {
@@ -463,10 +467,10 @@ impl SlottedPage {
                 break;
             }
             let cand = self.id_at(idx)?;
-            if cand.eq(&id) {
+            if probe.is_slot(cand) {
                 return Ok(Some(idx));
             }
-            if cand.cmp(&id).is_ne() {
+            if probe.cmp_slot(cand).is_ne() {
                 break;
             }
         }
@@ -673,7 +677,8 @@ impl PageTuple for SlottedPage {
             }
             lo
         };
-        let encoded = to_allocvec(&tuple)?;
+        let mut encoded = Vec::new();
+        tuple.encode_into(&mut encoded)?;
         self.ensure_room(encoded.len())?;
         // ensure_room may have compacted (offsets change, order/count/ids
         // don't) but never grown a non-empty page and never reorders
@@ -717,7 +722,8 @@ impl PageTuple for SlottedPage {
             .find_exact(id)?
             .ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
         let old_slot = self.slot(idx);
-        let encoded = to_allocvec(&tuple)?;
+        let mut encoded = Vec::new();
+        tuple.encode_into(&mut encoded)?;
         if encoded.len() <= old_slot.len as usize {
             // Fits in the old span: overwrite in place. Any leftover bytes
             // become reclaimable fragmentation, same as a remove's.
@@ -1400,5 +1406,98 @@ mod tests {
             "SlottedPage, lent: {ITERS} gets in {elapsed:?} ({:.0} gets/s)",
             ITERS as f64 / elapsed.as_secs_f64()
         );
+    }
+
+    // Persistence versioning (BYTE_KEYS_DESIGN.md stage 2b): a page written
+    // before record keys were kept as keycode bytes — every key as its
+    // values (DBIdType tag 1) — captured from commit 1c486ba. Five tuples:
+    // (5, "ab"), (5, "b"), (-3, NULL), (900, "x"), (-0.0, ""); the first
+    // written by transaction 9. DO NOT edit: it is what such a page is.
+    const OLD_FORM_PAGE_HEX: &str = "0500000000020000c501000014000000eb01000015000000d901000012000000\
+         ac01000019000000960100001600000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000000000000000000000000\
+         0000000000000000000000000000000000000000000001020200000000000000\
+         800400080000047a65726f00010201880e0401780800000c6e696e652d68756e\
+         6472656400010201050000000b6d696e75732d7468726565000102010a040162\
+         08000006666976652d62000102010a040261620801090007666976652d616200";
+
+    fn unhex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // The older page still reads, finds and orders its keys; it takes keys
+    // in the new form beside them, the two kinds searched and ordered as
+    // one; and it is all still there written out and read back.
+    #[test]
+    fn test_a_page_of_keys_from_before_keycode_reads_and_takes_new_ones() {
+        use crate::valueitem::{IndexKey, ValueItem};
+        let key = |v: &[ValueItem]| DBIdType::Rec(IndexKey::new_from(v).unwrap());
+        let s = |t: &str| ValueItem::Str((t.to_string(), 8));
+        let int = ValueItem::Integer;
+        let old: Vec<(DBIdType, &[u8])> = vec![
+            (key(&[int(-3), ValueItem::Null]), b"minus-three"),
+            (key(&[int(5), s("ab")]), b"five-ab"),
+            (key(&[int(5), s("b")]), b"five-b"),
+            (key(&[int(900), s("x")]), b"nine-hundred"),
+            (key(&[ValueItem::Double(-0.0), s("")]), b"zero"),
+        ];
+        let mut p = SlottedPage::from_bytes(&unhex(OLD_FORM_PAGE_HEX)).unwrap();
+        assert_eq!(p.count().unwrap(), 5);
+        let ids = |p: &SlottedPage| -> Vec<DBIdType> {
+            (0..p.slot_count()).map(|i| p.id_at(i).unwrap().to_owned()).collect()
+        };
+        assert_eq!(ids(&p), old.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+        for (k, data) in &old {
+            assert_eq!(p.get(k).unwrap().unwrap().data.to_vec(), *data, "{k:?}");
+            assert!(p.id_at(p.find_exact(k).unwrap().unwrap()).unwrap().stored_bytes().is_none());
+        }
+        assert_eq!(p.get(&old[1].0).unwrap().unwrap().txn_id, Some(crate::txn::TransactionId(9)));
+        assert!(p.get(&key(&[int(5), s("a")])).unwrap().is_none());
+
+        // An older key is still a duplicate of itself, written anew.
+        let dup = p.add(Tuple::new_with(old[1].0.clone(), b"again", None, None));
+        assert!(matches!(dup, Err(StoreError::DuplicateKey(_))), "{dup:?}");
+
+        // New keys, kept as keycode bytes, land among the older ones.
+        let new: Vec<(DBIdType, &[u8])> = vec![
+            (key(&[int(-4), s("z")]), b"first"),
+            (key(&[int(5), s("aa")]), b"before-ab"),
+            (key(&[int(5), s("abc")]), b"after-ab"),
+            (key(&[int(6), ValueItem::Null]), b"six"),
+            (key(&[ValueItem::Double(0.0), s("")]), b"plus-zero"),
+        ];
+        for (k, data) in &new {
+            p.add(Tuple::new_with(k.clone(), data, None, None)).unwrap();
+        }
+        let mut all: Vec<(DBIdType, &[u8])> = old.iter().chain(&new).cloned().collect();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        for page in [p.clone(), SlottedPage::from_bytes(&p.to_bytes().unwrap()).unwrap()] {
+            assert_eq!(ids(&page), all.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>());
+            for (k, data) in &all {
+                assert_eq!(page.get(k).unwrap().unwrap().data.to_vec(), *data, "{k:?}");
+            }
+            for (k, _) in &new {
+                let slot = page.find_exact(k).unwrap().unwrap();
+                assert!(page.id_at(slot).unwrap().stored_bytes().is_some(), "{k:?}");
+            }
+        }
+        // An older tuple replaced is written in the new form.
+        p.replace(&old[2].0, Tuple::new_with(old[2].0.clone(), b"replaced", None, None)).unwrap();
+        let slot = p.find_exact(&old[2].0).unwrap().unwrap();
+        assert!(p.id_at(slot).unwrap().stored_bytes().is_some());
+        assert_eq!(p.get(&old[2].0).unwrap().unwrap().data.to_vec(), b"replaced");
+        assert_eq!(p.count().unwrap(), 10);
     }
 }

@@ -114,9 +114,31 @@ A key is a `DBIdType`. It is either `Int(u64)` (a generated row id) or
 - `Str` and `Blob`, each with a declared capacity
 - `Boolean`
 
-`Rec` keys compare field by field. That is what makes composite keys,
-prefix scans and range seeks work. The layers above encode their keys into
-this:
+`Rec` keys compare field by field, and a key that is a prefix of another
+sorts before it. That is what makes composite keys, prefix scans and range
+seeks work. A `Rec` key sorts below every `Int`; a tree holds one kind.
+
+**A record key is kept on a page as bytes that compare as the keys do**
+(`keycode.rs`):
+- Its fields are written one after another, each behind a tag that rises
+  with its type's rank:
+  - integers in as few bytes as they need, most significant first
+  - doubles with the sign flipped (the order `f64::total_cmp` gives)
+  - strings up to a terminator
+- A page search, a duplicate check or a scan compares two such keys as
+  bytes, without decoding either.
+- The 16-byte prefix kept per slot to search by is the key's first 16
+  bytes.
+- A tuple is encoded in one pass straight into its buffer, and its size
+  is counted from its fields.
+
+A key whose string or blob holds a `00` byte, and every record key written
+before this form existed, is kept as its values and compared by reading
+them. Both forms have the same order, so they share pages, and an older
+database's keys take the new form as its tuples are rewritten. See
+[BYTE_KEYS_DESIGN.md](../BYTE_KEYS_DESIGN.md).
+
+The layers above encode their keys into this:
 - `squeal-sql`: primary keys, and index keys with the row's key appended
 - `sq-json`: BSON-ordered values behind a type bracket
 

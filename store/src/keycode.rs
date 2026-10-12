@@ -48,7 +48,7 @@ use std::borrow::Cow;
 use crate::{
     error::StoreError,
     tuple::DBIdType,
-    valueitem::{IndexKey, ValueItem},
+    valueitem::{IndexKey, ValueItem, ValueRef},
 };
 
 const REC: u8 = 0x01;
@@ -82,51 +82,366 @@ pub fn encode_record(fields: &[ValueItem], out: &mut Vec<u8>) {
     }
 }
 
+// ── a record key as a tuple on a page keeps it ──────────────────────────
+//
+// Its fields' bytes alone: the kind is the tuple's own tag (see DBIdType's
+// Serialize). Only a key none of whose strings or blobs holds a 00 is kept
+// this way, so nothing in one is escaped, and a string is lent from the
+// page as it is.
+
+/// A storable record key's bytes, as a page keeps them: `encode_record`'s
+/// without the kind. On the stack unless the key is a long one: a key is
+/// encoded for every tuple written and every search that ties on a prefix.
+pub(crate) fn stored<'a>(fields: impl Iterator<Item = ValueRef<'a>>) -> KeyBuf {
+    let mut out = KeyBuf {
+        stack: [0; KeyBuf::STACK],
+        len: 0,
+        heap: Vec::new(),
+    };
+    for field in fields {
+        put_field(&mut out, field);
+    }
+    out
+}
+
+/// A key's bytes: in place up to STACK of them, on the heap past that.
+pub(crate) struct KeyBuf {
+    stack: [u8; Self::STACK],
+    len: usize,
+    heap: Vec<u8>,
+}
+
+impl KeyBuf {
+    const STACK: usize = 120;
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        if self.heap.is_empty() {
+            &self.stack[..self.len]
+        } else {
+            &self.heap
+        }
+    }
+}
+
+impl Sink for KeyBuf {
+    fn push(&mut self, byte: u8) {
+        self.extend(&[byte]);
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        if self.heap.is_empty() && self.len + bytes.len() <= Self::STACK {
+            self.stack[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+            self.len += bytes.len();
+            return;
+        }
+        if self.heap.is_empty() {
+            self.heap.extend_from_slice(&self.stack[..self.len]);
+        }
+        self.heap.extend_from_slice(bytes);
+    }
+}
+
+/// How many bytes `stored_into` writes for `fields`; None if they are not
+/// storable. One pass: what a tuple's size and its encoding both start
+/// from.
+pub(crate) fn stored_len(fields: &[ValueItem]) -> Option<usize> {
+    let mut len = 0;
+    for f in fields {
+        len += match f {
+            ValueItem::Null | ValueItem::Boolean(_) => 1,
+            ValueItem::Integer(i) => 1 + significant(i.unsigned_abs()),
+            ValueItem::Datetime(t) => 1 + significant(*t),
+            ValueItem::Double(_) => 9,
+            ValueItem::Str((s, _)) if !s.as_bytes().contains(&END) => s.len() + 2,
+            ValueItem::Blob((b, _)) if !b.contains(&END) => b.len() + 2,
+            _ => return None,
+        };
+    }
+    Some(len)
+}
+
+/// Appends a storable record key's bytes to `out`, as `stored` gives them:
+/// straight to where they are going, with no buffer between.
+pub(crate) fn stored_into(fields: &[ValueItem], out: &mut Vec<u8>) {
+    for field in fields {
+        put_field(out, field.as_ref());
+    }
+}
+
+/// A record key's fields as a page keeps them (see `stored`), read in
+/// place: nothing decoded until asked for, nothing copied.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StoredKey<'a> {
+    bytes: &'a [u8],
+    // Known well-formed, its strings UTF-8 (see assume_checked).
+    checked: bool,
+}
+
+impl<'a> StoredKey<'a> {
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            checked: false,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Whether every field reads (`values` assumes so): each well-formed,
+    /// the strings UTF-8.
+    pub(crate) fn check(&self) -> Result<(), StoreError> {
+        let mut rest = self.bytes;
+        while let Some((&tag, after)) = rest.split_first() {
+            rest = stored_field(tag, after, false).ok_or_else(|| damaged("a stored key"))?.1;
+        }
+        Ok(())
+    }
+
+    /// This key, taken to be well-formed with UTF-8 strings without
+    /// checking as each value is read.
+    ///
+    /// # Safety
+    /// `check` said so of these bytes, or they were written by `stored`
+    /// from a key's own values. A SlottedPage holds only such bytes.
+    pub(crate) unsafe fn assume_checked(self) -> Self {
+        Self {
+            checked: true,
+            ..self
+        }
+    }
+
+    pub(crate) fn values(&self) -> StoredValues<'a> {
+        StoredValues {
+            rest: self.bytes,
+            checked: self.checked,
+        }
+    }
+}
+
+/// See StoredKey::values.
+#[derive(Debug, Clone)]
+pub(crate) struct StoredValues<'a> {
+    rest: &'a [u8],
+    checked: bool,
+}
+
+impl<'a> Iterator for StoredValues<'a> {
+    type Item = ValueRef<'a>;
+
+    fn next(&mut self) -> Option<ValueRef<'a>> {
+        let (&tag, after) = self.rest.split_first()?;
+        // A page checks its keys when it reads them in (StoredKey::check),
+        // so this can't fail there; if it somehow did, the key just ends.
+        match stored_field(tag, after, self.checked) {
+            Some((value, rest)) => {
+                self.rest = rest;
+                Some(value)
+            }
+            None => {
+                self.rest = &[];
+                None
+            }
+        }
+    }
+}
+
+// One field of a stored key, and what follows it; None if it isn't one. A
+// string's capacity comes back as its length (the key doesn't hold it).
+#[inline(always)]
+fn stored_field(tag: u8, rest: &[u8], checked: bool) -> Option<(ValueRef<'_>, &[u8])> {
+    let unsigned = |n: usize| -> Option<(u64, &[u8])> {
+        let (head, rest) = rest.split_at_checked(n)?;
+        Some((head.iter().fold(0u64, |v, b| (v << 8) | *b as u64), rest))
+    };
+    Some(match tag {
+        NULL => (ValueRef::Null, rest),
+        FALSE => (ValueRef::Boolean(false), rest),
+        TRUE => (ValueRef::Boolean(true), rest),
+        DOUBLE => {
+            let (ordered, rest) = unsigned(8)?;
+            let bits = if ordered >> 63 == 1 { ordered ^ (1 << 63) } else { !ordered };
+            (ValueRef::Double(f64::from_bits(bits)), rest)
+        }
+        STR | BLOB => {
+            let end = rest.iter().position(|b| *b == END)?;
+            let (content, after) = (&rest[..end], &rest[end + 1..]);
+            let value = if tag == BLOB {
+                ValueRef::Blob(content, content.len() as u32)
+            } else if checked {
+                // SAFETY: see StoredKey::assume_checked.
+                ValueRef::Str(unsafe { std::str::from_utf8_unchecked(content) }, content.len() as u32)
+            } else {
+                ValueRef::Str(std::str::from_utf8(content).ok()?, content.len() as u32)
+            };
+            (value, after)
+        }
+        _ if (INT_ZERO..=INT_ZERO + 8).contains(&tag) => {
+            let (v, rest) = unsigned((tag - INT_ZERO) as usize)?;
+            (ValueRef::Integer(i64::try_from(v).ok()?), rest)
+        }
+        _ if (INT_ZERO - 8..INT_ZERO).contains(&tag) => {
+            let n = (INT_ZERO - tag) as usize;
+            let (flipped, rest) = unsigned(n)?;
+            let mask = if n == 8 { u64::MAX } else { (1u64 << (8 * n)) - 1 };
+            let magnitude = !flipped & mask;
+            if magnitude > 1 << 63 {
+                return None;
+            }
+            (ValueRef::Integer((magnitude as i64).wrapping_neg()), rest)
+        }
+        _ if (DATETIME..=DATETIME + 8).contains(&tag) => {
+            let (t, rest) = unsigned((tag - DATETIME) as usize)?;
+            (ValueRef::Datetime(t), rest)
+        }
+        _ => return None,
+    })
+}
+
+// ── the first 16 bytes of a key's bytes, as a number ────────────────────
+//
+// What a page keeps per slot to search by (see SlottedPage): two keys
+// whose prefixes differ order as the prefixes do, since their bytes do and
+// a key shorter than 16 bytes is padded with 00, below any byte that could
+// follow it. Equal prefixes decide nothing (but see prefix_order).
+
+/// A row id's prefix: all of its bytes.
+pub(crate) fn row_id_prefix(n: u64) -> u128 {
+    let mut out = Prefix {
+        bytes: [0; 16],
+        len: 0,
+    };
+    put_unsigned(&mut out, ROW_ID, n);
+    u128::from_be_bytes(out.bytes)
+}
+
+/// The prefix of a record key kept as its bytes (see `stored`).
+pub(crate) fn stored_prefix(stored: &[u8]) -> u128 {
+    let mut out = Prefix {
+        bytes: [0; 16],
+        len: 0,
+    };
+    out.push(REC);
+    out.extend(stored);
+    u128::from_be_bytes(out.bytes)
+}
+
+/// The prefix of a record key of `fields`, whatever they hold: what
+/// `stored_prefix` gives for one that is storable, and the same of
+/// `encode_record`'s bytes for one that isn't.
+pub(crate) fn fields_prefix<'a>(fields: impl Iterator<Item = ValueRef<'a>>) -> u128 {
+    let mut out = Prefix {
+        bytes: [0; 16],
+        len: 0,
+    };
+    out.push(REC);
+    for field in fields {
+        if out.len == out.bytes.len() {
+            break;
+        }
+        put_field(&mut out, field);
+    }
+    u128::from_be_bytes(out.bytes)
+}
+
+/// What two keys' prefixes say of the keys' order: nothing if they are
+/// equal, unless they are row ids' (a row id's prefix is all of it).
+#[inline(always)]
+pub(crate) fn prefix_order(a: u128, b: u128) -> Option<std::cmp::Ordering> {
+    if a != b {
+        return Some(a.cmp(&b));
+    }
+    ((a >> 120) as u8 >= ROW_ID).then_some(std::cmp::Ordering::Equal)
+}
+
 /// Appends one more field to a record key in `out`.
 pub fn encode_field(field: &ValueItem, out: &mut Vec<u8>) {
+    put_field(out, field.as_ref());
+}
+
+// Where a key's bytes are written: a Vec, or the 16 bytes of a prefix
+// (which drops what doesn't fit).
+trait Sink {
+    fn push(&mut self, byte: u8);
+    fn extend(&mut self, bytes: &[u8]);
+}
+
+impl Sink for Vec<u8> {
+    fn push(&mut self, byte: u8) {
+        Vec::push(self, byte);
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+}
+
+struct Prefix {
+    bytes: [u8; 16],
+    len: usize,
+}
+
+impl Sink for Prefix {
+    fn push(&mut self, byte: u8) {
+        if let Some(slot) = self.bytes.get_mut(self.len) {
+            *slot = byte;
+            self.len += 1;
+        }
+    }
+    fn extend(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+    }
+}
+
+fn put_field(out: &mut impl Sink, field: ValueRef) {
     match field {
-        ValueItem::Null => out.push(NULL),
-        ValueItem::Boolean(b) => out.push(if *b { TRUE } else { FALSE }),
-        ValueItem::Integer(i) => put_integer(out, *i),
-        ValueItem::Double(d) => {
+        ValueRef::Null => out.push(NULL),
+        ValueRef::Boolean(b) => out.push(if b { TRUE } else { FALSE }),
+        ValueRef::Integer(i) => put_integer(out, i),
+        ValueRef::Double(d) => {
             out.push(DOUBLE);
             let bits = d.to_bits();
             let ordered = if bits >> 63 == 0 { bits ^ (1 << 63) } else { !bits };
-            out.extend_from_slice(&ordered.to_be_bytes());
+            out.extend(&ordered.to_be_bytes());
         }
-        ValueItem::Datetime(t) => put_unsigned(out, DATETIME, *t),
-        ValueItem::Str((s, _)) => put_bytes(out, STR, s.as_bytes()),
-        ValueItem::Blob((b, _)) => put_bytes(out, BLOB, b),
+        ValueRef::Datetime(t) => put_unsigned(out, DATETIME, t),
+        ValueRef::Str(s, _) => put_bytes(out, STR, s.as_bytes()),
+        ValueRef::Blob(b, _) => put_bytes(out, BLOB, b),
     }
 }
 
 // `v`'s significant bytes, big-endian, after a tag of `base` plus how many.
-fn put_unsigned(out: &mut Vec<u8>, base: u8, v: u64) {
-    let n = 8 - (v.leading_zeros() / 8) as usize;
+fn put_unsigned(out: &mut impl Sink, base: u8, v: u64) {
+    let n = significant(v);
     out.push(base + n as u8);
-    out.extend_from_slice(&v.to_be_bytes()[8 - n..]);
+    out.extend(&v.to_be_bytes()[8 - n..]);
 }
 
-fn put_integer(out: &mut Vec<u8>, v: i64) {
+fn put_integer(out: &mut impl Sink, v: i64) {
     if v >= 0 {
         return put_unsigned(out, INT_ZERO, v as u64);
     }
     let magnitude = v.unsigned_abs();
-    let n = 8 - (magnitude.leading_zeros() / 8) as usize;
+    let n = significant(magnitude);
     out.push(INT_ZERO - n as u8);
-    out.extend_from_slice(&(!magnitude).to_be_bytes()[8 - n..]);
+    out.extend(&(!magnitude).to_be_bytes()[8 - n..]);
 }
 
-fn put_bytes(out: &mut Vec<u8>, tag: u8, bytes: &[u8]) {
+fn put_bytes(out: &mut impl Sink, tag: u8, bytes: &[u8]) {
     out.push(tag);
     let mut rest = bytes;
     while let Some(zero) = rest.iter().position(|b| *b == END) {
-        out.extend_from_slice(&rest[..=zero]);
+        out.extend(&rest[..=zero]);
         out.push(ESCAPED);
         rest = &rest[zero + 1..];
     }
-    out.extend_from_slice(rest);
+    out.extend(rest);
     out.push(END);
+}
+
+fn significant(v: u64) -> usize {
+    8 - (v.leading_zeros() / 8) as usize
 }
 
 /// Whether the key in `key` begins with the fields of the record key in

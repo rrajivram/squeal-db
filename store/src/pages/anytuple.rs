@@ -66,72 +66,35 @@ impl<'de> Deserialize<'de> for AnyTuplePage {
     }
 }
 
-// Leading bits of an id that order the same way it does, wherever they
-// differ: if two ids' prefixes are both known (non-zero tag), of the same
-// kind, and unequal, the ids compare the same way their prefixes do. Equal
-// prefixes say nothing — compare the ids. Bits 127..126 are the kind: 0 no
-// prefix (always compare the ids), 1 Int, 2 Rec; an Int and a Rec order by
-// hash (DBIdType::cmp), so they compare by id too.
+// The first 16 bytes of an id's keycode bytes (see keycode.rs), as a
+// number: kept per slot to search a page by. Two ids whose prefixes differ
+// order as the prefixes do — their bytes do, and an id shorter than 16
+// bytes is padded with 00, below any byte that could follow it. Equal
+// prefixes say nothing (compare the ids), except of row ids, whose prefix
+// is all of them.
 //
-// Int: its own value, which is what it orders by. Rec: its first field
-// only — IndexKey compares field by field, so a difference there decides
-// the order; later fields would not be safe (a shorter key ties with any
-// longer one it starts). The field is its type rank (3 bits), then the
-// value, left-aligned in the remaining 120 bits: an integer or timestamp
-// as an unsigned big-endian number (sign bit flipped), a double by
-// total_cmp's bit trick, a string or blob as its first 15 bytes, zero
-// padded — a shorter string padded with zeros is never above a longer one
-// it starts, so truncating and padding can only turn a difference into a
-// tie, never reverse it. A key with no fields ties with every key: no
-// prefix.
+// Whatever form an id is held in — an owned DBIdType, a record key as its
+// values on an older page, or one as its keycode bytes — its prefix is the
+// same, so pages that mix the forms search alike.
 pub(crate) fn order_prefix(id: &DBIdType) -> u128 {
     order_prefix_of(IdRef::of(id))
 }
 
-// How two ids compare, if their order_prefixes say: both known, of the
-// same kind, and different — or both row ids, whose prefix is the whole
-// id (an Int's order is its number), so equal prefixes are equal ids.
+// How two ids compare, if their order_prefixes say (see order_prefix).
 #[inline(always)]
 pub(crate) fn prefix_order(a: u128, b: u128) -> Option<Ordering> {
-    let kind = b >> 126;
-    (a >> 126 == kind && (a != b && kind != 0 || kind == INT_PREFIX)).then(|| a.cmp(&b))
+    crate::keycode::prefix_order(a, b)
 }
-
-// order_prefix's kind for a row id (see there).
-const INT_PREFIX: u128 = 1;
 
 // order_prefix, of a lent id.
 pub(crate) fn order_prefix_of(id: IdRef) -> u128 {
-    use crate::valueitem::ValueRef;
-    const INT: u128 = 1 << 126;
-    const REC: u128 = 2 << 126;
-    let Some(mut values) = id.key_values() else {
-        return INT | id.as_int().unwrap_or_default() as u128;
-    };
-    let Some(first) = values.next() else {
-        return 0;
-    };
-    let ordered = |n: u64| (n as u128) << 56;
-    let bytes = |b: &[u8]| {
-        let mut out = [0u8; 16];
-        let n = b.len().min(15);
-        out[1..1 + n].copy_from_slice(&b[..n]);
-        u128::from_be_bytes(out)
-    };
-    let value = match first {
-        ValueRef::Null => 0,
-        ValueRef::Boolean(b) => ordered(b as u64),
-        ValueRef::Integer(i) => ordered(i as u64 ^ (1 << 63)),
-        ValueRef::Double(d) => {
-            let bits = d.to_bits() as i64;
-            let total = bits ^ (((bits >> 63) as u64) >> 1) as i64;
-            ordered(total as u64 ^ (1 << 63))
-        }
-        ValueRef::Datetime(t) => ordered(t),
-        ValueRef::Str(s, _) => bytes(s.as_bytes()),
-        ValueRef::Blob(b, _) => bytes(b),
-    };
-    REC | (first.type_rank() as u128) << 123 | value
+    if let Some(stored) = id.stored_bytes() {
+        return crate::keycode::stored_prefix(stored);
+    }
+    match id.key_values() {
+        Some(values) => crate::keycode::fields_prefix(values),
+        None => crate::keycode::row_id_prefix(id.as_int().unwrap_or_default()),
+    }
 }
 
 impl AnyTuplePage {
@@ -616,7 +579,7 @@ mod tests {
     // lengths, and Int ids next to Rec ones.
     #[test]
     fn test_order_prefix_never_contradicts_the_id_order() {
-        use super::order_prefix;
+        use super::{order_prefix, prefix_order};
         use crate::valueitem::{IndexKey, ValueItem};
         use std::sync::Arc;
 
@@ -675,11 +638,15 @@ mod tests {
         for a in &ids {
             for b in &ids {
                 let (pa, pb) = (order_prefix(a), order_prefix(b));
-                if pa == pb || pa >> 126 != pb >> 126 || pa >> 126 == 0 {
-                    continue;
+                // What prefix_order says, the ids' own order says: of any
+                // two ids, a row id against a record key too.
+                match prefix_order(pa, pb) {
+                    Some(order) => {
+                        assert_eq!(order, a.cmp(b), "{a:?} vs {b:?}");
+                        checked += 1;
+                    }
+                    None => assert_eq!(pa, pb),
                 }
-                assert_eq!(pa.cmp(&pb), a.cmp(b), "{a:?} vs {b:?}");
-                checked += 1;
             }
         }
         assert!(checked > 1000, "{checked}");

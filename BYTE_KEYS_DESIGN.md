@@ -84,8 +84,25 @@ the persistence convention (PERSISTENCE_VERSIONING_PROGRESS.md):
   record keys and row ids compared this way already. The hash is no
   longer part of ordering. The keycode tests check bytes against this
   order for every kind of pair, and that equal bytes are equal keys.
-- [ ] **2b. Tuples on pages carry their key as these bytes.** On-disk
-  change: brought for approval before it is committed.
+- [x] **2b. Tuples on pages carry their key as these bytes.** On-disk
+  change. Done 2026-10-11, approved 2026-10-12.
+  - **Measured against 2a.**
+
+    | | before | after |
+    |---|---:|---:|
+    | store: point lookup, composite key | 1.09 µs | 0.60 µs |
+    | store: delete, per row | 6.6 µs | 5.4 µs |
+    | store: range scan, per row | 85 ns | 76 ns |
+    | SQL, 1M orders: secondary-index lookup | 53 µs | 47 µs |
+    | SQL: `UPDATE`, 100 a transaction, per row | 136 µs | 123 µs |
+    | SQL: `CREATE INDEX`, per index | 812 ms | 743 ms |
+    | SQL: bulk load, per row | 2.35 µs | 2.27 µs |
+    | file, 1M orders | 216 MB | 213 MB |
+
+  - **Encoding once.** The first version re-encoded each key several
+    times through a buffer and serde, and made SQL writes 7% slower. A
+    tuple is now written in one pass, its key's bytes going straight in
+    (`Tuple::encode_into`), and its size is counted from its fields.
   - **The form.** A tuple's id starts with a tag: 0 is a row id, 1 a record
     key as postcard values. Tag 2 is new: a length, then the record key's
     keycode bytes. Every record key written from now on uses it, in every

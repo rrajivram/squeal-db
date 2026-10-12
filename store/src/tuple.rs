@@ -13,6 +13,7 @@ use crate::{
     error::StoreError,
     logger::LsnId,
     txn::TransactionId,
+    keycode::{self, StoredValues},
     valueitem::{IndexKey, ValueItem, ValueRef},
     wire::{WireId, WireTuple, WireValues},
 };
@@ -39,12 +40,57 @@ pub enum DBIdType {
     Rec(IndexKey),
 }
 
+// A record key is written as its keycode bytes (tag 2: bytes that compare
+// as the keys do, so a page orders and finds them without decoding one —
+// see keycode.rs, BYTE_KEYS_DESIGN.md), unless a string or blob of it
+// holds a 00 byte, which those bytes would have to escape: such a key keeps
+// the older form (tag 1, its values), as does every record key written
+// before tag 2 existed. Both read, and both order the same way. A row id
+// (tag 0) needs neither: it compares as a number already.
 impl Serialize for DBIdType {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             DBIdType::Int(v) => (0u8, v).serialize(serializer),
+            DBIdType::Rec(v) if keycode::stored_len(v.values()).is_some() => {
+                let key = keycode::stored(v.values().iter().map(ValueItem::as_ref));
+                (2u8, StoredBytes(key.bytes())).serialize(serializer)
+            }
             DBIdType::Rec(v) => (1u8, v).serialize(serializer),
         }
+    }
+}
+
+// A stored key's bytes, written as bytes (a length, then them).
+struct StoredBytes<'a>(&'a [u8]);
+
+impl Serialize for StoredBytes<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.0)
+    }
+}
+
+// A record key read back from its stored bytes.
+struct StoredRecord(IndexKey);
+
+impl<'de> Deserialize<'de> for StoredRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct BytesVisitor;
+        impl Visitor<'_> for BytesVisitor {
+            type Value = StoredRecord;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a record key's stored bytes")
+            }
+
+            fn visit_bytes<E: DeError>(self, bytes: &[u8]) -> Result<StoredRecord, E> {
+                let key = keycode::StoredKey::new(bytes);
+                key.check().map_err(|e| E::custom(e.to_string()))?;
+                Ok(StoredRecord(IndexKey::from_stored(
+                    key.values().map(|v| v.to_owned()).collect(),
+                )))
+            }
+        }
+        deserializer.deserialize_bytes(BytesVisitor)
     }
 }
 
@@ -69,6 +115,11 @@ impl<'de> Visitor<'de> for DBIdTypeVisitor {
             1 => Ok(DBIdType::Rec(
                 seq.next_element()?
                     .ok_or_else(|| DeError::custom("DBIdType::Rec: missing value"))?,
+            )),
+            2 => Ok(DBIdType::Rec(
+                seq.next_element::<StoredRecord>()?
+                    .ok_or_else(|| DeError::custom("DBIdType::Rec: missing stored key"))?
+                    .0,
             )),
             other => Err(DeError::custom(format!("unknown DBIdType tag {other}"))),
         }
@@ -194,16 +245,66 @@ impl Tuple {
             pre_lsn,
             ..Default::default()
         };
-        // serialized_size() over to_allocvec().len(): every Tuple construction
-        // needs only the byte count, not the bytes themselves — to_allocvec
-        // allocated and immediately discarded a full copy of the encoded
-        // tuple just to measure it. postcard's Size flavor computes the same
-        // exact count by walking the same Serialize impl without writing
-        // anything, so this is zero-allocation on what's likely the hottest
-        // single call site in the whole write path (every insert/update/
-        // remove constructs at least one Tuple).
-        s.serialized_size = postcard::experimental::serialized_size(&s).unwrap_or(0) as DBSizeType;
+        // Every Tuple construction needs its encoded size — pages budget by
+        // it — and only the count, not the bytes: worked out from the fields
+        // (encoded_len), with nothing written or allocated, on what is
+        // likely the hottest call site of the write path (every insert,
+        // update and remove constructs at least one Tuple).
+        s.serialized_size = s.encoded_len() as DBSizeType;
         s
+    }
+
+    // How many bytes this tuple's encoding takes: what postcard's Serialize
+    // of it writes (see encode_into), counted without writing it.
+    fn encoded_len(&self) -> usize {
+        let id = match &self.id {
+            DBIdType::Int(n) => 1 + varint_len(*n),
+            DBIdType::Rec(k) => match keycode::stored_len(k.values()) {
+                Some(len) => 1 + varint_len(len as u64) + len,
+                None => postcard::experimental::serialized_size(&self.id).unwrap_or(0),
+            },
+        };
+        let option = |v: Option<u64>| 1 + v.map_or(0, varint_len);
+        id + option(self.txn_id.map(|t| t.0))
+            + option(self.pre_lsn.map(|l| l.0))
+            + varint_len(self.data.len() as u64)
+            + self.data.len()
+            + 1
+    }
+
+    /// Appends this tuple's encoding to `out`: byte for byte what postcard
+    /// writes for it (id, txn_id, pre_lsn, data, flags — see wire.rs for
+    /// the layout), written in one pass with the key's bytes going straight
+    /// in, not gathered first.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), StoreError> {
+        out.reserve(self.size() as usize);
+        match &self.id {
+            DBIdType::Int(n) => {
+                out.push(0);
+                put_varint(out, *n);
+            }
+            DBIdType::Rec(k) => match keycode::stored_len(k.values()) {
+                Some(len) => {
+                    out.push(2);
+                    put_varint(out, len as u64);
+                    keycode::stored_into(k.values(), out);
+                }
+                None => *out = postcard::to_extend(&self.id, std::mem::take(out))?,
+            },
+        }
+        for option in [self.txn_id.map(|t| t.0), self.pre_lsn.map(|l| l.0)] {
+            match option {
+                Some(v) => {
+                    out.push(1);
+                    put_varint(out, v);
+                }
+                None => out.push(0),
+            }
+        }
+        put_varint(out, self.data.len() as u64);
+        out.extend_from_slice(&self.data);
+        out.push(self.flags);
+        Ok(())
     }
 
     pub fn is_index(&self) -> bool {
@@ -270,10 +371,9 @@ impl Tuple {
         if self.serialized_size > 0 {
             self.serialized_size
         } else {
-            // Deserialized tuples have serialized_size=0 (serde skips it); compute
-            // on demand. See new_with's comment on why serialized_size (not
-            // to_allocvec) is used here too.
-            postcard::experimental::serialized_size(self).unwrap_or(0) as DBSizeType
+            // Deserialized tuples have serialized_size=0 (serde skips it);
+            // counted on demand.
+            self.encoded_len() as DBSizeType
         }
     }
 
@@ -389,6 +489,7 @@ pub struct KeyValues<'a>(Values<'a>);
 enum Values<'a> {
     Owned(std::slice::Iter<'a, ValueItem>),
     Wire(WireValues<'a>),
+    Stored(StoredValues<'a>),
 }
 
 impl<'a> Iterator for KeyValues<'a> {
@@ -398,18 +499,10 @@ impl<'a> Iterator for KeyValues<'a> {
         match &mut self.0 {
             Values::Owned(i) => i.next().map(ValueItem::as_ref),
             Values::Wire(i) => i.next(),
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match &self.0 {
-            Values::Owned(i) => i.size_hint(),
-            Values::Wire(i) => i.size_hint(),
+            Values::Stored(i) => i.next(),
         }
     }
 }
-
-impl ExactSizeIterator for KeyValues<'_> {}
 
 impl<'a> IdRef<'a> {
     pub(crate) fn of(id: &'a DBIdType) -> Self {
@@ -434,6 +527,16 @@ impl<'a> IdRef<'a> {
         match self.0 {
             Id::Owned(DBIdType::Rec(k)) => Some(KeyValues(Values::Owned(k.values().iter()))),
             Id::Wire(WireId::Rec(k)) => Some(KeyValues(Values::Wire(k.values()))),
+            Id::Wire(WireId::Stored(k)) => Some(KeyValues(Values::Stored(k.values()))),
+            _ => None,
+        }
+    }
+
+    // A record key's keycode bytes, if it is lent as them (see
+    // keycode::stored): two such keys compare as their bytes do.
+    pub(crate) fn stored_bytes(&self) -> Option<&'a [u8]> {
+        match self.0 {
+            Id::Wire(WireId::Stored(k)) => Some(k.bytes()),
             _ => None,
         }
     }
@@ -442,9 +545,13 @@ impl<'a> IdRef<'a> {
         match self.0 {
             Id::Owned(id) => id.clone(),
             Id::Wire(WireId::Int(i)) => DBIdType::Int(i),
-            Id::Wire(WireId::Rec(k)) => {
-                DBIdType::Rec(IndexKey::from_stored(k.values().map(|v| v.to_owned()).collect()))
-            }
+            Id::Wire(_) => DBIdType::Rec(IndexKey::from_stored(
+                self.key_values()
+                    .into_iter()
+                    .flatten()
+                    .map(|v| v.to_owned())
+                    .collect(),
+            )),
         }
     }
 
@@ -464,17 +571,26 @@ impl<'a> IdRef<'a> {
         }
     }
 
-    // DBIdType's order (see its Ord).
+    // DBIdType's order (see its Ord). Two keys lent as keycode bytes
+    // compare as the bytes do, with no value read.
     pub(crate) fn cmp(&self, other: &IdRef) -> std::cmp::Ordering {
         use std::cmp::Ordering;
+        if let (Some(a), Some(b)) = (self.stored_bytes(), other.stored_bytes()) {
+            return a.cmp(b);
+        }
         match (self.key_values(), other.key_values()) {
-            (Some(a), Some(b)) => {
-                let (a_len, b_len) = (a.len(), b.len());
-                a.zip(b)
-                    .map(|(a, b)| a.cmp(&b))
-                    .find(|o| o.is_ne())
-                    .unwrap_or_else(|| a_len.cmp(&b_len))
-            }
+            (Some(mut a), Some(mut b)) => loop {
+                match (a.next(), b.next()) {
+                    (Some(a), Some(b)) => match a.cmp(&b) {
+                        Ordering::Equal => {}
+                        decided => return decided,
+                    },
+                    // The one that runs out first begins the other.
+                    (None, None) => return Ordering::Equal,
+                    (None, Some(_)) => return Ordering::Less,
+                    (Some(_), None) => return Ordering::Greater,
+                }
+            },
             (None, None) => self.as_int().cmp(&other.as_int()),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
@@ -501,10 +617,20 @@ impl<'a> IdRef<'a> {
             (Id::Wire(WireId::Rec(a)), Id::Wire(WireId::Rec(b))) if a.same_bytes(&b) => {
                 return true;
             }
+            // Keycode bytes are equal exactly when the keys are.
+            (Id::Wire(WireId::Stored(a)), Id::Wire(WireId::Stored(b))) => {
+                return a.bytes() == b.bytes();
+            }
             _ => {}
         }
         match (self.key_values(), other.key_values()) {
-            (Some(a), Some(b)) => a.len() == b.len() && a.zip(b).all(|(a, b)| a == b),
+            (Some(mut a), Some(mut b)) => loop {
+                match (a.next(), b.next()) {
+                    (Some(a), Some(b)) if a == b => {}
+                    (None, None) => return true,
+                    _ => return false,
+                }
+            },
             (None, None) => self.as_int() == other.as_int(),
             _ => false,
         }
@@ -517,6 +643,72 @@ impl<'a> IdRef<'a> {
         range: &crate::cursor::KeyRange,
     ) -> Option<std::cmp::Ordering> {
         Some(range.position(self.key_values()?))
+    }
+}
+
+// A LEB128 varint, as postcard writes an unsigned integer.
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    while v >= 0x80 {
+        out.push(v as u8 | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn varint_len(v: u64) -> usize {
+    (64 - (v | 1).leading_zeros() as usize).div_ceil(7)
+}
+
+/// An id being looked for on a page: compared with one slot after another.
+/// Against a slot whose key is lent as keycode bytes it compares as bytes —
+/// its own encoded once, the first time a slot's prefix doesn't decide.
+pub(crate) struct Probe<'a> {
+    id: IdRef<'a>,
+    stored: std::cell::OnceCell<Option<keycode::KeyBuf>>,
+}
+
+impl<'a> Probe<'a> {
+    pub(crate) fn new(id: IdRef<'a>) -> Self {
+        Self {
+            id,
+            stored: std::cell::OnceCell::new(),
+        }
+    }
+
+    pub(crate) fn id(&self) -> IdRef<'a> {
+        self.id
+    }
+
+    // This id's keycode bytes, if it is a record key that has them.
+    fn bytes(&self) -> Option<&[u8]> {
+        if let Some(bytes) = self.id.stored_bytes() {
+            return Some(bytes);
+        }
+        self.stored
+            .get_or_init(|| match self.id.0 {
+                Id::Owned(DBIdType::Rec(k)) if keycode::stored_len(k.values()).is_some() => {
+                    Some(keycode::stored(k.values().iter().map(ValueItem::as_ref)))
+                }
+                _ => None,
+            })
+            .as_ref()
+            .map(|k| k.bytes())
+    }
+
+    // How `slot`'s id compares with this one (DBIdType's order).
+    pub(crate) fn cmp_slot(&self, slot: IdRef) -> std::cmp::Ordering {
+        match (slot.stored_bytes(), self.bytes()) {
+            (Some(slot), Some(probe)) => slot.cmp(probe),
+            _ => slot.cmp(&self.id),
+        }
+    }
+
+    // Whether `slot`'s id is this one (DBIdType's `==`).
+    pub(crate) fn is_slot(&self, slot: IdRef) -> bool {
+        match (slot.stored_bytes(), self.bytes()) {
+            (Some(slot), Some(probe)) => slot == probe,
+            _ => slot.eq(&self.id),
+        }
     }
 }
 
@@ -751,6 +943,95 @@ mod tests {
                 assert_eq!(wa.eq_owned(b), a == b, "{a:?} == {b:?}");
                 assert_eq!(wa.eq(&wb), a == b, "{a:?} == {b:?}, both read");
                 assert_eq!(IdRef::of(a).eq(&wb), a == b, "{a:?} == read {b:?}");
+            }
+        }
+    }
+
+    // The three forms an id is written in (see DBIdType's Serialize), and
+    // that each reads back: a row id (tag 0); a record key as its keycode
+    // bytes (tag 2); one a string or blob of which holds a 00, as its
+    // values (tag 1) — the form every record key had before tag 2.
+    #[test]
+    fn test_a_record_key_is_written_as_keycode_bytes_unless_it_holds_a_zero() {
+        use crate::valueitem::{IndexKey, ValueItem};
+        let rec = |v: &[ValueItem]| DBIdType::Rec(IndexKey::new_from(v).unwrap());
+        let s = |t: &str| ValueItem::Str((t.to_string(), 8));
+
+        assert_eq!(to_allocvec(&DBIdType::Int(42)).unwrap(), [0, 42]);
+        // [2], 2 bytes long: an integer of one byte (0x19), 7.
+        assert_eq!(to_allocvec(&rec(&[ValueItem::Integer(7)])).unwrap(), [2, 2, 0x19, 7]);
+        // An integer of two bytes, then a string and its end.
+        assert_eq!(
+            to_allocvec(&rec(&[ValueItem::Integer(900), s("ab")])).unwrap(),
+            [2, 7, 0x1A, 3, 132, 0x40, b'a', b'b', 0]
+        );
+        // Holding a 00: its values, as before.
+        let zero = rec(&[s("a\0b")]);
+        assert_eq!(to_allocvec(&zero).unwrap()[0], 1);
+
+        for id in [
+            DBIdType::Int(0),
+            DBIdType::Int(u64::MAX),
+            rec(&[]),
+            rec(&[ValueItem::Integer(-7), s("ab"), ValueItem::Null, ValueItem::Double(-0.0)]),
+            zero,
+        ] {
+            let back: DBIdType = from_bytes(&to_allocvec(&id).unwrap()).unwrap();
+            assert_eq!(back, id);
+        }
+        // A key written before tag 2 existed still reads: Rec([Integer(7)]).
+        assert_eq!(from_bytes::<DBIdType>(&[1, 1, 1, 14]).unwrap(), rec(&[ValueItem::Integer(7)]));
+        // Damaged stored bytes are an error, not a key.
+        assert!(from_bytes::<DBIdType>(&[2, 2, 0x19]).is_err());
+        assert!(from_bytes::<DBIdType>(&[2, 1, 0xFF]).is_err());
+    }
+
+    // encode_into writes what postcard's Serialize of the tuple does, byte
+    // for byte, and size() counts that many: readers (wire.rs), the WAL and
+    // every page budget depend on the two agreeing.
+    #[test]
+    fn test_a_tuple_encodes_as_postcard_would_and_counts_its_size() {
+        use std::sync::Arc;
+
+        use crate::{
+            logger::LsnId,
+            txn::TransactionId,
+            valueitem::{IndexKey, ValueItem},
+        };
+        let rec = |v: &[ValueItem]| DBIdType::Rec(IndexKey::new_from(v).unwrap());
+        let s = |t: &str| ValueItem::Str((t.to_string(), 300));
+        let long = "x".repeat(200);
+        let ids = [
+            DBIdType::Int(0),
+            DBIdType::Int(127),
+            DBIdType::Int(128),
+            DBIdType::Int(u64::MAX),
+            rec(&[]),
+            rec(&[ValueItem::Integer(7)]),
+            rec(&[ValueItem::Integer(i64::MIN), ValueItem::Null, ValueItem::Boolean(true)]),
+            rec(&[ValueItem::Double(-0.0), ValueItem::Datetime(u64::MAX), s("ab")]),
+            // A key past 127 bytes: its length takes two.
+            rec(&[s(&long), ValueItem::Integer(1)]),
+            // Holding a 00: kept as its values.
+            rec(&[s("a\0b"), ValueItem::Integer(1)]),
+            rec(&[ValueItem::Blob((Arc::from(&[1u8, 0, 2][..]), 8))]),
+        ];
+        let big = vec![7u8; 300];
+        for id in &ids {
+            for data in [&b""[..], b"v", &big] {
+                for (txn, pre) in [(None, None), (Some(TransactionId(1)), None), (Some(TransactionId(u64::MAX)), Some(LsnId(1 << 40)))] {
+                    let mut tuple = Tuple::new_with(id.clone(), data, txn, pre);
+                    tuple.flags = 3;
+                    let want = to_allocvec(&tuple).unwrap();
+                    let mut got = vec![];
+                    tuple.encode_into(&mut got).unwrap();
+                    assert_eq!(got, want, "{id:?}");
+                    assert_eq!(tuple.size() as usize, want.len(), "{id:?}");
+                    // And counted afresh, as for a tuple read back.
+                    let back: Tuple = from_bytes(&want).unwrap();
+                    assert_eq!(back.size() as usize, want.len(), "{id:?}");
+                    assert_eq!(to_allocvec(&back).unwrap(), want, "{id:?}");
+                }
             }
         }
     }
