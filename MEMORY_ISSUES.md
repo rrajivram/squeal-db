@@ -19,6 +19,15 @@ Fixed since the audit:
   parse, about 40 MB in the bench, and without bound in a long-running
   process. Fixed in `552168c`.
 
+## The larger problem: allocate less, move fewer bytes
+
+Most of what follows is one habit seen from different sides: bytes are
+turned into owned values at each step, and back. The structural fix is to
+keep bytes as bytes (encode once, compare and sort in place, copy only
+what must be kept, decode only where a value is needed). It starts with
+keys: see [BYTE_KEYS_DESIGN.md](BYTE_KEYS_DESIGN.md), stage 1 of which is
+done.
+
 ## 1. The data is 5.8x larger than SQLite's (measured)
 
 The bench database (1M orders, 100k customers, 3 indexes) takes 332 MB on

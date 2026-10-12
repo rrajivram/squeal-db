@@ -33,6 +33,7 @@ mod constant;
 pub mod db;
 pub mod error;
 pub mod generator;
+pub mod keycode;
 mod maintenance;
 pub mod temppool;
 mod systempages;
