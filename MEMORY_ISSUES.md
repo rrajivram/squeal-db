@@ -154,10 +154,39 @@ or is unambiguous.
   - A non-unique index writes an empty payload.
   - Its readers take the identity from the end of the key.
   - An empty payload is unambiguous, so old entries still read.
-- [ ] **Step 4. Build `CREATE INDEX` sorted, in bulk.** Saves about 10 B an
-  entry.
-  - Leaves fill to about 95% instead of 69%.
-  - Also fixes the 3.7 s an index at 1M rows (SQLite: 0.18 s).
+- [x] **Step 4. Build `CREATE INDEX` sorted, in bulk.** Done 2026-10-11.
+  - squeal-sql sorts each partition's entries (`IndexEntries` into a
+    spilling `SortSource`, within the query memory). The store builds the
+    new tree bottom-up from them (`Db::bulk_load`):
+    - leaves filled until a split would be due;
+    - no WAL or version record per entry;
+    - a checkpoint before the commit, for durability.
+  - `SlottedPage::add` appends without searching when the key sorts last.
+  - Sorting first and then inserting one at a time made indexes smaller
+    but builds slower (3.1–4.5 s). The per-entry insert, not the leaf
+    access, was the cost.
+  - Measured at 1M orders:
+
+    | per index | before | after |
+    |---|---:|---:|
+    | `customer_id` | 66 MB, 2.9–3.1 s | 63 MB, 1.2 s |
+    | `day` | 69 MB, 3.7–4.5 s | 55 MB, 1.2 s |
+
+    The index is smaller by its leaves only: each entry is also on a data
+    page, which filled either way (step 5).
+  - Most of what's left is the sort. SQLite takes 0.18 s.
+  - Checked by a crash-harness thread that bulk-loads tables alongside
+    the workload: a load that returned before the cut is whole after
+    recovery.
+  - The harness caught a race in the first version: the loader allocated
+    pages without the writer permit.
+    - A checkpoint could capture between a page's count and its install,
+      and record a page it never wrote. Reopen then failed reading past
+      the end of the file.
+    - It failed at 1 in 20–150 seeds with a 24-page cache, and never
+      without the bulk thread.
+    - Fixed by holding the permit around each step's writes, as every tree
+      write does. 1,600 seeds clean since.
 - [ ] **Step 5. Keep entries in the leaf** (store B+tree; needs the
   author's go-ahead). Saves about 30 B an index entry.
   - A tree created as index-only keeps each whole entry in its leaf, with

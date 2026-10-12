@@ -90,8 +90,9 @@ Now 849 MiB and 459 MiB.
   orders on the default profile, a secondary-index lookup takes 167 µs
   (34 with 1 GiB), and a whole-table sort spills (1.4 s against
   SQLite's 0.4).
-- [ ] **CREATE INDEX: 3.7 s an index at 1M orders** (SQLite 0.18 s, Turso
-  0.6 s). Still a row at a time; a sorted bulk build.
+- [x] **CREATE INDEX: 3.7 s an index at 1M orders** (SQLite 0.18 s, Turso
+  0.6 s). Now sorted and bulk-loaded (Db::bulk_load): ~1.2 s. Most of what
+  is left is the sort (spilling at the 64 MiB query budget).
 
 ### The store alone (2026-10-10)
 

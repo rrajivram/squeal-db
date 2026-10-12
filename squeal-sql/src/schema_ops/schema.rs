@@ -18,7 +18,9 @@ use crate::{
     error::SchemaError,
     optim::table_stats::{SchemaStats, TableStat},
     partition::{Partition, PartitionBound},
+    plan::memory::QueryMemory,
     rslt::resultset::ResultSet,
+    source::{Source, index_entries::IndexEntries, sort::SortSource},
     table::{Field, SqlForeignKey, SqlIndex, SqlTable},
 };
 
@@ -1150,40 +1152,48 @@ where
                 created.push(q.clone());
             }
             let txn = self.db.begin()?;
+            // Each partition's entries, sorted by their keys, then loaded
+            // into its new tree bottom-up (Db::bulk_load): pages written
+            // full, in order, with no WAL or version record each — where an
+            // insert each would have descended the tree, logged, and left
+            // leaves about two-thirds full. The sort holds what the query
+            // memory allows and spills past it, as a query's would. The
+            // load ends with a checkpoint, so the tree is durable before
+            // the catalog names it; if anything fails, the trees are
+            // dropped below (a rollback has nothing of a bulk load to undo).
+            let limit = usize::try_from(self.db.config().query_memory_bytes).unwrap_or(usize::MAX);
+            let mem = QueryMemory::new(limit);
+            let identity_len = match table.primary_key() {
+                Some(pk) => pk.fields.len(),
+                None => 1,
+            };
+            let key_len = fields.len() + if is_unique { 0 } else { identity_len };
+            let key_positions: Vec<usize> = (0..key_len).collect();
             for (part, tree) in table.partitions.iter().zip(&trees) {
-                let mut cursor = self.db.table_scan_in_txn(part.rows(), &txn)?;
-                while let Some(tuple) = cursor.next_ref()? {
-                    let row = table.decode_row(tuple.data(), None)?;
-                    let identity = match tuple.id().to_owned() {
-                        DBIdType::Rec(ik) => ik,
-                        DBIdType::Int(n) => IndexKey::new_from(&[ValueItem::Integer(n as i64)])?,
-                    };
-                    let mut values = table.extract_field_values(&fields, row.values());
-                    if !is_unique {
-                        values.extend_from_slice(identity.values());
-                    }
-                    let index_key = DBIdType::Rec(IndexKey::new_from(&values)?);
-                    self.db
-                        .insert(
-                            *tree,
-                            Tuple::new_with(
-                                index_key,
-                                &to_allocvec(&identity)?,
-                                Some(txn.id()),
-                                None,
-                            ),
-                            &txn,
-                        )
-                        .map_err(|e| match e {
-                            StoreError::DuplicateKey(_) if is_unique => {
-                                SchemaError::UserError(format!(
-                                    "cannot create unique index {name:?}: table {table_name:?} \
-                                     has duplicate values for column(s) {column_names:?}"
-                                ))
-                            }
-                            other => other.into(),
-                        })?;
-                }
+                let entries = IndexEntries::new(&self.db, table.clone(), part.rows(), &txn, &fields)?;
+                let mut sorted = SortSource::with_fields(
+                    Box::new(entries),
+                    self.db.clone(),
+                    mem.clone(),
+                    &key_positions,
+                )?;
+                self.db
+                    .bulk_load(*tree, &txn, || -> Result<Option<Tuple>, SchemaError> {
+                        let Some(entry) = sorted.next()? else {
+                            return Ok(None);
+                        };
+                        let values = entry.values();
+                        let index_key = DBIdType::Rec(IndexKey::new_from(&values[..key_len])?);
+                        let identity = IndexKey::new_from(&values[fields.len()..])?;
+                        Ok(Some(Tuple::new_with(index_key, &to_allocvec(&identity)?, None, None)))
+                    })
+                    .map_err(|e| match e {
+                        SchemaError::DuplicateKey(_) if is_unique => SchemaError::UserError(format!(
+                            "cannot create unique index {name:?}: table {table_name:?} has \
+                             duplicate values for column(s) {column_names:?}"
+                        )),
+                        other => other,
+                    })?;
             }
             self.db.commit(txn)?;
             Ok(())

@@ -12,6 +12,7 @@ pub(crate) mod group;
 pub(crate) mod hashgroup;
 pub mod hash;
 pub mod index;
+pub(crate) mod index_entries;
 pub(crate) mod join;
 mod joinmatch;
 pub(crate) mod nestloop;

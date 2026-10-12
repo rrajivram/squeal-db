@@ -339,9 +339,11 @@ What the numbers say:
   and re-runs it.
 - **Behind on rows fetched through an index** (the range scan, the
   filtered join): each fetch descends the table's tree from the root.
-- **Well behind on bulk load and index builds.** Both insert a row at a
-  time through the transactional path; index builds have no sorted bulk
-  build yet.
+- **Well behind on bulk load and index builds.** A bulk load inserts a
+  row at a time through the transactional path. An index build sorts its
+  entries and loads the new tree bottom-up (since 2026-10-11: 1.2 s an
+  index at 1M orders, from 2.9-3.7 s; SQLite 0.18 s), and most of what is
+  left is the sort.
 - **On disk:** 66 MB against SQLite's 18 MB, when measured. Rows were
   fixed-width then (they are packed now: see MEMORY_ISSUES.md), pages are
   16 KiB and half full after splits, and the WAL is retained until a
