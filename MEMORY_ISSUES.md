@@ -372,10 +372,14 @@ Per row read or produced:
   - **Still to convert:** merge and nested-loop joins, sort output, set
     operations, `DISTINCT`. The per-statement planning cost (~180
     allocations a point lookup) is separate.
-  - **Noted, not changed:** the hash join builds its larger side on
-    purpose (measured ~3.5× faster on the retail 4-way join, per its
-    comment). That measurement predates lent rows, which made probing
-    cheaper, so it is worth re-measuring.
+  - [ ] **Re-measure which side the hash join builds.** It builds the
+    larger side on purpose (`HashedSource::new`; measured ~3.5× faster on
+    the retail 4-way join, per its comment, unless that side would spill).
+    - That measurement predates lent rows, which made probing much
+      cheaper. Building the larger side keeps every one of its rows in
+      memory, where building the smaller would keep few.
+    - Measure both on the retail 4-way join and the 1M-order bench, then
+      set the rule (and its comment) by the result.
 - [ ] **Owned lookups and scan rows copy the tuple** (`Cursor::next`,
   `Db::find`). The lending paths (`next_ref`, `find_with`) don't.
 - [ ] **Unread columns are not decoded but the row is still full width.**

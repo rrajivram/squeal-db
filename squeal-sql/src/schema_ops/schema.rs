@@ -1395,6 +1395,18 @@ where
         Ok(())
     }
 
+    // See SchemaStats::planning_stats.
+    pub(crate) fn planning_stats(
+        &self,
+        table: &Arc<SqlTable>,
+        build: impl FnOnce(TableStat) -> Result<crate::optim::table_stats::ComputedTableStat, SchemaError>,
+    ) -> Result<Option<crate::optim::table_stats::ComputedTableStat>, SchemaError> {
+        match self.stats.lock().as_ref() {
+            Some(stats) => stats.planning_stats(table, build),
+            None => Ok(None),
+        }
+    }
+
     pub(crate) fn get_table_stats(
         self: Arc<Self>,
         table: TableIdType,

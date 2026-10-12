@@ -566,7 +566,7 @@ pub(crate) fn pick_access(
         ordered: false,
         used: 0,
     });
-    for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
+    for (i, (index, stat)) in table.indices.iter().zip(index_stats.iter()).enumerate() {
         // A PRIMARY KEY is the rows tree's key: TableSeek above.
         if !index.has_tree() {
             continue;
@@ -893,7 +893,7 @@ pub(crate) fn pick_join_seek(
             table_row,
         );
     }
-    for (i, (index, stat)) in table.indices.iter().zip(index_stats).enumerate() {
+    for (i, (index, stat)) in table.indices.iter().zip(index_stats.iter()).enumerate() {
         if !index.has_tree() {
             continue; // the PRIMARY KEY: the table's own tree, above
         }

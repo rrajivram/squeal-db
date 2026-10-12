@@ -63,7 +63,7 @@ fn test_insert_feeds_schema_stats_row_count_and_column_stats() {
     execute(&c, "insert into customers values (3, 25, 'nyc')").unwrap();
 
     let stat = wait_for_row_count(&schema, table.id, 3);
-    assert_eq!(stat.name, "customers");
+    assert_eq!(&*stat.name, "customers");
 
     // `id` is the sole PRIMARY KEY column: known unique, so no bloom
     // filter, but its min/max are tracked (a range seek on it needs them)

@@ -49,6 +49,12 @@ pub(crate) struct TableStatStored {
     // change and shared until the next: planning asks for them on every
     // statement, and building them is a map and a string per column.
     snapshot: parking_lot::Mutex<Option<Arc<HashMap<usize, ColumnStat>>>>,
+    // What planning reads of this table (see compute_table_stats), built at
+    // the first read after a change and shared until the next, with the
+    // table definition it was built for: it holds the shapes of the
+    // table's trees, a walk from root to leaf of each, which every
+    // statement used to repeat. Dropped wherever `snapshot` is.
+    planning: parking_lot::Mutex<Option<(Arc<SqlTable>, ComputedTableStat)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,7 +75,8 @@ pub(crate) struct ColumnStatStored {
 #[derive(Debug, Clone)]
 pub struct ComputedTableStat {
     pub table_stat: TableStat,
-    pub indices: Option<Vec<IndexStat>>,
+    // Shared: a plan copies its statistics freely.
+    pub indices: Option<Arc<[IndexStat]>>,
     pub self_index: Option<IndexStat>,
     pub row_size: usize,
 }
@@ -86,10 +93,10 @@ pub struct IndexStat {
 #[allow(unused)]
 pub struct TableStat {
     pub(crate) id: TableIdType,
-    pub(crate) name: String,
+    pub(crate) name: Arc<str>,
     pub(crate) row_count: usize,
-    // See TableStatStored::partition_rows.
-    pub(crate) partition_rows: HashMap<u32, usize>,
+    // See TableStatStored::partition_rows. Shared, as col_stats is.
+    pub(crate) partition_rows: Arc<HashMap<u32, usize>>,
     // Keyed by field index (matching SqlTable::fields()'s own order) —
     // pub(crate), not private, so a caller outside this module (e.g.
     // Schema, for the `!show table stats` CLI command) can render it
@@ -304,6 +311,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             .collect();
         *stored.col_stats.write() = reshaped;
         *stored.snapshot.lock() = None;
+        *stored.planning.lock() = None;
         stored.name = table.name.clone();
         Ok(())
     }
@@ -351,6 +359,7 @@ impl<F: DBFile + 'static> SchemaStats<F> {
             row_count: 0,
             col_stats: RwLock::new(col_stats),
             snapshot: Default::default(),
+            planning: Default::default(),
             partition_rows: HashMap::new(),
         };
         Ok(tstat)
@@ -439,6 +448,29 @@ impl<F: DBFile + 'static> SchemaStats<F> {
         self.tables.write().remove(&table);
     }
 
+    // compute_table_stats's statistics of `table`: the ones built for its
+    // current statistics and definition, or `build` of its statistics,
+    // kept for next time. None if it has no statistics.
+    pub(crate) fn planning_stats(
+        &self,
+        table: &Arc<SqlTable>,
+        build: impl FnOnce(TableStat) -> Result<ComputedTableStat, SchemaError>,
+    ) -> Result<Option<ComputedTableStat>, SchemaError> {
+        let multiplier = 1.min((1.0 / self.sampling_rate) as usize);
+        let tables = self.tables.read();
+        let Some(stored) = tables.get(&table.id) else {
+            return Ok(None);
+        };
+        if let Some((built_for, stat)) = &*stored.planning.lock()
+            && Arc::ptr_eq(built_for, table)
+        {
+            return Ok(Some(stat.clone()));
+        }
+        let stat = build(stored.with_multiplier(multiplier))?;
+        *stored.planning.lock() = Some((table.clone(), stat.clone()));
+        Ok(Some(stat))
+    }
+
     pub(crate) fn get_table_stats(&self, table: TableIdType) -> Option<TableStat> {
         let multiplier = 1.min((1.0 / self.sampling_rate) as usize);
         self.tables
@@ -491,6 +523,7 @@ fn update_table_stats(
     table.row_count += 1;
     *table.partition_rows.entry(partition).or_default() += 1;
     *table.snapshot.get_mut() = None;
+    *table.planning.get_mut() = None;
     for (i, f) in table.col_stats.write().iter_mut() {
         // A row logged in a table's layout before an ALTER TABLE, applied
         // after it (see SchemaStats::reshape_table), can be short a column.
@@ -570,13 +603,14 @@ impl TableStatStored {
     fn with_multiplier(&self, mul: usize) -> TableStat {
         TableStat {
             id: self.id,
-            name: self.name.clone(),
+            name: Arc::from(self.name.as_str()),
             row_count: self.row_count * mul,
-            partition_rows: self
-                .partition_rows
-                .iter()
-                .map(|(p, n)| (*p, n * mul))
-                .collect(),
+            partition_rows: Arc::new(
+                self.partition_rows
+                    .iter()
+                    .map(|(p, n)| (*p, n * mul))
+                    .collect(),
+            ),
             col_stats: {
                 let mut snapshot = self.snapshot.lock();
                 match &*snapshot {
@@ -714,6 +748,7 @@ impl TableStatStored {
             row_count: p.row_count,
             col_stats: RwLock::new(col_stats),
             snapshot: Default::default(),
+            planning: Default::default(),
             partition_rows,
         })
     }
@@ -781,56 +816,64 @@ pub(crate) fn compute_table_stats<F: DBFile + 'static>(
     schema: &str,
     table: &Arc<SqlTable>,
 ) -> Result<Option<ComputedTableStat>, SchemaError> {
-    if let Some(table_stat) = conn.schema(schema)?.get_table_stats(table.id)? {
-        // The shape of each tree (depth, entries per page): a partitioned
-        // table has one per partition, and a seek's cost is set by the
-        // deepest it may have to descend.
-        let db = conn.database.read().db.clone();
-        let deepest = |tree: &dyn Fn(&crate::partition::Partition) -> TableIdType| {
-            let mut best: Option<(usize, usize, usize)> = None;
-            for p in &table.partitions {
-                let params = db.btree_range_params(tree(p))?;
-                if best.is_none_or(|b| params.0 > b.0) {
-                    best = Some(params);
-                }
-            }
-            Ok::<_, SchemaError>(best.expect("a table has at least one partition"))
-        };
-        let (levels, nodes_per_page, _) = deepest(&|p| p.rows())?;
-        let mut indices = vec![];
-        for (i, index) in table.indices.iter().enumerate() {
-            let unique = index.is_primary || index.is_unique;
-            // A PRIMARY KEY has no tree of its own: it is the rows tree's
-            // key, and its entry is as wide as the key.
-            let (levels, nodes_per_page, record_size) = if index.has_tree() {
-                deepest(&|p| p.index(i))?
-            } else {
-                (levels, nodes_per_page, index.size(table.identity_size()))
-            };
-            indices.push(IndexStat {
-                levels,
-                nodes_per_page,
-                unique,
-                row_size: record_size,
-            })
-        }
-        let row_size = table.fields().iter().map(|f| f.datatype.size()).sum();
-        return Ok(Some(ComputedTableStat {
-            table_stat,
-            indices: Some(indices),
-            self_index: Some(IndexStat {
-                levels,
-                nodes_per_page,
-                unique: true,
-                // The schema's row width, not the tree's entry budget (now
-                // the key's — see SqlTable::row_entry_size).
-                row_size: table.costed_row_size(),
-            }),
-            row_size,
-        }));
-    }
+    // Built once per change of the statistics or the table, then shared
+    // (see TableStatStored::planning).
+    conn.schema(schema)?
+        .planning_stats(table, |table_stat| build_table_stats(conn, table, table_stat))
+}
 
-    Ok(None)
+// What planning reads of `table`: its statistics, and the shape (depth,
+// entries per page) of each of its trees.
+fn build_table_stats<F: DBFile + 'static>(
+    conn: &Arc<Connection<F>>,
+    table: &Arc<SqlTable>,
+    table_stat: TableStat,
+) -> Result<ComputedTableStat, SchemaError> {
+    // A partitioned table has a tree per partition, and a seek's cost is
+    // set by the deepest it may have to descend.
+    let db = conn.database.read().db.clone();
+    let deepest = |tree: &dyn Fn(&crate::partition::Partition) -> TableIdType| {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for p in &table.partitions {
+            let params = db.btree_range_params(tree(p))?;
+            if best.is_none_or(|b| params.0 > b.0) {
+                best = Some(params);
+            }
+        }
+        Ok::<_, SchemaError>(best.expect("a table has at least one partition"))
+    };
+    let (levels, nodes_per_page, _) = deepest(&|p| p.rows())?;
+    let mut indices = vec![];
+    for (i, index) in table.indices.iter().enumerate() {
+        let unique = index.is_primary || index.is_unique;
+        // A PRIMARY KEY has no tree of its own: it is the rows tree's
+        // key, and its entry is as wide as the key.
+        let (levels, nodes_per_page, record_size) = if index.has_tree() {
+            deepest(&|p| p.index(i))?
+        } else {
+            (levels, nodes_per_page, index.size(table.identity_size()))
+        };
+        indices.push(IndexStat {
+            levels,
+            nodes_per_page,
+            unique,
+            row_size: record_size,
+        })
+    }
+    let row_size = table.fields().iter().map(|f| f.datatype.size()).sum();
+    Ok(ComputedTableStat {
+        table_stat,
+        indices: Some(indices.into()),
+        self_index: Some(IndexStat {
+            levels,
+            nodes_per_page,
+            unique: true,
+            // The schema's row width, not the tree's entry budget (now
+            // the key's — see SqlTable::row_entry_size).
+            row_size: table.costed_row_size(),
+        }),
+        row_size,
+    })
 }
 
 #[cfg(test)]
@@ -906,6 +949,7 @@ mod tests {
             row_count: 12345,
             col_stats: RwLock::new(col_stats),
             snapshot: Default::default(),
+            planning: Default::default(),
             partition_rows: HashMap::from([(0, 12000), (3, 345)]),
         };
 
