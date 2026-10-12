@@ -7,13 +7,15 @@ use store::valueitem::ValueItem;
 use crate::{
     error::SchemaError,
     plan::eval::EvalExpr,
-    source::{ProjectableField, QueryStats, Source, merge_stats},
+    source::{ProjectableField, QueryStats, Rows, Source, merge_stats},
 };
 
 #[derive(Debug)]
 pub(crate) struct WhereSource {
     timer: crate::source::timing::RowTimer,
-    source: Box<dyn Source>,
+    // Read a row at a time, lent where the input lends: a row the filter
+    // drops is never built, and one it passes is its input's own.
+    source: Rows,
     expr: EvalExpr,
     time_spent: u128,
 }
@@ -22,7 +24,7 @@ impl WhereSource {
     pub(crate) fn new(source: Box<dyn Source>, expr: EvalExpr) -> Result<Self, SchemaError> {
         Ok(Self {
             timer: Default::default(),
-            source,
+            source: Rows::new(source),
             expr,
             time_spent: 0,
         })
@@ -31,10 +33,10 @@ impl WhereSource {
 
 impl Source for WhereSource {
     fn plan(&self) -> PlanNode {
-        let names = column_names(&self.source.fields());
+        let names = column_names(&self.source.source().fields());
         PlanNode::new("Filter")
             .detail(self.expr.describe(&names))
-            .child(self.source.plan())
+            .child(self.source.source().plan())
     }
 
     fn fields(&self) -> std::sync::Arc<[ProjectableField]> {
@@ -42,32 +44,37 @@ impl Source for WhereSource {
         // layout IS its input's (it used to report one made-up boolean
         // "where" column, which nothing could resolve a real column
         // position against).
-        self.source.fields()
+        self.source.source().fields()
     }
 
     // A filter doesn't change which row is "current" — see Source::
     // last_id's own doc comment for why this exists at all.
     fn last_id(&self) -> Option<store::tuple::DBIdType> {
-        self.source.last_id()
+        self.source.source().last_id()
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, crate::error::SchemaError> {
+        Ok(match self.advance()? {
+            true => Some(self.source.take()?),
+            false => None,
+        })
+    }
+
+    fn lends(&self) -> bool {
+        true
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
         let start = self.timer.start();
-        while let Some(res) = self.source.next()? {
-            let mut slice = vec![res];
-            let should_output = self.expr.eval(&slice, 0)?;
-            match should_output {
-                ValueItem::Boolean(b) => {
-                    if b {
-                        crate::source::timing::add(&mut self.time_spent, start);
-                        return Ok(Some(slice.remove(0)));
-                    } else {
-                        continue;
-                    }
+        while self.source.advance()? {
+            match *self.expr.eval(self.source.row(), 0)? {
+                ValueItem::Boolean(true) => {
+                    crate::source::timing::add(&mut self.time_spent, start);
+                    return Ok(true);
                 }
                 // A NULL predicate (`k = 5` where k is NULL) is "not true":
                 // the row is filtered out, it is not an error.
-                ValueItem::Null => continue,
+                ValueItem::Boolean(false) | ValueItem::Null => continue,
                 _ => {
                     return Err(SchemaError::InternalSchemaError(
                         "Output of where is not boolean.".into(),
@@ -76,7 +83,11 @@ impl Source for WhereSource {
             }
         }
         crate::source::timing::add(&mut self.time_spent, start);
-        Ok(None)
+        Ok(false)
+    }
+
+    fn row(&self) -> &[ValueItem] {
+        self.source.row()
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
@@ -86,7 +97,7 @@ impl Source for WhereSource {
 
     // A filter keeps its input's row layout: the hint applies as it is.
     fn keep_matching(&mut self, column: usize, values: &[ValueItem]) {
-        self.source.keep_matching(column, values)
+        self.source.source_mut().keep_matching(column, values)
     }
 
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
@@ -97,7 +108,7 @@ impl Source for WhereSource {
                 level: 0,
             },
         )];
-        Some(merge_stats(this_stats, self.source.query_stats()))
+        Some(merge_stats(this_stats, self.source.source().query_stats()))
     }
 }
 

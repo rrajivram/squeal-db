@@ -319,14 +319,41 @@ Per insert:
   column (`build_insert_rows` in `squeal-sql/src/table.rs`).
 
 Per row read or produced:
-- [ ] **`eval` always returns a clone** (`squeal-sql/src/plan/eval.rs`).
-  `WHERE name = 'x'` allocates two Strings per row just to compare them.
-  `MAX`/`MIN` clone the current best on every row.
+- [x] **`eval` always returns a clone** (`squeal-sql/src/plan/eval.rs`).
+  `WHERE name = 'x'` allocated two Strings per row just to compare them;
+  `MAX`/`MIN` cloned the current best on every row. Fixed 2026-10-12:
+  `eval` lends a column, a literal or an aggregate's running value
+  (`Cow`), and owns only what it computes.
 - [ ] **Each operator builds a fresh row.** Projection, `UnionJoin`,
   `JoinMatcher` and nested-loop join each build a `Vec`, then
   `IndexKey::new_from_owned` copies it into an `Arc`: two allocations per
   row per operator, plus a String per text column. `WhereSource` does
   `vec![res]` per input row, rejected rows included.
+  - **Done 2026-10-12 for scan, filter, projection, aggregate and both
+    GROUP BYs.** A source may lend its rows (`Source::lends`, `advance`,
+    `row`) instead of handing them out owned. A table scan decodes into
+    one reused row buffer; a string column keeps its allocation from row
+    to row (`ValueRef::store_in`). Operators read through `Rows`, which
+    lends from either kind, and copy a row only to keep it.
+  - Allocations per row, 500k orders:
+
+    | | before | after |
+    |---|---:|---:|
+    | `count(*)`, `sum(price)` | 2 | 0 |
+    | `WHERE` pushdown, int or string | 0.3–0.6 | 0 |
+    | `GROUP BY item` | 6 | 0 |
+    | `select *` (streamed to the caller) | 7 | 2 |
+    | `select item, qty where qty > 5` | 3.5 | 1 |
+    | `ORDER BY price` | 4 | 1 |
+    | join + `GROUP BY`, per order row | 9.8 | 5.7 |
+
+  - At 1M orders: full-scan `GROUP BY` −28%, `IN (subquery)` −17%, the
+    totals check −21%, join + `GROUP BY` −7%. The live heap is unchanged.
+  - Guarded by `squeal-sql/tests/row_allocations.rs`.
+  - **Still to convert:** the joins (hash, merge, nested-loop), sort, set
+    operations, `LIMIT`, `DISTINCT`, and index scans. These still pass
+    owned rows; the per-statement planning cost (~180 allocations a
+    point lookup) is separate.
 - [ ] **Owned lookups and scan rows copy the tuple** (`Cursor::next`,
   `Db::find`). The lending paths (`next_ref`, `find_with`) don't.
 - [ ] **Unread columns are not decoded but the row is still full width.**

@@ -68,8 +68,37 @@ impl QueryStats {
     }
 }
 
+// A source hands out its rows one of two ways.
+//
+// `next` gives each row away, owned: an allocation for the row and one for
+// every string in it. That is what an operator that keeps rows wants (a
+// sort, a hash table, a result handed to the caller), and all there was —
+// so a filter, a projection and an aggregate each built and dropped a row
+// per input row, to read a column or two of it.
+//
+// A source that `lends` instead keeps one row's worth of values and
+// refills them: `advance` moves to the next row, and `row` is that row's
+// values until the next `advance` (or `reset`). Reading it costs nothing;
+// keeping it means copying it (`Rows::take`). An operator reads its input
+// through `Rows`, which lends from either kind.
 pub trait Source: Debug + Send {
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError>;
+    // Whether this source lends its rows: `advance` and `row` then work.
+    fn lends(&self) -> bool {
+        false
+    }
+    // Moves to the next row; false when there is none. Only for a source
+    // that `lends`.
+    fn advance(&mut self) -> Result<bool, SchemaError> {
+        Err(SchemaError::InternalSchemaError(format!(
+            "{self:?} does not lend its rows"
+        )))
+    }
+    // The row `advance` moved to: its values, until the next `advance` or
+    // `reset`.
+    fn row(&self) -> &[store::valueitem::ValueItem] {
+        &[]
+    }
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
     // The most recently yielded row's REAL physical key (Tuple::id — the
@@ -111,6 +140,78 @@ pub trait Source: Debug + Send {
     // real operator overrides it.
     fn plan(&self) -> planinfo::PlanNode {
         planinfo::PlanNode::new(format!("{self:?}"))
+    }
+}
+
+/// Puts an expression's value (see EvalExpr::eval) in `slot`, one of a
+/// row buffer's: a computed value is moved in, and a lent one copied — a
+/// string into the buffer of the string that was there, if one was.
+pub(crate) fn keep(value: std::borrow::Cow<'_, store::valueitem::ValueItem>, slot: &mut store::valueitem::ValueItem) {
+    match value {
+        std::borrow::Cow::Owned(value) => *slot = value,
+        std::borrow::Cow::Borrowed(value) => value.as_ref().store_in(slot),
+    }
+}
+
+/// A source, read a row at a time without owning the rows: lent by one
+/// that lends (see Source), held here for one that doesn't.
+#[derive(Debug)]
+pub(crate) struct Rows {
+    source: Box<dyn Source>,
+    lends: bool,
+    // The current row of a source that doesn't lend.
+    held: Option<IndexKey>,
+}
+
+impl Rows {
+    pub(crate) fn new(source: Box<dyn Source>) -> Self {
+        Self {
+            lends: source.lends(),
+            source,
+            held: None,
+        }
+    }
+
+    pub(crate) fn source(&self) -> &dyn Source {
+        self.source.as_ref()
+    }
+
+    pub(crate) fn source_mut(&mut self) -> &mut Box<dyn Source> {
+        &mut self.source
+    }
+
+    pub(crate) fn into_source(self) -> Box<dyn Source> {
+        self.source
+    }
+
+    /// Moves to the next row; false when there is none.
+    pub(crate) fn advance(&mut self) -> Result<bool, SchemaError> {
+        if self.lends {
+            return self.source.advance();
+        }
+        self.held = self.source.next()?;
+        Ok(self.held.is_some())
+    }
+
+    /// The current row's values, until the next `advance` or `reset`.
+    pub(crate) fn row(&self) -> &[store::valueitem::ValueItem] {
+        if self.lends {
+            return self.source.row();
+        }
+        self.held.as_ref().map_or(&[], |row| row.values())
+    }
+
+    /// The current row, to keep: the one held, or a copy of the one lent.
+    pub(crate) fn take(&mut self) -> Result<IndexKey, SchemaError> {
+        match self.held.take() {
+            Some(row) => Ok(row),
+            None => Ok(IndexKey::new_from(self.source.row())?),
+        }
+    }
+
+    pub(crate) fn reset(&mut self) -> Result<(), SchemaError> {
+        self.held = None;
+        self.source.reset()
     }
 }
 

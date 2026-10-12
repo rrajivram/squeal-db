@@ -22,4 +22,7 @@ crossbeam-skiplist = "0.1.3"
 rand = {version="0.10.2",features=["thread_rng"]}
 
 [dev-dependencies]
+# The store's counting allocator, for tests/row_allocations.rs (a process
+# has one global allocator; squeal-cli turns this on in workspace builds).
+store = { path = "../store", features = ["alloc-tracking"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }

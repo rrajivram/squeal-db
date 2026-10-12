@@ -47,6 +47,8 @@ pub struct TableSource<F: DBFile> {
     // Comparisons from WHERE a row is checked against before it is built
     // (see filtering): one that fails is passed over here.
     tests: Vec<ColumnTest>,
+    // The current row, lent (see Source::row): refilled by each advance.
+    row: Vec<store::valueitem::ValueItem>,
 }
 
 enum RowCursor<F: DBFile + 'static> {
@@ -205,6 +207,7 @@ where
             wanted: None,
             keep_ids: true,
             tests: vec![],
+            row: Vec::new(),
             next_time: 0,
             stats,
             last_id: None,
@@ -255,24 +258,41 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        Ok(match self.advance()? {
+            true => Some(IndexKey::new_from(&self.row)?),
+            false => None,
+        })
+    }
+
+    fn lends(&self) -> bool {
+        true
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
         let start = self.timer.start();
         // Loops past the rows `tests` rule out (see filtering).
         while let Some(tuple) = self.cursor.next_ref()? {
-            let Some(out) =
-                self.table
-                    .decode_row_if(tuple.data(), self.wanted.as_deref(), &self.tests)?
-            else {
+            if !self.table.decode_row_into(
+                tuple.data(),
+                self.wanted.as_deref(),
+                &self.tests,
+                &mut self.row,
+            )? {
                 continue;
-            };
+            }
             if self.keep_ids {
                 self.last_id = Some(tuple.id().to_owned());
             }
             crate::source::timing::add(&mut self.next_time, start);
-            return Ok(Some(out));
+            return Ok(true);
         }
         self.last_id = None;
         crate::source::timing::add(&mut self.next_time, start);
-        Ok(None)
+        Ok(false)
+    }
+
+    fn row(&self) -> &[store::valueitem::ValueItem] {
+        &self.row
     }
 
     fn last_id(&self) -> Option<store::tuple::DBIdType> {

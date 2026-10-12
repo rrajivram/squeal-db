@@ -80,7 +80,7 @@ impl JoinMatcher {
         } else {
             self.combine(left, right)?
         };
-        match residual.borrow_mut().eval(&[row], 0)? {
+        match *residual.borrow_mut().eval(row.values(), 0)? {
             ValueItem::Boolean(b) => Ok(b),
             ValueItem::Null => Ok(false),
             _ => Err(SchemaError::InternalSchemaError(

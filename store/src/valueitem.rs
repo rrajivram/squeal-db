@@ -41,6 +41,19 @@ pub enum ValueRef<'a> {
 }
 
 impl ValueRef<'_> {
+    /// Puts this value in `slot`. A string going where a string was keeps
+    /// that one's buffer: a slot filled row after row stops allocating.
+    pub fn store_in(&self, slot: &mut ValueItem) {
+        match (slot, *self) {
+            (ValueItem::Str((buffer, capacity)), ValueRef::Str(s, c)) => {
+                buffer.clear();
+                buffer.push_str(s);
+                *capacity = c;
+            }
+            (slot, value) => *slot = value.to_owned(),
+        }
+    }
+
     /// Appends this value as `decode` reads it: a tag, then a number's
     /// eight little-endian bytes, a boolean's one, or a string's or blob's
     /// capacity, length and content, zero-padded out to the capacity.
@@ -386,6 +399,19 @@ impl IndexKey {
         }
         Ok(Self {
             data: Arc::from(data),
+        })
+    }
+
+    /// The values `buffer` holds, moved out of it into a row in one
+    /// allocation (where new_from_owned's Vec is a second): `buffer` is
+    /// left empty with its capacity, to be filled with the next row's.
+    pub fn new_from_buffer(buffer: &mut Vec<ValueItem>) -> Result<Self, StoreError> {
+        for d in buffer.iter() {
+            d.validate()?;
+        }
+        // Drain's length is exact, which is what lets Arc size itself once.
+        Ok(Self {
+            data: Arc::from_iter(buffer.drain(..)),
         })
     }
 

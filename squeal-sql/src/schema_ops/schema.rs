@@ -794,9 +794,9 @@ where
         for (old_key, current) in matches {
             let mut new_row = current.values().to_vec();
             for (pos, expr) in &mut assignments {
-                let raw = expr.eval(std::slice::from_ref(&current), 0)?;
+                let raw = expr.eval(current.values(), 0)?;
                 let field = &fields[*pos];
-                let item = crate::table::coerce_selected_value(raw, field.datatype)?;
+                let item = crate::table::coerce_selected_value(raw.into_owned(), field.datatype)?;
                 if item == ValueItem::Null && !field.nullable {
                     return Err(SchemaError::UserError(format!(
                         "Column {:?} cannot be null",

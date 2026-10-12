@@ -22,7 +22,7 @@ use crate::{
     error::SchemaError,
     plan::{eval::EvalExpr, funcs::FuncTrait, memory::QueryMemory},
     source::{
-        ProjectableField, QueryStats, Source, column_names,
+        ProjectableField, QueryStats, Rows, Source, column_names,
         group::GroupSource,
         merge_stats, output_label,
         planinfo::PlanNode,
@@ -57,8 +57,10 @@ enum State {
 }
 
 pub(crate) struct HashGroupSource<F: DBFile + 'static> {
-    // Taken by the sort-based plan if it falls back.
-    source: Option<Box<dyn Source>>,
+    // Taken by the sort-based plan if it falls back. Read a row at a
+    // time, lent where the input lends: a row is fed to its group's
+    // aggregates, not kept.
+    source: Option<Rows>,
     fields: Vec<ProjectableField>,
     key_positions: Vec<usize>,
     having: Option<EvalExpr>,
@@ -93,7 +95,7 @@ where
         mem: Arc<QueryMemory>,
     ) -> Self {
         Self {
-            source: Some(source),
+            source: Some(Rows::new(source)),
             fields,
             key_positions,
             having,
@@ -119,9 +121,9 @@ where
         Ok(())
     }
 
-    fn is_true(v: ValueItem) -> Result<bool, SchemaError> {
+    fn is_true(v: &ValueItem) -> Result<bool, SchemaError> {
         match v {
-            ValueItem::Boolean(b) => Ok(b),
+            ValueItem::Boolean(b) => Ok(*b),
             ValueItem::Null => Ok(false),
             _ => Err(SchemaError::InternalSchemaError(
                 "Output of having is not boolean.".into(),
@@ -133,9 +135,15 @@ where
     fn hash(&mut self) -> Result<Option<Vec<IndexKey>>, SchemaError> {
         let source = self.source.as_mut().expect("the input, until a fallback takes it");
         let mut groups: HashMap<Vec<ValueItem>, Group> = HashMap::new();
-        while let Some(row) = source.next()? {
-            let key: Vec<ValueItem> = self.key_positions.iter().map(|&i| row[i].clone()).collect();
-            let group = match groups.get_mut(&key) {
+        // The current row's key: refilled row after row, and copied only
+        // for a group seen for the first time.
+        let mut key: Vec<ValueItem> = vec![ValueItem::Null; self.key_positions.len()];
+        while source.advance()? {
+            let row = source.row();
+            for (&i, slot) in self.key_positions.iter().zip(key.iter_mut()) {
+                row[i].as_ref().store_in(slot);
+            }
+            let group = match groups.get_mut(key.as_slice()) {
                 Some(g) => g,
                 None => {
                     let bytes = GROUP_BYTES
@@ -157,18 +165,18 @@ where
                         keep: true,
                         _reserved: reserved,
                     };
-                    groups.entry(key).or_insert(group)
+                    groups.entry(key.clone()).or_insert(group)
                 }
             };
             // Feed the row to the group's own accumulators: its SELECT list
             // (only the last row's values are the group's output) and HAVING.
-            let data = [row];
-            group.values.clear();
-            for (i, f) in group.fields.iter_mut().enumerate() {
-                group.values.push(f.expr.eval(&data, i)?);
+            let data = row;
+            group.values.resize(group.fields.len(), ValueItem::Null);
+            for ((i, f), slot) in group.fields.iter_mut().enumerate().zip(group.values.iter_mut()) {
+                crate::source::keep(f.expr.eval(data, i)?, slot);
             }
             group.keep = match &mut group.having {
-                Some(having) => Self::is_true(having.eval(&data, 0)?)?,
+                Some(having) => Self::is_true(having.eval(data, 0)?.as_ref())?,
                 None => true,
             };
         }
@@ -192,7 +200,7 @@ where
     // Rewinds the input and groups it the sort-based way.
     fn fall_back(&mut self) -> Result<GroupSource, SchemaError> {
         self.fell_back = true;
-        let mut source = self.source.take().expect("the input");
+        let mut source = self.source.take().expect("the input").into_source();
         source.reset()?;
         let sorted = SortSource::with_fields(
             source,
@@ -217,7 +225,7 @@ where
         if let State::Sorted(g) = &self.state {
             return g.plan();
         }
-        let input = self.source.as_ref().map(|s| s.fields()).unwrap_or_default();
+        let input = self.source.as_ref().map(|s| s.source().fields()).unwrap_or_default();
         let names = column_names(&input);
         let outputs = self
             .fields
@@ -237,7 +245,7 @@ where
             .join(", ");
         let node = PlanNode::new("HashAggregate").detail(format!("by {keys}: {outputs}"));
         match &self.source {
-            Some(s) => node.child(s.plan()),
+            Some(s) => node.child(s.source().plan()),
             None => node,
         }
     }
@@ -286,7 +294,7 @@ where
         };
         Some(merge_stats(
             vec![("HashAggregate".into(), stats)],
-            self.source.as_ref().and_then(|s| s.query_stats()),
+            self.source.as_ref().and_then(|s| s.source().query_stats()),
         ))
     }
 }

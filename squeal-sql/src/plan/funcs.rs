@@ -3,7 +3,7 @@ use std::{collections::HashSet, fmt::Debug};
 use sql_parser::{Expr, Ident, expr::FunctionArg};
 use store::{
     db::DBFile,
-    valueitem::{IndexKey, ValueItem},
+    valueitem::ValueItem,
 };
 
 use crate::{
@@ -14,7 +14,16 @@ use crate::{
 #[allow(unused)]
 pub(crate) trait FuncTrait: Debug {
     fn name(&self) -> String;
-    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError>;
+    fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError>;
+    // `eval`, its value lent where the function has it already (an
+    // aggregate's running value, which each row is otherwise given a copy
+    // of though only the group's last is used).
+    fn eval_lent<'a>(
+        &'a mut self,
+        args: &'a [ValueItem],
+    ) -> Result<std::borrow::Cow<'a, ValueItem>, SchemaError> {
+        Ok(std::borrow::Cow::Owned(self.eval(args)?))
+    }
     fn is_aggregate(&self) -> bool;
     fn reset(&mut self) -> Result<(), SchemaError>;
     /// This call's own argument list, exactly as given — `Wildcard` for
@@ -95,8 +104,14 @@ macro_rules! func_obj {
             fn name(&self) -> String {
                 match self { $(FuncObj::$variant(f) => f.name(),)+ }
             }
-            fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+            fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
                 match self { $(FuncObj::$variant(f) => f.eval(args),)+ }
+            }
+            fn eval_lent<'a>(
+                &'a mut self,
+                args: &'a [ValueItem],
+            ) -> Result<std::borrow::Cow<'a, ValueItem>, SchemaError> {
+                match self { $(FuncObj::$variant(f) => f.eval_lent(args),)+ }
             }
             fn is_aggregate(&self) -> bool {
                 match self { $(FuncObj::$variant(f) => f.is_aggregate(),)+ }
@@ -160,11 +175,11 @@ macro_rules! scalar_fn {
                 $sql_name.into()
             }
 
-            fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+            fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
                 let FuncArgs::Field(exp) = &mut self.args else {
                     unreachable!(concat!($sql_name, "(*) is rejected in new()"))
                 };
-                let $val = exp.eval(args, 0)?;
+                let $val = exp.eval(args, 0)?.into_owned();
                 $body
             }
 
@@ -203,14 +218,12 @@ macro_rules! scalar_fn {
 // A complete one-argument aggregate that just keeps the best-so-far value
 // under some ordering, ignoring NULLs (same convention Avg already uses)
 // and reporting NULL if every input was NULL or there were no rows.
-// `$pick` decides which of two non-NULL values to keep — `ValueItem::min`/
-// `ValueItem::max` (the std Ord ones: an owned receiver resolves there,
-// not to IndexKey/ValueItem's own differently-named lower_bound/
-// upper_bound — see valueitem.rs's own doc comment on that rename).
+// `$better` says whether a non-NULL value beats the best so far (by
+// ValueItem's own order).
 //
-// Usage: extremum_fn!(Max, "max", ValueItem::max);
+// Usage: extremum_fn!(Max, "max", |v, best| v > best);
 macro_rules! extremum_fn {
-    ($name:ident, $sql_name:literal, $pick:expr) => {
+    ($name:ident, $sql_name:literal, $better:expr) => {
         #[derive(Debug, Clone)]
         pub(crate) struct $name {
             args: FuncArgs,
@@ -246,18 +259,31 @@ macro_rules! extremum_fn {
                 $sql_name.into()
             }
 
-            fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+            fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
+                Ok(self.eval_lent(args)?.into_owned())
+            }
+
+            // A value is copied only when it becomes the best so far (a
+            // string into the buffer of the one it replaces), and the best
+            // is lent, not copied out for each row.
+            fn eval_lent<'a>(
+                &'a mut self,
+                args: &'a [ValueItem],
+            ) -> Result<std::borrow::Cow<'a, ValueItem>, SchemaError> {
                 let FuncArgs::Field(exp) = &mut self.args else {
                     unreachable!(concat!($sql_name, "(*) is rejected in new()"))
                 };
                 let v = exp.eval(args, 0)?;
-                if !matches!(v, ValueItem::Null) {
-                    self.best = Some(match self.best.take() {
-                        Some(cur) => $pick(cur, v),
-                        None => v,
-                    });
+                let better: fn(&ValueItem, &ValueItem) -> bool = $better;
+                if !matches!(*v, ValueItem::Null)
+                    && self.best.as_ref().is_none_or(|cur| better(&v, cur))
+                {
+                    crate::source::keep(v, self.best.get_or_insert(ValueItem::Null));
                 }
-                Ok(self.current())
+                Ok(match &self.best {
+                    Some(best) => std::borrow::Cow::Borrowed(best),
+                    None => std::borrow::Cow::Owned(ValueItem::Null),
+                })
             }
 
             fn is_aggregate(&self) -> bool {
@@ -447,11 +473,11 @@ impl Count {
 }
 
 impl FuncTrait for Count {
-    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
         // COUNT(*) counts rows; COUNT(x) and COUNT(DISTINCT x) the rows
         // where x is not NULL.
         let item = match &mut self.args {
-            FuncArgs::Field(exp) => exp.eval(args, 0)?,
+            FuncArgs::Field(exp) => exp.eval(args, 0)?.into_owned(),
             FuncArgs::Wildcard => ValueItem::Integer(1),
         };
         if item != ValueItem::Null {
@@ -552,11 +578,11 @@ impl FuncTrait for Avg {
         self.name.clone()
     }
 
-    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
         let FuncArgs::Field(exp) = &mut self.args else {
             unreachable!("avg(*) is rejected in Avg::new")
         };
-        match exp.eval(args, 0)? {
+        match exp.eval(args, 0)?.into_owned() {
             ValueItem::Integer(i) => {
                 self.sum += i as f64;
                 self.count += 1;
@@ -645,8 +671,8 @@ scalar_fn!(Lower, "lower", |v: ValueItem| match v {
     )),
 });
 
-extremum_fn!(Min, "min", ValueItem::min);
-extremum_fn!(Max, "max", ValueItem::max);
+extremum_fn!(Min, "min", |v, best| v < best);
+extremum_fn!(Max, "max", |v, best| v > best);
 
 // Not built on numeric_fold_fn-style sharing with Avg: SUM keeps its
 // input's own numeric shape (an all-Integer column sums to an Integer,
@@ -693,11 +719,11 @@ impl FuncTrait for Sum {
         "sum".into()
     }
 
-    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
         let FuncArgs::Field(exp) = &mut self.args else {
             unreachable!("sum(*) is rejected in Sum::new")
         };
-        match exp.eval(args, 0)? {
+        match exp.eval(args, 0)?.into_owned() {
             ValueItem::Integer(i) => {
                 self.any = true;
                 self.total = match self.total {
@@ -799,13 +825,13 @@ impl FuncTrait for Concat {
         "concat".into()
     }
 
-    fn eval(&mut self, args: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, args: &[ValueItem]) -> Result<ValueItem, SchemaError> {
         let mut out = String::new();
         for a in &mut self.args {
             let FuncArgs::Field(exp) = a else {
                 unreachable!("concat(*) is rejected in Concat::new")
             };
-            match exp.eval(args, 0)? {
+            match exp.eval(args, 0)?.into_owned() {
                 ValueItem::Null => return Ok(ValueItem::Null),
                 ValueItem::Str((s, _)) => out.push_str(&s),
                 other => out.push_str(&other.to_string()),
@@ -944,13 +970,13 @@ impl FuncTrait for Scalar {
         Self::name_of(self.kind).into()
     }
 
-    fn eval(&mut self, rows: &[IndexKey]) -> Result<ValueItem, SchemaError> {
+    fn eval(&mut self, rows: &[ValueItem]) -> Result<ValueItem, SchemaError> {
         let mut values = Vec::with_capacity(self.args.len());
         for a in &mut self.args {
             let FuncArgs::Field(e) = a else {
                 unreachable!("rejected in Scalar::new")
             };
-            values.push(e.eval(rows, 0)?);
+            values.push(e.eval(rows, 0)?.into_owned());
         }
         match self.kind {
             ScalarKind::Coalesce => Ok(values

@@ -151,3 +151,8 @@ the persistence convention (PERSISTENCE_VERSIONING_PROGRESS.md):
 - [ ] **6. The same for rows:** operators pass views of packed rows on
   their pages, and keep rows by copying bytes into a per-query arena.
   Tracked in MEMORY_ISSUES.md.
+  - **First step done 2026-10-12.** Sources may lend rows, and scan,
+    filter, projection, aggregate and GROUP BY do. A scan, filter or group
+    now allocates nothing per row.
+  - The lent row is still values (a reused buffer), not a view of the
+    page's bytes. That is the next step, along with the joins and sort.

@@ -1612,6 +1612,70 @@ impl SqlTable {
         self.decode_stored_row(&row, wanted).map(Some)
     }
 
+    /// decode_row_if, into `out` rather than a new row: false if the row
+    /// fails a test. `out` is the buffer a scan lends its rows from (see
+    /// Source::row): refilled row after row, a string going where one was
+    /// keeps its allocation, so a scan of packed rows allocates nothing
+    /// per row. A column not `wanted` comes out NULL.
+    pub(crate) fn decode_row_into(
+        &self,
+        data: &[u8],
+        wanted: Option<&[bool]>,
+        tests: &[ColumnTest],
+        out: &mut Vec<ValueItem>,
+    ) -> Result<bool, SchemaError> {
+        let row: StoredRow = postcard::from_bytes(data)?;
+        let fields = self.fields();
+        if row.version == self.version()
+            && let Some(packed) = Packed::parse(row.values, fields.len())
+        {
+            for test in tests {
+                let start = if test.pos == 0 { 0 } else { packed.end(test.pos - 1) };
+                let value = packed
+                    .value(test.pos, start, packed.end(test.pos), test.datatype)
+                    .ok_or_else(damaged)?;
+                if !test.passes(value) {
+                    return Ok(false);
+                }
+            }
+            out.resize(fields.len(), ValueItem::Null);
+            let mut last_end = None;
+            for (pos, (field, slot)) in fields.iter().zip(out.iter_mut()).enumerate() {
+                if let Some(w) = wanted
+                    && !w[pos]
+                {
+                    if *slot != ValueItem::Null {
+                        *slot = ValueItem::Null;
+                    }
+                    last_end = None;
+                    continue;
+                }
+                let start = match (pos, last_end) {
+                    (0, _) => 0,
+                    (_, Some(end)) => end,
+                    (_, None) => packed.end(pos - 1),
+                };
+                let end = packed.end(pos);
+                packed
+                    .value(pos, start, end, field.datatype)
+                    .ok_or_else(damaged)?
+                    .store_in(slot);
+                last_end = Some(end);
+            }
+            return Ok(true);
+        }
+        // A row of an older version or an older format: decoded the general
+        // way, then copied in.
+        let Some(decoded) = self.decode_row_if(data, wanted, tests)? else {
+            return Ok(false);
+        };
+        out.resize(decoded.values().len(), ValueItem::Null);
+        for (slot, value) in out.iter_mut().zip(decoded.values()) {
+            value.as_ref().store_in(slot);
+        }
+        Ok(true)
+    }
+
     fn decode_stored_row(
         &self,
         row: &StoredRow,

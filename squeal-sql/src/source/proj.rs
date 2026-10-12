@@ -7,7 +7,7 @@ use store::valueitem::IndexKey;
 use crate::{
     error::SchemaError,
     plan::eval::EvalExpr,
-    source::{ProjectableField, QueryStats, Source, merge_stats},
+    source::{ProjectableField, QueryStats, Rows, Source, merge_stats},
     table::Field,
 };
 
@@ -18,8 +18,11 @@ use crate::{
 pub(crate) struct Projection {
     timer: crate::source::timing::RowTimer,
     timer_eval_start: crate::source::timing::RowTimer,
-    source: Box<dyn Source>,
+    source: Rows,
     fields: Vec<ProjectableField>,
+    // The current output row, lent (see Source::row): refilled by each
+    // advance, and moved out of — its allocation kept — by next.
+    out: Vec<store::valueitem::ValueItem>,
     time_spent: u128,
     eval_time: u128,
 }
@@ -29,7 +32,8 @@ impl Projection {
         Self {
             timer: Default::default(),
             timer_eval_start: Default::default(),
-            source,
+            source: Rows::new(source),
+            out: Vec::with_capacity(fields.len()),
             fields,
             time_spent: 0,
             eval_time: 0,
@@ -39,7 +43,7 @@ impl Projection {
 
 impl Source for Projection {
     fn plan(&self) -> PlanNode {
-        let names = column_names(&self.source.fields());
+        let names = column_names(&self.source.source().fields());
         let cols = self
             .fields
             .iter()
@@ -48,7 +52,7 @@ impl Source for Projection {
             .join(", ");
         PlanNode::new("Projection")
             .detail(cols)
-            .child(self.source.plan())
+            .child(self.source.source().plan())
     }
 
     fn fields(&self) -> Arc<[ProjectableField]> {
@@ -56,20 +60,35 @@ impl Source for Projection {
     }
 
     fn next(&mut self) -> Result<Option<store::valueitem::IndexKey>, SchemaError> {
+        Ok(match self.advance()? {
+            true => Some(IndexKey::new_from_buffer(&mut self.out)?),
+            false => None,
+        })
+    }
+
+    fn lends(&self) -> bool {
+        true
+    }
+
+    fn advance(&mut self) -> Result<bool, SchemaError> {
         let start = self.timer.start();
-        if let Some(res) = self.source.next()? {
-            crate::source::timing::add(&mut self.time_spent, start);
-            let mut out = vec![];
-            let res = &[res];
-            let eval_start = self.timer_eval_start.start();
-            for (i, f) in self.fields.iter_mut().enumerate() {
-                out.push(f.expr.eval(res, i)?);
-            }
-            crate::source::timing::add(&mut self.eval_time, eval_start);
-            return Ok(Some(IndexKey::new_from_owned(out)?));
-        }
+        let more = self.source.advance()?;
         crate::source::timing::add(&mut self.time_spent, start);
-        Ok(None)
+        if !more {
+            return Ok(false);
+        }
+        let eval_start = self.timer_eval_start.start();
+        self.out.resize(self.fields.len(), store::valueitem::ValueItem::Null);
+        let row = self.source.row();
+        for ((i, f), slot) in self.fields.iter_mut().enumerate().zip(self.out.iter_mut()) {
+            crate::source::keep(f.expr.eval(row, i)?, slot);
+        }
+        crate::source::timing::add(&mut self.eval_time, eval_start);
+        Ok(true)
+    }
+
+    fn row(&self) -> &[store::valueitem::ValueItem] {
+        &self.out
     }
 
     fn reset(&mut self) -> Result<(), SchemaError> {
@@ -92,7 +111,7 @@ impl Source for Projection {
                 level: 0,
             },
         )];
-        Some(merge_stats(this_stats, self.source.query_stats()))
+        Some(merge_stats(this_stats, self.source.source().query_stats()))
     }
 }
 

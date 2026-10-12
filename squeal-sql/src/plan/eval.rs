@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use sql_parser::{
     Expr,
     expr::{BinaryOp, UnaryOp},
 };
 use store::{
     db::DBFile,
-    valueitem::{IndexKey, ValueItem},
+    valueitem::ValueItem,
 };
 
 use crate::{
@@ -311,39 +312,37 @@ impl EvalExpr {
             ),
         })
     }
-    pub(crate) fn eval(
-        &mut self,
-        data: &[IndexKey],
+    // This expression's value over `data`, a row: its values, lent (see
+    // Source::row) or a kept row's own. A column or a literal is lent in
+    // turn — reading a string column copies nothing; only what is computed
+    // is owned.
+    pub(crate) fn eval<'a>(
+        &'a mut self,
+        data: &'a [ValueItem],
         _index: usize,
-    ) -> Result<ValueItem, SchemaError> {
-        let v = match self {
-            Self::Literal(v) => v,
-            Self::Value(pos) => &data[0][*pos],
+    ) -> Result<Cow<'a, ValueItem>, SchemaError> {
+        Ok(match self {
+            Self::Literal(v) => Cow::Borrowed(v),
+            Self::Value(pos) => Cow::Borrowed(&data[*pos]),
             Self::Unary { op, field } => {
                 let v = field.eval(data, _index)?;
-                &CrateValueItem::unary(&v, op)?
+                Cow::Owned(CrateValueItem::unary(&v, op)?)
             }
             Self::Binary { lhs, op, rhs } => {
                 let lhs = lhs.eval(data, _index)?;
                 let rhs = rhs.eval(data, _index)?;
-                &CrateValueItem::binary(&lhs, &rhs, op)?
+                Cow::Owned(CrateValueItem::binary(&lhs, &rhs, op)?)
             }
-            // Not implemented yet — function evaluation (COUNT, ...) is
-            // its own separate, unfinished feature: FuncObj::eval takes
-            // already-resolved &[ValueItem], but nothing here resolves
-            // its stored FuncArgs against `data`/`_index` to produce
-            // them yet.
-            Self::Function(obj) => &obj.eval(data)?,
+            Self::Function(obj) => obj.eval_lent(data)?,
             Self::Subquery(s) => {
                 let mut operands = Vec::with_capacity(s.keys.len() + 1);
                 for e in s.operands_mut() {
-                    operands.push(e.eval(data, _index)?);
+                    operands.push(e.eval(data, _index)?.into_owned());
                 }
-                &s.answer(operands)
+                Cow::Owned(s.answer(operands))
             }
-            Self::None => &ValueItem::Null,
-        };
-        Ok(v.clone())
+            Self::None => Cow::Owned(ValueItem::Null),
+        })
     }
 
     // Builds just the evaluation tree for `expr` — no display name, no

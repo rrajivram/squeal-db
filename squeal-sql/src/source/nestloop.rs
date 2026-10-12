@@ -308,8 +308,8 @@ where
                             continue;
                         };
                         let row = Self::combine(&cur.outer, inner.values())?;
-                        let on = self.on_expr.eval(std::slice::from_ref(&row), 0)?;
-                        if on == ValueItem::Boolean(true) {
+                        let on = self.on_expr.eval(row.values(), 0)?;
+                        if *on == ValueItem::Boolean(true) {
                             if let Some(cur) = &mut self.current {
                                 cur.matched = true;
                             }

@@ -6,7 +6,7 @@ use store::valueitem::{IndexKey, ValueItem};
 use crate::{
     error::SchemaError,
     plan::{eval::EvalExpr, funcs::FuncTrait},
-    source::{ProjectableField, QueryStats, Source, merge_stats},
+    source::{ProjectableField, QueryStats, Rows, Source, merge_stats},
 };
 
 // Groups an already-sorted (by the GROUP BY key's raw field positions)
@@ -35,7 +35,9 @@ use crate::{
 pub(crate) struct GroupSource {
     timer: crate::source::timing::RowTimer,
     timer_eval: crate::source::timing::RowTimer,
-    source: Box<dyn Source>,
+    // Read a row at a time, lent where the input lends: a group's rows
+    // are fed to its aggregates and none is kept.
+    source: Rows,
     fields: Vec<ProjectableField>,
     key_positions: Vec<usize>,
     // HAVING: read over the raw rows like the SELECT list (its aggregates
@@ -44,10 +46,12 @@ pub(crate) struct GroupSource {
     // The SELECT list's values as of the latest row evaluated: reused row
     // after row, an output row made of it once per group.
     values: Vec<ValueItem>,
-    // The next raw row to start a new group with, and its own group key
-    // — already pulled from `source` while scanning ahead to find the
-    // end of the *previous* group, so it can't be pulled again.
-    pending: Option<(IndexKey, Vec<ValueItem>)>,
+    // The current group's key: refilled group after group.
+    key: Vec<ValueItem>,
+    // Whether `source` is already on the row that starts the next group —
+    // reached while looking for the end of the previous one, so it must
+    // not be advanced past.
+    pending: bool,
     started: bool,
     done: bool,
     time_spent: u128,
@@ -63,12 +67,13 @@ impl GroupSource {
         Self {
             timer: Default::default(),
             timer_eval: Default::default(),
-            source,
+            source: Rows::new(source),
             fields,
             key_positions,
             having: None,
             values: vec![],
-            pending: None,
+            key: vec![],
+            pending: false,
             started: false,
             done: false,
             time_spent: 0,
@@ -81,8 +86,9 @@ impl GroupSource {
         self
     }
 
-    fn key_of(&self, row: &IndexKey) -> Vec<ValueItem> {
-        self.key_positions.iter().map(|&i| row[i].clone()).collect()
+    // Whether `row` is of the group whose key is `key`.
+    fn in_group(key_positions: &[usize], key: &[ValueItem], row: &[ValueItem]) -> bool {
+        key_positions.iter().zip(key).all(|(&i, k)| row[i] == *k)
     }
 
     fn reset_aggregates(&mut self) -> Result<(), SchemaError> {
@@ -112,25 +118,26 @@ impl GroupSource {
     //
     // The values go to `self.values`; next_group makes the output row of
     // the group's last.
-    fn eval_row(&mut self, row: &IndexKey) -> Result<bool, SchemaError> {
-        let start = self.timer_eval.start();
-        let data = [row.clone()];
-        self.values.clear();
-        for (i, f) in self.fields.iter_mut().enumerate() {
-            self.values.push(f.expr.eval(&data, i)?);
+    fn eval_row(
+        fields: &mut [ProjectableField],
+        having: &mut Option<EvalExpr>,
+        values: &mut Vec<ValueItem>,
+        row: &[ValueItem],
+    ) -> Result<bool, SchemaError> {
+        values.resize(fields.len(), ValueItem::Null);
+        for ((i, f), slot) in fields.iter_mut().enumerate().zip(values.iter_mut()) {
+            crate::source::keep(f.expr.eval(row, i)?, slot);
         }
-        let keep = match &mut self.having {
-            Some(having) => Self::is_true(having.eval(&data, 0)?)?,
-            None => true,
-        };
-        crate::source::timing::add(&mut self.eval_time, start);
-        Ok(keep)
+        match having {
+            Some(having) => Self::is_true(having.eval(row, 0)?.as_ref()),
+            None => Ok(true),
+        }
     }
 
     // A NULL HAVING is "not true", as in WHERE: the group is left out.
-    fn is_true(v: ValueItem) -> Result<bool, SchemaError> {
+    fn is_true(v: &ValueItem) -> Result<bool, SchemaError> {
         match v {
-            ValueItem::Boolean(b) => Ok(b),
+            ValueItem::Boolean(b) => Ok(*b),
             ValueItem::Null => Ok(false),
             _ => Err(SchemaError::InternalSchemaError(
                 "Output of having is not boolean.".into(),
@@ -156,7 +163,7 @@ impl GroupSource {
             out.push(f.expr.eval_empty_group()?);
         }
         let keep = match &self.having {
-            Some(having) => Self::is_true(having.eval_empty_group()?)?,
+            Some(having) => Self::is_true(&having.eval_empty_group()?)?,
             None => true,
         };
         crate::source::timing::add(&mut self.eval_time, start);
@@ -170,51 +177,46 @@ impl GroupSource {
     // The next group's output row and whether it passes HAVING; None once
     // the input is exhausted.
     fn next_group(&mut self) -> Result<Option<(IndexKey, bool)>, SchemaError> {
-        let first_row = if let Some((row, _key)) = self.pending.take() {
-            Some(row)
-        } else {
-            self.source.next()?
-        };
-
-        let Some(mut current) = first_row else {
+        let on_a_row = std::mem::take(&mut self.pending) || self.source.advance()?;
+        if !on_a_row {
             self.done = true;
             if !self.started && self.key_positions.is_empty() {
                 self.reset_aggregates()?;
                 return Ok(self.empty_group_row()?.map(|row| (row, true)));
             }
             return Ok(None);
-        };
+        }
 
         self.started = true;
-        let current_key = self.key_of(&current);
         self.reset_aggregates()?;
-
-        let mut keep = self.eval_row(&current)?;
-        loop {
-            match self.source.next()? {
-                Some(next_row) => {
-                    let next_key = self.key_of(&next_row);
-                    if next_key == current_key {
-                        current = next_row;
-                        keep = self.eval_row(&current)?;
-                    } else {
-                        self.pending = Some((next_row, next_key));
-                        break;
-                    }
-                }
-                None => {
-                    self.done = true;
-                    break;
-                }
-            }
+        let row = self.source.row();
+        self.key.resize(self.key_positions.len(), ValueItem::Null);
+        for (&i, slot) in self.key_positions.iter().zip(self.key.iter_mut()) {
+            row[i].as_ref().store_in(slot);
         }
-        Ok(Some((IndexKey::new_from(&self.values)?, keep)))
+
+        let start = self.timer_eval.start();
+        let mut keep = Self::eval_row(&mut self.fields, &mut self.having, &mut self.values, row)?;
+        loop {
+            if !self.source.advance()? {
+                self.done = true;
+                break;
+            }
+            let row = self.source.row();
+            if !Self::in_group(&self.key_positions, &self.key, row) {
+                self.pending = true;
+                break;
+            }
+            keep = Self::eval_row(&mut self.fields, &mut self.having, &mut self.values, row)?;
+        }
+        crate::source::timing::add(&mut self.eval_time, start);
+        Ok(Some((IndexKey::new_from_buffer(&mut self.values)?, keep)))
     }
 }
 
 impl Source for GroupSource {
     fn plan(&self) -> PlanNode {
-        let names = column_names(&self.source.fields());
+        let names = column_names(&self.source.source().fields());
         let outputs = self
             .fields
             .iter()
@@ -228,7 +230,7 @@ impl Source for GroupSource {
         if self.key_positions.is_empty() {
             PlanNode::new("Aggregate")
                 .detail(outputs)
-                .child(self.source.plan())
+                .child(self.source.source().plan())
         } else {
             let keys = self
                 .key_positions
@@ -238,7 +240,7 @@ impl Source for GroupSource {
                 .join(", ");
             PlanNode::new("GroupAggregate")
                 .detail(format!("by {keys}: {outputs}"))
-                .child(self.source.plan())
+                .child(self.source.source().plan())
         }
     }
 
@@ -266,7 +268,7 @@ impl Source for GroupSource {
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.source.reset()?;
-        self.pending = None;
+        self.pending = false;
         self.started = false;
         self.done = false;
         Ok(())
@@ -282,7 +284,7 @@ impl Source for GroupSource {
         };
         Some(merge_stats(
             vec![("GroupSource".into(), query_stats)],
-            self.source.query_stats(),
+            self.source.source().query_stats(),
         ))
     }
 }
