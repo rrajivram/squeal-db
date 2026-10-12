@@ -86,13 +86,27 @@ comparison tests.
   - Point lookup: 178 → 163 allocations; the tree walks are gone from the
     profile, and the stats step fell to ~2% of a lookup's time (~9% faster
     in total).
-- [ ] **2. Parameter slots.**
-  - The parse cache hands back a shape's template, shared and not copied,
-    with the statement's literals beside it (`parse_sql_shaped`).
-  - `EvalExpr::Param(i)` reads the i-th value at execution.
-  - Placeholders (`?`, `$n`, `:name`) plan as parameters. That gives
-    prepared `SELECT`, `UPDATE` and `DELETE`, which today return an error,
-    for free.
+- [x] **2. Parameter values, not a copied tree.** Done 2026-10-12.
+  - `sql_parser::parse_sql_shaped` hands back a shape's template, shared
+    and not copied, with the statement's literals beside it. A literal has
+    the span of the placeholder standing for it.
+  - squeal-sql's `plan::params::Params` holds the values by span. SELECT,
+    UPDATE, DELETE and EXPLAIN run from the template, and every place that
+    reads a literal reads a placeholder through `Params`:
+    - `EvalExpr::from_expr` plans a placeholder as its value;
+    - `LIMIT`, `OFFSET` and `ORDER BY` positions.
+    Other statements (INSERT, DDL) still take a bound copy.
+  - So plans are exactly what they were: every decision sees the values.
+    The `EvalExpr::Param(i)` slot, which a cached plan needs, comes with
+    stage 3.
+  - Prepared `SELECT`, `UPDATE` and `DELETE` now run, through the same
+    `Params` (they used to return an error).
+  - Point lookup: 163 → 152 allocations, ~5.5 µs. A text served from the
+    exact-text cache costs one allocation more than before (its values'
+    list, where it used to get a tree with them bound in): the
+    secondary-index lookup went 188 → 189.
+  - Telling integer and float literals apart in the shape key is left for
+    stage 3, where it matters: values are not in the plan until then.
 - [ ] **3. The prepared-plan cache**, as designed above: the prepared part
   cached per shape and schema, validated against the catalog each
   execution, with everything value-sensitive run per execution.

@@ -1351,44 +1351,93 @@ fn test_prepared_statement_rejects_ddl() {
     );
 }
 
-#[test]
-fn test_prepared_update_execute_errors_not_implemented() {
-    let c = conn();
-    run(&c, "create table t (id integer)").unwrap();
-    let mut stmt = c
-        .clone()
-        .create_prepared_statement("update t set id = ? where id = ?")
-        .unwrap();
-    assert_eq!(stmt.parameter_count(), 2);
-    stmt.set_field(0, ValueItem::Integer(1)).unwrap();
-    stmt.set_field(1, ValueItem::Integer(2)).unwrap();
-    let err = stmt.execute().unwrap_err();
-    assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
+// The rows a prepared SELECT gave.
+fn prepared_rows(result: ResultType) -> Vec<Vec<ValueItem>> {
+    match result {
+        ResultType::StreamingResult(stream) => drain_streaming(stream).1,
+        other => panic!("expected rows, got {other:?}"),
+    }
 }
 
 #[test]
-fn test_prepared_delete_execute_errors_not_implemented() {
+fn test_prepared_update_executes_with_bound_values() {
     let c = conn();
-    run(&c, "create table t (id integer)").unwrap();
+    run(&c, "create table t (id integer not null, n integer, primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 10), (2, 20)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("update t set n = n + ? where id = ?")
+        .unwrap();
+    assert_eq!(stmt.parameter_count(), 2);
+    for (add, id) in [(5, 2), (7, 1)] {
+        stmt.set_field(0, ValueItem::Integer(add)).unwrap();
+        stmt.set_field(1, ValueItem::Integer(id)).unwrap();
+        let result = stmt.execute().unwrap();
+        assert!(matches!(result, ResultType::Count(1)), "got {result:?}");
+    }
+    let mut check = c.create_statement("select n from t order by id").unwrap();
+    check.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut check, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(17)], vec![ValueItem::Integer(25)]]);
+}
+
+#[test]
+fn test_prepared_delete_executes_with_bound_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, primary key(id))").unwrap();
+    run(&c, "insert into t values (1), (2), (3)").unwrap();
     let mut stmt = c
         .clone()
         .create_prepared_statement("delete from t where id = ?")
         .unwrap();
+    for id in [1, 3] {
+        stmt.set_field(0, ValueItem::Integer(id)).unwrap();
+        let result = stmt.execute().unwrap();
+        assert!(matches!(result, ResultType::Count(1)), "got {result:?}");
+    }
+    let mut check = c.create_statement("select id from t").unwrap();
+    check.execute().unwrap();
+    let (_, rows) = take_streaming_result(&mut check, 0);
+    assert_eq!(rows, vec![vec![ValueItem::Integer(2)]]);
+}
+
+#[test]
+fn test_prepared_select_executes_with_bound_values() {
+    let c = conn();
+    run(&c, "create table t (id integer not null, name varchar(10), primary key(id))").unwrap();
+    run(&c, "insert into t values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("select name from t where id >= ? order by id limit ?")
+        .unwrap();
+    assert_eq!(stmt.parameter_count(), 2);
+    let s = |v: &str| vec![ValueItem::Str((v.into(), v.len() as u32))];
+    stmt.set_field(0, ValueItem::Integer(2)).unwrap();
+    stmt.set_field(1, ValueItem::Integer(2)).unwrap();
+    assert_eq!(prepared_rows(stmt.execute().unwrap()), vec![s("b"), s("c")]);
+    // Again, with other values: planned for them, not the first ones.
     stmt.set_field(0, ValueItem::Integer(1)).unwrap();
+    stmt.set_field(1, ValueItem::Integer(3)).unwrap();
+    assert_eq!(prepared_rows(stmt.execute().unwrap()), vec![s("a"), s("b"), s("c")]);
+}
+
+#[test]
+fn test_prepared_select_fails_when_a_parameter_is_unbound() {
+    let c = conn();
+    run(&c, "create table t (id integer)").unwrap();
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("select * from t where id = ?")
+        .unwrap();
     let err = stmt.execute().unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 
 #[test]
-fn test_prepared_select_execute_errors_not_implemented() {
+fn test_a_placeholder_outside_a_prepared_statement_has_no_value() {
     let c = conn();
     run(&c, "create table t (id integer)").unwrap();
-    let mut stmt = c
-        .clone()
-        .create_prepared_statement("select * from t")
-        .unwrap();
-    assert_eq!(stmt.parameter_count(), 0);
-    let err = stmt.execute().unwrap_err();
+    let err = run(&c, "select * from t where id = ?").unwrap_err();
     assert!(matches!(err, SchemaError::UserError(_)), "got {err:?}");
 }
 

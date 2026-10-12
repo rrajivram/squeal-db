@@ -43,7 +43,7 @@ use store::{db::DBFile, valueitem::ValueItem};
 
 use crate::{
     error::SchemaError,
-    plan::{eval::EvalExpr, logical::TableQuery},
+    plan::{eval::EvalExpr, logical::TableQuery, params::Params},
     source::Source,
 };
 
@@ -208,6 +208,7 @@ pub(crate) fn compile<F: DBFile + 'static>(
     kind: Kind,
     lhs: Option<&Expr>,
     tables: &[TableQuery<F>],
+    params: &Params,
 ) -> Result<EvalExpr, SchemaError> {
     let found = RESOLVED.with(|r| {
         r.borrow()
@@ -240,12 +241,12 @@ pub(crate) fn compile<F: DBFile + 'static>(
     Ok(EvalExpr::Subquery(SubqueryExpr {
         kind,
         lhs: match lhs {
-            Some(e) => Some(EvalExpr::from_expr(e, tables)?),
+            Some(e) => Some(EvalExpr::from_expr(e, tables, params)?),
             None => None,
         },
         keys: keys
             .iter()
-            .map(|k| EvalExpr::from_expr(k, tables).map(|e| *e))
+            .map(|k| EvalExpr::from_expr(k, tables, params).map(|e| *e))
             .collect::<Result<_, _>>()?,
         data,
     }))
@@ -378,8 +379,11 @@ fn correlated<F: DBFile + 'static>(
     let inner = planner.scope(&core.from)?;
     // A column the subquery's own tables don't have but the outer query's
     // do. (A name both have is the subquery's own, as in SQL.)
+    // (A column holds no placeholder: no values are needed.)
+    let none = Params::none();
     let is_outer = |c: &Expr| {
-        EvalExpr::from_expr(c, &inner).is_err() && EvalExpr::from_expr(c, outer).is_ok()
+        EvalExpr::from_expr(c, &inner, &none).is_err()
+            && EvalExpr::from_expr(c, outer, &none).is_ok()
     };
     let reads_outer = |e: &Expr| {
         let mut cols = vec![];

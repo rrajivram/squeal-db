@@ -20,6 +20,12 @@
 //!   its statements use the exact-text cache. Statements with placeholders
 //!   of their own are never shaped.
 //!
+//! [`parse_sql_shaped`] goes one step further and hands back the template
+//! itself, shared, with the text's literals beside it: nothing is copied
+//! or bound, and the caller reads each placeholder's value from the
+//! literals (a literal and the placeholder standing for it have the same
+//! span).
+//!
 //! Only successful parses are kept, only texts up to MAX_CACHED_LEN (a bulk
 //! INSERT is rarely repeated and would crowd out everything else), and at
 //! most CAPACITY entries per level, the least recently used going first.
@@ -89,8 +95,51 @@ enum Shape {
     NotParameterizable,
 }
 
+// What an exact text's entry holds: its statements, or (a text first seen
+// through parse_sql_shaped) its shape's template and its literals.
+#[derive(Clone)]
+enum Exact {
+    Bound(Arc<[Statement]>),
+    Shaped(Shaped),
+}
+
+/// A statement text's parse, as [`parse_sql_shaped`] gives it.
+#[derive(Clone, Debug)]
+pub struct Shaped {
+    /// The statements. When `literals` is not empty these are the template
+    /// of the text's shape: each literal of the text is a placeholder there.
+    pub statements: Arc<[Statement]>,
+    /// The text's literals in source order, each with its span in the text,
+    /// which is the span of the placeholder standing for it.
+    pub literals: Arc<[Literal]>,
+}
+
+impl Shaped {
+    fn bound(statements: Arc<[Statement]>) -> Self {
+        Shaped {
+            statements,
+            literals: no_literals(),
+        }
+    }
+
+    // The statements with the literals bound in: a copy of the template.
+    fn into_bound(self) -> Option<Arc<[Statement]>> {
+        if self.literals.is_empty() {
+            return Some(self.statements);
+        }
+        let mut statements = self.statements.to_vec();
+        bind_literals(&mut statements, self.literals.to_vec()).then(|| statements.into())
+    }
+}
+
+// One shared empty list, so a text without literals allocates none.
+fn no_literals() -> Arc<[Literal]> {
+    static NONE: OnceLock<Arc<[Literal]>> = OnceLock::new();
+    NONE.get_or_init(|| Arc::from(Vec::new())).clone()
+}
+
 struct Cache {
-    exact: Lru<Arc<[Statement]>>,
+    exact: Lru<Exact>,
     shapes: Lru<Shape>,
     stats: CacheStats,
 }
@@ -130,15 +179,54 @@ pub fn parse_sql_cached(src: &str) -> Result<Arc<[Statement]>, Vec<ParseError>> 
     }
     {
         let mut c = lock();
-        if let Some(statements) = c.exact.get(src) {
-            c.stats.hits += 1;
-            return Ok(statements);
+        match c.exact.get(src) {
+            Some(Exact::Bound(statements)) => {
+                c.stats.hits += 1;
+                return Ok(statements);
+            }
+            Some(Exact::Shaped(shaped)) => {
+                c.stats.hits += 1;
+                drop(c);
+                if let Some(statements) = shaped.into_bound() {
+                    return Ok(statements);
+                }
+            }
+            None => {}
         }
     }
-    if let Some(statements) = from_shape(src) {
+    if let Some(shaped) = from_shape(src)
+        && let Some(statements) = shaped.into_bound()
+    {
         return Ok(statements);
     }
     exact_parse(src)
+}
+
+/// As [`parse_sql_cached`], but a text of a known shape comes back as the
+/// shape's template, shared, with the text's literals beside it, rather
+/// than as a copy with the literals bound in. See [`Shaped`].
+pub fn parse_sql_shaped(src: &str) -> Result<Shaped, Vec<ParseError>> {
+    if src.len() > MAX_CACHED_LEN {
+        return parse_sql(src).map(|s| Shaped::bound(s.into()));
+    }
+    {
+        let mut c = lock();
+        match c.exact.get(src) {
+            Some(Exact::Bound(statements)) => {
+                c.stats.hits += 1;
+                return Ok(Shaped::bound(statements));
+            }
+            Some(Exact::Shaped(shaped)) => {
+                c.stats.hits += 1;
+                return Ok(shaped);
+            }
+            None => {}
+        }
+    }
+    if let Some(shaped) = from_shape(src) {
+        return Ok(shaped);
+    }
+    exact_parse(src).map(Shaped::bound)
 }
 
 // Parses `src` and keeps it by its text.
@@ -148,39 +236,39 @@ fn exact_parse(src: &str) -> Result<Arc<[Statement]>, Vec<ParseError>> {
     let statements: Arc<[Statement]> = parse_sql(src)?.into();
     let mut c = lock();
     c.stats.misses += 1;
-    c.exact.insert(src.to_string(), statements.clone());
+    c.exact.insert(src.to_string(), Exact::Bound(statements.clone()));
     Ok(statements)
 }
 
-// `src` through its shape's template, or None when it has no usable shape
-// (no literals, placeholders of its own, a shape that isn't
+// `src` through its shape: its template and literals, or None when it has
+// no usable shape (no literals, placeholders of its own, a shape that isn't
 // parameterizable, or one that fails to parse).
-fn from_shape(src: &str) -> Option<Arc<[Statement]>> {
+fn from_shape(src: &str) -> Option<Shaped> {
     let tokens = tokenize(src).ok()?;
     let (key, normalized, literals) = shape_of(src, &tokens)?;
     let shape = lock().shapes.get(&key);
     match shape {
         Some(Shape::NotParameterizable) => None,
         Some(Shape::Template(template)) => {
-            let mut statements = template.to_vec();
-            if !bind_literals(&mut statements, literals) {
-                return None;
-            }
+            let shaped = Shaped {
+                statements: template,
+                literals: literals.into(),
+            };
             if verify() {
+                let bound = shaped.clone().into_bound();
                 let parsed = parse_sql(src).ok();
                 assert_eq!(
                     parsed.as_deref(),
-                    Some(&statements[..]),
+                    bound.as_deref(),
                     "parse cache: binding {src:?} into its shape differs from parsing it"
                 );
             }
             // Kept by its text as well: a statement repeated verbatim is
-            // then a lookup, not a bind.
-            let statements: Arc<[Statement]> = statements.into();
+            // then a lookup, not a tokenizing.
             let mut c = lock();
             c.stats.shape_hits += 1;
-            c.exact.insert(src.to_string(), statements.clone());
-            Some(statements)
+            c.exact.insert(src.to_string(), Exact::Shaped(shaped.clone()));
+            Some(shaped)
         }
         None => {
             // A new shape: parse it and this text, and keep the template
@@ -190,18 +278,29 @@ fn from_shape(src: &str) -> Option<Arc<[Statement]>> {
             let template = parse_sql(&normalized).ok();
             let fits = template.as_ref().is_some_and(|t| {
                 let mut bound = t.clone();
-                bind_literals(&mut bound, literals) && bound == parsed
+                bind_literals(&mut bound, literals.clone()) && bound == parsed
             });
-            let parsed: Arc<[Statement]> = parsed.into();
             let mut c = lock();
             c.stats.misses += 1;
-            let shape = match template {
-                Some(t) if fits => Shape::Template(t.into()),
-                _ => Shape::NotParameterizable,
+            let (shape, exact) = match template {
+                Some(t) if fits => {
+                    let shaped = Shaped {
+                        statements: t.into(),
+                        literals: literals.into(),
+                    };
+                    (
+                        Shape::Template(shaped.statements.clone()),
+                        Exact::Shaped(shaped),
+                    )
+                }
+                _ => (Shape::NotParameterizable, Exact::Bound(parsed.into())),
             };
             c.shapes.insert(key, shape);
-            c.exact.insert(src.to_string(), parsed.clone());
-            Some(parsed)
+            c.exact.insert(src.to_string(), exact.clone());
+            Some(match exact {
+                Exact::Shaped(shaped) => shaped,
+                Exact::Bound(statements) => Shaped::bound(statements),
+            })
         }
     }
 }
@@ -283,6 +382,7 @@ pub fn cache_stats() -> CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Placeholder;
 
     // The cache is process-wide and tests run in parallel: each test uses
     // texts of its own, and checks sharing by pointer, not by counts.
@@ -339,6 +439,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_shaped_texts_share_their_template() {
+        let a = parse_sql_shaped("select * from shaped_t where id = 'A1' and n > 5").unwrap();
+        let b = parse_sql_shaped("select * from shaped_t where id = 'B2' and n > 9").unwrap();
+        assert!(Arc::ptr_eq(&a.statements, &b.statements), "one template, not copied");
+        let placeholders = a.statements[0].placeholders();
+        assert_eq!(placeholders.len(), 2);
+        // Each literal has its placeholder's span.
+        for (p, l) in placeholders.iter().zip(b.literals.iter()) {
+            let (Placeholder::Anonymous(at) | Placeholder::Named(at, _)) = p else {
+                panic!("{p:?}");
+            };
+            let span = match l {
+                Literal::String(s) => s.span,
+                Literal::Number(n) => n.span,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(*at, span);
+        }
+        // And binding them gives the text's parse.
+        let t = "select * from shaped_t where id = 'B2' and n > 9";
+        assert_eq!(*b.into_bound().unwrap(), *parse_sql(t).unwrap());
+        // A text without literals is its own parse.
+        let c = parse_sql_shaped("select shaped_c from shaped_t").unwrap();
+        assert!(c.literals.is_empty());
     }
 
     #[test]

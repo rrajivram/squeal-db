@@ -17,6 +17,7 @@ use store::{
     valueitem::{IndexKey, ValueItem},
 };
 
+use crate::plan::params::Params;
 use crate::{
     error::SchemaError,
     plan::memory::{MemReservation, QueryMemory},
@@ -116,6 +117,7 @@ where
     pub(crate) fn create_from(
         source: Box<dyn Source>,
         clause: &OrderByClause,
+        params: &Params,
         limit: Option<usize>,
         db: Arc<Db<F>>,
         mem: Arc<QueryMemory>,
@@ -123,7 +125,7 @@ where
         let fields = source.fields();
         let mut items = vec![];
         for c in clause.items.items() {
-            let index = Self::resolve_order_by_index(&c.expr, &fields)?;
+            let index = Self::resolve_order_by_index(&c.expr, &fields, params)?;
             let asc = c.direction.map(|a| a.is_left()).unwrap_or(true);
             let null_first = c.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
             items.push(SortField {
@@ -168,15 +170,21 @@ where
     pub(crate) fn resolve_order_by_index(
         expr: &Expr,
         fields: &[ProjectableField],
+        params: &Params,
     ) -> Result<usize, SchemaError> {
         // `ORDER BY 2`: the select list's second column.
-        if let Expr::Literal(sql_parser::literal::Literal::Number(n)) = expr {
-            return match n.as_i64() {
+        if matches!(
+            expr,
+            Expr::Literal(sql_parser::literal::Literal::Number(_)) | Expr::Placeholder(_)
+        ) {
+            return match params.integer(expr) {
                 Some(i) if i >= 1 && (i as usize) <= fields.len() => Ok(i as usize - 1),
-                _ => Err(SchemaError::UserError(format!(
-                    "ORDER BY position {} is not in the select list",
-                    n.raw
-                ))),
+                _ => Err(SchemaError::UserError(match expr {
+                    Expr::Literal(sql_parser::literal::Literal::Number(n)) => {
+                        format!("ORDER BY position {} is not in the select list", n.raw)
+                    }
+                    _ => "ORDER BY position is not in the select list".into(),
+                })),
             };
         }
         let Expr::Column(c) = expr else {

@@ -8,7 +8,7 @@ use crate::{
     conn::connection::{Connection, TableRef},
     constant::DEFAULT_VAR_SIZE,
     error::SchemaError,
-    plan::logical::LogicalPlan,
+    plan::{logical::LogicalPlan, params::Params},
     rslt::resultset::{ResultSet, ResultType},
     schema_ops::schema::Schema,
     table::SqlTable,
@@ -18,8 +18,10 @@ use crate::{
 pub struct Statement<F: DBFile> {
     id: uuid::Uuid,
     sql: String,
-    // Shared with the parser's cache (see sql_parser::parse_sql_cached).
+    // Shared with the parser's cache (see sql_parser::parse_sql_shaped).
+    // May be a shape's template: its placeholders' values are `params`.
     stmts: Arc<[sql_parser::Statement]>,
+    params: Params,
     conn: Arc<Connection<F>>,
     // Option<_>, not a bare ResultType: a result — streaming ones
     // especially, see ResultType::StreamingResult — can't be cheaply
@@ -35,8 +37,8 @@ pub struct PreparedStatement<F: DBFile> {
     stmt: Statement<F>,
     // The original, still placeholder-bearing statement — kept
     // separate from (a clone of) `stmt.stmts[0]` specifically because
-    // execute() overwrites `stmt.stmts` with a *substituted* (no longer
-    // placeholder-bearing) copy each time it runs. Substituting always
+    // execute() overwrites an INSERT's `stmt.stmts` with a *substituted*
+    // (no longer placeholder-bearing) copy each time it runs. Substituting always
     // starts from this template, never from `stmt.stmts[0]` itself —
     // otherwise a second execute() call would find no placeholders left
     // to replace (they were already replaced by the first call) and
@@ -121,50 +123,27 @@ where
         Ok(())
     }
 
-    // Only INSERT is actually executable through PREPARE/EXECUTE right
-    // now — not because UPDATE/DELETE/SELECT themselves are
-    // unsupported (Statement::execute runs all three directly, WHERE
-    // clause and all), but because placeholder substitution
-    // (substitute_insert_placeholders below) only knows how to walk an
-    // Insert's VALUES rows. Extending it to Update's assignments/WHERE,
-    // Delete's WHERE, and Select's WHERE is a real follow-up, just not
-    // this one. All three are still accepted at `new()` (matching the
-    // parse-time validation already written) so a caller can construct
-    // and bind one ahead of when that follow-up lands, but execute()
-    // has to be honest about not being able to run them yet.
+    /// Runs the statement with the values bound so far.
     pub fn execute(&mut self) -> Result<ResultType, SchemaError> {
-        let insert = match &self.template {
-            sql_parser::Statement::Insert(insert) => insert.clone(),
-            sql_parser::Statement::Update(_) => {
-                return Err(SchemaError::UserError(
-                    "prepared UPDATE is not executable yet — run it unprepared instead, or bind \
-                     its values into the SQL text directly"
-                        .into(),
-                ));
+        match &self.template {
+            sql_parser::Statement::Insert(insert) => {
+                let substituted = substitute_insert_placeholders(insert.clone(), &self.params)?;
+                // Swapped into the underlying Statement and run through its
+                // own ordinary execute() — reuses every bit of INSERT's
+                // existing validation/dispatch (rows_from_insert's type/NOT
+                // NULL checks, FK enforcement, transaction handling, ...)
+                // unchanged, since a fully-substituted Insert is
+                // indistinguishable from one a caller typed as a literal
+                // statement.
+                self.stmt.stmts = vec![sql_parser::Statement::Insert(substituted)].into();
             }
-            sql_parser::Statement::Delete(_) => {
-                return Err(SchemaError::UserError(
-                    "prepared DELETE is not executable yet — run it unprepared instead, or bind \
-                     its values into the SQL text directly"
-                        .into(),
-                ));
+            // SELECT, UPDATE and DELETE plan each placeholder as its value
+            // (see plan::params): the tree stays as it is.
+            other => {
+                let placeholders = other.placeholders();
+                self.stmt.params = Params::bound(&placeholders, &self.params)?;
             }
-            _ => {
-                return Err(SchemaError::UserError(
-                    "prepared SELECT is not executable yet — run it unprepared instead, or bind \
-                     its values into the SQL text directly"
-                        .into(),
-                ));
-            }
-        };
-        let substituted = substitute_insert_placeholders(insert, &self.params)?;
-        // Swapped into the underlying Statement and run through its own
-        // ordinary execute() — reuses every bit of INSERT's existing
-        // validation/dispatch (rows_from_insert's type/NOT NULL checks,
-        // FK enforcement, transaction handling, ...) unchanged, since a
-        // fully-substituted Insert is indistinguishable from one a
-        // caller typed as a literal statement.
-        self.stmt.stmts = vec![sql_parser::Statement::Insert(substituted)].into();
+        }
         self.stmt.results.clear();
         self.stmt.current_result = None;
         self.stmt.execute()?;
@@ -173,7 +152,7 @@ where
             .results
             .first_mut()
             .and_then(Option::take)
-            .expect("Insert's own execute() arm always pushes exactly one result"))
+            .expect("a statement's execute() pushes exactly one result"))
     }
 }
 
@@ -268,6 +247,17 @@ fn value_item_to_expr(v: &ValueItem) -> Result<sql_parser::Expr, SchemaError> {
         })),
     };
     Ok(Expr::Literal(literal))
+}
+
+// Whether `stmt` may run from a shape's template: every literal it reads
+// is read through plan::params.
+fn runs_from_template(stmt: &sql_parser::Statement) -> bool {
+    use sql_parser::Statement as S;
+    match stmt {
+        S::Select(_) | S::Update(_) | S::Delete(_) => true,
+        S::Explain(_, inner) => matches!(inner.as_ref(), S::Select(_)),
+        _ => false,
+    }
 }
 
 // UPDATE/DELETE's own row-selection needs a single-table EvalExpr
@@ -540,7 +530,19 @@ where
     F: DBFile<Item = F>,
 {
     pub(crate) fn new(sql: &str, conn: Arc<Connection<F>>) -> Result<Self, SchemaError> {
-        let stmts = sql_parser::parse_sql_cached(sql)?;
+        let shaped = sql_parser::parse_sql_shaped(sql)?;
+        // Statements that plan their expressions run from the shape's
+        // template as it is, reading each literal through `params` (see
+        // plan::params): nothing is copied. Others read literals straight
+        // from the tree, so they take a copy with the literals bound in.
+        let (stmts, params) = if shaped.literals.is_empty() {
+            (shaped.statements, Params::none())
+        } else if shaped.statements.iter().all(runs_from_template) {
+            let params = Params::from_literals(&shaped.literals);
+            (shaped.statements, params)
+        } else {
+            (sql_parser::parse_sql_cached(sql)?, Params::none())
+        };
         Self::semantic_validate(&stmts)?;
         Ok(Self {
             // From the thread's own generator: Uuid::new_v4 asks the OS
@@ -549,6 +551,7 @@ where
             sql: sql.to_string(),
             conn,
             stmts,
+            params,
             results: vec![],
             current_result: None,
         })
@@ -753,7 +756,7 @@ where
                                 // t), so every source row has to be read
                                 // before any of them are written.
                                 sql_parser::dml::InsertSource::Select(query) => {
-                                    let mut plan = LogicalPlan::build(self.conn.clone(), query)?;
+                                    let mut plan = LogicalPlan::build(self.conn.clone(), query, self.params.clone())?;
                                     let mut result = plan.execute()?;
                                     let mut selected = vec![];
                                     while let Some(row) = result.next_result()? {
@@ -810,6 +813,7 @@ where
                         self.conn.clone(),
                         &subquery_exprs,
                         &tq,
+                        self.params.clone(),
                     )?;
                     let mut assignments = Vec::with_capacity(update.assignments.len());
                     let mut seen = std::collections::HashSet::new();
@@ -836,11 +840,11 @@ where
                                 "duplicate assignment to column {name:?} in UPDATE"
                             )));
                         }
-                        let expr = *crate::plan::eval::EvalExpr::from_expr(&a.value, &tq)?;
+                        let expr = *crate::plan::eval::EvalExpr::from_expr(&a.value, &tq, &self.params)?;
                         assignments.push((pos, expr));
                     }
                     let where_expr = match &update.where_clause {
-                        Some(wc) => Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?),
+                        Some(wc) => Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq, &self.params)?),
                         None => None,
                     };
 
@@ -862,8 +866,9 @@ where
                                 self.conn.clone(),
                                 &[&wc.expr],
                                 &tq,
+                                self.params.clone(),
                             )?;
-                            Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq)?)
+                            Some(*crate::plan::eval::EvalExpr::from_expr(&wc.expr, &tq, &self.params)?)
                         }
                         None => None,
                     };
@@ -907,7 +912,7 @@ where
                             Ok(())
                         })?;
                      */
-                    let mut plan = LogicalPlan::build(self.conn.clone(), query)?;
+                    let mut plan = LogicalPlan::build(self.conn.clone(), query, self.params.clone())?;
                     let result = plan.execute()?;
                     self.results.push(Some(ResultType::StreamingResult(result)));
                 }
@@ -1117,7 +1122,7 @@ where
                             "EXPLAIN is only supported for SELECT".into(),
                         ));
                     };
-                    let plan = LogicalPlan::build(self.conn.clone(), query)?;
+                    let plan = LogicalPlan::build(self.conn.clone(), query, self.params.clone())?;
                     self.results
                         .push(Some(ResultType::ResultString(plan.explain()?.render())));
                 }

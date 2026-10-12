@@ -32,7 +32,7 @@ The SQL database, built on [`store`](../store/README.md) with
 - **Transactions:** `BEGIN`, `COMMIT`, `ROLLBACK`, with snapshot isolation
   from the store.
 - **Prepared statements:** `PREPARE`, `EXECUTE`, `DEALLOCATE`, with `?` /
-  `:name` placeholders.
+  `:name` placeholders, for `INSERT`, `SELECT`, `UPDATE` and `DELETE`.
 - **Introspection:**
   - `EXPLAIN`
   - `ANALYZE`

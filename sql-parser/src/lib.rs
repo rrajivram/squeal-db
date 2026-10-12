@@ -37,7 +37,7 @@ use chumsky::{
     prelude::end,
 };
 
-pub use crate::cache::{CacheStats, cache_stats, parse_sql_cached};
+pub use crate::cache::{CacheStats, Shaped, cache_stats, parse_sql_cached, parse_sql_shaped};
 pub use crate::{
     expr::{Expr, Placeholder},
     ident::{Ident, ObjectName},

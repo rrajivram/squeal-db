@@ -363,7 +363,7 @@ where
             for arg in args {
                 func_args.push(match arg {
                     FunctionArg::Wildcard(_) => FuncArgs::Wildcard,
-                    FunctionArg::Expr(e) => FuncArgs::Field(EvalExpr::from_expr(e, value.tables)?),
+                    FunctionArg::Expr(e) => FuncArgs::Field(EvalExpr::from_expr(e, value.tables, value.params)?),
                 });
             }
             Self::get_fn(name, distinct, func_args)

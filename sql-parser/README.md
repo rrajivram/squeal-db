@@ -59,6 +59,11 @@ pub struct With {
    - **By shape:** statements that differ only in their literals share one
      parse. Each new statement gets its literals bound into the shape's
      template, and spans stay exact.
+   - **Without the copy:** `parse_sql_shaped` hands back the shape's
+     template itself, shared, with the text's literals beside it. Each
+     literal has the span of the placeholder standing for it, which is
+     how a caller finds a placeholder's value (squeal-sql's
+     `plan::params`).
    - **Safety:** a shape is checked against a real parse the first time
      it's seen.
    - **Bounds:** the cache is LRU, capped in size, and skips very long

@@ -3,5 +3,6 @@ pub(crate) mod eval;
 pub mod funcs;
 pub(crate) mod logical;
 pub mod memory;
+pub(crate) mod params;
 pub(crate) mod sarg;
 pub(crate) mod subquery;

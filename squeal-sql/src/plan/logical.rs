@@ -30,6 +30,7 @@ use crate::{
         conjuncts::{ConjunctKind, Conjuncts, TableShape, null_supplied_tables},
         eval::EvalExpr,
         memory::QueryMemory,
+        params::Params,
         sarg::condition_set,
         subquery,
     },
@@ -298,6 +299,8 @@ struct QueryVisitor<F: DBFile> {
     // The WITH queries in scope, outermost first and in the order defined:
     // a FROM item naming one reads that query (see get_table).
     ctes: Vec<CteScope>,
+    // The values of the statement's placeholders (see plan::params).
+    params: Params,
 }
 
 // One WITH query in scope.
@@ -670,7 +673,11 @@ where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
-    fn new(conn: Arc<Connection<F>>, mem: Arc<QueryMemory>) -> Result<Self, SchemaError> {
+    fn new(
+        conn: Arc<Connection<F>>,
+        mem: Arc<QueryMemory>,
+        params: Params,
+    ) -> Result<Self, SchemaError> {
         let stmt_txn = if conn.with_current_txn(|t| t.is_some()) {
             None
         } else {
@@ -683,6 +690,7 @@ where
             mem,
             stmt_txn,
             ctes: vec![],
+            params,
         })
     }
 
@@ -720,13 +728,13 @@ where
         let count = |e: Option<i64>| match e {
             Some(n) if n < 0 => Err(SchemaError::InvalidLimitValue(n)),
             Some(n) => Ok(Some(n as usize)),
-            // A count that isn't a literal (e.g. a bound parameter) can't
-            // be resolved here — pre-existing behavior, unchanged: treated
-            // as absent rather than erroring.
+            // A count that isn't an integer (a literal or a placeholder
+            // holding one) can't be resolved here: treated as absent.
             None => Ok(None),
         };
-        let limit = count(query.limit.as_ref().and_then(|l| l.count_i64()))?;
-        let offset = count(query.offset.as_ref().and_then(|o| o.count_i64()))?.unwrap_or(0);
+        let limit = count(query.limit.as_ref().and_then(|l| self.params.integer(&l.count)))?;
+        let offset =
+            count(query.offset.as_ref().and_then(|o| self.params.integer(&o.count)))?.unwrap_or(0);
         // The rows ORDER BY ... LIMIT must keep: those OFFSET skips too.
         let limit_count = limit.map(|l| l.saturating_add(offset));
         let (mut step, hidden, sorted) = match (&query.body, query.compounds.is_empty()) {
@@ -751,6 +759,7 @@ where
             step = Box::new(SortSource::create_from(
                 step,
                 order,
+                &self.params,
                 limit_count,
                 self.conn.database.read().db.clone(),
                 self.mem.clone(),
@@ -913,7 +922,7 @@ where
                 continue;
             }
             if let Err(SchemaError::FieldNotFound(name)) =
-                SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
+                SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields, &self.params)
             {
                 if distinct {
                     // Which of several source rows would a DISTINCT row
@@ -928,7 +937,7 @@ where
         }
         // HAVING reads the raw rows, like the SELECT list (see GroupSource).
         let having = match &select.having {
-            Some(h) => Some(*EvalExpr::from_expr(&h.expr, &flat_tables)?),
+            Some(h) => Some(*EvalExpr::from_expr(&h.expr, &flat_tables, &self.params)?),
             None => None,
         };
         // GROUP BY and HAVING make the query a grouped one even with no
@@ -939,7 +948,7 @@ where
         let projected_field_count = projected_fields.len();
 
         let wh_expr = if let Some(wh) = &select.where_clause {
-            Some(*EvalExpr::from_expr(&wh.expr, &flat_tables)?)
+            Some(*EvalExpr::from_expr(&wh.expr, &flat_tables, &self.params)?)
         } else {
             None
         };
@@ -963,7 +972,7 @@ where
             Some(g) => g
                 .exprs
                 .items()
-                .map(|e| EvalExpr::from_expr(e, &flat_tables).map(|e| *e))
+                .map(|e| EvalExpr::from_expr(e, &flat_tables, &self.params).map(|e| *e))
                 .collect::<Result<Vec<_>, _>>()?,
             None => vec![],
         };
@@ -987,7 +996,7 @@ where
                 .map(|item| {
                     let ascending = item.direction.map(|d| d.is_left()).unwrap_or(true);
                     let nulls_first = item.nulls.map(|(_, n)| n.is_left()).unwrap_or(false);
-                    let i = SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields)
+                    let i = SortSource::<F>::resolve_order_by_index(&item.expr, &projected_fields, &self.params)
                         .ok()?;
                     match projected_fields[i].expr {
                         EvalExpr::Value(column) if ascending => Some((column, nulls_first)),
@@ -1462,7 +1471,7 @@ where
         alias: &Option<Alias>,
         tables: &[TableQuery<F>],
     ) -> Result<ProjectableField, SchemaError> {
-        let eval_expr = EvalExpr::from_expr(expr, tables)?;
+        let eval_expr = EvalExpr::from_expr(expr, tables, &self.params)?;
         // The one place a display name/Field actually matter — a SELECT-
         // list item needs a result-set column header — so this is where
         // ProjectedField gets built now, not inside from_expr's own
@@ -2550,13 +2559,14 @@ pub(crate) fn resolve_subqueries<F>(
     conn: Arc<Connection<F>>,
     exprs: &[&Expr],
     tables: &[TableQuery<F>],
+    params: Params,
 ) -> Result<subquery::Registered, SchemaError>
 where
     F: DBFile + 'static,
     F: DBFile<Item = F>,
 {
     let mem = QueryMemory::new(query_memory_limit(&conn));
-    let mut visitor = QueryVisitor::new(conn, mem)?;
+    let mut visitor = QueryVisitor::new(conn, mem, params)?;
     subquery::resolve_all(&mut visitor, exprs, tables)
 }
 
@@ -2587,10 +2597,14 @@ where
         }
     }
 
-    pub(crate) fn build(conn: Arc<Connection<F>>, query: &Query) -> Result<Self, SchemaError> {
+    pub(crate) fn build(
+        conn: Arc<Connection<F>>,
+        query: &Query,
+        params: Params,
+    ) -> Result<Self, SchemaError> {
         let start = Instant::now();
         let mem = QueryMemory::new(query_memory_limit(&conn));
-        let mut visitor = QueryVisitor::new(conn.clone(), mem.clone())?;
+        let mut visitor = QueryVisitor::new(conn.clone(), mem.clone(), params)?;
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);
         }

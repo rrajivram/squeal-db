@@ -13,6 +13,7 @@ use crate::{
     plan::{
         funcs::{FuncArgs, FuncObj, FuncTrait},
         logical::TableQuery,
+        params::{Params, literal_value},
         subquery::{self, SubqueryExpr},
     },
 };
@@ -23,6 +24,7 @@ pub(crate) struct CrateValueItem(ValueItem);
 pub(crate) struct ExprWrapper<'a, F: DBFile + 'static> {
     pub(crate) expr: &'a Expr,
     pub(crate) tables: &'a [TableQuery<F>],
+    pub(crate) params: &'a Params,
 }
 
 #[derive(Debug, Clone)]
@@ -354,36 +356,24 @@ impl EvalExpr {
     pub(crate) fn from_expr<F: DBFile + 'static>(
         expr: &Expr,
         tables: &[TableQuery<F>],
+        params: &Params,
     ) -> Result<Box<EvalExpr>, SchemaError> {
         let eval_expr = match expr {
             Expr::Unary { op, expr } => Self::Unary {
                 op: *op,
-                field: Self::from_expr(expr, tables)?,
+                field: Self::from_expr(expr, tables, params)?,
             }
             .folded(),
             Expr::Binary { left, op, right } => Self::Binary {
-                lhs: Self::from_expr(left, tables)?,
+                lhs: Self::from_expr(left, tables, params)?,
                 op: *op,
-                rhs: Self::from_expr(right, tables)?,
+                rhs: Self::from_expr(right, tables, params)?,
             }
             .folded(),
-            Expr::Literal(l) => match l {
-                sql_parser::literal::Literal::Boolean(b) => {
-                    Self::Literal(ValueItem::Boolean(b.value()))
-                }
-                sql_parser::literal::Literal::Null(_) => Self::Literal(ValueItem::Null),
-                sql_parser::literal::Literal::String(s) => {
-                    Self::Literal(ValueItem::Str((s.value.clone(), s.value.len() as u32)))
-                }
-                sql_parser::literal::Literal::Number(f) => match f.value {
-                    sql_parser::literal::NumberValue::Float(f) => {
-                        Self::Literal(ValueItem::Double(f))
-                    }
-                    sql_parser::literal::NumberValue::Integer(i) => {
-                        Self::Literal(ValueItem::Integer(i))
-                    }
-                },
-            },
+            Expr::Literal(l) => Self::Literal(literal_value(l)),
+            // A placeholder plans as the value it holds, exactly as the
+            // literal would: every decision sees it (see plan::params).
+            Expr::Placeholder(p) => Self::Literal(params.get(p)?.clone()),
             Expr::Column(c) => {
                 let idents = c.idents().collect::<Vec<_>>();
                 if idents.len() > 1 {
@@ -427,9 +417,13 @@ impl EvalExpr {
                 }
             }
             Expr::Function { .. } => {
-                Self::Function(FuncObj::try_from(&ExprWrapper { expr, tables })?)
+                Self::Function(FuncObj::try_from(&ExprWrapper {
+                    expr,
+                    tables,
+                    params,
+                })?)
             }
-            Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables)?,
+            Expr::Nested(n) => *Self::from_expr(n.as_ref(), tables, params)?,
             // `x BETWEEN low AND high` is `x >= low AND x <= high`.
             Expr::Between {
                 expr: x,
@@ -437,18 +431,18 @@ impl EvalExpr {
                 low,
                 high,
             } => {
-                let x = Self::from_expr(x, tables)?;
+                let x = Self::from_expr(x, tables, params)?;
                 let both = EvalExpr::Binary {
                     lhs: Box::new(EvalExpr::Binary {
                         lhs: x.clone(),
                         op: BinaryOp::GtEq,
-                        rhs: Self::from_expr(low, tables)?,
+                        rhs: Self::from_expr(low, tables, params)?,
                     }),
                     op: BinaryOp::And,
                     rhs: Box::new(EvalExpr::Binary {
                         lhs: x,
                         op: BinaryOp::LtEq,
-                        rhs: Self::from_expr(high, tables)?,
+                        rhs: Self::from_expr(high, tables, params)?,
                     }),
                 };
                 if *negated {
@@ -473,8 +467,8 @@ impl EvalExpr {
                         insensitive: *case_insensitive,
                     },
                     vec![
-                        FuncArgs::Field(Self::from_expr(x, tables)?),
-                        FuncArgs::Field(Self::from_expr(pattern, tables)?),
+                        FuncArgs::Field(Self::from_expr(x, tables, params)?),
+                        FuncArgs::Field(Self::from_expr(pattern, tables, params)?),
                     ],
                 )?))
             }
@@ -484,7 +478,7 @@ impl EvalExpr {
                 else_expr,
             } => {
                 use crate::plan::funcs::{Scalar, ScalarKind};
-                let field = |e: &Expr| Self::from_expr(e, tables).map(FuncArgs::Field);
+                let field = |e: &Expr| Self::from_expr(e, tables, params).map(FuncArgs::Field);
                 let mut args = vec![];
                 if let Some(o) = operand {
                     args.push(field(o)?);
@@ -509,7 +503,7 @@ impl EvalExpr {
                 negated,
             } => {
                 use crate::plan::funcs::{IsNotNull, IsNull};
-                let arg = vec![FuncArgs::Field(Self::from_expr(inner, tables)?)];
+                let arg = vec![FuncArgs::Field(Self::from_expr(inner, tables, params)?)];
                 Self::Function(if *negated {
                     FuncObj::IsNotNull(IsNotNull::new(arg)?)
                 } else {
@@ -525,13 +519,13 @@ impl EvalExpr {
                 list,
                 negated,
             } => {
-                let lhs = Self::from_expr(lhs, tables)?;
+                let lhs = Self::from_expr(lhs, tables, params)?;
                 let mut any: Option<EvalExpr> = None;
                 for item in list {
                     let eq = EvalExpr::Binary {
                         lhs: lhs.clone(),
                         op: BinaryOp::Eq,
-                        rhs: Self::from_expr(item, tables)?,
+                        rhs: Self::from_expr(item, tables, params)?,
                     };
                     any = Some(match any {
                         None => eq,
@@ -558,7 +552,7 @@ impl EvalExpr {
                 query,
                 negated,
             } => {
-                let found = subquery::compile(query, subquery::Kind::In, Some(lhs), tables)?;
+                let found = subquery::compile(query, subquery::Kind::In, Some(lhs), tables, params)?;
                 if *negated {
                     EvalExpr::Unary {
                         op: sql_parser::expr::UnaryOp::Not,
@@ -568,8 +562,8 @@ impl EvalExpr {
                     found
                 }
             }
-            Expr::Exists { query } => subquery::compile(query, subquery::Kind::Exists, None, tables)?,
-            Expr::Subquery(query) => subquery::compile(query, subquery::Kind::Scalar, None, tables)?,
+            Expr::Exists { query } => subquery::compile(query, subquery::Kind::Exists, None, tables, params)?,
+            Expr::Subquery(query) => subquery::compile(query, subquery::Kind::Scalar, None, tables, params)?,
             other => {
                 return Err(SchemaError::UnsupportedFeature(format!(
                     "this kind of expression: {}",
