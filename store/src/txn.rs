@@ -585,6 +585,19 @@ impl TransactionManager {
         self.set_active(&txn, false, true);
     }
 
+    /// Ends `txn`, which wrote nothing, if it is still active: forgotten at
+    /// once, as `abort` then `abort_complete` would leave it, under one lock.
+    /// False if it isn't active (the caller takes the general path).
+    pub(crate) fn end_read_only(&self, txn: &TransactionId) -> bool {
+        let mut states = self.states.write();
+        if !matches!(states.get(txn), Some(TxnState::Active { .. })) {
+            return false;
+        }
+        states.remove(txn);
+        self.set_active(txn, false, true);
+        true
+    }
+
     /// Finish aborting `txn` — call only after its undo log has been fully
     /// replayed. True if it is forgotten outright (the caller may discard
     /// its version records now); false if it is kept as `Aborted` because

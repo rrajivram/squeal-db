@@ -32,9 +32,10 @@ cargo run --release -p bench --bin kv  -- --size 200000 --runs 3
   `synchronous=FULL` and `fullfsync` on, and the report shows the
   settings each read back.
 - **Prepared statements for SQLite and Turso**, their usual mode of use.
-  squeal-db is sent SQL text; its parse cache shares parses across
-  statements that differ only in literals. The store and redb are called
-  directly.
+  squeal-db runs twice: `squeal` is sent SQL text (its parse cache shares
+  parses across statements that differ only in literals), and `squealp`
+  runs every query and write as a prepared statement, as the other two
+  do. The store and redb are called directly.
 - **Same allocator.** Turso's default features install mimalloc as the
   global allocator; they are turned off, so every engine uses the system
   allocator.

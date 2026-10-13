@@ -3,12 +3,14 @@
 //! memory measured, under each memory profile.
 //!
 //!   cargo run --release -p bench --bin sql -- [--size ORDERS] [--threads N]
-//!       [--runs N] [--engines squeal,sqlite,turso] [--profiles default,large]
+//!       [--runs N] [--engines squeal,squealp,sqlite,turso] [--profiles default,large]
 //!
 //! Every engine is on disk and every commit waits for a full flush
 //! (F_FULLFSYNC on macOS): squeal-db always; SQLite and Turso in WAL mode
 //! with synchronous=FULL and fullfsync on. SQLite and Turso run prepared
-//! statements; squeal-db is sent SQL text (its parse cache shares parses).
+//! statements. squeal-db runs twice: sent SQL text (`squeal`; its parse
+//! cache shares parses), and with prepared statements (`squealp`), as the
+//! other two are.
 use std::sync::Arc;
 
 use bench::{ChildArgs, Digest, block_on, child_args, drive, phase, plan_from_args};
@@ -16,13 +18,15 @@ use squeal_sql::{
     CreateConfig, OpenConfig,
     conn::connection::{Connection, ConnectionManager},
     rslt::resultset::ResultType,
+    stmt::PreparedStatement,
 };
 use store::valueitem::ValueItem;
 
 const GIB: u64 = 1 << 30;
 
 const ENGINES: &[(&str, &str)] = &[
-    ("squeal", "squeal-db (squeal-sql on store)"),
+    ("squeal", "squeal-db (squeal-sql on store), sent SQL text"),
+    ("squealp", "squeal-db with prepared statements"),
     ("sqlite", "SQLite 3.53 through rusqlite, bundled"),
     ("turso", "Turso 0.8.2, the Rust rewrite of SQLite"),
 ];
@@ -82,21 +86,49 @@ fn squeal_query(conn: &Arc<Connection<std::fs::File>>, sql: &str) -> Digest {
     stmt.execute().unwrap_or_else(|e| panic!("{sql}: {e}"));
     let mut d = Digest::default();
     while let Some(r) = stmt.get_nextresult().unwrap() {
-        if let ResultType::StreamingResult(mut s) = r {
-            while let Some(row) = s.next_result().unwrap() {
-                d.row();
-                for v in row.values() {
-                    d.value(match v {
-                        ValueItem::Integer(i) => *i as f64,
-                        ValueItem::Double(f) => *f,
-                        ValueItem::Str((s, _)) => s.len() as f64,
-                        ValueItem::Boolean(b) => *b as i64 as f64,
-                        _ => 0.0,
-                    });
-                }
+        squeal_digest(r, &mut d);
+    }
+    d
+}
+
+fn squeal_digest(r: ResultType, d: &mut Digest) {
+    if let ResultType::StreamingResult(mut s) = r {
+        while let Some(row) = s.next_result().unwrap() {
+            d.row();
+            for v in row.values() {
+                d.value(match v {
+                    ValueItem::Integer(i) => *i as f64,
+                    ValueItem::Double(f) => *f,
+                    ValueItem::Str((s, _)) => s.len() as f64,
+                    ValueItem::Boolean(b) => *b as i64 as f64,
+                    _ => 0.0,
+                });
             }
         }
     }
+}
+
+// `sql` run prepared, with `params` bound: each statement prepared once per
+// connection, in `prepared`.
+fn squeal_prepared(
+    conn: &Arc<Connection<std::fs::File>>,
+    prepared: &mut std::collections::HashMap<String, PreparedStatement<std::fs::File>>,
+    sql: &str,
+    params: &[i64],
+) -> Digest {
+    if !prepared.contains_key(sql) {
+        let stmt = conn
+            .clone()
+            .create_prepared_statement(sql)
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        prepared.insert(sql.to_string(), stmt);
+    }
+    let stmt = prepared.get_mut(sql).expect("prepared above");
+    for (i, p) in params.iter().enumerate() {
+        stmt.set_field(i, ValueItem::Integer(*p)).unwrap();
+    }
+    let mut d = Digest::default();
+    squeal_digest(stmt.execute().unwrap_or_else(|e| panic!("{sql}: {e}")), &mut d);
     d
 }
 
@@ -149,6 +181,50 @@ impl Engine for Squeal {
                         let mut d = Digest::default();
                         for id in ids {
                             d.merge(squeal_query(&c, &bind(sql, &[*id])));
+                        }
+                        d
+                    })
+                })
+                .collect();
+            let mut total = Digest::default();
+            for h in handles {
+                total.merge(h.join().unwrap());
+            }
+            total
+        })
+    }
+}
+
+// squeal-db as the other engines are run: every query and write prepared.
+struct SquealPrepared {
+    squeal: Squeal,
+    prepared: std::collections::HashMap<String, PreparedStatement<std::fs::File>>,
+}
+
+impl Engine for SquealPrepared {
+    fn run(&mut self, sql: &str) {
+        self.squeal.run(sql);
+    }
+    fn query(&mut self, sql: &str, params: &[i64]) -> Digest {
+        squeal_prepared(&self.squeal.conn, &mut self.prepared, sql, params)
+    }
+    fn exec(&mut self, sql: &str, params: &[i64]) {
+        squeal_prepared(&self.squeal.conn, &mut self.prepared, sql, params);
+    }
+    fn parallel(&self, sql: &str, per_thread: &[Vec<i64>]) -> Digest {
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = per_thread
+                .iter()
+                .map(|ids| {
+                    let mgr = self.squeal.mgr.clone();
+                    let path = self.squeal.path.clone();
+                    scope.spawn(move || {
+                        let c = mgr.connect(&path).unwrap();
+                        c.use_schema("default").unwrap();
+                        let mut prepared = Default::default();
+                        let mut d = Digest::default();
+                        for id in ids {
+                            d.merge(squeal_prepared(&c, &mut prepared, sql, &[*id]));
                         }
                         d
                     })
@@ -550,6 +626,10 @@ fn child(a: ChildArgs) {
     let path = |name: &str| a.dir.join(name).to_string_lossy().into_owned();
     let mut engine: Box<dyn Engine> = match a.engine.as_str() {
         "squeal" => Box::new(Squeal::new(&path("bench.sq"), &a.profile)),
+        "squealp" => Box::new(SquealPrepared {
+            squeal: Squeal::new(&path("bench.sq"), &a.profile),
+            prepared: Default::default(),
+        }),
         "sqlite" => Box::new(Sqlite {
             conn: sqlite_open(&path("bench.sqlite"), &a.profile),
             path: path("bench.sqlite"),
@@ -569,7 +649,7 @@ fn child(a: ChildArgs) {
     };
     // What it is really running with, read back.
     match a.engine.as_str() {
-        "squeal" => bench::info(&format!(
+        "squeal" | "squealp" => bench::info(&format!(
             "page cache {} MiB, query memory {} MiB, scratch {} MiB",
             a_config(&a.profile).page_cache_bytes >> 20,
             a_config(&a.profile).query_memory_bytes >> 20,

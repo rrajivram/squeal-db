@@ -1693,6 +1693,11 @@ where
     /// and removes it. If the revert fails (I/O, corruption) the transaction
     /// stays Aborting and the maintenance thread retries.
     pub(crate) fn abort(&self, id: TransactionId) -> Result<(), StoreError> {
+        // A transaction that wrote nothing (a statement's read, ended with
+        // its result) has nothing to revert or log: it is just forgotten.
+        if !self.versions.has_writes(&id) && self.tx_mgr.end_read_only(&id) {
+            return Ok(());
+        }
         match self.tx_mgr.abort(id) {
             Ok(()) => {}
             // Already finished — most commonly AbortOnConflict already took
