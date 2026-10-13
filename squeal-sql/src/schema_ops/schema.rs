@@ -329,9 +329,18 @@ where
         created: &mut Vec<String>,
     ) -> Result<(), SchemaError> {
         let identity_size = table.identity_size();
-        let rows = self
-            .db
-            .create_table_with_index_entry_size(names.0.clone(), table.row_entry_size() as u64)?;
+        // Its rows kept in the tree's leaves (store's
+        // ROWS_IN_LEAVES_DESIGN.md) when the widest row the schema allows
+        // fits a leaf's inline budget; else on data pages, as before.
+        let routing = table.row_entry_size() as u64;
+        let cap = self.db.inline_leaf_entry_size();
+        let rows = if table.row_tuple_size() as u64 <= cap {
+            self.db
+                .create_table_with_rows_in_leaves(names.0.clone(), routing, cap)?
+        } else {
+            self.db
+                .create_table_with_index_entry_size(names.0.clone(), routing)?
+        };
         created.push(names.0.clone());
         part.set_rows(rows);
         for (i, (index, name)) in table.indices.iter().zip(&names.1).enumerate() {

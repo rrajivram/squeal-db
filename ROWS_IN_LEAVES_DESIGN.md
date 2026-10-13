@@ -165,9 +165,42 @@ Each stage its own commit, measured.
 
      An index read still fetches each row from the table's tree, which
      keeps data pages until stage 3.
-3. [ ] **Row trees in the new form,** for new tables: inline and overflowed
-   rows, in-place updates, splits, purge freeing leaves. Measure point
-   lookups, scans, inserts, updates and file size.
+3. [x] **Row trees in the new form, for rows that fit inline.** Done
+   2026-10-13.
+   - squeal-sql creates a table's row tree this way when the widest row its
+     schema allows (`SqlTable::row_tuple_size`) fits a leaf's inline budget,
+     an eighth of a page. A wider table keeps data pages until overflow
+     (3b).
+   - **Room in a leaf.** A leaf budget is now only a cap on one tuple's
+     size, not room a leaf keeps free:
+     - a write that knows its tuple (insert, update, a rollback's restore,
+       recovery's redo) asks the descent for room for that tuple, so
+       inserts fill leaves;
+     - one that doesn't (a delete's tombstone) only ever rewrites the tuple
+       already there: it reads that tuple's size under the leaf's lock and,
+       if the leaf lacks room for it, descends again asking for it, which
+       splits the leaf. Nothing is logged before that, so the retry is free.
+   - **Checked by:** the workspace suite; 20,000 SQLite oracle queries; a
+     two-minute SQL crash soak; 200 seeds of the store's crash harness with
+     every tree in the new form.
+   - **Measured**, 500k orders, against the build before, back to back:
+
+     | | before | after |
+     |---|---:|---:|
+     | point lookup, prepared | 1.72 µs | 1.25 µs |
+     | point lookup, SQL text | ~1.9 µs | ~1.65 µs |
+     | index range, per matching row | ~750 ns | ~505 ns |
+     | secondary-index lookup | ~13 µs | ~10.9 µs |
+     | bulk insert, per row | 2.5 µs, 44 allocations | 2.1 µs, 38 |
+     | scans, `GROUP BY`, sort, join | | unchanged |
+
+   - **Not yet:** a row past the inline budget (a table widened past it by
+     `ALTER TABLE`, which keeps its tree) is refused (`TupleTooLarge`)
+     until overflow.
+3b. [ ] **Overflow:** a row past the inline budget keeps its bytes on an
+   overflow chain, its leaf tuple holding the chain's first page. The
+   chain's pages are freed only once no snapshot can still be reading the
+   version that used them. Then every table can take the new form.
 4. [ ] **Old tables rebuilt on request** (optional, later).
 
 ## Decisions for the author

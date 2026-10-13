@@ -46,6 +46,10 @@ impl<'de> Deserialize<'de> for Node {
     }
 }
 
+/// What a tuple can grow by when a later version takes a pre-image pointer:
+/// an LSN's Some plus at most a 10-byte varint, where it had None's byte.
+pub(crate) const PRE_LSN_GROWTH: u64 = 10;
+
 /// What a `write_version` caller wants done with the row for a key, decided
 /// under the leaf lock against what is currently there
 /// (TXN_SIMPLIFICATION_PLAN.md phase 4).
@@ -527,7 +531,8 @@ where
     /// same bytes (see `already_applied`).
     pub(crate) fn insert_if_needed(&self, tuple: &Tuple) -> Result<PageId, StoreError> {
         let t = tuple.clone();
-        match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+        let room = Some(tuple.size() + PRE_LSN_GROWTH);
+        match self.write_version_sized(tuple.id.clone(), self.logger.next_lsn(), room, |cur| {
             Ok(match cur {
                 None => Decision::Insert(t),
                 Some(c) if already_applied(c, &t) => Decision::Skip,
@@ -555,7 +560,8 @@ where
         lsn: LsnId,
     ) -> Result<PageId, StoreError> {
         let id = tuple.id.clone();
-        match self.write_version(id.clone(), lsn, |cur| {
+        let room = Some(tuple.size() + PRE_LSN_GROWTH);
+        match self.write_version_sized(id.clone(), lsn, room, |cur| {
             Ok(match cur {
                 None => Decision::Insert(tuple),
                 Some(_) => return Err(StoreError::DuplicateKey(id.clone())),
@@ -582,8 +588,22 @@ where
         lsn: LsnId,
         decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
     ) -> Result<Written, StoreError> {
+        self.write_version_sized(id, lsn, None, decide)
+    }
+
+    /// `write_version`, for a write that knows the largest tuple `decide`
+    /// can make (`room`, in bytes): a tree with its rows in its leaves then
+    /// keeps only that much room free in the leaf, not its whole budget —
+    /// so inserts fill leaves (see is_full_for). None: the budget.
+    pub(crate) fn write_version_sized(
+        &self,
+        id: DBIdType,
+        lsn: LsnId,
+        room: Option<DBSizeType>,
+        decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
+    ) -> Result<Written, StoreError> {
         if self.rows_in_leaves {
-            return self.write_in_leaf(id, lsn, decide);
+            return self.write_in_leaf(id, lsn, room, decide);
         }
         // Phase 6: held for the whole write so a checkpoint's capture never
         // sees a split or a chain extension half done.
@@ -598,7 +618,7 @@ where
             None,
             None,
         );
-        let leaf = self.leaf_for_write(&probe, lsn)?;
+        let leaf = self.leaf_for_write(&probe, lsn, None)?;
         let entry = leaf
             .page
             .with_entry(Entry::Exact(&id), |e| from_bytes::<Node>(e.data()))?
@@ -696,9 +716,6 @@ where
     /// budget with room for the largest pre-image pointer a later version
     /// of it adds. Checked before a write's `decide` runs, which logs it.
     pub(crate) fn check_fits(&self, tuple: &Tuple) -> Result<(), StoreError> {
-        // A pre-image LSN: Some plus at most a 10-byte varint, where the
-        // tuple may now have None's one byte.
-        const PRE_LSN_GROWTH: u64 = 10;
         if self.rows_in_leaves && tuple.size() + PRE_LSN_GROWTH > self.leaf_budget as u64 {
             return Err(StoreError::TupleTooLarge(
                 tuple.size() + PRE_LSN_GROWTH,
@@ -710,19 +727,41 @@ where
 
     // write_version for a tree with its rows in its leaves: the leaf holds
     // the tuple, so the one locked page is all a write reads and changes.
-    // The leaf's budget (is_full, with proactive splits) leaves it room for
-    // any tuple up to the budget, whatever `decide` makes.
+    //
+    // The leaf must have room for what `decide` makes before `decide` runs
+    // (it logs). A write that knows its tuple says how much (`room`); one
+    // that doesn't — a delete's tombstone — only ever rewrites the tuple
+    // already there, so it needs that tuple's size and a little: read under
+    // the leaf's lock, and if the leaf lacks it, the descent is made again
+    // asking for it, which splits the leaf on the way. Nothing is logged
+    // before that, so the retry is free.
     fn write_in_leaf(
         &self,
         id: DBIdType,
         lsn: LsnId,
+        room: Option<DBSizeType>,
         decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
     ) -> Result<Written, StoreError> {
         let _writer = self.buffer.writer_permit();
         // Routing needs only the key.
         let probe = Tuple::new_with(id.clone(), &[], None, None);
-        let leaf = self.leaf_for_write(&probe, lsn)?;
-        let current = leaf.page.get(id.clone())?;
+        let mut asked = room.unwrap_or(0);
+        let (leaf, current) = loop {
+            let leaf = self.leaf_for_write(&probe, lsn, Some(asked))?;
+            let current = leaf.page.get(id.clone())?;
+            if room.is_none()
+                && let Some(cur) = &current
+            {
+                // Its next version: a pre-image pointer more, and a
+                // transaction id perhaps a byte or two longer.
+                let need = cur.size() + PRE_LSN_GROWTH + 4;
+                if need > asked && self.is_full_for(&leaf.page, Some(need))? {
+                    asked = need;
+                    continue;
+                }
+            }
+            break (leaf, current);
+        };
         match decide(current.as_ref())? {
             Decision::Skip => Ok(Written::Skipped),
             Decision::Insert(new) => {
@@ -757,7 +796,12 @@ where
     // retry-from-root that a full inner node asks for (it can't take the
     // separator a child split needs; the level above splits it first on the
     // next pass).
-    fn leaf_for_write(&self, probe: &Tuple, lsn: LsnId) -> Result<WritePageHandle, StoreError> {
+    fn leaf_for_write(
+        &self,
+        probe: &Tuple,
+        lsn: LsnId,
+        room: Option<DBSizeType>,
+    ) -> Result<WritePageHandle, StoreError> {
         // Fast path (B-link): route with unlocked reads, lock only the leaf,
         // and revalidate under that lock — the page is still a leaf (a root
         // split turns the root leaf into an inner node) and still covers the
@@ -785,7 +829,7 @@ where
                     _ => break,
                 }
             }
-            if !self.is_full(&handle.page)? && handle.page.can_store(probe) {
+            if !self.is_full_for(&handle.page, room)? && handle.page.can_store(probe) {
                 return Ok(handle);
             }
             // Needs a split: only the locked top-down descent can do that.
@@ -796,12 +840,12 @@ where
             let handle = self
                 .buffer
                 .get_page_mut(self.table.first_index_page, LockLevel::Index)?;
-            if self.is_full(&handle.page)? {
-                self.split_root_page(handle, &probe.id, lsn)?;
+            if self.is_full_for(&handle.page, room)? {
+                self.split_root_page(handle, &probe.id, lsn, room)?;
             } else {
                 drop(handle);
             }
-            match self.descend_for_write(probe, self.table.first_index_page, None, lsn) {
+            match self.descend_for_write(probe, self.table.first_index_page, None, lsn, room) {
                 Err(StoreError::PageCapacityError) if retries < 16 => {
                     retries += 1;
                     std::thread::sleep(std::time::Duration::from_micros(50 * retries as u64));
@@ -1006,7 +1050,8 @@ where
     /// Replace the row for `tuple.id` with `tuple` (tests and recovery).
     pub fn update(&self, tuple: Tuple) -> Result<Tuple, StoreError> {
         let id = tuple.id.clone();
-        match self.write_version(id.clone(), self.logger.next_lsn(), |cur| {
+        let room = Some(tuple.size() + PRE_LSN_GROWTH);
+        match self.write_version_sized(id.clone(), self.logger.next_lsn(), room, |cur| {
             Ok(match cur {
                 Some(_) => Decision::Replace(tuple),
                 None => return Err(StoreError::KeyNotFound(id.clone())),
@@ -1022,7 +1067,8 @@ where
     // a delete's redo changes only the flag), and a missing row (a log
     // older than the checkpoint: the data file is ahead of this record).
     pub(crate) fn update_if_needed(&self, tuple: Tuple) -> Result<(), StoreError> {
-        self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+        let room = Some(tuple.size() + PRE_LSN_GROWTH);
+        self.write_version_sized(tuple.id.clone(), self.logger.next_lsn(), room, |cur| {
             Ok(match cur {
                 Some(c) if already_applied(c, &tuple) => Decision::Skip,
                 Some(_) => Decision::Replace(tuple),
@@ -1052,7 +1098,8 @@ where
         expect_txn: &TransactionId,
     ) -> Result<Option<Tuple>, StoreError> {
         let expect = *expect_txn;
-        match self.write_version(tuple.id.clone(), self.logger.next_lsn(), |cur| {
+        let room = Some(tuple.size() + PRE_LSN_GROWTH);
+        match self.write_version_sized(tuple.id.clone(), self.logger.next_lsn(), room, |cur| {
             Ok(match cur {
                 Some(c) if c.is_same_txn(expect) => Decision::Replace(tuple),
                 _ => Decision::Skip,
@@ -1506,18 +1553,19 @@ where
         start: PageId,
         parent: Option<WritePageHandle>,
         lsn: LsnId,
+        room: Option<DBSizeType>,
     ) -> Result<WritePageHandle, StoreError> {
         let mut handle = self.buffer.get_page_mut(start, LockLevel::Index)?;
         // Crabbing: now that we hold this node's lock, release the parent's.
         drop(parent);
         if handle.page.is_flag_set(LEAF_NODE) {
-            if self.is_full(&handle.page)? {
+            if self.is_full_for(&handle.page, room)? {
                 if self.is_root_page(start) {
                     // Root leaf filled between the unlocked pre-check in
                     // leaf_for_write and this locked arrival: split it now
                     // (split_root_page re-checks under this lock) and retry.
-                    self.split_root_page(handle, &probe.id, lsn)?;
-                    return self.descend_for_write(probe, start, None, lsn);
+                    self.split_root_page(handle, &probe.id, lsn, room)?;
+                    return self.descend_for_write(probe, start, None, lsn, room);
                 }
                 // A non-root leaf full on arrival. Under the pure crabbing
                 // descent this could not happen (split_if_needed carried the
@@ -1566,7 +1614,7 @@ where
                 start
             )));
         };
-        match self.split_if_needed(p, probe, lsn)? {
+        match self.split_if_needed(p, probe, lsn, room)? {
             SplitOutcome::Split(separator, sibling) => {
                 // The entry that routed here (this node is locked: the same
                 // one), by its id now that it is to be rewritten.
@@ -1600,11 +1648,11 @@ where
                 let target = if probe.id < separator { p } else { sibling };
                 let child = self.buffer.get_page_mut(target, LockLevel::Index)?;
                 self.buffer.write_locked_page_with_lsn(handle, lsn)?;
-                self.descend_for_write(probe, target, Some(child), lsn)
+                self.descend_for_write(probe, target, Some(child), lsn, room)
             }
             SplitOutcome::NoSplitNeeded(child) => {
                 drop(handle);
-                self.descend_for_write(probe, p, Some(child), lsn)
+                self.descend_for_write(probe, p, Some(child), lsn, room)
             }
         }
     }
@@ -1614,11 +1662,12 @@ where
         page_id: PageId,
         tuple: &Tuple,
         lsn: LsnId,
+        room: Option<DBSizeType>,
     ) -> Result<SplitOutcome, StoreError> {
         let handle = self.buffer.get_page_mut(page_id, LockLevel::Index)?;
         // Full only: a page that isn't has room for any legal entry, and one
         // too large for the table fails with TupleTooLarge at the leaf.
-        if self.is_full(&handle.page)? {
+        if self.is_full_for(&handle.page, room)? {
             if self.is_root_page(page_id) {
                 // STORE_AUDIT.md S8: a caller-discipline invariant (the
                 // root is always split via split_root_page, from
@@ -1665,6 +1714,19 @@ where
     // cap allows. Pages from before record_size existed fall back to the
     // budget nodes_per_page implies.
     fn is_full(&self, page: &Page) -> Result<bool, StoreError> {
+        self.is_full_for(page, None)
+    }
+
+    // is_full, for a write needing `room` bytes free: a leaf of a tree with
+    // its rows in its leaves keeps that much free (the leaf budget when
+    // None), not its entry budget — a write that knows its tuple fills the
+    // leaf. Every other page by its budget, as is_full.
+    fn is_full_for(&self, page: &Page, room: Option<DBSizeType>) -> Result<bool, StoreError> {
+        if self.rows_in_leaves && page.is_flag_set(LEAF_NODE) {
+            let room = room.unwrap_or(self.leaf_budget as DBSizeType);
+            let usable = page.usable_data_size();
+            return Ok(page.used_data_size() + room + page.entry_overhead() + FULL_SLACK > usable);
+        }
         if let Some(cap) = self.count_cap
             && page.count()? >= cap - 1
         {
@@ -1897,6 +1959,7 @@ where
         handle: WritePageHandle,
         incoming_id: &DBIdType,
         lsn: LsnId,
+        room: Option<DBSizeType>,
     ) -> Result<(), StoreError> {
         // insert()'s caller decides whether to call this based on an
         // *unlocked* read of the root's count — by the time we actually hold
@@ -1917,7 +1980,7 @@ where
         // correct for re-splitting an inner root, so gating on "already
         // inner" here was the only thing wrong: it made every second split
         // silently no-op, permanently capping the tree at 2 levels.
-        if !self.is_full(&handle.page)? {
+        if !self.is_full_for(&handle.page, room)? {
             return Ok(());
         }
         let values = handle.page.iter().collect::<Vec<_>>();
@@ -2061,7 +2124,7 @@ where
             if entry.size() as usize > record_size {
                 return Err(StoreError::TupleTooLarge(entry.size(), record_size).into());
             }
-            if self.is_full(&leaf)? || !leaf.can_store(&entry) {
+            if self.is_full_for(&leaf, Some(entry.size()))? || !leaf.can_store(&entry) {
                 let this = match leaf_id {
                     Some(id) => id,
                     None => self.buffer.alloc_indexed_page(record_size)?,

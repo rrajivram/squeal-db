@@ -2175,6 +2175,21 @@ impl SqlTable {
         self.identity_size() + ENTRY_OVERHEAD_BYTES
     }
 
+    // Worst-case width of a whole row's tuple in the row tree: its key, the
+    // stored row (its version and every column at its widest, each as a
+    // tagged value — the older, unpacked form is never narrower than the
+    // packed one — with a few bytes a column for lengths and offsets), and
+    // the tuple's header. What a row tree keeping its rows in its leaves
+    // must take (see Schema::create_partition_trees).
+    pub(crate) fn row_tuple_size(&self) -> usize {
+        let columns = self.fields();
+        self.identity_size()
+            + columns.iter().map(|f| f.datatype.size()).sum::<usize>()
+            + 8 * columns.len()
+            + 32
+            + ENTRY_OVERHEAD_BYTES
+    }
+
     // A row's width as the cost model counts it (see optim::picker's
     // table_row): every field's budget plus ENTRY_OVERHEAD_BYTES — what
     // the row table's entry budget was before row_entry_size, and what the

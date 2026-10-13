@@ -2108,11 +2108,14 @@ where
         // Before anything is logged: a tree with its rows in its leaves takes
         // tuples up to its leaf budget.
         table.check_fits(&tuple)?;
+        // The room the write needs: this tuple, with a pre-image pointer
+        // if it takes over a tombstone.
+        let room = Some(tuple.size() + bplustree::PRE_LSN_GROWTH);
         // STORE_AUDIT.md T2: minted BEFORE mutating; the pages this write
         // touches, the version record, and the WAL record all carry it.
         let lsn = self.logger.next_lsn();
         let key = tuple.id.clone();
-        self.write_with_policy(&table, key.clone(), lsn, &tx_id, |current| {
+        self.write_with_policy(&table, key.clone(), lsn, &tx_id, room, |current| {
             match current {
                 None => {
                     let op = Operation::Add {
@@ -2238,15 +2241,18 @@ where
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         // See insert: checked as the version will be written, with its
-        // transaction.
-        if table.rows_in_leaves() {
+        // transaction and a pre-image pointer; that is the room it needs.
+        let room = if table.rows_in_leaves() {
             let mut written = new_tuple.clone();
             written.set_txn_id(txn);
             table.check_fits(&written)?;
-        }
+            Some(written.size() + bplustree::PRE_LSN_GROWTH)
+        } else {
+            None
+        };
         let id = new_tuple.id.clone();
         let lsn = self.logger.next_lsn();
-        self.write_with_policy(&table, id.clone(), lsn, &txn, |current| {
+        self.write_with_policy(&table, id.clone(), lsn, &txn, room, |current| {
             let current = current.ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
             self.check_write_conflict(current, &txn)?;
             // Phase 3: the pre-image is the version being replaced — a
@@ -2294,7 +2300,7 @@ where
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
         let lsn = self.logger.next_lsn();
-        match self.write_with_policy(&table, id.clone(), lsn, &txn, |current| {
+        match self.write_with_policy(&table, id.clone(), lsn, &txn, None, |current| {
             let current = current.ok_or_else(|| StoreError::KeyNotFound(id.clone()))?;
             self.check_write_conflict(current, &txn)?;
             let old_tuple = if current.txn_id == Some(txn) {
@@ -2335,10 +2341,11 @@ where
         id: DBIdType,
         lsn: LsnId,
         txn: &TransactionId,
+        room: Option<DBSizeType>,
         decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
     ) -> Result<Written, StoreError> {
         self.refuse_if_degraded()?;
-        let result = table.write_version(id, lsn, decide);
+        let result = table.write_version_sized(id, lsn, room, decide);
         match &result {
             Err(StoreError::WriteConflict(key))
                 if self.tx_mgr.conflict_policy(txn) == ConflictPolicy::AbortOnConflict =>
@@ -11276,10 +11283,11 @@ mod tests {
     fn test_rows_in_leaves_use_fewer_pages_than_data_pages_do() {
         let pages = |leaf: bool| {
             let db = TestDB::create(&format!("leaf_rows_pages_{leaf}.db")).unwrap();
+            // The data-page form asked for as such, whatever SQ_ROWS_IN_LEAVES says.
             let tid = if leaf {
                 leaf_rows_table(&db, "t")
             } else {
-                db.create_table_with_index_entry_size("t".to_string(), 64).unwrap()
+                db.create_tree("t".to_string(), 64, None).unwrap()
             };
             let start = db.page_count();
             let t = db.begin().unwrap();
