@@ -2520,6 +2520,14 @@ impl SqlIndex {
         self.key_size(identity_size) + ENTRY_OVERHEAD_BYTES
     }
 
+    // Worst-case width of a whole entry of this index's tree — its key, the
+    // row identity it holds, and the tuple's own header — what a tree
+    // keeping its entries in its leaves budgets each leaf entry for (see
+    // store's Db::create_table_with_rows_in_leaves).
+    pub(crate) fn entry_size(&self, identity_size: usize) -> usize {
+        self.key_size(identity_size) + identity_size + ENTRY_OVERHEAD_BYTES
+    }
+
     // Worst-case width of just this index's tree KEY (indexed columns, plus
     // the row identity appended to make a non-unique index's key unique) —
     // what a B-link `high_key` can end up holding, and so what

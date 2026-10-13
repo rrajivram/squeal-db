@@ -857,6 +857,14 @@ impl Page {
         self.record_size
     }
 
+    /// Sets the per-entry budget (see record_size): for a page changing
+    /// role, as a tree's root does when it stops being a leaf whose
+    /// entries are rows and becomes an inner page of routing entries.
+    pub(crate) fn set_record_size(&mut self, record_size: usize) -> Result<(), StoreError> {
+        self.record_size = Some(record_size);
+        self.set_dirty(true)
+    }
+
     pub(crate) fn can_store(&self, tuple: &Tuple) -> bool {
         // Accept a tuple only if it actually fits. Exception: an empty page
         // always accepts, so a single tuple larger than a whole page still has

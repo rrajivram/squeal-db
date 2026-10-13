@@ -2105,6 +2105,9 @@ where
         tuple.clear_tombstone();
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(id)?;
+        // Before anything is logged: a tree with its rows in its leaves takes
+        // tuples up to its leaf budget.
+        table.check_fits(&tuple)?;
         // STORE_AUDIT.md T2: minted BEFORE mutating; the pages this write
         // touches, the version record, and the WAL record all carry it.
         let lsn = self.logger.next_lsn();
@@ -2234,6 +2237,13 @@ where
         self.require_active(&txn)?;
         // STORE_AUDIT.md T17: guard held for the whole call.
         let (table, _table_guard) = self.table_by_id_guarded(tid)?;
+        // See insert: checked as the version will be written, with its
+        // transaction.
+        if table.rows_in_leaves() {
+            let mut written = new_tuple.clone();
+            written.set_txn_id(txn);
+            table.check_fits(&written)?;
+        }
         let id = new_tuple.id.clone();
         let lsn = self.logger.next_lsn();
         self.write_with_policy(&table, id.clone(), lsn, &txn, |current| {
@@ -2741,6 +2751,56 @@ where
         name: String,
         index_entry_size: DBSizeType,
     ) -> Result<TableIdType, StoreError> {
+        // SQ_ROWS_IN_LEAVES=1: every tree in that form, its leaves taking
+        // the largest tuple a leaf can (for running a test suite against
+        // it; see ROWS_IN_LEAVES_DESIGN.md).
+        let leaf = rows_in_leaves_everywhere().then(|| self.inline_leaf_entry_size());
+        self.create_tree(name, index_entry_size, leaf)
+    }
+
+    /// Like `create_table_with_index_entry_size`, but the tree keeps its
+    /// tuples in its leaves, with no data pages (ROWS_IN_LEAVES_DESIGN.md):
+    /// `index_entry_size` budgets its inner pages' routing entries, and
+    /// `leaf_entry_size` the tuples themselves, header included — the
+    /// largest it will take (`TupleTooLarge` past it).
+    pub fn create_table_with_rows_in_leaves(
+        &self,
+        name: String,
+        index_entry_size: DBSizeType,
+        leaf_entry_size: DBSizeType,
+    ) -> Result<TableIdType, StoreError> {
+        self.create_tree(name, index_entry_size, Some(leaf_entry_size))
+    }
+
+    /// The largest tuple a leaf of this database's page size can be given
+    /// a budget for: a quarter of a page, less the split slack (see
+    /// BPlusTree's is_full).
+    pub fn max_leaf_entry_size(&self) -> DBSizeType {
+        let usable = self
+            .header
+            .page_size
+            .saturating_sub(self.buffer.page_overhead() as DBSizeType + crate::page::USABLE_DATA_MARGIN);
+        (usable / crate::config::MIN_ENTRIES_PER_PAGE).saturating_sub(bplustree::FULL_SLACK)
+    }
+
+    /// The leaf budget a tree whose rows may be wide is given: an eighth of
+    /// a page, less the split slack. A leaf splits when it has less room
+    /// than its budget, so a quarter-page budget would leave leaves up to a
+    /// quarter empty; an eighth costs at most an eighth.
+    pub fn inline_leaf_entry_size(&self) -> DBSizeType {
+        let usable = self
+            .header
+            .page_size
+            .saturating_sub(self.buffer.page_overhead() as DBSizeType + crate::page::USABLE_DATA_MARGIN);
+        (usable / 8).saturating_sub(bplustree::FULL_SLACK)
+    }
+
+    fn create_tree(
+        &self,
+        name: String,
+        index_entry_size: DBSizeType,
+        leaf_entry_size: Option<DBSizeType>,
+    ) -> Result<TableIdType, StoreError> {
         // A tree whose pages can't hold a few entries can't split: it would
         // be created and then fail its second or third insert.
         let max = self.max_index_entry_size();
@@ -2757,14 +2817,26 @@ where
             let mut tables = self.tables.write();
             self.generator.create_generator(&name, None)?;
             //let table_page = self.buffer.alloc_page(false)?;
-            let table = BPlusTree::new(
-                self.generator.gen_key(SYSTEM_TABLE_NAME)?.into(),
-                name.clone(),
-                self.buffer.clone(),
-                self.tx_mgr.clone(),
-                self.logger.clone(),
-                index_entry_size,
-            )?;
+            let id = self.generator.gen_key(SYSTEM_TABLE_NAME)?.into();
+            let table = match leaf_entry_size {
+                Some(leaf) => BPlusTree::new_rows_in_leaves(
+                    id,
+                    name.clone(),
+                    self.buffer.clone(),
+                    self.tx_mgr.clone(),
+                    self.logger.clone(),
+                    index_entry_size,
+                    leaf,
+                )?,
+                None => BPlusTree::new(
+                    id,
+                    name.clone(),
+                    self.buffer.clone(),
+                    self.tx_mgr.clone(),
+                    self.logger.clone(),
+                    index_entry_size,
+                )?,
+            };
             let id = table.id();
             tables.insert(id, Arc::new(table));
             id
@@ -3257,6 +3329,13 @@ where
     pub fn get_page_data_size(&self) -> usize {
         self.buffer.page_data_size()
     }
+}
+
+// SQ_ROWS_IN_LEAVES set: every tree a database creates keeps its rows in
+// its leaves (see Db::create_table_with_index_entry_size).
+fn rows_in_leaves_everywhere() -> bool {
+    static EVERYWHERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EVERYWHERE.get_or_init(|| std::env::var_os("SQ_ROWS_IN_LEAVES").is_some())
 }
 
 impl<F: DBFile + 'static> TxnSink for Db<F>
@@ -11106,6 +11185,218 @@ mod tests {
         let mut want = keys.clone();
         want.push(id(1_000_000));
         check_loaded(&db2, tid2, &want);
+    }
+
+    // ── rows in leaves (ROWS_IN_LEAVES_DESIGN.md) ──────────────────────────
+
+    // A tree keeping its rows in its leaves, budgeted for rows of up to
+    // ~450 bytes.
+    fn leaf_rows_table(db: &Arc<TestDB>, name: &str) -> TableIdType {
+        db.create_table_with_rows_in_leaves(name.to_string(), 64, 512).unwrap()
+    }
+
+    // Key `i`'s data in `round`: lengths vary, so rows grow and shrink.
+    fn leaf_row_data(i: u64, round: u64) -> Vec<u8> {
+        let len = ((i * 31 + round * 97) % 400) as usize;
+        let mut v = vec![b'a' + (round % 26) as u8; len];
+        v.extend_from_slice(&i.to_le_bytes());
+        v
+    }
+
+    // Every row of `want` (key -> data) is found with its data; a range scan
+    // and a full scan each return exactly them, in key order.
+    fn check_leaf_rows(db: &Arc<TestDB>, tid: TableIdType, want: &std::collections::BTreeMap<u64, Vec<u8>>) {
+        let t = db.begin().unwrap();
+        for (k, v) in want {
+            let found = db.find(tid, id(*k), &t).unwrap().unwrap_or_else(|| panic!("{k} missing"));
+            assert_eq!(&found.data[..], &v[..], "{k}'s data");
+        }
+        let keys: Vec<DBIdType> = want.keys().map(|k| id(*k)).collect();
+        let mut cursor = db
+            .range_scan_bounds_in_txn(tid, &t, std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .unwrap();
+        let mut walked = vec![];
+        while let Some(tuple) = cursor.next().unwrap() {
+            walked.push(tuple.id().clone());
+        }
+        assert_eq!(walked, keys, "a range scan");
+        let mut cursor = db.table_scan_in_txn(tid, &t).unwrap();
+        let mut scanned = vec![];
+        while let Some(tuple) = cursor.next().unwrap() {
+            scanned.push(tuple.id().clone());
+        }
+        assert_eq!(scanned, keys, "a full scan, along the leaves: in key order");
+        db.commit(t).unwrap();
+    }
+
+    #[test]
+    fn test_rows_in_leaves_hold_every_row_through_inserts_updates_and_deletes() {
+        let db = TestDB::create("leaf_rows_writes.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        assert!(db.table_by_id(tid).unwrap().rows_in_leaves());
+        let n = 20_000u64;
+        let mut want = std::collections::BTreeMap::new();
+        // Inserted in a scattered order.
+        let t = db.begin().unwrap();
+        for i in 0..n {
+            let k = (i * 7919) % n;
+            db.insert(tid, Tuple::new(k, &leaf_row_data(k, 0)), &t).unwrap();
+            want.insert(k, leaf_row_data(k, 0));
+        }
+        db.commit(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+        // Rewritten, every third growing or shrinking; every fifth deleted.
+        let t = db.begin().unwrap();
+        for k in (0..n).step_by(3) {
+            db.update(tid, Tuple::new(k, &leaf_row_data(k, 1)), &t).unwrap();
+            want.insert(k, leaf_row_data(k, 1));
+        }
+        for k in (0..n).step_by(5) {
+            db.remove(tid, id(k), &t).unwrap();
+            want.remove(&k);
+        }
+        db.commit(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+        // A transaction's inserts, updates and deletes, rolled back.
+        let t = db.begin().unwrap();
+        for k in n..n + 500 {
+            db.insert(tid, Tuple::new(k, b"gone"), &t).unwrap();
+        }
+        for k in (1..n).step_by(11).filter(|k| want.contains_key(k)) {
+            db.update(tid, Tuple::new(k, &leaf_row_data(k, 2)), &t).unwrap();
+        }
+        for k in (2..n).step_by(13).filter(|k| want.contains_key(k)) {
+            db.remove(tid, id(k), &t).unwrap();
+        }
+        db.rollback(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+    }
+
+    #[test]
+    fn test_rows_in_leaves_use_fewer_pages_than_data_pages_do() {
+        let pages = |leaf: bool| {
+            let db = TestDB::create(&format!("leaf_rows_pages_{leaf}.db")).unwrap();
+            let tid = if leaf {
+                leaf_rows_table(&db, "t")
+            } else {
+                db.create_table_with_index_entry_size("t".to_string(), 64).unwrap()
+            };
+            let start = db.page_count();
+            let t = db.begin().unwrap();
+            for i in 0..20_000u64 {
+                db.insert(tid, row((i * 7919) % 20_000, b"a short row of data"), &t).unwrap();
+            }
+            db.commit(t).unwrap();
+            db.page_count() - start
+        };
+        let (leaf, data) = (pages(true), pages(false));
+        assert!(leaf < data, "rows in leaves {leaf} pages, with data pages {data}");
+    }
+
+    #[test]
+    fn test_rows_in_leaves_survive_a_reopen_and_a_power_cut() {
+        let db = TestDB::create("leaf_rows_power_cut.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        let mut want = std::collections::BTreeMap::new();
+        let t = db.begin().unwrap();
+        for k in 0..5_000u64 {
+            db.insert(tid, Tuple::new(k * 3, &leaf_row_data(k, 0)), &t).unwrap();
+            want.insert(k * 3, leaf_row_data(k, 0));
+        }
+        db.commit(t).unwrap();
+        db.checkpoint().unwrap();
+        // Writes after the checkpoint: recovered from the log.
+        let t = db.begin().unwrap();
+        for k in (0..5_000u64).step_by(4) {
+            db.update(tid, Tuple::new(k * 3, &leaf_row_data(k, 5)), &t).unwrap();
+            want.insert(k * 3, leaf_row_data(k, 5));
+        }
+        for k in 0..300u64 {
+            db.insert(tid, Tuple::new(k * 3 + 1, b"after"), &t).unwrap();
+            want.insert(k * 3 + 1, b"after".to_vec());
+        }
+        db.commit(t).unwrap();
+        let (f, l) = db.synced_snapshot();
+        let db2 = TestDB::open_using("leaf_rows_power_cut.db", f, l).unwrap();
+        let tid2 = db2.table_id_by_name("t").unwrap().unwrap();
+        assert!(db2.table_by_id(tid2).unwrap().rows_in_leaves(), "the form is in the catalog");
+        check_leaf_rows(&db2, tid2, &want);
+    }
+
+    #[test]
+    fn test_rows_in_leaves_bulk_load_then_take_ordinary_writes() {
+        let db = TestDB::create("leaf_rows_bulk.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        let n = 30_000u64;
+        let mut want: std::collections::BTreeMap<u64, Vec<u8>> =
+            (0..n).map(|k| (k * 2, leaf_row_data(k, 0))).collect();
+        let t = db.begin().unwrap();
+        let tuples = want.iter().map(|(k, v)| Tuple::new(*k, v)).collect();
+        assert_eq!(bulk(&db, tid, &t, tuples).unwrap(), n);
+        db.commit(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+        let t = db.begin().unwrap();
+        for k in (0..n).step_by(7) {
+            db.insert(tid, Tuple::new(k * 2 + 1, b"between"), &t).unwrap();
+            want.insert(k * 2 + 1, b"between".to_vec());
+        }
+        for k in (0..n).step_by(5) {
+            db.remove(tid, id(k * 2), &t).unwrap();
+            want.remove(&(k * 2));
+        }
+        db.commit(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+    }
+
+    #[test]
+    fn test_rows_in_leaves_refuse_a_row_past_their_budget_before_logging_it() {
+        let db = TestDB::create("leaf_rows_budget.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        let t = db.begin().unwrap();
+        let err = db.insert(tid, row(1, &[7u8; 600]), &t).unwrap_err();
+        assert!(matches!(err, StoreError::TupleTooLarge(_, 512)), "got {err:?}");
+        db.insert(tid, row(2, b"fits"), &t).unwrap();
+        let err = db.update(tid, row(2, &[7u8; 600]), &t).unwrap_err();
+        assert!(matches!(err, StoreError::TupleTooLarge(_, 512)), "got {err:?}");
+        db.commit(t).unwrap();
+        let mut want = std::collections::BTreeMap::new();
+        want.insert(2, b"fits".to_vec());
+        check_leaf_rows(&db, tid, &want);
+    }
+
+    #[test]
+    fn test_rows_in_leaves_take_concurrent_writers_and_readers() {
+        let db = TestDB::create("leaf_rows_concurrent.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        let threads = 8u64;
+        let per = 3_000u64;
+        std::thread::scope(|s| {
+            for w in 0..threads {
+                let db = &db;
+                s.spawn(move || {
+                    for i in 0..per {
+                        let k = i * threads + w;
+                        let t = db.begin().unwrap();
+                        db.insert(tid, Tuple::new(k, &leaf_row_data(k, 0)), &t).unwrap();
+                        db.commit(t).unwrap();
+                        // Its own write, at once; and a scan alongside the others'.
+                        let t = db.begin().unwrap();
+                        assert!(db.find(tid, id(k), &t).unwrap().is_some(), "{k} after its commit");
+                        if i % 500 == 0 {
+                            let mut cursor = db.table_scan_in_txn(tid, &t).unwrap();
+                            let mut last = None;
+                            while let Some(tuple) = cursor.next().unwrap() {
+                                assert!(last.as_ref().is_none_or(|l| *l < tuple.id), "in key order");
+                                last = Some(tuple.id.clone());
+                            }
+                        }
+                        db.commit(t).unwrap();
+                    }
+                });
+            }
+        });
+        let want = (0..threads * per).map(|k| (k, leaf_row_data(k, 0))).collect();
+        check_leaf_rows(&db, tid, &want);
     }
 
     // Built bottom-up, pages are filled as a split would leave the left one:

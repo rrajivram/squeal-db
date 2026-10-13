@@ -81,6 +81,10 @@ const OPTIMISTIC_DESCENT: bool = true;
 
 const INNER_NODE: usize = 4;
 const LEAF_NODE: usize = 5;
+// A leaf whose entries are the tree's tuples themselves, not pointers to
+// them on data pages (TableType::RowsInLeaves; ROWS_IN_LEAVES_DESIGN.md):
+// so a page says what its entries are on its own.
+const LEAF_ROWS: usize = 6;
 
 // NOT used inside BPlusTree::new anymore — index_entry_size is now a real
 // parameter callers must supply deliberately (see BPlusTree::new's own doc
@@ -127,7 +131,7 @@ pub(crate) type LocatedRow = (Arc<dyn PageTuple>, PageId, usize);
 // a child split rewrites one routing entry (its page id may grow by a few
 // varint bytes) besides adding the separator. Sized by bytes, not count,
 // so small keys pack a page however large the table's key budget.
-const FULL_SLACK: u64 = 16;
+pub(crate) const FULL_SLACK: u64 = 16;
 
 // A full page split at its byte midpoint leaves each half below
 // usable/2 + one entry; for either half to then take another entry, a
@@ -203,6 +207,12 @@ pub(crate) struct BPlusTree<F: DBFile + 'static> {
     // byte-midpoint split can't promise room in either half, and the count
     // cap is what always has. None for every other table.
     count_cap: Option<usize>,
+    // Whether this tree keeps its tuples in its leaves (see
+    // TableType::RowsInLeaves): no data pages, and a leaf entry is a tuple.
+    rows_in_leaves: bool,
+    // Such a tree's leaf entry budget: the largest tuple it takes (see
+    // check_fits). 0 for a tree with data pages, which take any size.
+    leaf_budget: usize,
 }
 
 // See BPlusTree::count_cap. Derived from nodes_per_page (persisted), so a
@@ -246,7 +256,56 @@ where
         logger: Arc<Logger>,
         index_entry_size: DBSizeType,
     ) -> Result<Self, StoreError> {
+        Self::create(id, name, buffer, txn_mgr, logger, index_entry_size, None)
+    }
+
+    /// A tree keeping its tuples in its leaves (TableType::RowsInLeaves):
+    /// `index_entry_size` budgets its inner pages' routing entries, as in
+    /// `new`, and `leaf_entry_size` its leaves' entries — whole tuples, so
+    /// the largest one this tree will be given.
+    pub fn new_rows_in_leaves(
+        id: TableIdType,
+        name: String,
+        buffer: Arc<PageBuffer<F>>,
+        txn_mgr: Arc<TransactionManager>,
+        logger: Arc<Logger>,
+        index_entry_size: DBSizeType,
+        leaf_entry_size: DBSizeType,
+    ) -> Result<Self, StoreError> {
+        Self::create(
+            id,
+            name,
+            buffer,
+            txn_mgr,
+            logger,
+            index_entry_size,
+            Some(leaf_entry_size),
+        )
+    }
+
+    fn create(
+        id: TableIdType,
+        name: String,
+        buffer: Arc<PageBuffer<F>>,
+        txn_mgr: Arc<TransactionManager>,
+        logger: Arc<Logger>,
+        index_entry_size: DBSizeType,
+        leaf_entry_size: Option<DBSizeType>,
+    ) -> Result<Self, StoreError> {
         let pg = buffer.page_size();
+        if let Some(leaf) = leaf_entry_size {
+            // A leaf split at its byte midpoint must leave room for one
+            // more of the largest entry in either half (see is_full).
+            let usable =
+                pg.saturating_sub(buffer.page_overhead() as DBSizeType + USABLE_DATA_MARGIN);
+            if leaf == 0 || usable < MIN_ENTRIES_PER_PAGE * (leaf + FULL_SLACK) {
+                return Err(StoreError::IndexEntryTooLarge {
+                    entry: leaf,
+                    max: (usable / MIN_ENTRIES_PER_PAGE).saturating_sub(FULL_SLACK),
+                    page_size: pg,
+                });
+            }
+        }
         if index_entry_size == 0 {
             return Err(StoreError::UnknownError(
                 "index_entry_size must be greater than 0".into(),
@@ -261,23 +320,36 @@ where
             )));
         }
         let first_index_page = buffer.alloc_page(false)?;
+        // A tree with its rows in its leaves keeps this empty page only so
+        // the catalog entry, and what walks a table's pages, are the same
+        // for both forms; nothing is ever written to it.
         let first_data_page = buffer.alloc_page(false)?;
-        let index_page = Page::new_indexed(pg, index_entry_size as usize, buffer.page_overhead());
+        let root_budget = leaf_entry_size.unwrap_or(index_entry_size);
+        let index_page = Page::new_indexed(pg, root_budget as usize, buffer.page_overhead());
         // Adopt into this database's WAL clock before flagging (set_page_flags
         // dirties it, which stamps the lsn from the clock).
         index_page.set_page_flags(LEAF_NODE)?;
+        if leaf_entry_size.is_some() {
+            index_page.set_page_flags(LEAF_ROWS)?;
+        }
         let mut handle = buffer.get_page_mut(first_index_page, LockLevel::Index)?;
         handle.page = Arc::new(index_page);
         buffer.write_locked_page(handle)?;
         let table = Table {
             id,
             name,
-            table_type: TableType::BtreeTable,
+            table_type: if leaf_entry_size.is_some() {
+                TableType::RowsInLeaves
+            } else {
+                TableType::BtreeTable
+            },
             first_index_page,
             first_data_page,
             nodes_per_page: count as usize,
         };
         Ok(Self {
+            rows_in_leaves: leaf_entry_size.is_some(),
+            leaf_budget: leaf_entry_size.unwrap_or(0) as usize,
             count_cap: count_cap(&table, &buffer),
             table,
             buffer,
@@ -318,6 +390,16 @@ where
             last_data_page: AtomicU64::new(t.first_data_page.into()),
             key_fields: AtomicU64::new(0),
             tail_known: std::sync::atomic::AtomicBool::new(false),
+            rows_in_leaves: t.table_type.rows_in_leaves(),
+            // A leaf's own budget, as every leaf of the tree has it.
+            leaf_budget: if t.table_type.rows_in_leaves() {
+                Self::first_leaf_of(&buffer, t.first_index_page)?
+                    .1
+                    .record_size()
+                    .unwrap_or(0)
+            } else {
+                0
+            },
             count_cap: count_cap(&t, &buffer),
             table: t,
             buffer,
@@ -386,6 +468,26 @@ where
 
     pub fn id(&self) -> TableIdType {
         self.table.id
+    }
+
+    /// Whether this tree keeps its tuples in its leaves.
+    pub(crate) fn rows_in_leaves(&self) -> bool {
+        self.rows_in_leaves
+    }
+
+    // An inner page's per-entry budget: the index_entry_size the tree was
+    // made with, which nodes_per_page records.
+    fn inner_budget(&self) -> usize {
+        (self.buffer.page_size() / self.table.nodes_per_page.max(1) as DBSizeType) as usize
+    }
+
+    // Marks a page a leaf of this tree.
+    fn flag_leaf(&self, page: &Page) -> Result<(), StoreError> {
+        page.set_page_flags(LEAF_NODE)?;
+        if self.rows_in_leaves {
+            page.set_page_flags(LEAF_ROWS)?;
+        }
+        Ok(())
     }
     // Redo-replay counterpart to insert(): tolerates the row already being
     // there, since a committed Add's row may or may not have made it to
@@ -480,6 +582,9 @@ where
         lsn: LsnId,
         decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
     ) -> Result<Written, StoreError> {
+        if self.rows_in_leaves {
+            return self.write_in_leaf(id, lsn, decide);
+        }
         // Phase 6: held for the whole write so a checkpoint's capture never
         // sees a split or a chain extension half done.
         let _writer = self.buffer.writer_permit();
@@ -582,6 +687,68 @@ where
                 leaf.page.remove_tuple(id)?;
                 self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
                 Ok(Written::Deleted(old))
+            }
+        }
+    }
+
+    /// Whether `tuple` can go in this tree: always for one with data pages;
+    /// for one with its rows in its leaves, when it is within the leaf
+    /// budget with room for the largest pre-image pointer a later version
+    /// of it adds. Checked before a write's `decide` runs, which logs it.
+    pub(crate) fn check_fits(&self, tuple: &Tuple) -> Result<(), StoreError> {
+        // A pre-image LSN: Some plus at most a 10-byte varint, where the
+        // tuple may now have None's one byte.
+        const PRE_LSN_GROWTH: u64 = 10;
+        if self.rows_in_leaves && tuple.size() + PRE_LSN_GROWTH > self.leaf_budget as u64 {
+            return Err(StoreError::TupleTooLarge(
+                tuple.size() + PRE_LSN_GROWTH,
+                self.leaf_budget,
+            ));
+        }
+        Ok(())
+    }
+
+    // write_version for a tree with its rows in its leaves: the leaf holds
+    // the tuple, so the one locked page is all a write reads and changes.
+    // The leaf's budget (is_full, with proactive splits) leaves it room for
+    // any tuple up to the budget, whatever `decide` makes.
+    fn write_in_leaf(
+        &self,
+        id: DBIdType,
+        lsn: LsnId,
+        decide: impl FnOnce(Option<&Tuple>) -> Result<Decision, StoreError>,
+    ) -> Result<Written, StoreError> {
+        let _writer = self.buffer.writer_permit();
+        // Routing needs only the key.
+        let probe = Tuple::new_with(id.clone(), &[], None, None);
+        let leaf = self.leaf_for_write(&probe, lsn)?;
+        let current = leaf.page.get(id.clone())?;
+        match decide(current.as_ref())? {
+            Decision::Skip => Ok(Written::Skipped),
+            Decision::Insert(new) => {
+                if current.is_some() {
+                    return Err(StoreError::DuplicateKey(id));
+                }
+                let at = leaf.page_num;
+                leaf.page.add_tuple(new)?;
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                Ok(Written::Inserted(at))
+            }
+            Decision::Replace(new) => {
+                if current.is_none() {
+                    return Err(StoreError::KeyNotFound(id));
+                }
+                let old = leaf.page.replace_tuple(&id, new)?;
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                Ok(Written::Replaced(old))
+            }
+            Decision::Delete => {
+                if current.is_none() {
+                    return Ok(Written::Deleted(None));
+                }
+                let old = leaf.page.remove_tuple(id)?;
+                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+                Ok(Written::Deleted(Some(old)))
             }
         }
     }
@@ -792,6 +959,9 @@ where
         // read (an earlier attempt at this fix) narrowed the window a lot
         // but couldn't close it — confirmed empirically: it cut a
         // ~1140-4067-per-20,000 failure rate to ~150-200, not zero.
+        if self.rows_in_leaves {
+            return self.route_to_leaf(&id, self.table.first_index_page)?.get(id);
+        }
         let _guard = self
             .relocation_lock
             .read()
@@ -811,8 +981,10 @@ where
         f: impl FnOnce(TupleRef<'_>) -> Result<R, StoreError>,
     ) -> Result<Option<R>, StoreError> {
         // See find: index lookup and data page read as one step against a
-        // relocation.
-        let content = {
+        // relocation. (A tree with its rows in its leaves reads the leaf.)
+        let content = if self.rows_in_leaves {
+            self.route_to_leaf(id, self.table.first_index_page)?.content()
+        } else {
             let _guard = self
                 .relocation_lock
                 .read()
@@ -904,6 +1076,23 @@ where
         &self,
         current: Option<(PageId, Arc<Page>)>,
     ) -> Result<Option<(PageId, Arc<Page>)>, StoreError> {
+        // A tree with its rows in its leaves is read along its leaves, in
+        // key order. From the snapshot of the leaf just read: a split after
+        // it was taken moved its upper part to a sibling between it and the
+        // `next` it holds, which the snapshot already had all of.
+        if self.rows_in_leaves {
+            return match current {
+                None => Self::first_leaf_of(&self.buffer, self.table.first_index_page).map(Some),
+                Some((_, page)) => {
+                    let next = page.get_next_page();
+                    if next.is_valid_next_page() {
+                        Ok(Some((next, self.buffer.get_page(next)?)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+            };
+        }
         match current {
             Some((page_id, page)) => {
                 let next = self.buffer.data_chain_next(&page, page_id)?;
@@ -1047,16 +1236,28 @@ where
     // each inner node's first routing entry down (its smallest separator
     // covers everything below it).
     pub(crate) fn first_leaf_page(&self) -> Result<Arc<Page>, StoreError> {
-        let mut page = self.buffer.get_page(self.table.first_index_page)?;
+        Self::first_leaf_of(&self.buffer, self.table.first_index_page).map(|(_, page)| page)
+    }
+
+    // The leftmost leaf of the tree rooted at `root`, and its id.
+    fn first_leaf_of(
+        buffer: &PageBuffer<F>,
+        root: PageId,
+    ) -> Result<(PageId, Arc<Page>), StoreError> {
+        let mut id = root;
+        let mut page = buffer.get_page(root)?;
         while page.is_flag_set(INNER_NODE) {
             let first = page
                 .with_entry(Entry::First, |e| from_bytes::<Node>(e.data()))?
                 .transpose()?;
             let Some(first) = first else {
-                return Ok(page);
+                return Ok((id, page));
             };
-            page = match first {
-                Node::Inner(page_num) => self.buffer.get_page(page_num)?,
+            match first {
+                Node::Inner(page_num) => {
+                    id = page_num;
+                    page = buffer.get_page(page_num)?;
+                }
                 Node::Leaf(_) => {
                     return Err(StoreError::Corruption(
                         "expected an inner routing entry, found a leaf entry first in an inner \
@@ -1064,9 +1265,9 @@ where
                             .into(),
                     ));
                 }
-            };
+            }
         }
-        Ok(page)
+        Ok((id, page))
     }
 
     // Given a leaf index page, returns its sibling in the leaf chain (see
@@ -1269,6 +1470,11 @@ where
     }
 
     fn find_page(&self, id: DBIdType, start: PageId) -> Result<Option<PageId>, StoreError> {
+        // The leaf holding the tuple, for a tree with its rows there.
+        if self.rows_in_leaves {
+            let (leaf, page) = self.route_to_leaf_id(&id, start)?;
+            return Ok(page.contains(id)?.then_some(leaf));
+        }
         let page = self.route_to_leaf(&id, start)?;
         let entry = page
             .with_entry(Entry::Exact(&id), |e| from_bytes::<Node>(e.data()))?
@@ -1600,7 +1806,7 @@ where
         if is_inner {
             new_page.set_page_flags(INNER_NODE)?;
         } else {
-            new_page.set_page_flags(LEAF_NODE)?;
+            self.flag_leaf(new_page)?;
         }
         // B-link tree sibling chain + high key, maintained the same way for
         // both leaf and inner splits (this used to be leaf-only — see
@@ -1662,8 +1868,14 @@ where
         // old leaf tuples → "Expected Inner. Found leaf!".
         let page = Arc::make_mut(&mut handle.page);
         page.clear_page_flag(LEAF_NODE)?;
+        page.clear_page_flag(LEAF_ROWS)?;
         page.set_page_flags(INNER_NODE)?;
         page.clear()?;
+        // A root that held rows held them to the leaves' budget; routing
+        // entries have the inner pages'.
+        if self.rows_in_leaves {
+            page.set_record_size(self.inner_budget())?;
+        }
         let left_node = Node::Inner(left_page);
         let right_node = Node::Inner(right_page);
         // STORE_AUDIT.md P4: see insert_index's identical comment.
@@ -1736,8 +1948,13 @@ where
         // Flags on the COW copy, not the shared cached Arc (see update_root_page).
         let left_page = Arc::make_mut(&mut left_handle.page);
         let right_page = Arc::make_mut(&mut right_handle.page);
-        left_page.set_page_flags(flags)?;
-        right_page.set_page_flags(flags)?;
+        if is_inner {
+            left_page.set_page_flags(INNER_NODE)?;
+            right_page.set_page_flags(INNER_NODE)?;
+        } else {
+            self.flag_leaf(left_page)?;
+            self.flag_leaf(right_page)?;
+        }
         // See split_non_root_page's matching comment: maintain the B-link
         // sibling chain and high key for both leaf and inner roots. The old
         // root (about to become an inner routing page via update_root_page)
@@ -1787,6 +2004,13 @@ where
         let record_size = root.record_size().ok_or_else(|| {
             StoreError::UnknownError("bulk load: the tree's pages have no entry size".into())
         })?;
+        // The root is still a leaf: its budget is the leaves'. A tree with
+        // its rows in its leaves budgets its inner pages apart.
+        let inner_record_size = if self.rows_in_leaves {
+            self.inner_budget()
+        } else {
+            record_size
+        };
         if root.count()? != 0 || !root.is_flag_set(LEAF_NODE) {
             return Err(StoreError::UnknownError("bulk load: the tree is not empty".into()).into());
         }
@@ -1820,9 +2044,20 @@ where
                     }
                 }
             }
-            let data_page = self.write_data(&tuple, lsn)?;
-            let entry =
-                Tuple::new_with(tuple.id.clone(), &to_allocvec(&Node::Leaf(data_page)).map_err(StoreError::from)?, None, None);
+            // The leaf's entry: the tuple itself, or where it went on the
+            // data pages.
+            let entry = if self.rows_in_leaves {
+                self.check_fits(&tuple)?;
+                tuple.clone()
+            } else {
+                let data_page = self.write_data(&tuple, lsn)?;
+                Tuple::new_with(
+                    tuple.id.clone(),
+                    &to_allocvec(&Node::Leaf(data_page)).map_err(StoreError::from)?,
+                    None,
+                    None,
+                )
+            };
             if entry.size() as usize > record_size {
                 return Err(StoreError::TupleTooLarge(entry.size(), record_size).into());
             }
@@ -1864,14 +2099,14 @@ where
                     Ok(Tuple::new_with(key.clone(), &to_allocvec(&Node::Inner(*child))?, None, None))
                 })
                 .collect::<Result<Vec<_>, StoreError>>()?;
-            let pages = self.pack(entries, record_size, INNER_NODE)?;
+            let pages = self.pack(entries, inner_record_size, INNER_NODE)?;
             if let [only] = &pages[..] {
                 self.publish_page(self.table.first_index_page, only.clone(), lsn)?;
                 return Ok(loaded);
             }
             let ids = pages
                 .iter()
-                .map(|_| self.buffer.alloc_indexed_page(record_size))
+                .map(|_| self.buffer.alloc_indexed_page(inner_record_size))
                 .collect::<Result<Vec<_>, _>>()?;
             bounds = vec![];
             for (i, (page, id)) in pages.into_iter().zip(&ids).enumerate() {
@@ -1906,7 +2141,11 @@ where
 
     fn empty_index_page(&self, record_size: usize, flags: usize) -> Result<Page, StoreError> {
         let page = Page::new_indexed(self.buffer.page_size(), record_size, self.buffer.page_overhead());
-        page.set_page_flags(flags)?;
+        if flags == LEAF_NODE {
+            self.flag_leaf(&page)?;
+        } else {
+            page.set_page_flags(flags)?;
+        }
         Ok(page)
     }
 

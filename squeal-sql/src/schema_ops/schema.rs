@@ -336,14 +336,31 @@ where
         part.set_rows(rows);
         for (i, (index, name)) in table.indices.iter().zip(&names.1).enumerate() {
             let Some(name) = name else { continue };
-            let id = self.db.create_table_with_index_entry_size(
-                name.clone(),
-                index.size(identity_size) as u64,
-            )?;
+            let id = self.create_index_tree(name.clone(), index, identity_size)?;
             created.push(name.clone());
             part.set_index(i, id);
         }
         Ok(())
+    }
+
+    // A secondary index's tree: its entries kept in its leaves (see store's
+    // ROWS_IN_LEAVES_DESIGN.md), each budgeted for the widest entry the
+    // index can have. An index whose entries could take more than an
+    // eighth of a page keeps them on data pages, as before: its leaves
+    // would split with that much room left.
+    fn create_index_tree(
+        &self,
+        name: String,
+        index: &crate::table::SqlIndex,
+        identity_size: usize,
+    ) -> Result<store::table::TableIdType, SchemaError> {
+        let routing = index.size(identity_size) as u64;
+        let entry = index.entry_size(identity_size) as u64;
+        Ok(if entry <= self.db.inline_leaf_entry_size() {
+            self.db.create_table_with_rows_in_leaves(name, routing, entry)?
+        } else {
+            self.db.create_table_with_index_entry_size(name, routing)?
+        })
     }
 
     // Whether `table` has a row whose key in its index `index` (a position
@@ -1148,10 +1165,7 @@ where
         let mut trees: Vec<TableIdType> = vec![];
         let build: Result<(), SchemaError> = (|| {
             for q in &qualified {
-                trees.push(self.db.create_table_with_index_entry_size(
-                    q.clone(),
-                    index.size(identity_size) as u64,
-                )?);
+                trees.push(self.create_index_tree(q.clone(), &index, identity_size)?);
                 created.push(q.clone());
             }
             let txn = self.db.begin()?;

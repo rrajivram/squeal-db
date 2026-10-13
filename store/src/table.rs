@@ -14,11 +14,20 @@ use crate::{db::DBSizeType, page::PageId};
 pub enum TableType {
     BtreeTable,
     Index,
+    /// A B+tree whose leaves hold its tuples themselves, with no data pages
+    /// (ROWS_IN_LEAVES_DESIGN.md). The other two keep their tuples on a
+    /// chain of data pages, the leaves holding where each is.
+    RowsInLeaves,
 }
 
 impl TableType {
     const TAG_BTREE_TABLE: u8 = 0;
     const TAG_INDEX: u8 = 1;
+    const TAG_ROWS_IN_LEAVES: u8 = 10;
+
+    pub(crate) fn rows_in_leaves(&self) -> bool {
+        matches!(self, TableType::RowsInLeaves)
+    }
 }
 
 impl Serialize for TableType {
@@ -26,6 +35,7 @@ impl Serialize for TableType {
         let tag = match self {
             TableType::BtreeTable => Self::TAG_BTREE_TABLE,
             TableType::Index => Self::TAG_INDEX,
+            TableType::RowsInLeaves => Self::TAG_ROWS_IN_LEAVES,
         };
         serializer.serialize_u8(tag)
     }
@@ -37,6 +47,7 @@ impl<'de> Deserialize<'de> for TableType {
         match tag {
             Self::TAG_BTREE_TABLE => Ok(TableType::BtreeTable),
             Self::TAG_INDEX => Ok(TableType::Index),
+            Self::TAG_ROWS_IN_LEAVES => Ok(TableType::RowsInLeaves),
             other => Err(DeError::custom(format!("unknown TableType tag {other}"))),
         }
     }
@@ -89,15 +100,28 @@ mod tests {
 
     #[test]
     fn test_round_trip() {
-        for v in [TableType::BtreeTable, TableType::Index] {
+        for v in [TableType::BtreeTable, TableType::Index, TableType::RowsInLeaves] {
             let bytes = postcard::to_allocvec(&v).unwrap();
             let back: TableType = postcard::from_bytes(&bytes).unwrap();
             assert!(matches!(
                 (v, back),
                 (TableType::BtreeTable, TableType::BtreeTable)
                     | (TableType::Index, TableType::Index)
+                    | (TableType::RowsInLeaves, TableType::RowsInLeaves)
             ));
         }
+    }
+
+    // The new form's tag is 10, for good: a catalog written with it must
+    // read back the same, and older builds refuse it (unknown tag) rather
+    // than read its leaves as data-page pointers.
+    #[test]
+    fn test_rows_in_leaves_is_tag_10() {
+        assert_eq!(postcard::to_allocvec(&TableType::RowsInLeaves).unwrap(), [10]);
+        assert!(matches!(
+            postcard::from_bytes::<TableType>(&[10]).unwrap(),
+            TableType::RowsInLeaves
+        ));
     }
 
     #[test]

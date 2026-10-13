@@ -621,6 +621,14 @@ where
             // to close, not a new failure mode this cursor needs to invent
             // handling for; skip and move on rather than erroring the
             // whole scan over one stale entry.
+            // A tree with its rows in its leaves: the entry is the row.
+            if table.rows_in_leaves() {
+                match self.db.visible_version(&entry, &self.snapshot)? {
+                    Visible::Itself => return Ok(Some(entry)),
+                    Visible::Ancestor(t) => break Lent::Owned(t),
+                    Visible::Not => continue,
+                }
+            }
             let Some((content, page, at)) = table.locate_index_entry(&entry, self.last_row)?
             else {
                 continue;

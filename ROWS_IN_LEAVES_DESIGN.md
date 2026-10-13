@@ -1,7 +1,7 @@
 # Rows in the leaves
 
-Started 2026-10-13. A proposal, **awaiting approval**: it changes what is on
-disk. It is MEMORY_ISSUES.md section 1, step 5 ("keep entries in the
+Started 2026-10-13. **Approved 2026-10-13**, with the three decisions at the
+end as recommended. It changes what is on disk. It is MEMORY_ISSUES.md section 1, step 5 ("keep entries in the
 leaf"), worked out.
 
 ## The problem
@@ -127,15 +127,48 @@ It follows PERSISTENCE_VERSIONING_PROGRESS.md:
 
 Each stage its own commit, measured.
 
-1. **The format:** the tag, the flag, the inline-size rule and the overflow
-   reference, with fixtures. Nothing creates the new form yet.
-2. **Secondary indexes in the new form.** Their entries are small, so no
-   overflow is needed, and `CREATE INDEX` is the bulk path to prove it on.
-   Measure index lookups, `CREATE INDEX` and index size.
-3. **Row trees in the new form,** for new tables: inline and overflowed
+1. [x] **The format.** Done 2026-10-13.
+   - `TableType::RowsInLeaves`, catalog tag 10 (a fixture pins it; older
+     builds refuse an unknown tag at open, rather than read its leaves as
+     data-page pointers).
+   - Leaf pages of such a tree carry a new flag, `LEAF_ROWS` (bit 6), and a
+     per-entry budget of their own (`record_size`, already in every page
+     header). Inner pages keep the routing budget; a root that stops being
+     a leaf takes it then (`Page::set_record_size`).
+   - The tree keeps one empty data page, so its catalog entry, and what
+     walks a table's pages (drop, free-list reconciliation), are the same
+     for both forms.
+2. [x] **Secondary indexes in the new form.** Done 2026-10-13.
+   - The store: `Db::create_table_with_rows_in_leaves`. A write reads and
+     changes the tuple in its one locked leaf (`write_in_leaf`); lookups
+     search the leaf; range scans lend the leaf entry as the row; full
+     scans walk the leaves, in key order; bulk loads fill leaves with the
+     tuples. A tuple past the leaf budget is refused before its write is
+     logged (`check_fits`).
+   - squeal-sql creates each secondary index this way, budgeted for its
+     widest entry (key, row identity, header). An index whose entries could
+     pass an eighth of a page keeps the old form.
+   - **Checked by:** targeted store tests (writes, rollback, bulk load,
+     reopen and power cut, concurrent writers and readers); the store suite
+     run with every tree in the new form (`SQ_ROWS_IN_LEAVES=1`: all pass
+     but tests of data-page chains and of rows past a leaf's budget, which
+     stage 3's overflow covers); the workspace suite, 20,000 SQLite oracle
+     queries, a 60-second crash soak.
+   - **Measured**, against the build before, back to back:
+
+     | | before | after |
+     |---|---:|---:|
+     | index range, per matching row (probe, 500k) | ~690 ns | ~620 ns |
+     | secondary-index lookup (probe) | ~15 µs | ~13 µs |
+     | `CREATE INDEX`, per index (bench, 200k) | 160 ms | 122 ms |
+     | memory after the load / peak (bench, 200k) | 105 / 177 MiB | 83 / 155 MiB |
+
+     An index read still fetches each row from the table's tree, which
+     keeps data pages until stage 3.
+3. [ ] **Row trees in the new form,** for new tables: inline and overflowed
    rows, in-place updates, splits, purge freeing leaves. Measure point
    lookups, scans, inserts, updates and file size.
-4. **Old tables rebuilt on request** (optional, later).
+4. [ ] **Old tables rebuilt on request** (optional, later).
 
 ## Decisions for the author
 
@@ -145,3 +178,8 @@ Each stage its own commit, measured.
 3. **The largest row kept inline**: what four tuples to a page allows
    (about 4 KiB on the default 16 KiB page; 1 KiB on the smallest, 4 KiB,
    pages), larger rows going to overflow.
+   - **Revised in stage 2: an eighth of a page (about 2 KiB on 16 KiB).** A
+     leaf splits when it has less room than its budget, so a quarter-page
+     budget left leaves up to a quarter empty; an eighth costs at most an
+     eighth. A tree whose rows are narrower is budgeted by their real
+     width, and its leaves fill.
