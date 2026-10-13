@@ -10,33 +10,33 @@ size 200000, 4 reader threads, median of 3 run(s), each engine in its own proces
 
 | phase | squeal | sqlite | turso | same answers |
 |---|---:|---:|---:|---|
-| Bulk load, one transaction (per row) | 8.38 µs | 554 ns | 1.11 µs | — |
-| Create 3 indexes (per index) | 715.2 ms | 36.9 ms | 98.5 ms | — |
-| `ANALYZE` | 58.3 ms | 17.9 ms | 22.9 ms | — |
-| Point lookup by primary key | 9.52 µs | 1.52 µs | 2.04 µs | yes |
-| Secondary-index lookup + aggregate | 29.85 µs | 11.24 µs | 9.85 µs | yes |
-| Index range (1 week of 52) + aggregate | 5.2 ms | 2.2 ms | 2.4 ms | yes |
-| Full scan with `GROUP BY` | 46.3 ms | 50.0 ms | 45.9 ms | yes |
-| Join + `GROUP BY` | 107.2 ms | 156.8 ms | 193.6 ms | yes |
-| Join, filtered, `ORDER BY` + `LIMIT` | 1.8 ms | 484.31 µs | 539.14 µs | yes |
-| Sort the whole table (`ORDER BY` without an index) | 114.2 ms | 71.5 ms | 69.6 ms | yes |
-| `IN (subquery)` | 35.0 ms | 24.4 ms | 32.0 ms | yes |
-| Correlated `EXISTS` | 33.6 ms | 29.5 ms | 29.8 ms | yes |
-| Correlated `NOT EXISTS` | 17.3 ms | 79.6 ms | 57.6 ms | yes |
-| `UPDATE` one row, autocommit | 4.6 ms | 4.1 ms | 4.1 ms | — |
-| `INSERT` one row, autocommit | 4.3 ms | 4.1 ms | 4.1 ms | — |
-| `UPDATE`, 100 rows per transaction (per row) | 77.93 µs | 72.12 µs | 81.92 µs | — |
-| Check: totals after the writes | 27.4 ms | 13.1 ms | 16.1 ms | yes |
-| Point lookups, 4 threads (per lookup) | 5.75 µs | 1.80 µs | 1.09 µs | yes |
+| Bulk load, one transaction (per row) | 2.13 µs | 552 ns | 1.01 µs | — |
+| Create 3 indexes (per index) | 160.3 ms | 35.3 ms | 86.5 ms | — |
+| `ANALYZE` | 46.8 ms | 18.3 ms | 22.8 ms | — |
+| Point lookup by primary key | 5.00 µs | 1.31 µs | 1.66 µs | yes |
+| Secondary-index lookup + aggregate | 13.71 µs | 9.32 µs | 7.53 µs | yes |
+| Index range (1 week of 52) + aggregate | 2.6 ms | 1.8 ms | 1.9 ms | yes |
+| Full scan with `GROUP BY` | 30.0 ms | 44.8 ms | 39.6 ms | yes |
+| Join + `GROUP BY` | 67.2 ms | 134.0 ms | 157.2 ms | yes |
+| Join, filtered, `ORDER BY` + `LIMIT` | 1.1 ms | 412.77 µs | 442.20 µs | yes |
+| Sort the whole table (`ORDER BY` without an index) | 88.6 ms | 65.8 ms | 62.6 ms | yes |
+| `IN (subquery)` | 23.4 ms | 20.8 ms | 24.6 ms | yes |
+| Correlated `EXISTS` | 24.0 ms | 25.6 ms | 23.8 ms | yes |
+| Correlated `NOT EXISTS` | 13.6 ms | 64.7 ms | 41.5 ms | yes |
+| `UPDATE` one row, autocommit | 5.4 ms | 4.4 ms | 4.5 ms | — |
+| `INSERT` one row, autocommit | 5.0 ms | 4.3 ms | 4.6 ms | — |
+| `UPDATE`, 100 rows per transaction (per row) | 128.86 µs | 73.60 µs | 92.89 µs | — |
+| Check: totals after the writes | 14.9 ms | 22.2 ms | 34.4 ms | yes |
+| Point lookups, 4 threads (per lookup) | 2.84 µs | 1.73 µs | 1.11 µs | yes |
 
 | memory | squeal | sqlite | turso |
 |---|---:|---:|---:|
 | after open | 3 MiB | 3 MiB | 3 MiB |
-| after load | 163 MiB | 35 MiB | 48 MiB |
-| after reads | 158 MiB | 37 MiB | 65 MiB |
-| after writes | 160 MiB | 37 MiB | 65 MiB |
-| at end | 161 MiB | 47 MiB | 88 MiB |
-| peak | 223 MiB | 47 MiB | 88 MiB |
+| after load | 105 MiB | 35 MiB | 47 MiB |
+| after reads | 108 MiB | 35 MiB | 67 MiB |
+| after writes | 133 MiB | 35 MiB | 67 MiB |
+| at end | 134 MiB | 46 MiB | 90 MiB |
+| peak | 177 MiB | 46 MiB | 90 MiB |
 
 ## Profile `large`: 1 GiB page cache each; squeal-db also 512 MiB per query and 512 MiB of scratch, SQLite and Turso temp tables in memory
 
@@ -46,31 +46,31 @@ size 200000, 4 reader threads, median of 3 run(s), each engine in its own proces
 
 | phase | squeal | sqlite | turso | same answers |
 |---|---:|---:|---:|---|
-| Bulk load, one transaction (per row) | 5.05 µs | 563 ns | 1.18 µs | — |
-| Create 3 indexes (per index) | 618.5 ms | 45.0 ms | 95.1 ms | — |
-| `ANALYZE` | 55.6 ms | 16.9 ms | 24.2 ms | — |
-| Point lookup by primary key | 9.73 µs | 1.26 µs | 1.66 µs | yes |
-| Secondary-index lookup + aggregate | 27.89 µs | 7.20 µs | 5.80 µs | yes |
-| Index range (1 week of 52) + aggregate | 5.2 ms | 1.0 ms | 1.2 ms | yes |
-| Full scan with `GROUP BY` | 46.8 ms | 51.3 ms | 38.9 ms | yes |
-| Join + `GROUP BY` | 106.2 ms | 99.2 ms | 119.3 ms | yes |
-| Join, filtered, `ORDER BY` + `LIMIT` | 1.7 ms | 262.64 µs | 371.30 µs | yes |
-| Sort the whole table (`ORDER BY` without an index) | 111.3 ms | 70.7 ms | 66.5 ms | yes |
-| `IN (subquery)` | 35.2 ms | 12.2 ms | 16.2 ms | yes |
-| Correlated `EXISTS` | 33.9 ms | 17.1 ms | 22.4 ms | yes |
-| Correlated `NOT EXISTS` | 17.0 ms | 39.0 ms | 47.8 ms | yes |
-| `UPDATE` one row, autocommit | 4.7 ms | 4.1 ms | 4.1 ms | — |
-| `INSERT` one row, autocommit | 4.1 ms | 4.1 ms | 4.1 ms | — |
-| `UPDATE`, 100 rows per transaction (per row) | 79.98 µs | 70.93 µs | 68.88 µs | — |
-| Check: totals after the writes | 29.8 ms | 13.9 ms | 17.3 ms | yes |
-| Point lookups, 4 threads (per lookup) | 5.77 µs | 1.75 µs | 992 ns | yes |
+| Bulk load, one transaction (per row) | 2.17 µs | 519 ns | 1.02 µs | — |
+| Create 3 indexes (per index) | 164.7 ms | 37.5 ms | 87.5 ms | — |
+| `ANALYZE` | 46.9 ms | 16.0 ms | 24.3 ms | — |
+| Point lookup by primary key | 5.01 µs | 1000 ns | 1.34 µs | yes |
+| Secondary-index lookup + aggregate | 13.42 µs | 5.87 µs | 4.24 µs | yes |
+| Index range (1 week of 52) + aggregate | 2.7 ms | 785.72 µs | 890.29 µs | yes |
+| Full scan with `GROUP BY` | 29.6 ms | 42.2 ms | 29.8 ms | yes |
+| Join + `GROUP BY` | 67.4 ms | 78.2 ms | 84.1 ms | yes |
+| Join, filtered, `ORDER BY` + `LIMIT` | 1.1 ms | 213.81 µs | 304.62 µs | yes |
+| Sort the whole table (`ORDER BY` without an index) | 82.3 ms | 60.3 ms | 53.8 ms | yes |
+| `IN (subquery)` | 23.3 ms | 9.7 ms | 12.6 ms | yes |
+| Correlated `EXISTS` | 24.0 ms | 14.0 ms | 17.5 ms | yes |
+| Correlated `NOT EXISTS` | 13.2 ms | 31.4 ms | 35.7 ms | yes |
+| `UPDATE` one row, autocommit | 5.4 ms | 4.3 ms | 4.5 ms | — |
+| `INSERT` one row, autocommit | 5.0 ms | 4.5 ms | 4.5 ms | — |
+| `UPDATE`, 100 rows per transaction (per row) | 105.92 µs | 99.97 µs | 105.10 µs | — |
+| Check: totals after the writes | 13.6 ms | 27.0 ms | 32.1 ms | yes |
+| Point lookups, 4 threads (per lookup) | 2.87 µs | 1.58 µs | 1.02 µs | yes |
 
 | memory | squeal | sqlite | turso |
 |---|---:|---:|---:|
 | after open | 3 MiB | 3 MiB | 3 MiB |
-| after load | 163 MiB | 22 MiB | 49 MiB |
-| after reads | 158 MiB | 32 MiB | 69 MiB |
-| after writes | 160 MiB | 32 MiB | 69 MiB |
-| at end | 161 MiB | 62 MiB | 88 MiB |
-| peak | 224 MiB | 62 MiB | 88 MiB |
+| after load | 105 MiB | 22 MiB | 49 MiB |
+| after reads | 108 MiB | 30 MiB | 58 MiB |
+| after writes | 133 MiB | 31 MiB | 58 MiB |
+| at end | 134 MiB | 61 MiB | 78 MiB |
+| peak | 176 MiB | 61 MiB | 78 MiB |
 

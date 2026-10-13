@@ -56,8 +56,9 @@ and orders in one, and each key-value table in one.
 
 ## Results
 
-Measured 2026-10-10 on an Apple M4 Max (48 GB, macOS 27), release build,
-after the memory fixes described below. The full reports, every phase and
+Measured on an Apple M4 Max (48 GB, macOS 27), release build: the SQL
+reports on 2026-10-12, the key-value ones on 2026-10-10, after the memory
+fixes described below. The full reports, every phase and
 every memory reading, are in [`results/`](results/):
 
 | report | size | runs |
@@ -73,45 +74,58 @@ point lookup gave 10.5 µs, not the report's 38.8.
 
 ### SQL: squeal-db, SQLite, Turso (200k orders)
 
+Re-measured 2026-10-12, after the byte-comparable keys, lent rows,
+planning once per statement shape, and the first batch work (see
+BYTE_KEYS_DESIGN.md, PLANNING_DESIGN.md, BATCH_EXECUTION_DESIGN.md).
+
 Time per operation, `default` / `large` profile:
 
 | phase | squeal-db | SQLite | Turso |
 |---|---:|---:|---:|
-| Bulk load, one transaction, per row | 8.38 µs / 5.05 µs | 554 ns / 563 ns | 1.11 µs / 1.18 µs |
-| Create an index | 715 ms / 619 ms | 37 ms / 45 ms | 99 ms / 95 ms |
-| Point lookup by primary key | 9.52 µs / 9.73 µs | 1.52 µs / 1.26 µs | 2.04 µs / 1.66 µs |
-| Secondary-index lookup + aggregate | 29.9 µs / 27.9 µs | 11.2 µs / 7.2 µs | 9.9 µs / 5.8 µs |
-| Index range (1 week) + aggregate | 5.2 ms / 5.2 ms | 2.2 ms / 1.0 ms | 2.4 ms / 1.2 ms |
-| Full scan with `GROUP BY` | 46 ms / 47 ms | 50 ms / 51 ms | 46 ms / **39 ms** |
-| Join + `GROUP BY` | **107 ms / 106 ms** | 157 ms / 99 ms | 194 ms / 119 ms |
-| Join, filtered, `ORDER BY` + `LIMIT` | 1.8 ms / 1.7 ms | 0.48 ms / 0.26 ms | 0.54 ms / 0.37 ms |
-| Sort the whole table | 114 ms / 111 ms | 72 ms / 71 ms | 70 ms / 67 ms |
-| `IN (subquery)` | 35 ms / 35 ms | 24 ms / 12 ms | 32 ms / 16 ms |
-| Correlated `EXISTS` | 34 ms / 34 ms | 30 ms / 17 ms | 30 ms / 22 ms |
-| Correlated `NOT EXISTS` | **17 ms / 17 ms** | 80 ms / 39 ms | 58 ms / 48 ms |
-| `UPDATE` one row, autocommit | 4.6 ms / 4.7 ms | 4.1 ms / 4.1 ms | 4.1 ms / 4.1 ms |
-| `INSERT` one row, autocommit | 4.3 ms / 4.1 ms | 4.1 ms / 4.1 ms | 4.1 ms / 4.1 ms |
-| `UPDATE`, 100 rows a transaction, per row | 78 µs / 80 µs | 72 µs / 71 µs | 82 µs / 69 µs |
-| Point lookups on 4 threads | 5.75 µs / 5.77 µs | 1.80 µs / 1.75 µs | **1.09 µs / 992 ns** |
+| Bulk load, one transaction, per row | 2.13 µs / 2.17 µs | 552 ns / 519 ns | 1.01 µs / 1.02 µs |
+| Create an index | 160 ms / 165 ms | 35 ms / 38 ms | 87 ms / 88 ms |
+| Point lookup by primary key | 5.00 µs / 5.01 µs | 1.31 µs / 1.00 µs | 1.66 µs / 1.34 µs |
+| Secondary-index lookup + aggregate | 13.7 µs / 13.4 µs | 9.3 µs / 5.9 µs | 7.5 µs / 4.2 µs |
+| Index range (1 week) + aggregate | 2.6 ms / 2.7 ms | 1.8 ms / 0.79 ms | 1.9 ms / 0.89 ms |
+| Full scan with `GROUP BY` | **30 ms / 30 ms** | 45 ms / 42 ms | 40 ms / 30 ms |
+| Join + `GROUP BY` | **67 ms / 67 ms** | 134 ms / 78 ms | 157 ms / 84 ms |
+| Join, filtered, `ORDER BY` + `LIMIT` | 1.1 ms / 1.1 ms | 0.41 ms / 0.21 ms | 0.44 ms / 0.30 ms |
+| Sort the whole table | 89 ms / 82 ms | 66 ms / 60 ms | 63 ms / 54 ms |
+| `IN (subquery)` | 23 ms / 23 ms | 21 ms / 10 ms | 25 ms / 13 ms |
+| Correlated `EXISTS` | 24 ms / 24 ms | 26 ms / 14 ms | 24 ms / 18 ms |
+| Correlated `NOT EXISTS` | **14 ms / 13 ms** | 65 ms / 31 ms | 42 ms / 36 ms |
+| `UPDATE` one row, autocommit | 5.4 ms / 5.4 ms | 4.4 ms / 4.3 ms | 4.5 ms / 4.5 ms |
+| `INSERT` one row, autocommit | 5.0 ms / 5.0 ms | 4.3 ms / 4.5 ms | 4.6 ms / 4.5 ms |
+| `UPDATE`, 100 rows a transaction, per row | 129 µs / 106 µs | 74 µs / 100 µs | 93 µs / 105 µs |
+| Point lookups on 4 threads | 2.84 µs / 2.87 µs | 1.73 µs / 1.58 µs | **1.11 µs / 1.02 µs** |
 
 Memory (physical footprint), `default` / `large`:
 
 | | squeal-db | SQLite | Turso |
 |---|---:|---:|---:|
-| after the load | 163 / 163 MiB | 35 / 22 MiB | 48 / 49 MiB |
-| at the end | 161 / 161 MiB | 47 / 62 MiB | 88 / 88 MiB |
-| peak | 223 / 224 MiB | 47 / 62 MiB | 88 / 88 MiB |
+| after the load | 105 / 105 MiB | 35 / 22 MiB | 47 / 49 MiB |
+| at the end | 134 / 134 MiB | 46 / 61 MiB | 90 / 78 MiB |
+| peak | 177 / 176 MiB | 46 / 61 MiB | 90 / 78 MiB |
+
+Against the 2026-10-10 run: point lookups 9.5 -> 5.0 µs, secondary-index
+lookups 30 -> 14 µs, bulk load 8.4 -> 2.1 µs a row, index builds 715 ->
+160 ms, full-scan `GROUP BY` 46 -> 30 ms, join + `GROUP BY` 107 -> 67 ms,
+peak memory 223 -> 177 MiB. The durable writes are slower (`UPDATE` in a
+transaction 78 -> 129 µs a row, autocommit writes about 0.7 ms more): to
+be looked into.
 
 At 1M orders ([`sql_1m.md`](results/sql_1m.md)):
-- **squeal-db leads on the blocking queries.** Correlated `NOT EXISTS`
-  takes 172 ms against 599 and 723 ms. Join + `GROUP BY` takes 756 ms
-  against 1.2 and 1.5 s on the default profile.
-- **Its lookups need the large cache.** The default 128 MiB no longer
-  holds the indexes, and a secondary-index lookup takes 167 µs (34 µs
-  with 1 GiB).
-- **Its memory peaks at 459 MiB on the default profile and 1.07 GB on
-  the large one**, within its limits (a 1 GiB cache, plus 512 MiB a
-  query). SQLite peaks at 140 / 224 MiB and Turso at 230 / 398 MiB.
+- **squeal-db leads on the blocking queries.** Join + `GROUP BY` takes
+  326 ms against 893 ms and 1.1 s; correlated `NOT EXISTS` 73 ms against
+  449 and 516 ms; full-scan `GROUP BY` 149 ms against 251 and 207 ms.
+- **Its lookups no longer need the large cache:** a point lookup takes
+  6.0 µs (5.4 with 1 GiB; it was 14.8 and 38.8), a secondary-index lookup
+  43 µs (it was 167).
+- **Index builds** take 0.74 s each (they took 3.7 s); SQLite 0.16 s,
+  Turso 0.53 s.
+- **Its memory peaks at 404 MiB on the default profile and 812 MiB on
+  the large one** (459 MiB and 1.07 GB before). SQLite peaks at 140 /
+  222 MiB and Turso at 178 / 398 MiB.
 
 ### Key-value: the store, SQLite, redb (200k rows a table)
 
@@ -148,8 +162,9 @@ the store's default 128 MiB cache:
 - **Ahead** on the blocking SQL queries: correlated `NOT EXISTS` (a hash
   anti-join) and join + `GROUP BY` (hash grouping). Also ahead on the
   store's full scans.
-- **Behind** on lookups and bulk writes, by 2-6x, in both the SQL layer
-  and the store.
+- **Behind** on lookups and bulk writes: SQL point lookups by 3-4x, bulk
+  loads and index builds by 2-4x, and the store's lookups and writes by
+  2-6x.
 - **redb is the fastest key-value store here**, by 2-3x on lookups and
   more on concurrent reads.
 - **Turso is close to SQLite throughout**, ahead on concurrent reads.
