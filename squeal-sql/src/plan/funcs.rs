@@ -3,10 +3,11 @@ use std::{collections::HashSet, fmt::Debug};
 use sql_parser::{Expr, Ident, expr::FunctionArg};
 use store::{
     db::DBFile,
-    valueitem::ValueItem,
+    valueitem::{ValueItem, ValueRef},
 };
 
 use crate::{
+    batch::{Batch, Column, ColumnData},
     error::SchemaError,
     plan::eval::{EvalExpr, ExprWrapper},
 };
@@ -252,6 +253,29 @@ macro_rules! extremum_fn {
                     best: None,
                 })
             }
+
+            // Every value of `column`, as `eval` takes them one by one.
+            fn feed_column(&mut self, column: &Column, rows: usize) {
+                let better: fn(&ValueRef<'_>, &ValueRef<'_>) -> bool = $better;
+                // The best so far in this column, then kept once.
+                let mut found: Option<ValueRef<'_>> = None;
+                for row in 0..rows {
+                    let v = column.get(row);
+                    if matches!(v, ValueRef::Null) {
+                        continue;
+                    }
+                    let beats = match &found {
+                        Some(f) => better(&v, f),
+                        None => self.best.as_ref().is_none_or(|cur| better(&v, &cur.as_ref())),
+                    };
+                    if beats {
+                        found = Some(v);
+                    }
+                }
+                if let Some(v) = found {
+                    v.store_in(self.best.get_or_insert(ValueItem::Null));
+                }
+            }
         }
 
         impl FuncTrait for $name {
@@ -344,6 +368,58 @@ func_obj! {
     Abs(Abs),
     IsNull(IsNull),
     IsNotNull(IsNotNull),
+}
+
+// Aggregates fed a whole column at a time (see source::total): each the same
+// as feeding `eval` the column's values in order.
+impl FuncObj {
+    /// What a batch update reads: Some(None) for `count(*)`, Some(Some(p))
+    /// for an aggregate of plain column `p`; None for anything a batch
+    /// can't update yet.
+    pub(crate) fn batch_input(&self) -> Option<Option<usize>> {
+        let arg = match self {
+            FuncObj::Count(c) if !c.distinct => &c.args,
+            FuncObj::Sum(s) => &s.args,
+            FuncObj::Avg(a) => &a.args,
+            FuncObj::Min(m) => &m.args,
+            FuncObj::Max(m) => &m.args,
+            _ => return None,
+        };
+        match arg {
+            FuncArgs::Wildcard => Some(None),
+            FuncArgs::Field(e) => match e.as_ref() {
+                EvalExpr::Value(p) => Some(Some(*p)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Feeds every row of `batch` (see batch_input).
+    pub(crate) fn feed_batch(&mut self, batch: &Batch) -> Result<(), SchemaError> {
+        let rows = batch.len();
+        let column = match self.batch_input() {
+            Some(Some(p)) => match batch.columns.get(p) {
+                Some(c) if !c.is_absent() => Some(c),
+                _ => return Err(not_in_batch()),
+            },
+            Some(None) => None,
+            None => return Err(not_in_batch()),
+        };
+        match (self, column) {
+            (FuncObj::Count(c), None) => c.count += rows,
+            (FuncObj::Count(c), Some(column)) => c.count += rows - column.nulls(),
+            (FuncObj::Sum(s), Some(column)) => s.feed_column(column, rows)?,
+            (FuncObj::Avg(a), Some(column)) => a.feed_column(column, rows)?,
+            (FuncObj::Min(m), Some(column)) => m.feed_column(column, rows),
+            (FuncObj::Max(m), Some(column)) => m.feed_column(column, rows),
+            _ => return Err(not_in_batch()),
+        }
+        Ok(())
+    }
+}
+
+fn not_in_batch() -> SchemaError {
+    SchemaError::InternalSchemaError("an aggregate fed a batch it can't read".into())
 }
 
 impl<'a, F> TryFrom<&'a ExprWrapper<'a, F>> for FuncObj
@@ -573,6 +649,51 @@ impl Avg {
     }
 }
 
+impl Avg {
+    fn feed_column(&mut self, column: &Column, rows: usize) -> Result<(), SchemaError> {
+        match &column.data {
+            ColumnData::Integer(v) => {
+                for (row, i) in v[..rows].iter().enumerate() {
+                    if !column.is_null(row) {
+                        self.sum += *i as f64;
+                        self.count += 1;
+                    }
+                }
+            }
+            ColumnData::Double(v) => {
+                for (row, d) in v[..rows].iter().enumerate() {
+                    if !column.is_null(row) {
+                        self.sum += d;
+                        self.count += 1;
+                    }
+                }
+            }
+            _ => {
+                for row in 0..rows {
+                    match column.get(row) {
+                        ValueRef::Integer(i) => {
+                            self.sum += i as f64;
+                            self.count += 1;
+                        }
+                        ValueRef::Double(d) => {
+                            self.sum += d;
+                            self.count += 1;
+                        }
+                        ValueRef::Null => {}
+                        other => {
+                            return Err(SchemaError::InvalidOperationOnOperand(
+                                "avg".into(),
+                                format!("non-numeric operand {:?}", other.to_owned()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl FuncTrait for Avg {
     fn name(&self) -> String {
         self.name.clone()
@@ -711,6 +832,71 @@ impl Sum {
             total: ValueItem::Integer(0),
             any: false,
         })
+    }
+}
+
+impl Sum {
+    fn add_integer(&mut self, i: i64) -> Result<(), SchemaError> {
+        self.any = true;
+        self.total = match self.total {
+            ValueItem::Integer(t) => ValueItem::Integer(t.checked_add(i).ok_or_else(|| {
+                SchemaError::InvalidOperationOnOperand("sum".into(), "integer overflow".into())
+            })?),
+            ValueItem::Double(t) => ValueItem::Double(t + i as f64),
+            _ => unreachable!("total is always Integer or Double"),
+        };
+        Ok(())
+    }
+
+    fn add_double(&mut self, d: f64) {
+        self.any = true;
+        self.total = ValueItem::Double(match self.total {
+            ValueItem::Integer(t) => t as f64 + d,
+            ValueItem::Double(t) => t + d,
+            _ => unreachable!("total is always Integer or Double"),
+        });
+    }
+
+    fn feed_column(&mut self, column: &Column, rows: usize) -> Result<(), SchemaError> {
+        match &column.data {
+            // The common case in one loop: an integer column with no NULLs
+            // into an integer total.
+            ColumnData::Integer(v) if column.nulls() == 0 && matches!(self.total, ValueItem::Integer(_)) => {
+                let ValueItem::Integer(mut t) = self.total else {
+                    unreachable!()
+                };
+                for i in &v[..rows] {
+                    t = t.checked_add(*i).ok_or_else(|| {
+                        SchemaError::InvalidOperationOnOperand("sum".into(), "integer overflow".into())
+                    })?;
+                }
+                self.total = ValueItem::Integer(t);
+                self.any |= rows > 0;
+            }
+            ColumnData::Double(v) => {
+                for (row, d) in v[..rows].iter().enumerate() {
+                    if !column.is_null(row) {
+                        self.add_double(*d);
+                    }
+                }
+            }
+            _ => {
+                for row in 0..rows {
+                    match column.get(row) {
+                        ValueRef::Integer(i) => self.add_integer(i)?,
+                        ValueRef::Double(d) => self.add_double(d),
+                        ValueRef::Null => {}
+                        other => {
+                            return Err(SchemaError::InvalidOperationOnOperand(
+                                "sum".into(),
+                                format!("non-numeric operand {:?}", other.to_owned()),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

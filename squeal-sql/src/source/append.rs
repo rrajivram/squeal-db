@@ -250,6 +250,24 @@ impl Source for AppendSource {
         self.sources.get(self.current).map_or(&[], |s| s.row())
     }
 
+    fn batches(&self) -> bool {
+        self.order.is_none() && self.sources.iter().all(|s| s.batches())
+    }
+
+    fn advance_batch(&mut self) -> Result<bool, SchemaError> {
+        while let Some(source) = self.sources.get_mut(self.current) {
+            if self.skip.get(self.current) != Some(&true) && source.advance_batch()? {
+                return Ok(true);
+            }
+            self.current += 1;
+        }
+        Ok(false)
+    }
+
+    fn batch(&self) -> Option<&crate::batch::Batch> {
+        self.sources.get(self.current)?.batch()
+    }
+
     // The row just yielded came from the source read last.
     fn last_id(&self) -> Option<store::tuple::DBIdType> {
         self.sources.get(self.current)?.last_id()

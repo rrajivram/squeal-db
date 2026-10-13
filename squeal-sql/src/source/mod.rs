@@ -25,6 +25,7 @@ pub mod sort;
 pub(crate) mod sortjoin;
 pub(crate) mod timing;
 pub mod table;
+pub(crate) mod total;
 #[cfg(test)]
 mod tests;
 pub mod where_source;
@@ -98,6 +99,23 @@ pub trait Source: Debug + Send {
     // `reset`.
     fn row(&self) -> &[store::valueitem::ValueItem] {
         &[]
+    }
+    // Whether this source gives its rows in batches (see crate::batch):
+    // `advance_batch` and `batch` then work, in place of reading rows.
+    fn batches(&self) -> bool {
+        false
+    }
+    // Moves to the next batch of rows, never empty; false when there are no
+    // more. Only for a source that `batches`.
+    fn advance_batch(&mut self) -> Result<bool, SchemaError> {
+        Err(SchemaError::InternalSchemaError(format!(
+            "{self:?} does not give batches"
+        )))
+    }
+    // The batch `advance_batch` moved to, until the next `advance_batch` or
+    // `reset`.
+    fn batch(&self) -> Option<&crate::batch::Batch> {
+        None
     }
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;

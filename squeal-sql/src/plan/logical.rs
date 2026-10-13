@@ -1551,25 +1551,35 @@ where
                     ..WantedOrder::default()
                 })
             });
-            if key_positions.is_empty() || already_grouped {
-                // One group, or groups arriving one after another: stream.
-                let group = GroupSource::new(for_proj, projected_fields.clone(), key_positions);
-                Box::new(match having {
-                    Some(having) => group.with_having(having),
-                    None => group,
-                })
-            } else {
+            // The whole table as one group, read in batches: each aggregate
+            // takes a column at a time (see source::total).
+            use crate::source::total::BatchTotal;
+            let batched = key_positions.is_empty()
+                && having.is_none()
+                && BatchTotal::fits(for_proj.as_ref(), &projected_fields);
+            match for_proj {
+                for_proj if batched => {
+                    Box::new(BatchTotal::new(for_proj, projected_fields.clone()))
+                }
+                for_proj if key_positions.is_empty() || already_grouped => {
+                    // One group, or groups arriving one after another: stream.
+                    let group = GroupSource::new(for_proj, projected_fields.clone(), key_positions);
+                    Box::new(match having {
+                        Some(having) => group.with_having(having),
+                        None => group,
+                    })
+                }
                 // Hash the groups, holding one accumulator set each rather
                 // than sorting every row (see source::hashgroup); it falls
                 // back to sorting if they outgrow the query's memory.
-                Box::new(crate::source::hashgroup::HashGroupSource::new(
+                for_proj => Box::new(crate::source::hashgroup::HashGroupSource::new(
                     for_proj,
                     projected_fields.clone(),
                     key_positions,
                     having,
                     self.conn.database.read().db.clone(),
                     self.mem.clone(),
-                ))
+                )),
             }
         } else {
             Box::new(Projection::new(for_proj, projected_fields.clone()))

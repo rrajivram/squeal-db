@@ -2237,6 +2237,7 @@ fn test_order_by_desc_without_limit_is_applied() {
     );
 }
 
+mod batch_total;
 mod index_build;
 mod index_scan;
 mod layers;

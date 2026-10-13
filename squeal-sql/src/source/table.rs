@@ -49,6 +49,9 @@ pub struct TableSource<F: DBFile> {
     tests: Vec<ColumnTest>,
     // The current row, lent (see Source::row): refilled by each advance.
     row: Vec<store::valueitem::ValueItem>,
+    // The current batch, lent (see Source::batch): refilled by each
+    // advance_batch. Made on the first.
+    batch: Option<crate::batch::Batch>,
 }
 
 enum RowCursor<F: DBFile + 'static> {
@@ -208,6 +211,7 @@ where
             keep_ids: true,
             tests: vec![],
             row: Vec::new(),
+            batch: None,
             next_time: 0,
             stats,
             last_id: None,
@@ -293,6 +297,37 @@ where
 
     fn row(&self) -> &[store::valueitem::ValueItem] {
         &self.row
+    }
+
+    // Not for a reader of row keys (UPDATE, DELETE): a batch keeps none.
+    fn batches(&self) -> bool {
+        !self.keep_ids
+    }
+
+    fn advance_batch(&mut self) -> Result<bool, SchemaError> {
+        let start = self.timer.start();
+        let batch = self.batch.get_or_insert_with(|| {
+            crate::batch::Batch::new(
+                self.table.fields().iter().map(|f| f.datatype),
+                self.wanted.as_deref(),
+            )
+        });
+        batch.clear();
+        while !batch.is_full() {
+            let Some(tuple) = self.cursor.next_ref()? else {
+                break;
+            };
+            self.table
+                .decode_row_to_batch(tuple.data(), &self.tests, batch)?;
+        }
+        batch.finish()?;
+        let any = batch.len() > 0;
+        crate::source::timing::add(&mut self.next_time, start);
+        Ok(any)
+    }
+
+    fn batch(&self) -> Option<&crate::batch::Batch> {
+        self.batch.as_ref()
     }
 
     fn last_id(&self) -> Option<store::tuple::DBIdType> {

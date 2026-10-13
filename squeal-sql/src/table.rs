@@ -1676,6 +1676,60 @@ impl SqlTable {
         Ok(true)
     }
 
+    /// As decode_row_into, into the next row of `batch` (see crate::batch):
+    /// each column the batch reads straight from the row's bytes, no
+    /// value made. False, and nothing added, for a row `tests` rule out.
+    pub(crate) fn decode_row_to_batch(
+        &self,
+        data: &[u8],
+        tests: &[ColumnTest],
+        batch: &mut crate::batch::Batch,
+    ) -> Result<bool, SchemaError> {
+        let row: StoredRow = postcard::from_bytes(data)?;
+        let fields = self.fields();
+        if row.version == self.version()
+            && let Some(packed) = Packed::parse(row.values, fields.len())
+        {
+            for test in tests {
+                let start = if test.pos == 0 { 0 } else { packed.end(test.pos - 1) };
+                let value = packed
+                    .value(test.pos, start, packed.end(test.pos), test.datatype)
+                    .ok_or_else(damaged)?;
+                if !test.passes(value) {
+                    return Ok(false);
+                }
+            }
+            let mut start = 0;
+            for (pos, column) in batch.columns.iter_mut().enumerate() {
+                let end = packed.end(pos);
+                if !column.is_absent() {
+                    if packed.is_null(pos) {
+                        column.push_null();
+                    } else {
+                        column.push_packed(packed.data.get(start..end).ok_or_else(damaged)?)?;
+                    }
+                }
+                start = end;
+            }
+            batch.row_pushed();
+            return Ok(true);
+        }
+        // A row of an older version or an older format: decoded the general
+        // way, then copied in.
+        let Some(decoded) = self.decode_row_if(data, None, tests)? else {
+            return Ok(false);
+        };
+        let values = decoded.values();
+        for (pos, column) in batch.columns.iter_mut().enumerate() {
+            match values.get(pos) {
+                Some(value) => column.push(value.as_ref()),
+                None => column.push_null(),
+            }
+        }
+        batch.row_pushed();
+        Ok(true)
+    }
+
     fn decode_stored_row(
         &self,
         row: &StoredRow,

@@ -283,6 +283,52 @@ impl EvalExpr {
         }
     }
 
+    /// Calls `f` on every aggregate in this expression, outermost first,
+    /// as get_funcs finds them, without collecting them.
+    pub(crate) fn for_each_aggregate(
+        &mut self,
+        f: &mut dyn FnMut(&mut FuncObj) -> Result<(), SchemaError>,
+    ) -> Result<(), SchemaError> {
+        match self {
+            Self::Unary { field, .. } => field.for_each_aggregate(f),
+            Self::Binary { lhs, rhs, .. } => {
+                lhs.for_each_aggregate(f)?;
+                rhs.for_each_aggregate(f)
+            }
+            Self::Function(func) if func.is_aggregate() => f(func),
+            Self::Function(func) => {
+                for a in func.args_mut() {
+                    if let FuncArgs::Field(e) = a {
+                        e.for_each_aggregate(f)?;
+                    }
+                }
+                Ok(())
+            }
+            Self::Subquery(s) => {
+                for e in s.operands_mut() {
+                    e.for_each_aggregate(f)?;
+                }
+                Ok(())
+            }
+            Self::None | Self::Literal(_) | Self::Value(_) | Self::Param(_) => Ok(()),
+        }
+    }
+
+    /// Whether `f` holds for every aggregate in this expression.
+    pub(crate) fn every_aggregate(&self, f: &dyn Fn(&FuncObj) -> bool) -> bool {
+        match self {
+            Self::Unary { field, .. } => field.every_aggregate(f),
+            Self::Binary { lhs, rhs, .. } => lhs.every_aggregate(f) && rhs.every_aggregate(f),
+            Self::Function(func) if func.is_aggregate() => f(func),
+            Self::Function(func) => func.args().iter().all(|a| match a {
+                FuncArgs::Field(e) => e.every_aggregate(f),
+                FuncArgs::Wildcard => true,
+            }),
+            Self::Subquery(s) => s.operands().all(|e| e.every_aggregate(f)),
+            Self::None | Self::Literal(_) | Self::Value(_) | Self::Param(_) => true,
+        }
+    }
+
     pub(crate) fn get_funcs(&mut self) -> Vec<&mut FuncObj> {
         match self {
             Self::Unary { field, .. } => field.get_funcs(),

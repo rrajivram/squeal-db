@@ -1,3 +1,4 @@
+pub(crate) mod batch;
 pub mod conn;
 pub(crate) mod constant;
 pub(crate) mod csv_infer;
