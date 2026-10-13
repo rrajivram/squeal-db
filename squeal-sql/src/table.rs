@@ -1644,7 +1644,7 @@ impl SqlTable {
                 if let Some(w) = wanted
                     && !w[pos]
                 {
-                    if *slot != ValueItem::Null {
+                    if !matches!(slot, ValueItem::Null) {
                         *slot = ValueItem::Null;
                     }
                     last_end = None;

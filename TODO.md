@@ -1,5 +1,14 @@
 # Open items
 
+## Plans of record
+
+- **PLANNING_DESIGN.md:** statements planned once per shape. Stages 1–3
+  done (point lookup 7 -> 4 us); 3b and 4 open.
+- **BATCH_EXECUTION_DESIGN.md:** queries over batches of columns, then
+  SIMD kernels, Parquet, and PAX pages. Not started.
+- **BYTE_KEYS_DESIGN.md** and **MEMORY_ISSUES.md:** keys as bytes, and
+  allocating less.
+
 ## From the SQLite comparison (2026-10-10)
 
 `cargo run --release -p squeal-sql --example load_vs_sqlite -- 200000 4`,
