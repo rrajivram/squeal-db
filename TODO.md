@@ -2,12 +2,14 @@
 
 ## Plans of record
 
-- **PLANNING_DESIGN.md:** statements planned once per shape. Stages 1–3
-  done (point lookup 7 -> 4 us); 3b and 4 open.
+- **PLANNING_DESIGN.md:** statements planned once per shape, and key
+  lookups kept whole. Stages 1–3b done (point lookup 7 -> 1.7 us); 4 open.
 - **BATCH_EXECUTION_DESIGN.md:** queries over batches of columns, then
   SIMD kernels, Parquet, and PAX pages. Not started.
 - **BYTE_KEYS_DESIGN.md** and **MEMORY_ISSUES.md:** keys as bytes, and
   allocating less.
+- **ROWS_IN_LEAVES_DESIGN.md:** rows kept in the B+tree's leaves, not on
+  separate data pages. On-disk change, awaiting approval.
 
 ## From the SQLite comparison (2026-10-10)
 

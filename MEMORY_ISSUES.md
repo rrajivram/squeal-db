@@ -196,7 +196,8 @@ or is unambiguous.
       without the bulk thread.
     - Fixed by holding the permit around each step's writes, as every tree
       write does. 1,600 seeds clean since.
-- [ ] **Step 5. Keep entries in the leaf** (store B+tree; needs the
+- [ ] **Step 5. Keep entries in the leaf** (worked out in
+  ROWS_IN_LEAVES_DESIGN.md, awaiting approval) (store B+tree; needs the
   author's go-ahead). Saves about 30 B an index entry.
   - A tree created as index-only keeps each whole entry in its leaf, with
     no data page.
