@@ -58,6 +58,11 @@ pub(crate) struct ItemNeeds {
 /// GROUP BY. `wh_expr` is in that same space. Each join's ON condition is
 /// read from `tables`, where its positions start at its own FROM item's
 /// base table (see QueryVisitor::get_tables).
+///
+/// These are what the query states. What its values imply through join
+/// equalities is added by `add_derived_comparisons`, once the values are
+/// known: a plan prepared for every execution of a statement shape holds
+/// parameter slots here.
 pub(crate) fn analyze_query<F: DBFile + 'static>(
     tables: &[TableQuery<F>],
     flat_tables: &[TableQuery<F>],
@@ -102,6 +107,42 @@ pub(crate) fn analyze_query<F: DBFile + 'static>(
             .collect();
         n.stated = n.filters.len();
     }
+    needs
+}
+
+/// Adds to `needs` (from `analyze_query`) the comparisons the query implies
+/// through its equalities of columns (see derived_comparisons), for seeks.
+pub(crate) fn add_derived_comparisons<F: DBFile + 'static>(
+    tables: &[TableQuery<F>],
+    flat_tables: &[TableQuery<F>],
+    shapes: &[TableShape],
+    wh_expr: Option<&EvalExpr>,
+    needs: &mut [ItemNeeds],
+) {
+    // Nothing to carry a comparison across without an equality of columns:
+    // an inner join's, or WHERE's.
+    let column_equality = |e: &EvalExpr| {
+        let mut terms = vec![];
+        and_terms(e, &mut terms);
+        terms.iter().any(|t| {
+            matches!(t, EvalExpr::Binary { lhs, op: BinaryOp::Eq, rhs }
+                if matches!((lhs.as_ref(), rhs.as_ref()), (EvalExpr::Value(_), EvalExpr::Value(_))))
+        })
+    };
+    let inner_join = tables
+        .iter()
+        .flat_map(|t| &t.joins)
+        .any(|j| matches!(j.join_type, JoinType::Inner));
+    if !inner_join && !wh_expr.is_some_and(column_equality) {
+        return;
+    }
+    let mut starts = Vec::with_capacity(flat_tables.len());
+    let mut next = 0;
+    for t in flat_tables {
+        starts.push(next);
+        next += t.fields.len();
+    }
+    let conjuncts = Conjuncts::analyze(wh_expr, shapes);
     let item_of = |pos: usize| {
         (0..starts.len())
             .find(|&i| starts[i] <= pos && pos < starts[i] + flat_tables[i].fields.len())
@@ -119,7 +160,6 @@ pub(crate) fn analyze_query<F: DBFile + 'static>(
             rhs: Box::new(EvalExpr::Literal(value)),
         });
     }
-    needs
 }
 
 // Comparisons implied by the query that it doesn't state: `a.x = b.y AND
@@ -223,7 +263,7 @@ fn and_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
 // the NULL the index scan pads it with.
 fn every_position(e: &EvalExpr) -> Vec<usize> {
     match e {
-        EvalExpr::None | EvalExpr::Literal(_) => vec![],
+        EvalExpr::None | EvalExpr::Literal(_) | EvalExpr::Param(_) => vec![],
         EvalExpr::Value(i) => vec![*i],
         EvalExpr::Unary { field, .. } => every_position(field),
         EvalExpr::Binary { lhs, rhs, .. } => {

@@ -78,6 +78,8 @@ pub struct Connection<F: DBFile + 'static> {
     // specific database's PageBuffer, so it can't survive this
     // connection repointing at a different one.
     temp_tables: TempTables<F>,
+    // SELECT plans prepared once per statement shape (see PlanCache).
+    pub(crate) plans: crate::plan::logical::PlanCache<F>,
 }
 
 impl<F> ConnectionManager<F>
@@ -254,6 +256,7 @@ where
             current_txn: RwLock::new(None),
             txn_locks: Default::default(),
             temp_tables: TempTables::new(),
+            plans: Default::default(),
         }
     }
 

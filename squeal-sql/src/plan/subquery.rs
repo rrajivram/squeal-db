@@ -595,6 +595,13 @@ fn visit<'a>(e: &'a Expr, sub: &mut dyn FnMut(&'a Query, Kind), child: &mut dyn 
     }
 }
 
+/// Whether `e` holds a subquery anywhere.
+pub(crate) fn has_subquery(e: &Expr) -> bool {
+    let mut found = vec![];
+    subqueries(e, &mut found);
+    !found.is_empty()
+}
+
 fn subqueries<'a>(e: &'a Expr, out: &mut Vec<(&'a Query, Kind)>) {
     let mut children = vec![];
     visit(e, &mut |q, k| out.push((q, k)), &mut |c| children.push(c));

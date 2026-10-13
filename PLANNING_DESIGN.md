@@ -107,8 +107,49 @@ comparison tests.
     secondary-index lookup went 188 → 189.
   - Telling integer and float literals apart in the shape key is left for
     stage 3, where it matters: values are not in the plan until then.
-- [ ] **3. The prepared-plan cache**, as designed above: the prepared part
-  cached per shape and schema, validated against the catalog each
-  execution, with everything value-sensitive run per execution.
+- [x] **3. The prepared-plan cache.** Done 2026-10-12.
+  - `handle_select` is two halves:
+    - `prepare_select` (no value decides it): FROM resolved, expressions
+      built, conditions sorted by table (`analyze_query`).
+    - `run_select` (per execution): comparisons implied through join
+      equalities, `GROUP BY` validation, partitions, access paths, joins,
+      and the sources opened.
+  - A plain SELECT is prepared once per shape with `EvalExpr::Param` slots
+    and kept in the connection's `PlanCache`. Each execution clones it,
+    binds its values in (folding what then becomes constant), refreshes
+    each table's statistics, and runs the second half, so every
+    value-sensitive choice is made again. Plan quality is unchanged.
+  - **Key:** the address of the outermost query in the parse cache's
+    shared tree. The entry holds that tree, so the address can't be reused.
+  - **Valid** while a process-wide catalog generation (bumped by any table
+    created, dropped or altered, and by a schema made or loaded) and the
+    connection's current schema are the ones it was prepared under.
+  - **Not kept**, planned as before every time (decided from the syntax
+    tree, so nothing runs with unbound slots):
+    - WITH queries, FROM subqueries and subqueries anywhere;
+    - temp tables;
+    - an `ORDER BY` position.
+  - Prepared statements use it too: their tree is fixed.
+  - Integer and float literals need no separate keys after all: nothing
+    kept depends on the values' types.
+  - **Measured**, 500k orders:
+
+    | | before | after |
+    |---|---:|---:|
+    | point lookup by primary key | 5.5 µs | 4.0 µs |
+    | secondary-index lookup + aggregate | 20.5 µs | 13.5 µs |
+
+  - **Where a point lookup's 4.0 µs goes now:**
+    - planning per execution, ~58%: choosing the access path ~0.5 µs,
+      opening the sources ~0.5 µs, cloning and binding the kept plan
+      ~0.5 µs;
+    - reading the row ~18%;
+    - parsing (tokenizing, the shape lookup) ~14%;
+    - dropping the result ~7%.
+- [ ] **3b. Reusing value-blind choices.** An access path that no value
+  can change (an equality on every column of the primary key, or of a
+  unique index) is kept with the plan, so an execution only builds its key
+  from the values. The kept plan is also made cheaper to bind: shared
+  parts behind `Arc`, so only expressions are copied.
 - [ ] **4. What is left per statement**, measured again after 3: the
   statement transaction, locks, and the result set.

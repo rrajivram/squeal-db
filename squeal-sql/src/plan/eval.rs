@@ -53,6 +53,10 @@ pub enum EvalExpr {
     // `x IN (SELECT ...)`, `EXISTS (SELECT ...)`, `(SELECT ...)`: answered
     // when planned (see plan::subquery).
     Subquery(SubqueryExpr),
+    // The statement's i-th placeholder value (see plan::params), in a plan
+    // prepared once for every execution of a statement shape. Each
+    // execution binds the values in (`bind`) before anything reads them.
+    Param(usize),
 }
 
 impl EvalExpr {
@@ -64,7 +68,7 @@ impl EvalExpr {
     // appearance (repeats included; a function contributes its arguments').
     pub(crate) fn column_positions(&self) -> Vec<usize> {
         match self {
-            Self::None | Self::Literal(_) => vec![],
+            Self::None | Self::Literal(_) | Self::Param(_) => vec![],
             Self::Value(i) => vec![*i],
             Self::Unary { field, .. } => field.column_positions(),
             Self::Binary { lhs, rhs, .. } => {
@@ -89,6 +93,7 @@ impl EvalExpr {
         Some(match self {
             Self::None => Self::None,
             Self::Literal(v) => Self::Literal(v.clone()),
+            Self::Param(i) => Self::Param(*i),
             Self::Value(i) => Self::Value(i.checked_sub(offset)?),
             Self::Unary { op, field } => Self::Unary {
                 op: *op,
@@ -130,6 +135,7 @@ impl EvalExpr {
                 other => other.to_string(),
             },
             Self::Value(i) => Self::column_label(names, *i),
+            Self::Param(i) => format!("${}", i + 1),
             Self::Unary { op, field } => {
                 let f = field.describe(names);
                 match op {
@@ -179,6 +185,38 @@ impl EvalExpr {
         }
     }
 
+    /// This expression with the statement's values in its parameter slots,
+    /// and anything over literals alone then computed (see `folded`): what
+    /// a prepared plan's expression is at one execution.
+    pub(crate) fn bind(&mut self, params: &Params) -> Result<(), SchemaError> {
+        match self {
+            Self::Param(i) => *self = Self::Literal(params.value(*i)?.clone()),
+            Self::Unary { field, .. } => {
+                field.bind(params)?;
+                *self = std::mem::replace(self, Self::None).folded();
+            }
+            Self::Binary { lhs, rhs, .. } => {
+                lhs.bind(params)?;
+                rhs.bind(params)?;
+                *self = std::mem::replace(self, Self::None).folded();
+            }
+            Self::Function(f) => {
+                for a in f.args_mut() {
+                    if let FuncArgs::Field(e) = a {
+                        e.bind(params)?;
+                    }
+                }
+            }
+            Self::Subquery(s) => {
+                for e in s.operands_mut() {
+                    e.bind(params)?;
+                }
+            }
+            Self::None | Self::Literal(_) | Self::Value(_) => {}
+        }
+        Ok(())
+    }
+
     pub(crate) fn has_aggregate(&self) -> bool {
         match self {
             Self::Unary { field, .. } => field.has_aggregate(),
@@ -205,7 +243,7 @@ impl EvalExpr {
                 v.extend_from_slice(&rhs.get_non_agg_fields());
                 v
             }
-            Self::Literal(_) | Self::None => {
+            Self::Literal(_) | Self::None | Self::Param(_) => {
                 vec![]
             }
             Self::Value(u) => {
@@ -230,7 +268,7 @@ impl EvalExpr {
             return None;
         }
         match self {
-            Self::None | Self::Literal(_) => None,
+            Self::None | Self::Literal(_) | Self::Param(_) => None,
             Self::Value(i) => Some(*i),
             Self::Unary { field, .. } => field.ungrouped_column(grouped),
             Self::Binary { lhs, rhs, .. } => lhs
@@ -292,6 +330,7 @@ impl EvalExpr {
                     "a column reference outside any aggregate in an empty group".into(),
                 ));
             }
+            Self::Param(_) => return Err(unbound()),
             Self::Unary { op, field } => CrateValueItem::unary(&field.eval_empty_group()?, op)?,
             Self::Binary { lhs, op, rhs } => {
                 CrateValueItem::binary(&lhs.eval_empty_group()?, &rhs.eval_empty_group()?, op)?
@@ -336,6 +375,7 @@ impl EvalExpr {
                 Cow::Owned(CrateValueItem::binary(&lhs, &rhs, op)?)
             }
             Self::Function(obj) => obj.eval_lent(data)?,
+            Self::Param(_) => return Err(unbound()),
             Self::Subquery(s) => {
                 let mut operands = Vec::with_capacity(s.keys.len() + 1);
                 for e in s.operands_mut() {
@@ -373,6 +413,9 @@ impl EvalExpr {
             Expr::Literal(l) => Self::Literal(literal_value(l)),
             // A placeholder plans as the value it holds, exactly as the
             // literal would: every decision sees it (see plan::params).
+            // Or, planning once for every execution, as a slot each
+            // execution binds its value into.
+            Expr::Placeholder(p) if params.slots() => Self::Param(params.index_of(p)?),
             Expr::Placeholder(p) => Self::Literal(params.get(p)?.clone()),
             Expr::Column(c) => {
                 let idents = c.idents().collect::<Vec<_>>();
@@ -918,6 +961,10 @@ fn compare(
 
 // A short name for an expression kind from_expr doesn't evaluate, for its
 // error message — not the whole debug dump of the syntax tree.
+fn unbound() -> SchemaError {
+    SchemaError::InternalSchemaError("a parameter slot was read before its value was bound".into())
+}
+
 fn describe_unsupported(expr: &Expr) -> String {
     let debug = format!("{expr:?}");
     debug

@@ -21,14 +21,16 @@ use crate::error::SchemaError;
 
 // Each value with where its placeholder starts in the text, in that order.
 // Shared: a plan and its statement hold the same list.
+// `slots`: placeholders plan as parameter slots (EvalExpr::Param) rather
+// than as their values — preparing a plan for every execution of a shape.
 #[derive(Debug, Clone)]
-pub(crate) struct Params(Arc<[(usize, ValueItem)]>);
+pub(crate) struct Params(Arc<[(usize, ValueItem)]>, bool);
 
 impl Params {
     /// No placeholders.
     pub(crate) fn none() -> Self {
         static NONE: OnceLock<Arc<[(usize, ValueItem)]>> = OnceLock::new();
-        Params(NONE.get_or_init(|| Arc::from(Vec::new())).clone())
+        Params(NONE.get_or_init(|| Arc::from(Vec::new())).clone(), false)
     }
 
     /// A shape's literals, in source order.
@@ -38,6 +40,7 @@ impl Params {
                 .iter()
                 .map(|l| (literal_span(l).start, literal_value(l)))
                 .collect(),
+            false,
         )
     }
 
@@ -54,18 +57,38 @@ impl Params {
             out.push((placeholder_span(p).start, value));
         }
         out.sort_by_key(|(at, _)| *at);
-        Ok(Params(out.into()))
+        Ok(Params(out.into(), false))
+    }
+
+    /// The same values, with placeholders planned as slots.
+    pub(crate) fn as_slots(&self) -> Self {
+        Params(self.0.clone(), true)
+    }
+
+    pub(crate) fn slots(&self) -> bool {
+        self.1
+    }
+
+    /// Which value the placeholder `p` is: its slot.
+    pub(crate) fn index_of(&self, p: &Placeholder) -> Result<usize, SchemaError> {
+        let at = placeholder_span(p).start;
+        self.0.binary_search_by_key(&at, |(s, _)| *s).map_err(|_| {
+            SchemaError::UserError(
+                "a placeholder has no value: run the statement prepared, binding each one".into(),
+            )
+        })
     }
 
     /// The value of the placeholder `p`.
     pub(crate) fn get(&self, p: &Placeholder) -> Result<&ValueItem, SchemaError> {
-        let at = placeholder_span(p).start;
-        match self.0.binary_search_by_key(&at, |(s, _)| *s) {
-            Ok(i) => Ok(&self.0[i].1),
-            Err(_) => Err(SchemaError::UserError(
-                "a placeholder has no value: run the statement prepared, binding each one".into(),
-            )),
-        }
+        Ok(&self.0[self.index_of(p)?].1)
+    }
+
+    /// The value in slot `i`.
+    pub(crate) fn value(&self, i: usize) -> Result<&ValueItem, SchemaError> {
+        self.0.get(i).map(|(_, v)| v).ok_or_else(|| {
+            SchemaError::InternalSchemaError(format!("no value for parameter slot {i}"))
+        })
     }
 
     /// `e` as an integer, when it is an integer literal or a placeholder

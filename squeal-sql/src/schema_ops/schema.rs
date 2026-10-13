@@ -63,6 +63,21 @@ mod tests;
 /// Rows per transaction for COPY INTO (phase 7).
 const COPY_BATCH_ROWS: usize = 1000;
 
+// Advances whenever any schema's set of tables, or a table's definition,
+// changes, in any database of the process (a schema loaded or created
+// counts too). A plan prepared at one generation still names the tables it
+// was prepared against while the generation stands (see
+// plan::logical::PlanCache).
+static CATALOG_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn catalog_generation() -> u64 {
+    CATALOG_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn bump_catalog() {
+    CATALOG_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+}
+
 impl<F: DBFile> std::fmt::Debug for Schema<F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Schema")
@@ -97,6 +112,7 @@ where
         // to find via schema.list_tables() at this point regardless.
         let stats = SchemaStats::new(schema.clone(), DEFAULT_STATS_SAMPLING_RATE)?;
         *schema.stats.lock() = Some(stats);
+        bump_catalog();
         Ok(schema)
     }
 
@@ -123,6 +139,7 @@ where
             locks: Default::default(),
         };
         s.load_tables()?;
+        bump_catalog();
         let schema = Arc::new(s);
         let stats = if existed {
             SchemaStats::load(schema.clone(), DEFAULT_STATS_SAMPLING_RATE, stats_table_id)?
@@ -509,6 +526,7 @@ where
             log::warn!("failed to register {:?} with SchemaStats: {e}", table.name);
         }
         self.tables.write().insert(table.name.clone(), table);
+        bump_catalog();
         Ok(())
     }
 
@@ -1501,6 +1519,7 @@ where
         }
         self.db.commit(txn)?;
         self.tables.write().remove(&name);
+        bump_catalog();
         // Best effort from here: the table is gone either way.
         if table.primary_key().is_none()
             && let Err(e) = self
@@ -1672,6 +1691,7 @@ where
             log::warn!("failed to reshape {:?}'s stats: {e}", table.name);
         }
         self.tables.write().insert(name, table);
+        bump_catalog();
         Ok(())
     }
 }

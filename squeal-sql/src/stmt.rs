@@ -912,7 +912,12 @@ where
                             Ok(())
                         })?;
                      */
-                    let mut plan = LogicalPlan::build(self.conn.clone(), query, self.params.clone())?;
+                    let mut plan = LogicalPlan::build_cached(
+                        self.conn.clone(),
+                        query,
+                        self.params.clone(),
+                        self.stmts.clone(),
+                    )?;
                     let result = plan.execute()?;
                     self.results.push(Some(ResultType::StreamingResult(result)));
                 }

@@ -1,11 +1,11 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use parking_lot::RwLock;
 use sql_parser::{
     Expr, Query,
     expr::BinaryOp,
     query::{
-        Alias, FromClause, GroupByClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
+        Alias, FromClause, JoinConstraint, JoinOperator, OrderByClause, SelectItem,
         SetOperand, TableFactor,
     },
     token::Comma,
@@ -21,7 +21,7 @@ use crate::{
     optim::{
         picker::{
             Access, AccessPath, ItemNeeds, OrderWanted, PageCosts, SORT_BYTES_PER_COMPARE,
-            analyze_query,
+            add_derived_comparisons, analyze_query,
             filtered_rows, pick_access, pick_join_seek,
         },
         table_stats::{ComputedTableStat, compute_table_stats},
@@ -35,6 +35,7 @@ use crate::{
         subquery,
     },
     rslt::resultset::StreamingResultSet,
+    schema_ops::schema::catalog_generation,
     source::{
         ProjectableField, Source,
         aggr::AggregatingSource,
@@ -301,6 +302,14 @@ struct QueryVisitor<F: DBFile> {
     ctes: Vec<CteScope>,
     // The values of the statement's placeholders (see plan::params).
     params: Params,
+    // Something planned since this was last cleared can't be part of a
+    // plan kept for later executions: a subquery, WITH query or FROM
+    // subquery (each run while planning), a temp table, or an ORDER BY
+    // position (see PlanCache).
+    uncacheable: bool,
+    // The statement's outermost query (its address) and the statements
+    // holding it, when its prepared plan may be kept for later executions.
+    cache: Option<(usize, Arc<[sql_parser::Statement]>)>,
 }
 
 // One WITH query in scope.
@@ -612,6 +621,77 @@ pub(crate) fn conjunct_terms<'a>(e: &'a EvalExpr, out: &mut Vec<&'a EvalExpr>) {
     }
 }
 
+// What prepare_select builds: see there.
+struct PreparedSelect<F: DBFile + 'static> {
+    tables: Vec<TableQuery<F>>,
+    flat_tables: Vec<TableQuery<F>>,
+    projected_fields: Vec<ProjectableField>,
+    hidden: usize,
+    having: Option<EvalExpr>,
+    has_aggregation: bool,
+    wh_expr: Option<EvalExpr>,
+    shapes: Vec<TableShape>,
+    group_fields: Vec<ProjectableField>,
+    needs: Vec<ItemNeeds>,
+    distinct: bool,
+}
+
+impl<F: DBFile + 'static> Clone for PreparedSelect<F> {
+    fn clone(&self) -> Self {
+        PreparedSelect {
+            tables: self.tables.clone(),
+            flat_tables: self.flat_tables.clone(),
+            projected_fields: self.projected_fields.clone(),
+            hidden: self.hidden,
+            having: self.having.clone(),
+            has_aggregation: self.has_aggregation,
+            wh_expr: self.wh_expr.clone(),
+            shapes: self.shapes.clone(),
+            group_fields: self.group_fields.clone(),
+            needs: self.needs.clone(),
+            distinct: self.distinct,
+        }
+    }
+}
+
+impl<F> PreparedSelect<F>
+where
+    F: DBFile + 'static,
+    F: DBFile<Item = F>,
+{
+    // This plan at one execution: `params` bound into its slots, and each
+    // table's current statistics.
+    fn bind(&mut self, conn: &Arc<Connection<F>>, params: &Params) -> Result<(), SchemaError> {
+        fn table<F>(t: &mut TableQuery<F>, conn: &Arc<Connection<F>>, params: &Params) -> Result<(), SchemaError>
+        where
+            F: DBFile + 'static,
+            F: DBFile<Item = F>,
+        {
+            if let TableRef::Real(schema, sqltable) = &t.resolved {
+                t.stats = compute_table_stats(conn, &schema.name, sqltable)?;
+            }
+            for j in &mut t.joins {
+                j.on_expr.bind(params)?;
+                table(&mut j.relation, conn, params)?;
+            }
+            Ok(())
+        }
+        for t in self.tables.iter_mut().chain(self.flat_tables.iter_mut()) {
+            table(t, conn, params)?;
+        }
+        for f in self.projected_fields.iter_mut().chain(self.group_fields.iter_mut()) {
+            f.expr.bind(params)?;
+        }
+        for e in self.having.iter_mut().chain(self.wh_expr.iter_mut()) {
+            e.bind(params)?;
+        }
+        for e in self.needs.iter_mut().flat_map(|n| n.filters.iter_mut()) {
+            e.bind(params)?;
+        }
+        Ok(())
+    }
+}
+
 struct SourceHolder {
     source: Box<dyn Source>,
     // How many columns at the END of `source`'s rows are not part of the
@@ -691,6 +771,8 @@ where
             stmt_txn,
             ctes: vec![],
             params,
+            uncacheable: false,
+            cache: None,
         })
     }
 
@@ -739,11 +821,22 @@ where
         let limit_count = limit.map(|l| l.saturating_add(offset));
         let (mut step, hidden, sorted) = match (&query.body, query.compounds.is_empty()) {
             (SetOperand::Select(select), true) => {
+                let order_by = query.order_by.as_ref();
+                let key = std::ptr::from_ref(query) as usize;
+                let prepared = match self.cache.take() {
+                    Some((at, statements)) if at == key => {
+                        self.cached_select(key, statements, select, order_by)?
+                    }
+                    other => {
+                        self.cache = other;
+                        self.prepare_select(select, order_by)?
+                    }
+                };
                 let SourceHolder {
                     source,
                     hidden,
                     sorted,
-                } = self.handle_select(select, query.order_by.as_ref(), limit_count)?;
+                } = self.run_select(prepared, order_by, limit_count)?;
                 (source, hidden, sorted)
             }
             // `(query)`, or set operations: ORDER BY and LIMIT apply to the
@@ -874,6 +967,79 @@ where
         order_by: Option<&OrderByClause>,
         limit: Option<usize>,
     ) -> Result<SourceHolder, SchemaError> {
+        let prepared = self.prepare_select(select, order_by)?;
+        self.run_select(prepared, order_by, limit)
+    }
+
+    // prepare_select through the connection's PlanCache: the plan kept for
+    // this statement's shape, with this execution's values bound in, or one
+    // prepared now (and kept, if it may be).
+    fn cached_select(
+        &mut self,
+        key: usize,
+        statements: Arc<[sql_parser::Statement]>,
+        select: &sql_parser::query::SelectCore,
+        order_by: Option<&OrderByClause>,
+    ) -> Result<PreparedSelect<F>, SchemaError> {
+        let generation = catalog_generation();
+        let schema = self
+            .conn
+            .current_schema()
+            .map_or(0, |s| Arc::as_ptr(&s) as usize);
+        match self.conn.plans.get(key, generation, schema) {
+            Some(Some(mut plan)) => {
+                plan.bind(&self.conn, &self.params)?;
+                return Ok(plan);
+            }
+            Some(None) => return self.prepare_select(select, order_by),
+            None => {}
+        }
+        // Only a plain SELECT is prepared with slots: one that runs nothing
+        // while it is planned (see plain_select), and whose ORDER BY names
+        // its columns (a position decides which column is sorted on).
+        self.uncacheable = !self.ctes.is_empty()
+            || !plain_select(select)
+            || order_by.is_some_and(|o| {
+                o.items
+                    .items()
+                    .any(|i| matches!(i.expr, Expr::Placeholder(_)))
+            });
+        let slotted = if self.uncacheable {
+            None
+        } else {
+            let slots = self.params.as_slots();
+            let values = std::mem::replace(&mut self.params, slots);
+            let slotted = self.prepare_select(select, order_by);
+            self.params = values;
+            Some(slotted)
+        };
+        match slotted {
+            Some(Ok(plan)) if !self.uncacheable => {
+                self.conn
+                    .plans
+                    .insert(key, statements, generation, schema, Some(plan.clone()));
+                let mut plan = plan;
+                plan.bind(&self.conn, &self.params)?;
+                Ok(plan)
+            }
+            // Planned with its values, as it will be each time (an error
+            // is then reported as planning it that way reports it).
+            _ => {
+                self.conn.plans.insert(key, statements, generation, schema, None);
+                self.prepare_select(select, order_by)
+            }
+        }
+    }
+
+    // The part of planning a SELECT block no value decides: names resolved,
+    // expressions built, conditions sorted by the tables they read. With
+    // `params` as slots, a plan for every execution of the statement's
+    // shape (see PlanCache).
+    fn prepare_select(
+        &mut self,
+        select: &sql_parser::query::SelectCore,
+        order_by: Option<&OrderByClause>,
+    ) -> Result<PreparedSelect<F>, SchemaError> {
         let distinct = select.distinct.is_some();
         let tables = self.get_tables(&select.from)?;
         // `tables` mirrors the FROM clause: one entry per top-level item,
@@ -908,6 +1074,9 @@ where
             .chain(select.having.as_ref().map(|h| &h.expr))
             .collect();
         let _subqueries = subquery::resolve_all(self, &subquery_exprs, &flat_tables)?;
+        if subquery_exprs.iter().any(|e| subquery::has_subquery(e)) {
+            self.uncacheable = true;
+        }
         let proj = self.get_projections(&select.projection, &flat_tables)?;
         let mut projected_fields = proj.into_iter().flatten().collect::<Vec<_>>();
         // ORDER BY may name a column the SELECT list leaves out (`SELECT
@@ -945,7 +1114,6 @@ where
         let has_aggregation = select.group_by.is_some()
             || having.is_some()
             || projected_fields.iter().any(|f| f.expr.has_aggregate());
-        let projected_field_count = projected_fields.len();
 
         let wh_expr = if let Some(wh) = &select.where_clause {
             Some(*EvalExpr::from_expr(&wh.expr, &flat_tables, &self.params)?)
@@ -966,23 +1134,60 @@ where
         // outright (confirmed via direct repro: an integer column came
         // back holding a string value from an unrelated table).
         let shapes = Self::table_shapes(&tables, &flat_tables);
-        // GROUP BY is resolved again (and validated) by validate_aggreations;
-        // here it only contributes the columns it reads.
-        let group_by = match &select.group_by {
+        // Validated (against the values) by validate_aggreations.
+        let group_fields = match &select.group_by {
             Some(g) => g
                 .exprs
                 .items()
-                .map(|e| EvalExpr::from_expr(e, &flat_tables, &self.params).map(|e| *e))
+                .map(|e| self.handle_expr(e, &None, &flat_tables))
                 .collect::<Result<Vec<_>, _>>()?,
             None => vec![],
         };
         let reads: Vec<&EvalExpr> = projected_fields
             .iter()
             .map(|f| &f.expr)
-            .chain(&group_by)
+            .chain(group_fields.iter().map(|f| &f.expr))
             .chain(&having)
             .collect();
         let needs = analyze_query(&tables, &flat_tables, &shapes, &reads, wh_expr.as_ref());
+        Ok(PreparedSelect {
+            tables,
+            flat_tables,
+            projected_fields,
+            hidden,
+            having,
+            has_aggregation,
+            wh_expr,
+            shapes,
+            group_fields,
+            needs,
+            distinct,
+        })
+    }
+
+    // The rest of planning a SELECT block, for these values: seeks and
+    // ranges, partitions, access paths, joins, and the sources opened.
+    fn run_select(
+        &mut self,
+        prepared: PreparedSelect<F>,
+        order_by: Option<&OrderByClause>,
+        limit: Option<usize>,
+    ) -> Result<SourceHolder, SchemaError> {
+        let PreparedSelect {
+            tables,
+            flat_tables,
+            projected_fields,
+            hidden,
+            having,
+            has_aggregation,
+            wh_expr,
+            shapes,
+            group_fields,
+            mut needs,
+            distinct,
+        } = prepared;
+        let projected_field_count = projected_fields.len();
+        add_derived_comparisons(&tables, &flat_tables, &shapes, wh_expr.as_ref(), &mut needs);
         // The order ORDER BY wants, when one table's key could provide it:
         // a single table, nothing grouping or deduplicating rows, and every
         // ORDER BY item an ascending plain column of it.
@@ -1007,9 +1212,9 @@ where
             _ => None,
         };
         // GROUP BY's columns, when they are all plain columns.
-        let group_positions: Option<Vec<usize>> = group_by
+        let group_positions: Option<Vec<usize>> = group_fields
             .iter()
-            .map(|e| match e {
+            .map(|f| match &f.expr {
                 EvalExpr::Value(p) => Some(*p),
                 _ => None,
             })
@@ -1319,7 +1524,7 @@ where
                 &projected_fields,
                 having.as_ref(),
                 &flat_tables,
-                &select.group_by,
+                &group_fields,
                 &raw_fields,
             )?;
             // A GROUP BY expression that is not a plain column is computed
@@ -2411,6 +2616,7 @@ where
             && let Some(cte) = self.cte_named(name)
         {
             // A WITH query's name: read like a FROM subquery (see cte_rows).
+            self.uncacheable = true;
             let (position, cte) = cte;
             let (rows, stats) = self.cte_rows(position)?;
             let alias = alias
@@ -2440,6 +2646,7 @@ where
                     merged: vec![],
                 }
             } else if let TableRef::Temp(schema, temptable) = &table {
+                self.uncacheable = true;
                 TableQuery {
                     schema: schema.clone(),
                     table: temptable.read().name.clone(),
@@ -2460,6 +2667,7 @@ where
             // Planned right here, as a self-contained inner query whose
             // rows the outer query then reads like a table. It shares this
             // statement's transaction (one snapshot) and memory budget.
+            self.uncacheable = true;
             let alias = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -2487,8 +2695,8 @@ where
         &self,
         fields: &[ProjectableField],
         having: Option<&EvalExpr>,
-        tables: &[TableQuery<F>],
-        group: &Option<GroupByClause>,
+        _tables: &[TableQuery<F>],
+        group: &[ProjectableField],
         raw: &[ProjectableField],
     ) -> Result<(Vec<usize>, Vec<ProjectableField>), SchemaError> {
         let names = column_names(raw);
@@ -2497,8 +2705,8 @@ where
         // How each computed GROUP BY expression reads (see EvalExpr::
         // describe): what an expression elsewhere is matched against.
         let mut computed_text = vec![];
-        for f in group.iter().flat_map(|g| g.exprs.items()) {
-            let field = self.handle_expr(f, &None, tables)?;
+        for field in group {
+            let field = field.clone();
             if field.expr.has_aggregate() {
                 return Err(SchemaError::UserError(
                     "GROUP BY cannot contain an aggregate".into(),
@@ -2602,9 +2810,32 @@ where
         query: &Query,
         params: Params,
     ) -> Result<Self, SchemaError> {
+        Self::build_with(conn, query, params, None)
+    }
+
+    /// As `build`, for a statement's own outermost query, `statements`
+    /// being the statements that hold it: its prepared plan is kept for
+    /// later executions of the same statement shape (see PlanCache).
+    pub(crate) fn build_cached(
+        conn: Arc<Connection<F>>,
+        query: &Query,
+        params: Params,
+        statements: Arc<[sql_parser::Statement]>,
+    ) -> Result<Self, SchemaError> {
+        let key = std::ptr::from_ref(query) as usize;
+        Self::build_with(conn, query, params, Some((key, statements)))
+    }
+
+    fn build_with(
+        conn: Arc<Connection<F>>,
+        query: &Query,
+        params: Params,
+        cache: Option<(usize, Arc<[sql_parser::Statement]>)>,
+    ) -> Result<Self, SchemaError> {
         let start = Instant::now();
         let mem = QueryMemory::new(query_memory_limit(&conn));
         let mut visitor = QueryVisitor::new(conn.clone(), mem.clone(), params)?;
+        visitor.cache = cache;
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);
         }
@@ -2652,6 +2883,111 @@ where
             .take()
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
         Ok(StreamingResultSet::new(tail, self.start).owning_transaction(self.stmt_txn.take()))
+    }
+}
+
+// A SELECT block with no subquery in it, in FROM or anywhere else: planning
+// it runs nothing.
+fn plain_select(select: &sql_parser::query::SelectCore) -> bool {
+    let plain_factor = |f: &TableFactor| matches!(f, TableFactor::Table { .. });
+    let from_plain = select.from.as_ref().is_none_or(|from| {
+        from.tables.items().all(|t| {
+            plain_factor(&t.relation)
+                && t.joins.iter().all(|j| {
+                    plain_factor(&j.relation)
+                        && match &j.constraint {
+                            Some(JoinConstraint::On(_, e)) => !subquery::has_subquery(e),
+                            _ => true,
+                        }
+                })
+        })
+    });
+    let exprs = select
+        .projection
+        .items()
+        .filter_map(|i| match i {
+            SelectItem::Expr { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .chain(select.where_clause.as_ref().map(|w| &w.expr))
+        .chain(select.having.as_ref().map(|h| &h.expr))
+        .chain(select.group_by.iter().flat_map(|g| g.exprs.items()));
+    from_plain && exprs.into_iter().all(|e| !subquery::has_subquery(e))
+}
+
+/// A connection's prepared SELECT plans, one per statement shape: what
+/// stage 3 of PLANNING_DESIGN.md keeps.
+///
+/// - **Key:** the address of the statement's outermost query inside the
+///   parse cache's shared tree (a shape's template, or a prepared
+///   statement's own parse), which the entry holds on to so the address
+///   can't be reused.
+/// - **Valid** while the catalog generation (see
+///   schema_ops::schema::catalog_generation) and the connection's current
+///   schema are the ones it was prepared under: any table created,
+///   dropped or altered anywhere makes every entry stale.
+/// - **Holds** only what no value decides (see PreparedSelect); each
+///   execution binds its values and the tables' current statistics in,
+///   and makes every value-sensitive choice again.
+/// - `None`: the shape plans something that can't be kept (see
+///   QueryVisitor::uncacheable), so it is planned as usual every time.
+pub(crate) struct PlanCache<F: DBFile + 'static> {
+    plans: parking_lot::Mutex<HashMap<usize, Kept<F>>>,
+}
+
+struct Kept<F: DBFile + 'static> {
+    _statements: Arc<[sql_parser::Statement]>,
+    generation: u64,
+    schema: usize,
+    plan: Option<PreparedSelect<F>>,
+}
+
+// Entries a connection keeps; past it, they all go.
+const PLAN_CACHE_CAPACITY: usize = 256;
+
+impl<F: DBFile + 'static> Default for PlanCache<F> {
+    fn default() -> Self {
+        PlanCache {
+            plans: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<F: DBFile + 'static> PlanCache<F> {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.plans.lock().len()
+    }
+
+    // Some(plan) when one is kept for `key` and still valid; Some(None)
+    // when the shape is not kept; None when nothing valid is known.
+    fn get(&self, key: usize, generation: u64, schema: usize) -> Option<Option<PreparedSelect<F>>> {
+        let plans = self.plans.lock();
+        let kept = plans.get(&key)?;
+        (kept.generation == generation && kept.schema == schema).then(|| kept.plan.clone())
+    }
+
+    fn insert(
+        &self,
+        key: usize,
+        statements: Arc<[sql_parser::Statement]>,
+        generation: u64,
+        schema: usize,
+        plan: Option<PreparedSelect<F>>,
+    ) {
+        let mut plans = self.plans.lock();
+        if plans.len() >= PLAN_CACHE_CAPACITY && !plans.contains_key(&key) {
+            plans.clear();
+        }
+        plans.insert(
+            key,
+            Kept {
+                _statements: statements,
+                generation,
+                schema,
+                plan,
+            },
+        );
     }
 }
 
