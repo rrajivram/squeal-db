@@ -105,6 +105,16 @@ impl Source for Limit {
         Ok(())
     }
 
+    fn reopen(&mut self, reopen: &super::Reopen<'_>) -> Result<bool, crate::error::SchemaError> {
+        self.yielded = 0;
+        self.skipped = 0;
+        self.source.reopen(reopen)
+    }
+
+    fn release(&mut self) {
+        self.source.release()
+    }
+
     fn query_stats(&self) -> Option<Vec<(String, QueryStats)>> {
         let this_stats = vec![(
             "Limit".to_string(),

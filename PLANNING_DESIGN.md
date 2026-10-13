@@ -146,10 +146,37 @@ comparison tests.
     - reading the row ~18%;
     - parsing (tokenizing, the shape lookup) ~14%;
     - dropping the result ~7%.
-- [ ] **3b. Reusing value-blind choices.** An access path that no value
-  can change (an equality on every column of the primary key, or of a
-  unique index) is kept with the plan, so an execution only builds its key
-  from the values. The kept plan is also made cheaper to bind: shared
-  parts behind `Arc`, so only expressions are copied.
+- [x] **3b. Plans kept whole.** Done 2026-10-12.
+  - SQLite's prepared statement is a program reset and re-bound, not
+    rebuilt. A plan no value can change is now kept the same way: its
+    operators themselves, reopened for each execution.
+  - **Which plans:** one unpartitioned table read for a plain SELECT list
+    (no grouping, aggregate, `DISTINCT` or `ORDER BY`), seeking every
+    column of its primary key or of a unique index, each held by one
+    `column = constant` condition and no other. That is at most one row
+    whatever the values, so no value could change the plan. Every
+    parameter must be in those conditions. Anything else is planned per
+    execution as in stage 3.
+  - **Reopening** (`Source::reopen`): the key is read from the slots
+    through the planner's own rule (`sarg::equal_points`), the seek gets a
+    new cursor under the statement's transaction, and the scan drops its
+    pre-checks on key columns (the seek enforces them). Nothing else in the
+    tree depends on a value.
+  - **Checkout:** the tree is taken out of the `PlanCache` entry for an
+    execution, and parked back, its cursors released
+    (`Source::release`), when the result set is dropped. A second
+    execution while the first is held is planned as usual.
+  - **The catalog generation is now per database** (`Db::catalog_epoch`):
+    DDL in one database no longer drops every connection's plans.
+  - **Parsing:** a text of a known shape is no longer copied into the
+    exact-text cache (texts of a shape mostly differ), and its shape key is
+    built in one buffer.
+  - **Measured**, 500k orders, point lookup by primary key:
+
+    | | before | after |
+    |---|---:|---:|
+    | allocations | 117 | 23 |
+    | time | ~4.3 µs | 1.43 µs |
+
 - [ ] **4. What is left per statement**, measured again after 3: the
   statement transaction, locks, and the result set.

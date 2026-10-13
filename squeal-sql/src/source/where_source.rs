@@ -95,6 +95,14 @@ impl Source for WhereSource {
         Ok(())
     }
 
+    fn reopen(&mut self, reopen: &super::Reopen<'_>) -> Result<bool, SchemaError> {
+        self.source.reopen(reopen)
+    }
+
+    fn release(&mut self) {
+        self.source.release()
+    }
+
     // A filter keeps its input's row layout: the hint applies as it is.
     fn keep_matching(&mut self, column: usize, values: &[ValueItem]) {
         self.source.source_mut().keep_matching(column, values)

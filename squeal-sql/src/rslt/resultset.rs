@@ -26,6 +26,9 @@ pub struct StreamingResultSet {
     // long as the client holds this result; dropped (rolled back — it
     // wrote nothing) with it. None inside an explicit BEGIN block.
     txn: Option<store::txn::Transaction>,
+    // Where `begin` goes when this is dropped, if its plan is kept for the
+    // statement's next execution (see plan::logical::PlanCache).
+    park: Option<crate::plan::logical::Park>,
 }
 
 impl StreamingResultSet {
@@ -35,11 +38,17 @@ impl StreamingResultSet {
             start,
             count: 0,
             txn: None,
+            park: None,
         }
     }
 
     pub(crate) fn owning_transaction(mut self, txn: Option<store::txn::Transaction>) -> Self {
         self.txn = txn;
+        self
+    }
+
+    pub(crate) fn parking(mut self, park: Option<crate::plan::logical::Park>) -> Self {
+        self.park = park;
         self
     }
 
@@ -138,6 +147,35 @@ pub enum ResultType {
     // BEGIN/COMMIT/ROLLBACK, ...) — e.g. "Table 'users' created".
     ResultString(String),
     StreamingResult(StreamingResultSet),
+}
+
+impl Drop for StreamingResultSet {
+    // A kept plan goes back for the next execution, its cursors let go,
+    // before the statement's transaction ends.
+    fn drop(&mut self) {
+        if let Some(park) = self.park.take() {
+            let tree = std::mem::replace(&mut self.begin, Box::new(Parked));
+            park.park(tree);
+        }
+    }
+}
+
+// What a result set holds once its plan is parked: nothing.
+#[derive(Debug)]
+struct Parked;
+
+impl Source for Parked {
+    fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
+        Ok(None)
+    }
+
+    fn fields(&self) -> std::sync::Arc<[crate::source::ProjectableField]> {
+        std::sync::Arc::from(Vec::new())
+    }
+
+    fn reset(&mut self) -> Result<(), SchemaError> {
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for StreamingResultSet {

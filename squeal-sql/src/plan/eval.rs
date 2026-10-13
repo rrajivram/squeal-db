@@ -314,6 +314,21 @@ impl EvalExpr {
         }
     }
 
+    /// Whether a parameter slot is anywhere in this expression.
+    pub(crate) fn has_param(&self) -> bool {
+        match self {
+            Self::Param(_) => true,
+            Self::None | Self::Literal(_) | Self::Value(_) => false,
+            Self::Unary { field, .. } => field.has_param(),
+            Self::Binary { lhs, rhs, .. } => lhs.has_param() || rhs.has_param(),
+            Self::Function(func) => func.args().iter().any(|a| match a {
+                FuncArgs::Field(e) => e.has_param(),
+                FuncArgs::Wildcard => false,
+            }),
+            Self::Subquery(s) => s.operands().any(|e| e.has_param()),
+        }
+    }
+
     /// Whether `f` holds for every aggregate in this expression.
     pub(crate) fn every_aggregate(&self, f: &dyn Fn(&FuncObj) -> bool) -> bool {
         match self {

@@ -38,7 +38,10 @@ pub struct IndexSource<F: DBFile + 'static> {
     // Which of the table's partitions this reads the index of.
     part: usize,
     index: usize,
-    cursor: RangeCursor<F>,
+    // None once released (see Source::release), until reopened.
+    cursor: Option<RangeCursor<F>>,
+    // A seek's database, to reopen it on (see Source::reopen).
+    db: Option<Arc<Db<F>>>,
     fields: Arc<[ProjectableField]>,
     // Table column position of each indexed column, in key order.
     key_positions: Vec<usize>,
@@ -99,7 +102,8 @@ where
             db.key_ranges_scan(Self::tree(table, part, index)?, txn.map(|t| t.id()), ranges)?;
         let mut source = Self::with_cursor(table, part, index, cursor, stats)?;
         source.seek = Some((seek, rows));
-        source.lookup = lookup.then_some(db);
+        source.lookup = lookup.then(|| db.clone());
+        source.db = Some(db);
         Ok(source)
     }
 
@@ -167,7 +171,8 @@ where
             table: table.clone(),
             part,
             index,
-            cursor,
+            cursor: Some(cursor),
+            db: None,
             fields: Arc::from(fields),
             key_positions,
             pk_positions,
@@ -200,7 +205,8 @@ where
         // Read in place (find_in): the row's bytes are decoded straight
         // into the row buffer, not copied out first.
         let (table, wanted, row) = (&self.table, self.wanted.as_deref(), &mut self.row);
-        let Some(found) = db.find_in(rows, &id, self.cursor.snapshot(), |found| {
+        let snapshot = self.cursor.as_ref().ok_or_else(released)?.snapshot();
+        let Some(found) = db.find_in(rows, &id, snapshot, |found| {
             table.decode_row_into(found.data(), wanted, &[], row)
         })?
         else {
@@ -301,7 +307,7 @@ where
         let start = self.timer.start();
         if let Some(db) = self.lookup.clone() {
             loop {
-                let Some(entry) = self.cursor.next_ref()? else {
+                let Some(entry) = self.cursor.as_mut().ok_or_else(released)?.next_ref()? else {
                     self.last_id = None;
                     crate::source::timing::add(&mut self.next_time, start);
                     return Ok(false);
@@ -322,7 +328,7 @@ where
                 }
             }
         }
-        let Some(entry) = self.cursor.next_ref()? else {
+        let Some(entry) = self.cursor.as_mut().ok_or_else(released)?.next_ref()? else {
             crate::source::timing::add(&mut self.next_time, start);
             return Ok(false);
         };
@@ -379,7 +385,30 @@ where
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.last_id = None;
-        Ok(self.cursor.reset()?)
+        Ok(self.cursor.as_mut().ok_or_else(released)?.reset()?)
+    }
+
+    // A seek, kept: the same index read over new ranges.
+    fn reopen(&mut self, reopen: &super::Reopen<'_>) -> Result<bool, SchemaError> {
+        let (Some((ranges, rows)), Some(db)) = (&mut self.seek, &self.db) else {
+            return Ok(false);
+        };
+        ranges.clear();
+        ranges.extend_from_slice(reopen.ranges);
+        *rows = Some(reopen.ranges.len());
+        let tree = Self::tree(&self.table, self.part, self.index)?;
+        self.cursor = Some(db.key_ranges_scan(
+            tree,
+            reopen.txn.map(|t| t.id()),
+            reopen.ranges.to_vec(),
+        )?);
+        self.last_id = None;
+        Ok(true)
+    }
+
+    fn release(&mut self) {
+        self.cursor = None;
+        self.last_id = None;
     }
 
     fn table_stats(&self) -> Option<ComputedTableStat> {
@@ -397,4 +426,8 @@ where
             .field("index", &self.index_name())
             .finish()
     }
+}
+
+fn released() -> SchemaError {
+    SchemaError::InternalSchemaError("a kept source was read before it was reopened".into())
 }

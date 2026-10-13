@@ -245,7 +245,8 @@ fn exact_parse(src: &str) -> Result<Arc<[Statement]>, Vec<ParseError>> {
 // parameterizable, or one that fails to parse).
 fn from_shape(src: &str) -> Option<Shaped> {
     let tokens = tokenize(src).ok()?;
-    let (key, normalized, literals) = shape_of(src, &tokens)?;
+    let (key, text_len, literals) = shape_of(src, &tokens)?;
+    let normalized = &key[..text_len];
     let shape = lock().shapes.get(&key);
     match shape {
         Some(Shape::NotParameterizable) => None,
@@ -263,11 +264,10 @@ fn from_shape(src: &str) -> Option<Shaped> {
                     "parse cache: binding {src:?} into its shape differs from parsing it"
                 );
             }
-            // Kept by its text as well: a statement repeated verbatim is
-            // then a lookup, not a tokenizing.
-            let mut c = lock();
-            c.stats.shape_hits += 1;
-            c.exact.insert(src.to_string(), Exact::Shaped(shaped.clone()));
+            // Not kept by its text as well: texts of a shape mostly differ,
+            // and a shape hit is cheap; keeping each would cost a copy of
+            // the text and an entry, and push out texts that do repeat.
+            lock().stats.shape_hits += 1;
             Some(shaped)
         }
         None => {
@@ -275,7 +275,7 @@ fn from_shape(src: &str) -> Option<Shaped> {
             // only if binding this text's literals into it gives exactly
             // this text's parse.
             let parsed = parse_sql(src).ok()?;
-            let template = parse_sql(&normalized).ok();
+            let template = parse_sql(normalized).ok();
             let fits = template.as_ref().is_some_and(|t| {
                 let mut bound = t.clone();
                 bind_literals(&mut bound, literals.clone()) && bound == parsed
@@ -305,12 +305,13 @@ fn from_shape(src: &str) -> Option<Shaped> {
     }
 }
 
-// The shape of `src`: its key, the text to parse as its template, and the
-// literals to bind into that, in order. None when it has no literals, has
-// placeholders of its own, or has a literal its parse wouldn't accept.
-fn shape_of(src: &str, tokens: &[TokenStruct]) -> Option<(String, String, Vec<Literal>)> {
-    let mut normalized = String::with_capacity(src.len());
-    let mut kinds = String::new();
+// The shape of `src`: its key, whose first bytes (the returned length) are
+// the text to parse as its template, and the literals to bind into that, in
+// order. None when it has no literals, has placeholders of its own, or has
+// a literal its parse wouldn't accept.
+fn shape_of(src: &str, tokens: &[TokenStruct]) -> Option<(String, usize, Vec<Literal>)> {
+    let mut normalized = String::with_capacity(src.len() + 16);
+    let mut kinds = String::with_capacity(8);
     let mut literals = vec![];
     let mut at = 0;
     for t in tokens {
@@ -360,8 +361,13 @@ fn shape_of(src: &str, tokens: &[TokenStruct]) -> Option<(String, String, Vec<Li
         return None;
     }
     normalized.push_str(&src[at..]);
-    let key = format!("{kinds}\u{0}{normalized}");
-    Some((key, normalized, literals))
+    // The key is the text, then the literals' kinds: one buffer, the text
+    // its first `len` bytes.
+    let len = normalized.len();
+    let mut key = normalized;
+    key.push('\u{0}');
+    key.push_str(&kinds);
+    Some((key, len, literals))
 }
 
 // SQ_PARSE_CACHE_VERIFY=1: check every statement bound from a shape

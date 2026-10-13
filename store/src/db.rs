@@ -550,6 +550,10 @@ pub struct Db<F: DBFile + 'static> {
     // Records recovery replayed at open (those at or above the persisted
     // floor); 0 for a freshly created database.
     recovered_records: std::sync::atomic::AtomicUsize,
+    // Advances whenever the catalog kept above this store (the SQL layer's
+    // tables and schemas) changes: what a plan prepared against that
+    // catalog is checked by (see catalog_epoch).
+    catalog_epoch: std::sync::atomic::AtomicU64,
     // Persistence versioning Stage 6: the continuation page ids of each
     // system chain (indexed by SystemKind), as last loaded or written — see
     // systempages.rs. Head pages are the fixed 0/1/2; only continuations
@@ -902,6 +906,7 @@ where
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            catalog_epoch: std::sync::atomic::AtomicU64::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             temp,
             dirty_page_limit: config.dirty_page_limit(cache_pages),
@@ -2479,6 +2484,17 @@ where
     // given — as the transaction `reader` (which the caller keeps
     // open for as long as the cursor is used), else a transaction of the
     // cursor's own. No ranges reads nothing.
+    /// The catalog epoch: advanced by `advance_catalog_epoch` whenever
+    /// whatever keeps a catalog above this store changes it. Nothing in the
+    /// store reads it.
+    pub fn catalog_epoch(&self) -> u64 {
+        self.catalog_epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn advance_catalog_epoch(&self) {
+        self.catalog_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
     pub fn key_ranges_scan(
         self: &Arc<Self>,
         tid: TableIdType,
@@ -3004,6 +3020,7 @@ where
             forced_aborts: parking_lot::Mutex::new(HashMap::new()),
             snapshot_too_old_aborts: std::sync::atomic::AtomicU64::new(0),
             recovered_records: std::sync::atomic::AtomicUsize::new(0),
+            catalog_epoch: std::sync::atomic::AtomicU64::new(0),
             system_chains: parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]),
             temp,
             dirty_page_limit: config.open.dirty_page_limit(cache_pages),

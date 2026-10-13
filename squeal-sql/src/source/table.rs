@@ -22,7 +22,9 @@ use crate::{
 // filled (see reading).
 pub struct TableSource<F: DBFile> {
     timer: crate::source::timing::RowTimer,
-    cursor: RowCursor<F>,
+    // None once released (see Source::release), until reopened.
+    cursor: Option<RowCursor<F>>,
+    db: Arc<Db<F>>,
     // The seek's ranges, described for EXPLAIN only when asked (see
     // plan::sarg::describe_key_range), and its estimated row count; None
     // for a full scan.
@@ -103,7 +105,7 @@ where
         // Built around the seek's own cursor: opening a scan only to replace
         // it cost every primary key lookup a copy of the table's first data
         // page (TableCursor reads a page whole when it starts).
-        let mut source = Self::over(RowCursor::Seek(cursor), table, part, stats);
+        let mut source = Self::over(db, RowCursor::Seek(cursor), table, part, stats);
         source.seek = Some((seek, rows));
         Ok(source)
     }
@@ -142,7 +144,7 @@ where
             Some(txn) => db.table_scan_in_txn(rows, txn)?,
             None => db.table_scan(rows)?,
         };
-        Ok(Self::over(RowCursor::Scan(cursor), table, part, stats))
+        Ok(Self::over(db, RowCursor::Scan(cursor), table, part, stats))
     }
 
     /// Fills only `columns` (positions in the table's row) — the ones the
@@ -188,6 +190,7 @@ where
     }
 
     fn over(
+        db: Arc<Db<F>>,
         cursor: RowCursor<F>,
         table: Arc<SqlTable>,
         part: usize,
@@ -202,7 +205,8 @@ where
         let fields = Arc::from(fields);
         Self {
             timer: Default::default(),
-            cursor,
+            cursor: Some(cursor),
+            db,
             seek: None,
             table,
             part,
@@ -217,6 +221,10 @@ where
             last_id: None,
         }
     }
+}
+
+fn released() -> SchemaError {
+    SchemaError::InternalSchemaError("a kept source was read before it was reopened".into())
 }
 
 // The table's name, and its partition's when the table is partitioned.
@@ -275,7 +283,8 @@ where
     fn advance(&mut self) -> Result<bool, SchemaError> {
         let start = self.timer.start();
         // Loops past the rows `tests` rule out (see filtering).
-        while let Some(tuple) = self.cursor.next_ref()? {
+        let cursor = self.cursor.as_mut().ok_or_else(released)?;
+        while let Some(tuple) = cursor.next_ref()? {
             if !self.table.decode_row_into(
                 tuple.data(),
                 self.wanted.as_deref(),
@@ -314,7 +323,7 @@ where
         });
         batch.clear();
         while !batch.is_full() {
-            let Some(tuple) = self.cursor.next_ref()? else {
+            let Some(tuple) = self.cursor.as_mut().ok_or_else(released)?.next_ref()? else {
                 break;
             };
             self.table
@@ -340,7 +349,34 @@ where
 
     fn reset(&mut self) -> Result<(), SchemaError> {
         self.last_id = None;
-        Ok(self.cursor.reset()?)
+        Ok(self.cursor.as_mut().ok_or_else(released)?.reset()?)
+    }
+
+    // A seek, kept: the same table read over new ranges. (A full scan has
+    // no key to change and is never kept.)
+    fn reopen(&mut self, reopen: &crate::source::Reopen<'_>) -> Result<bool, SchemaError> {
+        let Some((ranges, rows)) = &mut self.seek else {
+            return Ok(false);
+        };
+        ranges.clear();
+        ranges.extend_from_slice(reopen.ranges);
+        *rows = Some(reopen.ranges.len());
+        let cursor = self.db.key_ranges_scan(
+            self.table.partitions[self.part].rows(),
+            reopen.txn.map(|t| t.id()),
+            reopen.ranges.to_vec(),
+        )?;
+        self.cursor = Some(RowCursor::Seek(cursor));
+        // The key's conditions held the last execution's values; the seek
+        // reads exactly what they allow, so they need no test.
+        self.tests.retain(|t| !reopen.key.contains(&t.column()));
+        self.last_id = None;
+        Ok(true)
+    }
+
+    fn release(&mut self) {
+        self.cursor = None;
+        self.last_id = None;
     }
 
     fn table_stats(&self) -> Option<ComputedTableStat> {

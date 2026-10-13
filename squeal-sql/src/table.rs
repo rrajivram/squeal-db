@@ -495,6 +495,11 @@ pub(crate) struct ColumnTest {
 }
 
 impl ColumnTest {
+    /// The column (position in the row) the test reads.
+    pub(crate) fn column(&self) -> usize {
+        self.pos
+    }
+
     /// The test `filter` is, if it is one: a column of `fields` compared
     /// with a literal of its type, either way round.
     pub(crate) fn of(fields: &[Arc<Field>], filter: &EvalExpr) -> Option<Self> {

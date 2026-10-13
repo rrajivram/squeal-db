@@ -119,6 +119,16 @@ pub trait Source: Debug + Send {
     }
     fn fields(&self) -> Arc<[ProjectableField]>;
     fn reset(&mut self) -> Result<(), SchemaError>;
+    // Makes this source, kept from an earlier execution of its statement's
+    // plan, ready to run again (see plan::logical::PlanCache): its seek
+    // over `reopen`'s key ranges, under `reopen`'s transaction. False when
+    // it can't be (it is then built anew); nothing has to be undone then.
+    fn reopen(&mut self, _reopen: &Reopen<'_>) -> Result<bool, SchemaError> {
+        Ok(false)
+    }
+    // Lets go of what a kept source must not hold between executions: its
+    // cursors (and the pages they hold). `reopen` gets new ones.
+    fn release(&mut self) {}
     // The most recently yielded row's REAL physical key (Tuple::id — the
     // PRIMARY KEY's own IndexKey if the table declared one, its auto-
     // generated rowid otherwise), if this source (or, through however
@@ -169,6 +179,16 @@ pub(crate) fn keep(value: std::borrow::Cow<'_, store::valueitem::ValueItem>, slo
         std::borrow::Cow::Owned(value) => *slot = value,
         std::borrow::Cow::Borrowed(value) => value.as_ref().store_in(slot),
     }
+}
+
+/// What a kept plan's next execution changes (see Source::reopen): the
+/// statement's transaction (None outside one, as when a source is opened),
+/// and the key ranges its one seek reads. `key`: the key's columns
+/// (positions in the table's row), the only ones whose conditions change.
+pub(crate) struct Reopen<'a> {
+    pub(crate) txn: Option<&'a store::txn::Transaction>,
+    pub(crate) ranges: &'a [store::cursor::KeyRange],
+    pub(crate) key: &'a [usize],
 }
 
 /// A source, read a row at a time without owning the rows: lent by one
@@ -230,6 +250,16 @@ impl Rows {
     pub(crate) fn reset(&mut self) -> Result<(), SchemaError> {
         self.held = None;
         self.source.reset()
+    }
+
+    pub(crate) fn reopen(&mut self, reopen: &Reopen<'_>) -> Result<bool, SchemaError> {
+        self.held = None;
+        self.source.reopen(reopen)
+    }
+
+    pub(crate) fn release(&mut self) {
+        self.held = None;
+        self.source.release()
     }
 }
 

@@ -107,3 +107,164 @@ fn test_shapes_that_run_while_planned_are_not_kept_but_still_right() {
         assert_eq!(with, ints(&[&[want.len() as i64]]));
     }
 }
+
+// ---- plans kept whole: a key lookup's operators reopened per execution ----
+
+fn reopened() -> usize {
+    crate::plan::logical::REOPENED.with(|r| r.get())
+}
+
+// A table of three people, named `table`: each test its own, so no other
+// test shares (and replaces, running at the same time) its statements'
+// shapes in the parse cache.
+fn people(c: &Arc<Connection<MemFile>>, table: &str) {
+    run(c, &format!("create table {table} (id integer not null, name varchar(10), n integer, primary key(id))")).unwrap();
+    run(c, &format!("insert into {table} values (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)")).unwrap();
+}
+
+#[test]
+fn test_a_key_lookup_is_kept_and_reopened_for_each_key() {
+    let c = conn();
+    people(&c, "pk_1");
+    let before = reopened();
+    for (id, want) in [(1, Some("a")), (2, Some("b")), (9, None), (3, Some("c")), (1, Some("a"))] {
+        let got = values(&c, &format!("select name from pk_1 where id = {id}"));
+        let want: Vec<Vec<ValueItem>> = want.map(|w| vec![s(w)]).into_iter().collect();
+        assert_eq!(got, want, "id = {id}");
+    }
+    // The first execution builds the plan; each after it reopens it.
+    assert_eq!(reopened(), before + 4);
+    // With a condition besides the key that holds no value of its own
+    // (every literal in the text becomes one): kept too.
+    let before = reopened();
+    for (id, want) in [(1, 1), (9, 0), (2, 1)] {
+        let got = values(&c, &format!("select id from pk_1 where id = {id} and n > id"));
+        assert_eq!(got.len(), want, "id = {id}");
+    }
+    assert_eq!(reopened(), before + 2);
+}
+
+#[test]
+fn test_a_lookup_with_a_value_outside_the_key_is_planned_each_time() {
+    let c = conn();
+    people(&c, "pk_2");
+    let before = reopened();
+    for (id, n, want) in [(1, 10, 1), (1, 20, 0), (2, 20, 1)] {
+        let got = values(&c, &format!("select name from pk_2 where id = {id} and n = {n}"));
+        assert_eq!(got.len(), want, "id = {id}, n = {n}");
+    }
+    assert_eq!(reopened(), before, "n's value would be stale in a kept plan");
+}
+
+#[test]
+fn test_a_kept_lookup_held_open_while_the_shape_runs_again() {
+    let c = conn();
+    people(&c, "pk_3");
+    values(&c, "select name from pk_3 where id = 1");
+    let mut first = c.clone().create_statement("select name from pk_3 where id = 2").unwrap();
+    first.execute().unwrap();
+    // The kept plan is out with `first`: this one is planned anew.
+    assert_eq!(values(&c, "select name from pk_3 where id = 3"), vec![vec![s("c")]]);
+    assert_eq!(take_streaming_result(&mut first, 0).1, vec![vec![s("b")]]);
+    assert_eq!(values(&c, "select name from pk_3 where id = 1"), vec![vec![s("a")]]);
+}
+
+#[test]
+fn test_a_kept_lookup_sees_its_transaction_and_others_commits() {
+    let mgr: ConMgr<MemFile> = Arc::new(ConnectionManager::new());
+    let c = mgr.create_and_connect("pk_db").unwrap();
+    c.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    people(&c, "pk_4");
+    values(&c, "select n from pk_4 where id = 1");
+    run(&c, "begin").unwrap();
+    run(&c, "insert into pk_4 values (4, 'd', 40)").unwrap();
+    assert_eq!(values(&c, "select n from pk_4 where id = 4"), ints(&[&[40]]));
+    run(&c, "rollback").unwrap();
+    assert_eq!(values(&c, "select n from pk_4 where id = 4"), Vec::<Vec<ValueItem>>::new());
+    // Another connection's commit, between two executions.
+    let other = mgr.connect("pk_db").unwrap();
+    other.use_schema(DEFAULT_SCHEMA_NAME).unwrap();
+    run(&other, "update pk_4 set n = 11 where id = 1").unwrap();
+    assert_eq!(values(&c, "select n from pk_4 where id = 1"), ints(&[&[11]]));
+}
+
+#[test]
+fn test_a_kept_lookup_sees_the_table_change() {
+    let c = conn();
+    people(&c, "pk_5");
+    values(&c, "select * from pk_5 where id = 1");
+    values(&c, "select * from pk_5 where id = 2");
+    run(&c, "alter table pk_5 add column m integer").unwrap();
+    assert_eq!(
+        values(&c, "select * from pk_5 where id = 3"),
+        vec![vec![ValueItem::Integer(3), s("c"), ValueItem::Integer(30), ValueItem::Null]]
+    );
+}
+
+#[test]
+fn test_composite_and_unique_index_lookups_are_kept() {
+    let c = conn();
+    run(&c, "create table ck (a integer not null, b varchar(4) not null, v integer, primary key(a, b))").unwrap();
+    run(&c, "insert into ck values (1, 'x', 10), (1, 'y', 11), (2, 'x', 20)").unwrap();
+    let before = reopened();
+    for (a, b, want) in [(1, "x", Some(10)), (1, "y", Some(11)), (2, "y", None), (2, "x", Some(20))] {
+        let got = values(&c, &format!("select v from ck where a = {a} and b = '{b}'"));
+        let want: Vec<Vec<ValueItem>> = want.map(|w| vec![ValueItem::Integer(w)]).into_iter().collect();
+        assert_eq!(got, want, "({a}, {b})");
+    }
+    assert_eq!(reopened(), before + 3);
+    // Only part of the key: many rows may match, so planned each time.
+    let before = reopened();
+    for a in [1, 2] {
+        values(&c, &format!("select v from ck where a = {a}"));
+    }
+    assert_eq!(reopened(), before);
+
+    // Enough rows that the index is read, not the table.
+    run(&c, "create table uk (id integer not null, name varchar(10), primary key(id))").unwrap();
+    // Names of one length: a literal's length is part of its shape.
+    let rows: Vec<String> = (1..=500).map(|i| format!("({i}, 'n{i:03}')")).collect();
+    run(&c, &format!("insert into uk values {}", rows.join(", "))).unwrap();
+    run(&c, "create unique index uk_name on uk (name)").unwrap();
+    run(&c, "analyze tables").unwrap();
+    let before = reopened();
+    for (name, want) in [("n001", Some(1)), ("n300", Some(300)), ("zzzz", None), ("n002", Some(2))] {
+        let got = values(&c, &format!("select id from uk where name = '{name}'"));
+        let want: Vec<Vec<ValueItem>> = want.map(|w| vec![ValueItem::Integer(w)]).into_iter().collect();
+        assert_eq!(got, want, "{name}");
+    }
+    assert_eq!(reopened(), before + 3);
+}
+
+#[test]
+fn test_a_prepared_lookup_is_kept() {
+    let c = conn();
+    people(&c, "pk_6");
+    let mut stmt = c
+        .clone()
+        .create_prepared_statement("select name from pk_6 where id = ?")
+        .unwrap();
+    let before = reopened();
+    for (id, want) in [(1, "a"), (3, "c"), (2, "b")] {
+        stmt.set_field(0, ValueItem::Integer(id)).unwrap();
+        assert_eq!(prepared_rows(stmt.execute().unwrap()), vec![vec![s(want)]]);
+    }
+    assert_eq!(reopened(), before + 2);
+}
+
+
+#[test]
+fn test_a_kept_lookup_reads_doubles_as_the_planner_does() {
+    // `200`, `2.0` and `2.5` are one shape: a kept plan reads each key as a
+    // seek planned for it would.
+    let c = conn();
+    run(&c, "create table pk_d (id integer not null, name varchar(10), primary key(id))").unwrap();
+    run(&c, "insert into pk_d values (2, 'two'), (200, 'many')").unwrap();
+    let before = reopened();
+    for (key, want) in [("200", Some("many")), ("2.0", Some("two")), ("2.5", None), ("201", None)] {
+        let got = values(&c, &format!("select name from pk_d where id = {key}"));
+        let want: Vec<Vec<ValueItem>> = want.map(|w| vec![s(w)]).into_iter().collect();
+        assert_eq!(got, want, "id = {key}");
+    }
+    assert_eq!(reopened(), before + 3);
+}

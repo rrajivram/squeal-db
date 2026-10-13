@@ -95,6 +95,14 @@ impl Source for Projection {
         self.source.reset()
     }
 
+    fn reopen(&mut self, reopen: &super::Reopen<'_>) -> Result<bool, SchemaError> {
+        self.source.reopen(reopen)
+    }
+
+    fn release(&mut self) {
+        self.source.release()
+    }
+
     // Sits at the top of nearly every SELECT's Source tree — without
     // its own entry here, the trait default (`None`) would silently
     // swallow every child's stats for any query with an explicit

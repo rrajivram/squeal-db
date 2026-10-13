@@ -1,6 +1,7 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc};
 
 use parking_lot::RwLock;
+use store::valueitem::ValueItem;
 use sql_parser::{
     Expr, Query,
     expr::BinaryOp,
@@ -35,7 +36,6 @@ use crate::{
         subquery,
     },
     rslt::resultset::StreamingResultSet,
-    schema_ops::schema::catalog_generation,
     source::{
         ProjectableField, Source,
         aggr::AggregatingSource,
@@ -80,6 +80,9 @@ pub(crate) struct LogicalPlan<F: DBFile> {
     // whatever else it needs before handing it off.
     mem: Arc<QueryMemory>,
     start: Instant,
+    // Where the plan goes when its result is done with, if it is kept for
+    // the next execution (see PlanCache).
+    park: Option<Park>,
     _phanton: PhantomData<F>,
 }
 
@@ -310,6 +313,11 @@ struct QueryVisitor<F: DBFile> {
     // The statement's outermost query (its address) and the statements
     // holding it, when its prepared plan may be kept for later executions.
     cache: Option<(usize, Arc<[sql_parser::Statement]>)>,
+    // A kept prepared plan that might be kept whole, operators and all (see
+    // keep_candidate); then, once its access is chosen, what keeping it
+    // takes (see confirm_keep).
+    keep: Option<KeepCandidate>,
+    kept: Option<KeptMeta>,
 }
 
 // One WITH query in scope.
@@ -773,6 +781,8 @@ where
             params,
             uncacheable: false,
             cache: None,
+            keep: None,
+            kept: None,
         })
     }
 
@@ -844,6 +854,16 @@ where
             _ => (self.plan_set_operations(query)?, 0, false),
         };
 
+        // A plan kept whole changes only its seek's key from one execution to
+        // the next: not a sort, nor a count a placeholder gives.
+        let counted = |e: Option<&Expr>| e.is_some_and(|e| matches!(e, Expr::Placeholder(_)));
+        if query.order_by.is_some()
+            || hidden > 0
+            || counted(query.limit.as_ref().map(|l| &l.count))
+            || counted(query.offset.as_ref().map(|o| &o.count))
+        {
+            self.kept = None;
+        }
         // Already in ORDER BY's order (read through a key that gives it —
         // see optim::picker::OrderWanted): no sort, just the LIMIT.
         // A sort with a LIMIT keeps only that many rows itself (TopN).
@@ -981,13 +1001,14 @@ where
         select: &sql_parser::query::SelectCore,
         order_by: Option<&OrderByClause>,
     ) -> Result<PreparedSelect<F>, SchemaError> {
-        let generation = catalog_generation();
+        let generation = catalog_generation(&self.conn);
         let schema = self
             .conn
             .current_schema()
             .map_or(0, |s| Arc::as_ptr(&s) as usize);
         match self.conn.plans.get(key, generation, schema) {
             Some(Some(mut plan)) => {
+                self.keep = keep_candidate(&plan);
                 plan.bind(&self.conn, &self.params)?;
                 return Ok(plan);
             }
@@ -1015,6 +1036,7 @@ where
         };
         match slotted {
             Some(Ok(plan)) if !self.uncacheable => {
+                self.keep = keep_candidate(&plan);
                 self.conn
                     .plans
                     .insert(key, statements, generation, schema, Some(plan.clone()));
@@ -1396,6 +1418,9 @@ where
             sources.push(combined);
             item_rows.push(outer_rows);
             item_types.push(left_types);
+        }
+        if let Some(candidate) = self.keep.take() {
+            self.kept = confirm_keep(candidate, &tables, &accesses);
         }
         // Top-level FROM items (`FROM a, b, c`) are implicitly cross joined,
         // but a WHERE equality between two of them (`a.id = b.id`) is
@@ -2811,6 +2836,7 @@ where
             stmt_txn: None,
             mem: QueryMemory::new(limit),
             start: Instant::now(),
+            park: None,
             _phanton: PhantomData,
         }
     }
@@ -2844,17 +2870,34 @@ where
     ) -> Result<Self, SchemaError> {
         let start = Instant::now();
         let mem = QueryMemory::new(query_memory_limit(&conn));
+        let generation = catalog_generation(&conn);
+        let schema = conn.current_schema().map_or(0, |s| Arc::as_ptr(&s) as usize);
+        let key = cache.as_ref().map(|(key, _)| *key);
+        if let Some(key) = key
+            && let Some((run, slot)) = conn.plans.checkout(key, generation, schema)
+            && let Some(plan) = Self::reopened(&conn, run, slot, &params, mem.clone(), start)?
+        {
+            return Ok(plan);
+        }
         let mut visitor = QueryVisitor::new(conn.clone(), mem.clone(), params)?;
         visitor.cache = cache;
         if let std::ops::ControlFlow::Break(e) = query.visit(&mut visitor) {
             return Err(e);
         }
         let stmt_txn = visitor.stmt_txn.take();
+        let park = match (key, visitor.kept.take()) {
+            (Some(key), Some(meta)) => conn
+                .plans
+                .slot(key, generation, schema)
+                .map(|slot| Park { slot, meta }),
+            _ => None,
+        };
         let mut this = Self {
             tail: None,
             stmt_txn,
             mem,
             start,
+            park,
             _phanton: PhantomData,
         };
         assert!(visitor.steps.len() == 2);
@@ -2892,7 +2935,81 @@ where
             .tail
             .take()
             .ok_or(SchemaError::InternalSchemaError("Nothing in plan".into()))?;
-        Ok(StreamingResultSet::new(tail, self.start).owning_transaction(self.stmt_txn.take()))
+        Ok(StreamingResultSet::new(tail, self.start)
+            .owning_transaction(self.stmt_txn.take())
+            .parking(self.park.take()))
+    }
+
+    // A kept plan made ready for this execution: its seek's key ranges
+    // worked out from `params` as the planner would (column_sets,
+    // key_ranges over the table's filters), and its operators reopened over
+    // them. None when it can't be: the statement is then planned as usual.
+    fn reopened(
+        conn: &Arc<Connection<F>>,
+        run: KeptRun,
+        slot: RunSlot,
+        params: &Params,
+        mem: Arc<QueryMemory>,
+        start: Instant,
+    ) -> Result<Option<Self>, SchemaError> {
+        let KeptRun { mut tree, meta } = run;
+        // The key's values, read as the planner reads `column = constant`
+        // (sarg::equal_points): each combination of each column's points is
+        // a range — usually one point, none for NULL.
+        let mut prefixes: Vec<Vec<ValueItem>> = vec![Vec::with_capacity(meta.parts.len())];
+        for (datatype, part) in &meta.parts {
+            let value = match part {
+                KeyPart::Slot(i) => params.value(*i)?,
+                KeyPart::Literal(v) => v,
+            };
+            let Some(points) = crate::plan::sarg::equal_points(*datatype, value) else {
+                return Ok(None);
+            };
+            prefixes = match points.as_slice() {
+                [only] => {
+                    for p in &mut prefixes {
+                        p.push(only.clone());
+                    }
+                    prefixes
+                }
+                _ => prefixes
+                    .iter()
+                    .flat_map(|p| {
+                        points.iter().map(move |v| {
+                            let mut p = p.clone();
+                            p.push(v.clone());
+                            p
+                        })
+                    })
+                    .collect(),
+            };
+        }
+        let ranges: Vec<_> = prefixes.into_iter().map(store::cursor::KeyRange::prefix).collect();
+        let stmt_txn = if conn.with_current_txn(|t| t.is_some()) {
+            None
+        } else {
+            Some(conn.database.read().begin()?)
+        };
+        let reopened = conn.with_current_txn(|explicit| {
+            tree.reopen(&crate::source::Reopen {
+                txn: explicit.or(stmt_txn.as_ref()),
+                ranges: &ranges,
+                key: &meta.key,
+            })
+        })?;
+        if !reopened {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        REOPENED.with(|r| r.set(r.get() + 1));
+        Ok(Some(Self {
+            tail: Some(tree),
+            stmt_txn,
+            mem,
+            start,
+            park: Some(Park { slot, meta }),
+            _phanton: PhantomData,
+        }))
     }
 }
 
@@ -2925,6 +3042,186 @@ fn plain_select(select: &sql_parser::query::SelectCore) -> bool {
     from_plain && exprs.into_iter().all(|e| !subquery::has_subquery(e))
 }
 
+// Kept plans reopened on this thread: what tests check reuse by.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REOPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// What a plan kept whole changes from one execution to the next: its seek's
+// key. Per key column, in key order: its position in the table's row, its
+// type, and the constant its one condition (`column = constant`) holds it
+// to — a parameter slot's value, or a literal.
+struct KeptMeta {
+    key: Vec<usize>,
+    parts: Vec<(DataType, KeyPart)>,
+}
+
+enum KeyPart {
+    Slot(usize),
+    Literal(ValueItem),
+}
+
+/// A plan kept whole for the next execution of its statement's shape: its
+/// operators, opened again for each (see Source::reopen).
+pub(crate) struct KeptRun {
+    tree: Box<dyn Source>,
+    meta: KeptMeta,
+}
+
+type RunSlot = Arc<parking_lot::Mutex<Option<KeptRun>>>;
+
+/// Where a kept plan goes back to when its result is done with.
+pub(crate) struct Park {
+    slot: RunSlot,
+    meta: KeptMeta,
+}
+
+impl Park {
+    pub(crate) fn park(self, mut tree: Box<dyn Source>) {
+        tree.release();
+        *self.slot.lock() = Some(KeptRun {
+            tree,
+            meta: self.meta,
+        });
+    }
+}
+
+// A prepared SELECT (with its parameter slots) that may be kept whole once
+// its access is known: one table, unpartitioned, read for a plain SELECT
+// list (no grouping, aggregate, DISTINCT or hidden ORDER BY column), and
+// every slot in a `column = slot` condition. What the key may then be is
+// left to confirm_keep.
+struct KeepCandidate {
+    filters: Vec<EvalExpr>,
+    types: Vec<DataType>,
+}
+
+// `column = constant` (either way round): the column, and the constant.
+fn equality_part(e: &EvalExpr) -> Option<(usize, KeyPart)> {
+    let EvalExpr::Binary {
+        lhs,
+        op: BinaryOp::Eq,
+        rhs,
+    } = e
+    else {
+        return None;
+    };
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (EvalExpr::Value(c), EvalExpr::Param(i)) | (EvalExpr::Param(i), EvalExpr::Value(c)) => {
+            Some((*c, KeyPart::Slot(*i)))
+        }
+        (EvalExpr::Value(c), EvalExpr::Literal(v)) | (EvalExpr::Literal(v), EvalExpr::Value(c)) => {
+            Some((*c, KeyPart::Literal(v.clone())))
+        }
+        _ => None,
+    }
+}
+
+fn keep_candidate<F: DBFile + 'static>(plan: &PreparedSelect<F>) -> Option<KeepCandidate> {
+    let [table] = plan.tables.as_slice() else {
+        return None;
+    };
+    let TableRef::Real(_, sqltable) = &table.resolved else {
+        return None;
+    };
+    if !table.joins.is_empty()
+        || sqltable.is_partitioned()
+        || plan.has_aggregation
+        || plan.distinct
+        || plan.hidden > 0
+        || !plan.group_fields.is_empty()
+        || plan.having.is_some()
+        || plan.projected_fields.iter().any(|f| f.expr.has_param())
+    {
+        return None;
+    }
+    let [needs] = plan.needs.as_slice() else {
+        return None;
+    };
+    let mut terms = vec![];
+    if let Some(w) = &plan.wh_expr {
+        conjunct_terms(w, &mut terms);
+    }
+    if terms.iter().any(|t| {
+        t.has_param() && !matches!(equality_part(t), Some((_, KeyPart::Slot(_))))
+    }) {
+        return None;
+    }
+    Some(KeepCandidate {
+        filters: needs.filters.clone(),
+        types: sqltable.fields().iter().map(|f| f.datatype).collect(),
+    })
+}
+
+// Whether a candidate's plan, now its access is chosen, can be kept whole:
+// it seeks a key no value can change the choice of — every column of the
+// primary key, or of a unique index, held to one value by its condition, so
+// at most one row whatever the values — and its slots are all in that key.
+// Each key column has that one condition and no other (none the seek would
+// have to combine with it), so the key is read straight from its constants
+// (see LogicalPlan::reopened).
+fn confirm_keep<F: DBFile + 'static>(
+    candidate: KeepCandidate,
+    tables: &[TableQuery<F>],
+    accesses: &[Option<Access>],
+) -> Option<KeptMeta> {
+    let ([table], [Some(access)]) = (tables, accesses) else {
+        return None;
+    };
+    let TableRef::Real(_, sqltable) = &table.resolved else {
+        return None;
+    };
+    let index = match &access.path {
+        AccessPath::TableSeek(_) => sqltable.primary_key()?,
+        AccessPath::IndexSeek(i, _) | AccessPath::IndexLookup(i, _)
+            if sqltable.indices[*i].is_unique =>
+        {
+            &sqltable.indices[*i]
+        }
+        _ => return None,
+    };
+    let fields = sqltable.fields();
+    let key = index
+        .fields
+        .iter()
+        .map(|f| fields.iter().position(|t| t.name.eq_ignore_ascii_case(&f.name)))
+        .collect::<Option<Vec<usize>>>()?;
+    if key.is_empty() || access.enforced.len() != key.len() {
+        return None;
+    }
+    let mut parts: Vec<Option<KeyPart>> = key.iter().map(|_| None).collect();
+    for f in &candidate.filters {
+        let limits = crate::plan::sarg::condition_set(f, &candidate.types).map(|(c, _)| c);
+        match (equality_part(f), limits) {
+            // A slot outside the key: its value would be stale.
+            (Some((c, KeyPart::Slot(_))), _) if !key.contains(&c) => return None,
+            (Some((c, part)), _) if key.contains(&c) => {
+                let at = key.iter().position(|k| *k == c)?;
+                if parts[at].replace(part).is_some() {
+                    return None;
+                }
+            }
+            // Another condition on a key column.
+            (_, Some(c)) if key.contains(&c) => return None,
+            _ => {}
+        }
+    }
+    let parts = key
+        .iter()
+        .zip(parts)
+        .map(|(c, part)| Some((candidate.types[*c], part?)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(KeptMeta { key, parts })
+}
+
+// The catalog epoch of the connection's database (see Db::catalog_epoch):
+// advanced by any table created, dropped or altered, or schema made or
+// loaded, in it.
+fn catalog_generation<F: DBFile + 'static>(conn: &Arc<Connection<F>>) -> u64 {
+    conn.database.read().db.catalog_epoch()
+}
+
 /// A connection's prepared SELECT plans, one per statement shape: what
 /// stage 3 of PLANNING_DESIGN.md keeps.
 ///
@@ -2932,10 +3229,10 @@ fn plain_select(select: &sql_parser::query::SelectCore) -> bool {
 ///   parse cache's shared tree (a shape's template, or a prepared
 ///   statement's own parse), which the entry holds on to so the address
 ///   can't be reused.
-/// - **Valid** while the catalog generation (see
-///   schema_ops::schema::catalog_generation) and the connection's current
-///   schema are the ones it was prepared under: any table created,
-///   dropped or altered anywhere makes every entry stale.
+/// - **Valid** while the catalog generation of the connection's database
+///   (see catalog_generation) and its current schema are the ones it was
+///   prepared under: any table created, dropped or altered in the database
+///   makes every entry stale.
 /// - **Holds** only what no value decides (see PreparedSelect); each
 ///   execution binds its values and the tables' current statistics in,
 ///   and makes every value-sensitive choice again.
@@ -2950,6 +3247,9 @@ struct Kept<F: DBFile + 'static> {
     generation: u64,
     schema: usize,
     plan: Option<PreparedSelect<F>>,
+    // The plan kept whole, operators and all, when it may be (see
+    // confirm_keep): parked here between executions, taken out by one.
+    run: RunSlot,
 }
 
 // Entries a connection keeps; past it, they all go.
@@ -2977,6 +3277,25 @@ impl<F: DBFile + 'static> PlanCache<F> {
         (kept.generation == generation && kept.schema == schema).then(|| kept.plan.clone())
     }
 
+    // The plan kept whole for `key`, taken out for one execution, and where
+    // it goes back.
+    fn checkout(&self, key: usize, generation: u64, schema: usize) -> Option<(KeptRun, RunSlot)> {
+        let plans = self.plans.lock();
+        let kept = plans.get(&key)?;
+        if kept.generation != generation || kept.schema != schema {
+            return None;
+        }
+        let run = kept.run.lock().take()?;
+        Some((run, kept.run.clone()))
+    }
+
+    // Where `key`'s plan, kept whole, is parked.
+    fn slot(&self, key: usize, generation: u64, schema: usize) -> Option<RunSlot> {
+        let plans = self.plans.lock();
+        let kept = plans.get(&key)?;
+        (kept.generation == generation && kept.schema == schema).then(|| kept.run.clone())
+    }
+
     fn insert(
         &self,
         key: usize,
@@ -2996,6 +3315,7 @@ impl<F: DBFile + 'static> PlanCache<F> {
                 generation,
                 schema,
                 plan,
+                run: Default::default(),
             },
         );
     }
