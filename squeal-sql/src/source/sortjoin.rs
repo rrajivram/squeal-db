@@ -140,6 +140,8 @@ pub(crate) struct SortJoinSource<F: DBFile + 'static> {
     group_cursor: Option<RunCursor<F>>,
     sort_time: u128,
     next_time: u128,
+    // Samples next's clock reads (see source::timing).
+    timer: crate::source::timing::RowTimer,
     // Key groups that outgrew the memory budget and moved to a Run.
     spilled_groups: usize,
 }
@@ -199,6 +201,7 @@ where
             group_cursor: None,
             sort_time: 0,
             next_time: 0,
+            timer: Default::default(),
             spilled_groups: 0,
         })
     }
@@ -473,9 +476,9 @@ where
     }
 
     fn next(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.timer.start();
         let out = self.step();
-        self.next_time += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.next_time, start);
         out
     }
 

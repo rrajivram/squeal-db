@@ -322,7 +322,7 @@ committing (each stage is its own commit).
       committing now leaves orphan store tables with NO catalog row (a leak),
       instead of a catalog row pointing at id 0 (a wrong answer).
 
-- [ ] **Stage 9 — record keys as keycode bytes (BYTE_KEYS_DESIGN.md
+- [x] **Stage 9 — record keys as keycode bytes (BYTE_KEYS_DESIGN.md
       stage 2b) — DONE 2026-10-11, approved 2026-10-12.**
       `DBIdType`'s wire form gains tag 2: a record key as its keycode
       bytes (a length, then them), written for every record key none of

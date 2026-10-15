@@ -167,6 +167,31 @@ pub(crate) fn stored_into(fields: &[ValueItem], out: &mut Vec<u8>) {
     }
 }
 
+/// Appends `field`'s bytes as a page keeps a record key's (see `stored`):
+/// a key is its fields' bytes one after another. False, with nothing
+/// appended, for a string or blob holding a 00 byte, which a stored key
+/// can't hold (such a key is kept as values; see DBIdType's Serialize).
+pub fn put_stored(field: ValueRef<'_>, out: &mut Vec<u8>) -> bool {
+    let holds_end = match field {
+        ValueRef::Str(s, _) => s.as_bytes().contains(&END),
+        ValueRef::Blob(b, _) => b.contains(&END),
+        _ => false,
+    };
+    if holds_end {
+        return false;
+    }
+    put_field(out, field);
+    true
+}
+
+/// A stored key's bytes (see `stored`) as the key they are.
+pub fn stored_to_id(bytes: &[u8]) -> Result<DBIdType, StoreError> {
+    let key = StoredKey::new(bytes);
+    key.check()?;
+    let values = key.values().map(|v| v.to_owned()).collect::<Vec<_>>();
+    Ok(DBIdType::Rec(crate::valueitem::IndexKey::new_from_owned(values)?))
+}
+
 /// A record key's fields as a page keeps them (see `stored`), read in
 /// place: nothing decoded until asked for, nothing copied.
 #[derive(Debug, Clone, Copy)]

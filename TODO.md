@@ -4,12 +4,15 @@
 
 - **PLANNING_DESIGN.md:** statements planned once per shape, and key
   lookups kept whole. Stages 1–3b done (point lookup 7 -> 1.7 us); 4 open.
-- **BATCH_EXECUTION_DESIGN.md:** queries over batches of columns, then
-  SIMD kernels, Parquet, and PAX pages. Not started.
+- **BATCH_EXECUTION_DESIGN.md:** retiring ValueItem from execution:
+  batches of columns, then SIMD kernels, Parquet, and PAX pages. Stage 1
+  done (whole-table aggregates on batches).
 - **BYTE_KEYS_DESIGN.md** and **MEMORY_ISSUES.md:** keys as bytes, and
-  allocating less.
+  allocating less. Byte keys stages 1-2b and 4 (`CREATE INDEX` on bytes)
+  done.
 - **ROWS_IN_LEAVES_DESIGN.md:** rows kept in the B+tree's leaves, not on
-  separate data pages. On-disk change, awaiting approval.
+  separate data pages. Approved; stages 1-3 done (indexes, and tables
+  whose rows fit inline); overflow (3b) open.
 
 ## From the SQLite comparison (2026-10-10)
 
@@ -379,7 +382,8 @@ build — see `squeal-sql/src/stmt/tests/layers.rs` to re-run.
 - [ ] If kept: step 3 is done by this (the default switched; old
   AnyTuplePage data pages still read). Still owned on the way: the
   nested-loop join's inner rows, Db::find.
-- [ ] Concurrent scans don't scale: 4 threads scanning order_details finish
+- [x] Concurrent scans don't scale (fixed by 6d119d2: per-reader
+  snapshots). The note as it was: 4 threads scanning order_details finish
   no more queries than 1 (8 do worse), on main as on this branch. Not
   locks — the threads are in malloc/free (system allocator) for those keys
   and for rows (`new_from_owned`). Fewer allocations (above) is the real

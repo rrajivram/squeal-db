@@ -2091,6 +2091,33 @@ where
         Ok(loaded)
     }
 
+    /// `bulk_load`, for a tree that keeps its rows in its leaves, from each
+    /// tuple's key as stored keycode bytes (keycode::put_stored) and its
+    /// data, ascending by key bytes: written straight into the leaves as
+    /// `txn`'s inserts, with no Tuple made for each. Durable once it
+    /// returns, as `bulk_load` is.
+    pub fn bulk_load_stored<'a>(
+        &self,
+        id: TableIdType,
+        txn: &Transaction,
+        entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> Result<u64, StoreError> {
+        let tx_id = txn.id();
+        self.require_active(&tx_id)?;
+        let lsn = self.logger.next_lsn();
+        let loaded = {
+            let (table, _table_guard) = self.table_by_id_guarded(id)?;
+            table.bulk_load_stored(entries, tx_id, lsn)?
+        };
+        self.checkpoint()?;
+        Ok(loaded)
+    }
+
+    /// Whether the tree `id` keeps its rows in its leaves.
+    pub fn rows_in_leaves(&self, id: TableIdType) -> Result<bool, StoreError> {
+        Ok(self.table_by_id(id)?.rows_in_leaves())
+    }
+
     pub fn insert(
         &self,
         id: TableIdType,
@@ -2114,42 +2141,93 @@ where
         // STORE_AUDIT.md T2: minted BEFORE mutating; the pages this write
         // touches, the version record, and the WAL record all carry it.
         let lsn = self.logger.next_lsn();
-        let key = tuple.id.clone();
-        self.write_with_policy(&table, key.clone(), lsn, &tx_id, room, |current| {
-            match current {
-                None => {
-                    let op = Operation::Add {
-                        txn: tx_id,
-                        post: Record::new(id, tuple.clone(), None),
-                    };
-                    self.versions.insert(lsn, op.clone());
-                    self.logger.log(lsn, op)?;
-                    Ok(Decision::Insert(tuple.clone()))
-                }
-                // Phase 3: a tombstone visible to this transaction is free
-                // to reuse — a new version over it, logged as a Mod whose
-                // pre-image is the tombstone (an older reader still
-                // resolves to "deleted"; a rollback restores the tombstone).
-                Some(current) if current.is_tombstoned() => {
-                    self.check_write_conflict(current, &tx_id)?;
-                    let mut revived = current.clone();
-                    revived.set_txn_id(tx_id);
-                    revived.set_pre_lsn(lsn);
-                    revived.set_data(&tuple.data);
-                    revived.clear_tombstone();
-                    let op = Operation::Mod {
-                        txn: tx_id,
-                        pre: Record::new(id, current.clone(), None),
-                        post: Record::new(id, revived.clone(), None),
-                    };
-                    self.versions.insert(lsn, op.clone());
-                    self.logger.log(lsn, op)?;
-                    Ok(Decision::Replace(revived))
-                }
-                Some(_) => Err(StoreError::DuplicateKey(key.clone())),
-            }
+        self.write_with_policy(&table, tuple.id.clone(), lsn, &tx_id, room, |current| {
+            self.insert_decision(id, &tuple, tx_id, lsn, current)
         })?;
         Ok(())
+    }
+
+    /// `insert`, of many tuples into one tree in one go: each written as
+    /// `insert` writes it (its conflict check, version record and WAL
+    /// record), but in key order and a leaf at a time — the rows that
+    /// belong in a leaf, and fit, written under one hold of its lock, with
+    /// one descent and one page write for them all. For a tree with its
+    /// rows in its leaves; any other takes them one by one.
+    pub fn insert_many(
+        &self,
+        id: TableIdType,
+        mut tuples: Vec<Tuple>,
+        txn: &Transaction,
+    ) -> Result<(), StoreError> {
+        let tx_id = txn.id();
+        self.require_active(&tx_id)?;
+        if !self.table_by_id(id)?.rows_in_leaves() {
+            for tuple in tuples {
+                self.insert(id, tuple, txn)?;
+            }
+            return Ok(());
+        }
+        let (table, _table_guard) = self.table_by_id_guarded(id)?;
+        for tuple in &mut tuples {
+            tuple.set_txn_id(tx_id);
+            tuple.set_pre_lsn_none();
+            tuple.clear_tombstone();
+            table.check_fits(tuple)?;
+        }
+        if !tuples.is_sorted_by(|a, b| a.id <= b.id) {
+            tuples.sort_by(|a, b| a.id.cmp(&b.id));
+        }
+        self.refuse_if_degraded()?;
+        let result = table.write_batch_in_leaves(&tuples, |tuple, current| {
+            let lsn = self.logger.next_lsn();
+            Ok((self.insert_decision(id, tuple, tx_id, lsn, current)?, lsn))
+        });
+        self.after_write(result, &tx_id)
+    }
+
+    // What an insert of `tuple` (stamped for `tx_id`, its write at `lsn`)
+    // does to the key's `current` tuple: recorded and logged here, the
+    // change to the page left to the caller. See `insert`.
+    fn insert_decision(
+        &self,
+        id: TableIdType,
+        tuple: &Tuple,
+        tx_id: TransactionId,
+        lsn: LsnId,
+        current: Option<&Tuple>,
+    ) -> Result<Decision, StoreError> {
+        match current {
+            None => {
+                let op = Operation::Add {
+                    txn: tx_id,
+                    post: Record::new(id, tuple.clone(), None),
+                };
+                self.versions.insert(lsn, op.clone());
+                self.logger.log(lsn, op)?;
+                Ok(Decision::Insert(tuple.clone()))
+            }
+            // Phase 3: a tombstone visible to this transaction is free
+            // to reuse — a new version over it, logged as a Mod whose
+            // pre-image is the tombstone (an older reader still
+            // resolves to "deleted"; a rollback restores the tombstone).
+            Some(current) if current.is_tombstoned() => {
+                self.check_write_conflict(current, &tx_id)?;
+                let mut revived = current.clone();
+                revived.set_txn_id(tx_id);
+                revived.set_pre_lsn(lsn);
+                revived.set_data(&tuple.data);
+                revived.clear_tombstone();
+                let op = Operation::Mod {
+                    txn: tx_id,
+                    pre: Record::new(id, current.clone(), None),
+                    post: Record::new(id, revived.clone(), None),
+                };
+                self.versions.insert(lsn, op.clone());
+                self.logger.log(lsn, op)?;
+                Ok(Decision::Replace(revived))
+            }
+            Some(_) => Err(StoreError::DuplicateKey(tuple.id.clone())),
+        }
     }
 
     pub fn find(
@@ -2346,6 +2424,17 @@ where
     ) -> Result<Written, StoreError> {
         self.refuse_if_degraded()?;
         let result = table.write_version_sized(id, lsn, room, decide);
+        self.after_write(result, txn)
+    }
+
+    // What a write's error does to its transaction: an AbortOnConflict one
+    // is taken down by a write conflict; any is by a lock-order violation
+    // or a lock timeout.
+    fn after_write<T>(
+        &self,
+        result: Result<T, StoreError>,
+        txn: &TransactionId,
+    ) -> Result<T, StoreError> {
         match &result {
             Err(StoreError::WriteConflict(key))
                 if self.tx_mgr.conflict_policy(txn) == ConflictPolicy::AbortOnConflict =>
@@ -11405,6 +11494,127 @@ mod tests {
         });
         let want = (0..threads * per).map(|k| (k, leaf_row_data(k, 0))).collect();
         check_leaf_rows(&db, tid, &want);
+    }
+
+    // A bulk load from stored key bytes builds the same tree a load of the
+    // same tuples does: every key found and scanned in order, its data
+    // intact, durable through a power cut, and refusing duplicates and
+    // disorder.
+    #[test]
+    fn test_a_bulk_load_from_stored_keys() {
+        use crate::valueitem::{IndexKey, ValueItem, ValueRef};
+        let db = TestDB::create("bulk_stored.db").unwrap();
+        let tid = db.create_table_with_rows_in_leaves("t".to_string(), 128, 256).unwrap();
+        let mut keys: Vec<Vec<ValueItem>> = (0..30_000i64)
+            .map(|i| {
+                let s = if i % 13 == 0 { ValueItem::Null } else { ValueItem::Str((format!("k{}", (i * 7919) % 1000), 8)) };
+                vec![s, ValueItem::Integer(i - 15_000)]
+            })
+            .collect();
+        let as_id = |k: &[ValueItem]| DBIdType::Rec(IndexKey::new_from(k).unwrap());
+        keys.sort_by(|a, b| as_id(a).cmp(&as_id(b)));
+        // Each key's stored bytes and its data, in one buffer.
+        let mut arena = vec![];
+        let mut spans = vec![];
+        for (n, k) in keys.iter().enumerate() {
+            let start = arena.len();
+            for v in k {
+                assert!(crate::keycode::put_stored(v.as_ref(), &mut arena));
+            }
+            let mid = arena.len();
+            arena.extend_from_slice(format!("data{n}").as_bytes());
+            spans.push((start, mid, arena.len()));
+        }
+        let entries = || spans.iter().map(|&(s, m, e)| (&arena[s..m], &arena[m..e]));
+        let t = db.begin().unwrap();
+        assert_eq!(db.bulk_load_stored(tid, &t, entries()).unwrap(), keys.len() as u64);
+        db.commit(t).unwrap();
+        let ids: Vec<DBIdType> = keys.iter().map(|k| DBIdType::Rec(IndexKey::new_from(k).unwrap())).collect();
+        check_loaded(&db, tid, &ids);
+        let t = db.begin().unwrap();
+        let found = db.find(tid, ids[1234].clone(), &t).unwrap().unwrap();
+        assert_eq!(&found.data[..], b"data1234");
+        db.commit(t).unwrap();
+        // A power cut after the commit keeps it all.
+        let (f, l) = db.synced_snapshot();
+        let db2 = TestDB::open_using("bulk_stored.db", f, l).unwrap();
+        check_loaded(&db2, db2.table_id_by_name("t").unwrap().unwrap(), &ids);
+        // Duplicates and disorder are refused.
+        let load = |pairs: Vec<(&[u8], &[u8])>| {
+            let tid = db.create_table_with_rows_in_leaves(format!("r{}", pairs.len()), 128, 256).unwrap();
+            let t = db.begin().unwrap();
+            let r = db.bulk_load_stored(tid, &t, pairs);
+            db.rollback(t).unwrap();
+            r
+        };
+        let key = |i: i64| {
+            let mut b = vec![];
+            crate::keycode::put_stored(ValueRef::Integer(i), &mut b);
+            b
+        };
+        let (a, b) = (key(1), key(2));
+        assert!(matches!(load(vec![(&a, b"x"), (&a, b"y")]), Err(StoreError::DuplicateKey(_))));
+        assert!(load(vec![(&b, b"x"), (&a, b"y"), (&b, b"z")]).is_err());
+    }
+
+    // insert_many writes what an insert each would: every row found and
+    // scanned, a deleted key taken over, a duplicate refused with the rows
+    // before it kept (they were logged), a rollback undoing it all, and a
+    // power cut keeping what committed.
+    #[test]
+    fn test_insert_many_writes_what_an_insert_each_would() {
+        let db = TestDB::create("insert_many.db").unwrap();
+        let tid = leaf_rows_table(&db, "t");
+        let mut want = std::collections::BTreeMap::new();
+        // Shuffled, across many leaves.
+        let t = db.begin().unwrap();
+        let tuples: Vec<Tuple> = (0..20_000u64)
+            .map(|i| (i * 7919) % 20_000)
+            .map(|k| Tuple::new(k * 2, &leaf_row_data(k, 0)))
+            .collect();
+        for tp in &tuples {
+            let DBIdType::Int(k) = tp.id else { unreachable!() };
+            want.insert(k, tp.data.to_vec());
+        }
+        db.insert_many(tid, tuples, &t).unwrap();
+        db.commit(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+        // A deleted key, taken over by a batch's row.
+        let t = db.begin().unwrap();
+        db.remove(tid, id(10), &t).unwrap();
+        db.commit(t).unwrap();
+        let t = db.begin().unwrap();
+        db.insert_many(tid, vec![Tuple::new(10u64, b"again"), Tuple::new(11u64, b"odd")], &t).unwrap();
+        db.commit(t).unwrap();
+        want.insert(10, b"again".to_vec());
+        want.insert(11, b"odd".to_vec());
+        check_leaf_rows(&db, tid, &want);
+        // A duplicate: the rows before it, in key order, are written.
+        let t = db.begin().unwrap();
+        let err = db
+            .insert_many(tid, vec![Tuple::new(1u64, b"one"), Tuple::new(3u64, b"three"), Tuple::new(4u64, b"dup")], &t)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::DuplicateKey(_)), "got {err:?}");
+        assert_eq!(&db.find(tid, id(3), &t).unwrap().unwrap().data[..], b"three");
+        db.commit(t).unwrap();
+        want.insert(1, b"one".to_vec());
+        want.insert(3, b"three".to_vec());
+        check_leaf_rows(&db, tid, &want);
+        // Rolled back: none of it.
+        let t = db.begin().unwrap();
+        db.insert_many(tid, (0..3_000u64).map(|k| Tuple::new(100_000 + k, b"gone")).collect(), &t).unwrap();
+        db.rollback(t).unwrap();
+        check_leaf_rows(&db, tid, &want);
+        // Recovered from the log after a power cut.
+        let t = db.begin().unwrap();
+        db.insert_many(tid, (0..3_000u64).map(|k| Tuple::new(200_001 + 2 * k, b"late")).collect(), &t).unwrap();
+        db.commit(t).unwrap();
+        for k in 0..3_000u64 {
+            want.insert(200_001 + 2 * k, b"late".to_vec());
+        }
+        let (f, l) = db.synced_snapshot();
+        let db2 = TestDB::open_using("insert_many.db", f, l).unwrap();
+        check_leaf_rows(&db2, db2.table_id_by_name("t").unwrap().unwrap(), &want);
     }
 
     // Built bottom-up, pages are filled as a split would leave the left one:

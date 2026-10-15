@@ -109,6 +109,11 @@ pub(crate) struct HashedSource<F: DBFile + 'static> {
     probe_time: u128,
     rehash_time: u128,
     insert_left: u128,
+    // Sample the per-row clock reads (see source::timing): building,
+    // probing and the unmatched sweep each time one call in SAMPLE.
+    insert_timer: crate::source::timing::RowTimer,
+    probe_timer: crate::source::timing::RowTimer,
+    sweep_timer: crate::source::timing::RowTimer,
 }
 
 // STORE_AUDIT.md P6: `left_value` used to be `Option<IndexKey>` even
@@ -434,6 +439,9 @@ impl<F: DBFile + 'static> HashedSource<F> {
             probe_time: 0,
             rehash_time: 0,
             insert_left: 0,
+            insert_timer: Default::default(),
+            probe_timer: Default::default(),
+            sweep_timer: Default::default(),
         })
     }
 
@@ -560,7 +568,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // reproduce either way. (All Run-specific — a Mem table has no
     // capacity/load-factor concept at all; std HashMap grows on its own.)
     fn insert_left(&mut self, item: IndexKey) -> Result<(), SchemaError> {
-        let start = Instant::now();
+        let start = self.insert_timer.start();
         let hash = Self::get_hash(item.values(), &self.left_fields);
         match &mut self.table {
             BuildTable::Mem(mt) => match mt.try_insert(
@@ -584,7 +592,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
             },
             BuildTable::Run(_) => self.insert_into_run(item, hash)?,
         }
-        self.insert_left += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.insert_left, start);
         Ok(())
     }
 
@@ -669,14 +677,14 @@ impl<F: DBFile + 'static> HashedSource<F> {
 
     // Into `pending_matches`, which holds none when this is called.
     fn probe_matches(&mut self) -> Result<(), SchemaError> {
-        let start_time = Instant::now();
+        let start_time = self.probe_timer.start();
         let right = self.probe.row();
         let hash = Self::get_hash(right, &self.right_fields);
         match &mut self.table {
             BuildTable::Mem(mt) => mt.probe(&self.matcher, right, hash, &mut self.pending_matches)?,
             BuildTable::Run(rt) => rt.probe(&self.matcher, right, hash, &mut self.pending_matches)?,
         };
-        self.probe_time += start_time.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.probe_time, start_time);
         Ok(())
     }
 
@@ -832,7 +840,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
     // used to be wasted decode work here).
     // The next build row nothing matched; None when there are no more.
     fn next_unmatched_left(&mut self) -> Result<Option<IndexKey>, SchemaError> {
-        let start = Instant::now();
+        let start = self.sweep_timer.start();
         // Finds the next never-matched entry, if any, without calling back
         // into `self.emit` (a &self method — would conflict with the
         // in-progress mutable borrow of self.table below) until after the
@@ -883,7 +891,7 @@ impl<F: DBFile + 'static> HashedSource<F> {
                 found
             }
         };
-        self.next_time += start.elapsed().as_nanos();
+        crate::source::timing::add(&mut self.next_time, start);
         Ok(found)
     }
 

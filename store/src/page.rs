@@ -921,6 +921,90 @@ impl Page {
         Ok(())
     }
 
+    /// add_tuple, for a tuple given as its encoding, its key above every key
+    /// here (see PageTuple::append_encoded): a bulk load's, in order.
+    pub(crate) fn append_encoded(&self, encoded: &[u8]) -> Result<(), StoreError> {
+        let size = encoded.len() as DBSizeType;
+        if let Some(max) = self.record_size
+            && size as usize > max
+        {
+            return Err(StoreError::TupleTooLarge(size, max));
+        }
+        if !self.can_store_len(size) {
+            return Err(StoreError::PageCapacityError);
+        }
+        {
+            let mut inner = self.inner.write();
+            let stored = size + inner.data.entry_overhead();
+            inner.data_mut().append_encoded(encoded)?;
+            inner.page_used_size += stored;
+        }
+        self.set_dirty(true)
+    }
+
+    /// Each tuple's encoded size, in order — what a split divides by —
+    /// for content that keeps its tuples as bytes; None for older content.
+    pub(crate) fn record_sizes(&self) -> Option<Vec<DBSizeType>> {
+        let inner = self.inner.read();
+        let n = inner.data.count().ok()?;
+        (0..n)
+            .map(|i| inner.data.record_bytes(i).map(|b| b.len() as DBSizeType))
+            .collect()
+    }
+
+    /// Tuple `i`'s key.
+    pub(crate) fn id_at(&self, i: usize) -> Result<DBIdType, StoreError> {
+        let inner = self.inner.read();
+        let t = inner
+            .data
+            .at_ref(i)
+            .ok_or_else(|| StoreError::UnknownError(format!("no tuple at position {i}")))?;
+        Ok(t.id().to_owned())
+    }
+
+    /// Appends tuples `range` of this page, as their bytes, to `to` (empty
+    /// or holding only keys below them): a split's halves, moved without
+    /// decoding a tuple.
+    pub(crate) fn copy_records_to(
+        &self,
+        range: std::ops::Range<usize>,
+        to: &Page,
+    ) -> Result<(), StoreError> {
+        let inner = self.inner.read();
+        for i in range {
+            let bytes = inner
+                .data
+                .record_bytes(i)
+                .ok_or_else(|| StoreError::UnknownError(format!("no tuple bytes at {i}")))?;
+            to.append_encoded(bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Keeps only the first `n` tuples (see PageTuple::truncate).
+    pub(crate) fn truncate(&self, n: usize) -> Result<(), StoreError> {
+        {
+            let mut inner = self.inner.write();
+            let overhead = inner.data.entry_overhead();
+            let count = inner.data.count()?;
+            let removed: DBSizeType = (n..count)
+                .map(|i| inner.data.record_bytes(i).map_or(0, |b| b.len() as DBSizeType) + overhead)
+                .sum();
+            inner.data_mut().truncate(n)?;
+            inner.page_used_size = inner.page_used_size.checked_sub(removed).ok_or_else(|| {
+                StoreError::UnknownError("truncate: used size underflow".into())
+            })?;
+        }
+        self.set_dirty(true)
+    }
+
+    /// can_store, for a tuple of `size` encoded bytes.
+    pub(crate) fn can_store_len(&self, size: DBSizeType) -> bool {
+        let inner = self.inner.read();
+        let used = inner.page_used_size;
+        used == 0 || used + size + inner.data.entry_overhead() <= self.usable_data_size()
+    }
+
     pub(crate) fn remove_tuple(&self, id: DBIdType) -> Result<Tuple, StoreError> {
         let old = {
             let mut inner = self.inner.write();

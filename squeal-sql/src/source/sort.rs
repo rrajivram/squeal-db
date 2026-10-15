@@ -49,6 +49,9 @@ pub(crate) struct SortSource<F: DBFile + 'static> {
     // or a SortProgress::next), summed across every call after the
     // sort itself has finished.
     next_time: u128,
+    // Samples next's clock reads (see source::timing): a read a row cost
+    // as much as handing the row out.
+    timer: crate::source::timing::RowTimer,
 }
 
 #[derive(Debug)]
@@ -154,6 +157,7 @@ where
             progress: None,
             sort_time: 0,
             next_time: 0,
+            timer: Default::default(),
         })
     }
 
@@ -231,6 +235,7 @@ where
             results: None,
             sort_time: 0,
             next_time: 0,
+            timer: Default::default(),
         })
     }
 
@@ -655,9 +660,9 @@ where
         // span's elapsed() is measured only after the inner call (and
         // its own bookkeeping) has already returned.
         if let Some(results) = &mut self.results {
-            let start = Instant::now();
+            let start = self.timer.start();
             let out = results.pop().to_owned();
-            self.next_time += start.elapsed().as_nanos();
+            crate::source::timing::add(&mut self.next_time, start);
             return Ok(out);
         }
         let mut limited = false;
@@ -1040,6 +1045,7 @@ mod tests {
             progress: None,
             sort_time: 0,
             next_time: 0,
+            timer: Default::default(),
         }
     }
 
@@ -1196,6 +1202,7 @@ mod tests {
             progress: None,
             sort_time: 0,
             next_time: 0,
+            timer: Default::default(),
         }
     }
 

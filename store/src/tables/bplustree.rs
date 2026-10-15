@@ -762,34 +762,98 @@ where
             }
             break (leaf, current);
         };
-        match decide(current.as_ref())? {
-            Decision::Skip => Ok(Written::Skipped),
+        let decision = decide(current.as_ref())?;
+        let written = Self::apply_in_leaf(&leaf, id, current.is_some(), decision)?;
+        if !matches!(written, Written::Skipped) {
+            self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
+        }
+        Ok(written)
+    }
+
+    // `decision`, made for key `id` (present before it or not), applied to
+    // the locked leaf holding it. The leaf is the caller's to publish.
+    fn apply_in_leaf(
+        leaf: &WritePageHandle,
+        id: DBIdType,
+        present: bool,
+        decision: Decision,
+    ) -> Result<Written, StoreError> {
+        Ok(match decision {
+            Decision::Skip => Written::Skipped,
             Decision::Insert(new) => {
-                if current.is_some() {
+                if present {
                     return Err(StoreError::DuplicateKey(id));
                 }
-                let at = leaf.page_num;
                 leaf.page.add_tuple(new)?;
-                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
-                Ok(Written::Inserted(at))
+                Written::Inserted(leaf.page_num)
             }
             Decision::Replace(new) => {
-                if current.is_none() {
+                if !present {
                     return Err(StoreError::KeyNotFound(id));
                 }
-                let old = leaf.page.replace_tuple(&id, new)?;
-                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
-                Ok(Written::Replaced(old))
+                Written::Replaced(leaf.page.replace_tuple(&id, new)?)
             }
             Decision::Delete => {
-                if current.is_none() {
+                if !present {
                     return Ok(Written::Deleted(None));
                 }
-                let old = leaf.page.remove_tuple(id)?;
-                self.buffer.write_locked_page_with_lsn(leaf, lsn)?;
-                Ok(Written::Deleted(Some(old)))
+                Written::Deleted(Some(leaf.page.remove_tuple(id)?))
+            }
+        })
+    }
+
+    /// Writes `tuples` (in key order) a leaf at a time, for a tree with its
+    /// rows in its leaves: each tuple's `decide` — given what its key holds
+    /// now, it records and logs the write and says what to do, and with
+    /// what lsn — is run and applied under one hold of the leaf's lock for
+    /// every tuple that belongs in that leaf and fits; the leaf is then
+    /// written once. A tuple past the leaf, or one it has no room for,
+    /// starts a new descent (which splits as it must). Each tuple needs at
+    /// most its size and a pre-image pointer of room. On an error, what was
+    /// already applied — it was logged — is published with the leaf.
+    pub(crate) fn write_batch_in_leaves(
+        &self,
+        tuples: &[Tuple],
+        mut decide: impl FnMut(&Tuple, Option<&Tuple>) -> Result<(Decision, LsnId), StoreError>,
+    ) -> Result<(), StoreError> {
+        let room = |t: &Tuple| t.size() + PRE_LSN_GROWTH;
+        let mut i = 0;
+        while i < tuples.len() {
+            let _writer = self.buffer.writer_permit();
+            let probe = Tuple::new_with(tuples[i].id.clone(), &[], None, None);
+            let leaf = self.leaf_for_write(&probe, self.logger.next_lsn(), Some(room(&tuples[i])))?;
+            let high_key = leaf.page.high_key();
+            let start = i;
+            let mut last_lsn = None;
+            let mut failed = None;
+            while i < tuples.len() {
+                let tuple = &tuples[i];
+                if i > start
+                    && (high_key.as_ref().is_some_and(|h| tuple.id >= *h)
+                        || self.is_full_for(&leaf.page, Some(room(tuple)))?)
+                {
+                    break;
+                }
+                let applied = leaf.page.get(tuple.id.clone()).and_then(|current| {
+                    let (decision, lsn) = decide(tuple, current.as_ref())?;
+                    last_lsn = Some(lsn);
+                    Self::apply_in_leaf(&leaf, tuple.id.clone(), current.is_some(), decision)
+                });
+                if let Err(e) = applied {
+                    failed = Some(e);
+                    break;
+                }
+                i += 1;
+            }
+            match last_lsn {
+                Some(lsn) => self.buffer.write_locked_page_with_lsn(leaf, lsn)?,
+                None => drop(leaf),
+            }
+            if let Some(e) = failed {
+                return Err(e);
             }
         }
+        Ok(())
     }
 
     // The locked leaf for `probe.id`, with the root split pre-check and the
@@ -1776,27 +1840,41 @@ where
     // fallthrough (see find_page) — so "would land past everything" means
     // landing at or past the entry *before* the last one.
     fn split_point(values: &[Tuple], is_inner: bool, incoming_id: &DBIdType) -> usize {
+        let sizes: Vec<DBSizeType> = values.iter().map(Tuple::size).collect();
+        Self::split_point_of(&sizes, is_inner, incoming_id, |i| Ok(values[i].id.clone()))
+            .expect("ids of tuples in hand")
+    }
+
+    // split_point, from each entry's size and a way to read an entry's key:
+    // only the one or two keys the rightmost-append test needs are read.
+    fn split_point_of(
+        sizes: &[DBSizeType],
+        is_inner: bool,
+        incoming_id: &DBIdType,
+        id: impl Fn(usize) -> Result<DBIdType, StoreError>,
+    ) -> Result<usize, StoreError> {
+        let n = sizes.len();
         let is_rightmost_append = if is_inner {
-            values.len() < 2 || *incoming_id >= values[values.len() - 2].id
+            n < 2 || *incoming_id >= id(n - 2)?
         } else {
-            *incoming_id > values.last().unwrap().id
+            *incoming_id > id(n - 1)?
         };
         if is_rightmost_append {
-            return values.len() - 1;
+            return Ok(n - 1);
         }
         // The byte midpoint: the first cut leaving at least half the bytes
         // on the left, so each half has room again (see MIN_ENTRIES_PER_PAGE).
-        let total: DBSizeType = values.iter().map(Tuple::size).sum();
+        let total: DBSizeType = sizes.iter().sum();
         let mut left = 0;
-        let mut mid = values.len() - 1;
-        for (i, t) in values.iter().enumerate() {
-            left += t.size();
+        let mut mid = n - 1;
+        for (i, size) in sizes.iter().enumerate() {
+            left += size;
             if 2 * left >= total {
                 mid = i + 1;
                 break;
             }
         }
-        mid.clamp(1, values.len() - 1)
+        Ok(mid.clamp(1, n - 1))
     }
 
     // Splits must carry a fixed-record (index) page's per-entry budget
@@ -1825,8 +1903,15 @@ where
         lsn: LsnId,
     ) -> Result<(DBIdType, PageId), StoreError> {
         let mut current_handle = handle;
-        let values = current_handle.page.iter().collect::<Vec<_>>();
         let is_inner = current_handle.page.is_flag_set(INNER_NODE);
+        // A page keeping its tuples as bytes splits as bytes: the cut from
+        // their sizes, the upper part copied to the sibling and cut from
+        // this page, only the separator's key decoded. Older content
+        // splits by its tuples.
+        if let Some(sizes) = current_handle.page.record_sizes() {
+            return self.split_non_root_bytes(current_handle, &sizes, is_inner, incoming_id, lsn);
+        }
+        let values = current_handle.page.iter().collect::<Vec<_>>();
 
         let mid = Self::split_point(&values, is_inner, incoming_id);
         let current_vals = &values[..mid];
@@ -1914,6 +1999,51 @@ where
         Ok((separator_id, new_page_id))
     }
 
+    // split_non_root_page for a page keeping its tuples as bytes: the same
+    // split (see it for the separator, B-link and publishing order), with
+    // the moved entries copied as their bytes and the kept ones left as
+    // they are.
+    fn split_non_root_bytes(
+        &self,
+        mut current_handle: WritePageHandle,
+        sizes: &[DBSizeType],
+        is_inner: bool,
+        incoming_id: &DBIdType,
+        lsn: LsnId,
+    ) -> Result<(DBIdType, PageId), StoreError> {
+        let n = sizes.len();
+        let mid = Self::split_point_of(sizes, is_inner, incoming_id, |i| {
+            current_handle.page.id_at(i)
+        })?;
+        let separator_id = if is_inner {
+            current_handle.page.id_at(mid - 1)?
+        } else {
+            current_handle.page.id_at(mid)?
+        };
+        let new_page_id = self.alloc_sibling_index_page(&current_handle.page)?;
+        let mut new_handle = self.buffer.get_page_mut(new_page_id, LockLevel::Index)?;
+        let current_page = Arc::make_mut(&mut current_handle.page);
+        let new_page = Arc::make_mut(&mut new_handle.page);
+        if is_inner {
+            new_page.set_page_flags(INNER_NODE)?;
+        } else {
+            self.flag_leaf(new_page)?;
+        }
+        let old_next_page = current_page.get_next_page();
+        let old_high_key = current_page.high_key();
+        new_page.set_next_page(old_next_page)?;
+        current_page.set_next_page(new_page_id)?;
+        new_page.set_high_key(old_high_key)?;
+        current_page.set_high_key(Some(separator_id.clone()))?;
+        current_page.copy_records_to(mid..n, new_page)?;
+        current_page.truncate(mid)?;
+        // The new sibling first: see split_non_root_page.
+        self.buffer.write_locked_page_with_lsn(new_handle, lsn)?;
+        self.buffer
+            .write_locked_page_with_lsn(current_handle, lsn)?;
+        Ok((separator_id, new_page_id))
+    }
+
     fn update_root_page(
         &self,
         id: DBIdType,
@@ -1983,15 +2113,31 @@ where
         if !self.is_full_for(&handle.page, room)? {
             return Ok(());
         }
-        let values = handle.page.iter().collect::<Vec<_>>();
         let is_inner = handle.page.is_flag_set(INNER_NODE);
         let flags = if is_inner { INNER_NODE } else { LEAF_NODE };
-
-        // See split_non_root_page's split_point for the rightmost-append
-        // optimization this shares.
-        let mid = Self::split_point(&values, is_inner, incoming_id);
-        let left_vals = &values[..mid];
-        let right_vals = &values[mid..];
+        // As bytes, where the root keeps its tuples so (see
+        // split_non_root_page): the halves copied, nothing decoded but
+        // the separator. Otherwise by its tuples.
+        let sizes = handle.page.record_sizes();
+        let values = match &sizes {
+            Some(_) => vec![],
+            None => handle.page.iter().collect::<Vec<_>>(),
+        };
+        let (mid, n) = match &sizes {
+            Some(sizes) => (
+                Self::split_point_of(sizes, is_inner, incoming_id, |i| handle.page.id_at(i))?,
+                sizes.len(),
+            ),
+            // See split_non_root_page's split_point for the rightmost-append
+            // optimization this shares.
+            None => (Self::split_point(&values, is_inner, incoming_id), values.len()),
+        };
+        let id_at = |i: usize| -> Result<DBIdType, StoreError> {
+            match &sizes {
+                Some(_) => handle.page.id_at(i),
+                None => Ok(values[i].id.clone()),
+            }
+        };
         // See split_non_root_page's comment for why the separator formula
         // differs for inner vs leaf: an inner node's last entry inherits
         // everything up to its own external bound via fallthrough, so the
@@ -2000,9 +2146,9 @@ where
         // entry silently swallows the range that belongs to whatever moved
         // into right, orphaning it.
         let separator_id = if flags == INNER_NODE {
-            left_vals.last().unwrap().id.clone()
+            id_at(mid - 1)?
         } else {
-            right_vals[0].id.clone()
+            id_at(mid)?
         };
         let left_page_id = self.alloc_sibling_index_page(&handle.page)?;
         let right_page_id = self.alloc_sibling_index_page(&handle.page)?;
@@ -2029,12 +2175,17 @@ where
         left_page.set_next_page(right_page_id)?;
         right_page.set_high_key(handle.page.high_key())?;
         left_page.set_high_key(Some(separator_id.clone()))?;
-        left_vals
-            .iter()
-            .try_for_each(|t| left_page.add_tuple(t.clone()))?;
-        right_vals
-            .iter()
-            .try_for_each(|t| right_page.add_tuple(t.clone()))?;
+        if sizes.is_some() {
+            handle.page.copy_records_to(0..mid, left_page)?;
+            handle.page.copy_records_to(mid..n, right_page)?;
+        } else {
+            values[..mid]
+                .iter()
+                .try_for_each(|t| left_page.add_tuple(t.clone()))?;
+            values[mid..]
+                .iter()
+                .try_for_each(|t| right_page.add_tuple(t.clone()))?;
+        }
         self.buffer.write_locked_page_with_lsn(left_handle, lsn)?;
         self.buffer.write_locked_page_with_lsn(right_handle, lsn)?;
         self.update_root_page(separator_id, left_page_id, right_page_id, lsn)?;
@@ -2063,21 +2214,7 @@ where
         mut next: impl FnMut() -> Result<Option<Tuple>, E>,
         lsn: LsnId,
     ) -> Result<u64, E> {
-        let root = self.buffer.get_page(self.table.first_index_page)?;
-        let record_size = root.record_size().ok_or_else(|| {
-            StoreError::UnknownError("bulk load: the tree's pages have no entry size".into())
-        })?;
-        // The root is still a leaf: its budget is the leaves'. A tree with
-        // its rows in its leaves budgets its inner pages apart.
-        let inner_record_size = if self.rows_in_leaves {
-            self.inner_budget()
-        } else {
-            record_size
-        };
-        if root.count()? != 0 || !root.is_flag_set(LEAF_NODE) {
-            return Err(StoreError::UnknownError("bulk load: the tree is not empty".into()).into());
-        }
-        drop(root);
+        let (record_size, inner_record_size) = self.bulk_budgets()?;
 
         // The leaves, as they fill: each published once the next is begun
         // (its high key is the next one's first key, its next_page the
@@ -2141,11 +2278,127 @@ where
             last = Some(tuple.id);
             loaded += 1;
         }
+        self.bulk_finish(leaf, leaf_id, bounds, inner_record_size, lsn)?;
+        Ok(loaded)
+    }
+
+    /// bulk_load, from each tuple's key as stored keycode bytes and its
+    /// data, for a tree with its rows in its leaves: each tuple's encoding
+    /// is written straight into its leaf, under `txn` — no Tuple, and no
+    /// key as values, is made for it (a key is decoded only where it ends
+    /// a leaf). Keys ascending by their bytes, which is the tree's order.
+    pub(crate) fn bulk_load_stored<'a>(
+        &self,
+        entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+        txn: TransactionId,
+        lsn: LsnId,
+    ) -> Result<u64, StoreError> {
+        if !self.rows_in_leaves {
+            return Err(StoreError::UnknownError(
+                "bulk load from stored keys: the tree keeps data pages".into(),
+            ));
+        }
+        let (record_size, inner_record_size) = self.bulk_budgets()?;
+        let mut leaf = self.empty_index_page(record_size, LEAF_NODE)?;
+        let mut leaf_id: Option<PageId> = None;
+        let mut bounds: Vec<(DBIdType, PageId)> = vec![];
+        let mut previous: Vec<u8> = vec![];
+        let mut encoded: Vec<u8> = vec![];
+        let mut loaded = 0u64;
+        let mut started = false;
+        for (key, data) in entries {
+            {
+                let _writer = self.buffer.writer_permit();
+                if started {
+                    match previous.as_slice().cmp(key) {
+                        std::cmp::Ordering::Less => {}
+                        std::cmp::Ordering::Equal => {
+                            return Err(StoreError::DuplicateKey(crate::keycode::stored_to_id(key)?));
+                        }
+                        std::cmp::Ordering::Greater => {
+                            return Err(StoreError::UnknownError(
+                                "bulk load: a key out of the tree's order".into(),
+                            ));
+                        }
+                    }
+                }
+                // The tuple's encoding (Tuple::encode_into's): a stored key
+                // (tag 2, its length, its bytes), the writing transaction,
+                // no pre-image, the data, no flags.
+                encoded.clear();
+                encoded.push(2);
+                crate::tuple::put_varint(&mut encoded, key.len() as u64);
+                encoded.extend_from_slice(key);
+                encoded.push(1);
+                crate::tuple::put_varint(&mut encoded, txn.0);
+                encoded.push(0);
+                crate::tuple::put_varint(&mut encoded, data.len() as u64);
+                encoded.extend_from_slice(data);
+                encoded.push(0);
+                let size = encoded.len() as DBSizeType;
+                if size + PRE_LSN_GROWTH > self.leaf_budget as DBSizeType || size as usize > record_size {
+                    return Err(StoreError::TupleTooLarge(size + PRE_LSN_GROWTH, self.leaf_budget));
+                }
+                if self.is_full_for(&leaf, Some(size))? || !leaf.can_store_len(size) {
+                    let this = match leaf_id {
+                        Some(id) => id,
+                        None => self.buffer.alloc_indexed_page(record_size)?,
+                    };
+                    let following = self.buffer.alloc_indexed_page(record_size)?;
+                    let bound = crate::keycode::stored_to_id(key)?;
+                    leaf.set_high_key(Some(bound.clone()))?;
+                    leaf.set_next_page(following)?;
+                    let full = std::mem::replace(&mut leaf, self.empty_index_page(record_size, LEAF_NODE)?);
+                    self.publish_page(this, full, lsn)?;
+                    bounds.push((bound, this));
+                    leaf_id = Some(following);
+                }
+                leaf.append_encoded(&encoded)?;
+                previous.clear();
+                previous.extend_from_slice(key);
+                started = true;
+                loaded += 1;
+            }
+        }
+        self.bulk_finish(leaf, leaf_id, bounds, inner_record_size, lsn)?;
+        Ok(loaded)
+    }
+
+    // A bulk load's page budgets — its leaves', and its inner pages' —
+    // once it has checked the tree is empty.
+    fn bulk_budgets(&self) -> Result<(usize, usize), StoreError> {
+        let root = self.buffer.get_page(self.table.first_index_page)?;
+        let record_size = root.record_size().ok_or_else(|| {
+            StoreError::UnknownError("bulk load: the tree's pages have no entry size".into())
+        })?;
+        if root.count()? != 0 || !root.is_flag_set(LEAF_NODE) {
+            return Err(StoreError::UnknownError("bulk load: the tree is not empty".into()));
+        }
+        // The root is still a leaf: its budget is the leaves'. A tree with
+        // its rows in its leaves budgets its inner pages apart.
+        let inner_record_size = if self.rows_in_leaves {
+            self.inner_budget()
+        } else {
+            record_size
+        };
+        Ok((record_size, inner_record_size))
+    }
+
+    // The end of a bulk load: the last leaf published, then the levels
+    // above it built.
+    fn bulk_finish(
+        &self,
+        leaf: Page,
+        leaf_id: Option<PageId>,
+        mut bounds: Vec<(DBIdType, PageId)>,
+        inner_record_size: usize,
+        lsn: LsnId,
+    ) -> Result<(), StoreError> {
         let _writer = self.buffer.writer_permit();
         let Some(last_leaf) = leaf_id else {
             // One leaf's worth: the root stays a leaf.
             self.publish_page(self.table.first_index_page, leaf, lsn)?;
-            return Ok(loaded);
+            return Ok(());
         };
         self.publish_page(last_leaf, leaf, lsn)?;
         bounds.push((DBIdType::Int(DBSizeType::MAX), last_leaf));
@@ -2165,7 +2418,7 @@ where
             let pages = self.pack(entries, inner_record_size, INNER_NODE)?;
             if let [only] = &pages[..] {
                 self.publish_page(self.table.first_index_page, only.clone(), lsn)?;
-                return Ok(loaded);
+                return Ok(());
             }
             let ids = pages
                 .iter()

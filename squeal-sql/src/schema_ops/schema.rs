@@ -71,6 +71,14 @@ impl<F: DBFile> std::fmt::Debug for Schema<F> {
     }
 }
 
+// What inserting a row writes (see Schema::row_tuples): its tuple in its
+// partition's rows tree, and each index tree's entry for it.
+struct RowTuples {
+    rows: store::table::TableIdType,
+    row: Tuple,
+    entries: Vec<(store::table::TableIdType, Tuple)>,
+}
+
 impl<F> Schema<F>
 where
     F: DBFile + 'static,
@@ -350,6 +358,87 @@ where
             part.set_index(i, id);
         }
         Ok(())
+    }
+
+    // Builds an index's tree from the rows of one partition (`rows`) as
+    // bytes (BYTE_KEYS_DESIGN.md stage 4): each entry's key — the index's
+    // columns, then for a non-unique index the row's identity — written
+    // once as stored keycode bytes into one buffer, with its data (the
+    // identity, as an IndexKey is serialized) after it; the entries sorted
+    // by comparing their key bytes, which is the tree's order; and handed
+    // to the store's bulk load as bytes. No row of values, no key as
+    // values, and no tuple is made for an entry. Only the index's columns
+    // of a row are decoded, into one buffer reused row after row.
+    //
+    // False, with nothing loaded, when an entry can't be kept as bytes (a
+    // string holding a 00 byte) or the entries would pass `limit` bytes:
+    // the caller builds the index the general way, which can spill.
+    #[allow(clippy::too_many_arguments)]
+    fn build_index_stored(
+        &self,
+        table: &SqlTable,
+        rows: store::table::TableIdType,
+        tree: store::table::TableIdType,
+        txn: &store::txn::Transaction,
+        columns: &[Arc<crate::table::Field>],
+        unique: bool,
+        limit: usize,
+    ) -> Result<bool, SchemaError> {
+        use store::keycode::put_stored;
+        let current = table.fields();
+        let positions = columns
+            .iter()
+            .map(|c| current.iter().position(|f| f.id == c.id))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| SchemaError::InternalSchemaError("an index column not in its table".into()))?;
+        let wanted: Vec<bool> = (0..current.len()).map(|i| positions.contains(&i)).collect();
+        let mut cursor = self.db.table_scan_in_txn(rows, txn)?;
+        let mut row: Vec<ValueItem> = vec![];
+        let mut identity: Vec<ValueItem> = vec![];
+        let mut arena: Vec<u8> = vec![];
+        // Per entry: where its key starts, where its data starts, where it ends.
+        let mut spans: Vec<(usize, usize, usize)> = vec![];
+        while let Some(tuple) = cursor.next_ref()? {
+            if !table.decode_row_into(tuple.data(), Some(&wanted), &[], &mut row)? {
+                continue;
+            }
+            let start = arena.len();
+            for &p in &positions {
+                if !put_stored(row[p].as_ref(), &mut arena) {
+                    return Ok(false);
+                }
+            }
+            let id = tuple.id();
+            identity.clear();
+            match id.as_int() {
+                Some(n) => identity.push(ValueItem::Integer(n as i64)),
+                None => identity.extend(id.key_values().into_iter().flatten().map(|v| v.to_owned())),
+            }
+            if !unique {
+                match id.stored_bytes() {
+                    // A key kept as bytes is its fields' bytes: as they are.
+                    Some(bytes) => arena.extend_from_slice(bytes),
+                    None => {
+                        for v in &identity {
+                            if !put_stored(v.as_ref(), &mut arena) {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                }
+            }
+            let data = arena.len();
+            arena = postcard::to_extend(&identity[..], arena).map_err(store::error::StoreError::from)?;
+            spans.push((start, data, arena.len()));
+            if arena.len() + spans.len() * std::mem::size_of::<(usize, usize, usize)>() > limit {
+                return Ok(false);
+            }
+        }
+        drop(cursor);
+        spans.sort_unstable_by(|a, b| arena[a.0..a.1].cmp(&arena[b.0..b.1]));
+        self.db
+            .bulk_load_stored(tree, txn, spans.iter().map(|&(s, d, e)| (&arena[s..d], &arena[d..e])))?;
+        Ok(true)
     }
 
     // A secondary index's tree: its entries kept in its leaves (see store's
@@ -632,16 +721,44 @@ where
     // Vec<ValueItem> is moved into its row-storage IndexKey inside
     // insert_one_row_in_txn (see IndexKey::new_from_owned's own doc
     // comment for why that avoids cloning every field).
+    //
+    // Several rows are written a tree at a time (store's Db::insert_many):
+    // every row's tuples built first, then each tree given all of its —
+    // the rows trees first, so a duplicate primary key fails before an
+    // index entry is written. A table with foreign keys takes its rows one
+    // by one: a row may reference one inserted before it in the same
+    // statement, which its check must see.
     fn insert_rows_in_txn(
         self: &Arc<Self>,
         table: &SqlTable,
         rows: Vec<Vec<ValueItem>>,
         txn: &Transaction,
     ) -> Result<usize, SchemaError> {
-        let mut count = 0usize;
+        let count = rows.len();
+        if count < 2 || !table.foreign_keys.is_empty() {
+            for row in rows {
+                self.insert_one_row_in_txn(table, row, txn)?;
+            }
+            return Ok(count);
+        }
+        // Each tree's tuples, rows trees before index trees.
+        let mut row_writes: Vec<(store::table::TableIdType, Vec<Tuple>)> = vec![];
+        let mut index_writes: Vec<(store::table::TableIdType, Vec<Tuple>)> = vec![];
+        let add = |writes: &mut Vec<(store::table::TableIdType, Vec<Tuple>)>, tree, tuple| {
+            match writes.iter_mut().find(|(t, _)| *t == tree) {
+                Some((_, tuples)) => tuples.push(tuple),
+                None => writes.push((tree, vec![tuple])),
+            }
+        };
         for row in rows {
-            self.insert_one_row_in_txn(table, row, txn)?;
-            count += 1;
+            let built = self.row_tuples(table, row, txn)?;
+            add(&mut row_writes, built.rows, built.row);
+            for (tree, entry) in built.entries {
+                add(&mut index_writes, tree, entry);
+            }
+        }
+        for (tree, tuples) in row_writes.into_iter().chain(index_writes) {
+            self.db.insert_many(tree, tuples, txn)?;
         }
         Ok(count)
     }
@@ -664,6 +781,25 @@ where
         txn: &Transaction,
     ) -> Result<(), SchemaError> {
         self.check_foreign_keys(table, &row, txn)?;
+        let built = self.row_tuples(table, row, txn)?;
+        // The row first: the rows tree is keyed by the PRIMARY KEY, so a
+        // duplicate one fails here, before any index entry is written.
+        self.db.insert(built.rows, built.row, txn)?;
+        for (tree, entry) in built.entries {
+            self.db.insert(tree, entry, txn)?;
+        }
+        Ok(())
+    }
+
+    // What inserting `row` writes: its tuple in its partition's rows tree,
+    // and an entry in each index tree (see insert_one_row_in_txn). Logs the
+    // row to the table's statistics.
+    fn row_tuples(
+        self: &Arc<Self>,
+        table: &SqlTable,
+        row: Vec<ValueItem>,
+        txn: &Transaction,
+    ) -> Result<RowTuples, SchemaError> {
         let row_key = self.row_key(table, &row)?;
 
         // What every index's entry points back to: the row's own
@@ -702,39 +838,36 @@ where
             index_keys.push((i, DBIdType::Rec(IndexKey::new_from(&values)?)));
         }
 
-        // The row first: the rows tree is keyed by the PRIMARY KEY, so a
-        // duplicate one fails here, before any index entry is written.
         // Stamped with the table's CURRENT version — every new insert is
         // always written in the table's latest shape; only rows written
         // before an ALTER TABLE carry an older version (see VersionedRow,
         // SqlTable::reproject). Moves `row` (see new_from_owned).
         let row = IndexKey::new_from_owned(row)?;
         let row_data = table.encode_row(&row)?;
-        self.db.insert(
-            part.rows(),
-            Tuple::new_with(row_key.clone(), &row_data, Some(txn.id()), None),
-            txn,
-        )?;
+        let row_tuple = Tuple::new_with(row_key.clone(), &row_data, Some(txn.id()), None);
         let identity = to_allocvec(&identity)?;
-        for (i, index_key) in index_keys {
-            self.db.insert(
-                part.index(i),
-                Tuple::new_with(index_key, &identity, Some(txn.id()), None),
-                txn,
-            )?;
-        }
+        let entries = index_keys
+            .into_iter()
+            .map(|(i, index_key)| {
+                (part.index(i), Tuple::new_with(index_key, &identity, Some(txn.id()), None))
+            })
+            .collect();
         // Best-effort, matching SchemaStats' own approximate nature
         // (bloom-filter uniqueness, a skippable send — see log_stat's
-        // own doc comment): logged right after this row's own insert
-        // succeeds, not after the whole batch/transaction commits, so
-        // a row whose transaction later rolls back may still count
-        // once here. Fine for stats used to guide query planning, not
-        // worth threading commit/rollback awareness into an already-
+        // own doc comment): logged as the row's tuples are built, not
+        // after its insert or its transaction commits, so a row whose
+        // insert fails or whose transaction later rolls back may still
+        // count once here. Fine for stats used to guide query planning,
+        // not worth threading commit/rollback awareness into an already-
         // lossy background collector for.
         if let Some(stats) = self.stats.lock().as_ref() {
             stats.log_stat(table.id, part.id, row.clone());
         }
-        Ok(())
+        Ok(RowTuples {
+            rows: part.rows(),
+            row: row_tuple,
+            entries,
+        })
     }
 
     // The mirror of insert_one_row_in_txn: removes `row_key`'s entry
@@ -1195,7 +1328,23 @@ where
             };
             let key_len = fields.len() + if is_unique { 0 } else { identity_len };
             let key_positions: Vec<usize> = (0..key_len).collect();
+            let unique_error = |e: SchemaError| match e {
+                SchemaError::DuplicateKey(_) if is_unique => SchemaError::UserError(format!(
+                    "cannot create unique index {name:?}: table {table_name:?} has \
+                     duplicate values for column(s) {column_names:?}"
+                )),
+                other => other,
+            };
             for (part, tree) in table.partitions.iter().zip(&trees) {
+                // As bytes, when the tree and its entries allow (see
+                // build_index_stored); else the general way below.
+                if self.db.rows_in_leaves(*tree)?
+                    && self
+                        .build_index_stored(&table, part.rows(), *tree, &txn, &fields, is_unique, limit)
+                        .map_err(unique_error)?
+                {
+                    continue;
+                }
                 let entries = IndexEntries::new(&self.db, table.clone(), part.rows(), &txn, &fields)?;
                 let mut sorted = SortSource::with_fields(
                     Box::new(entries),
@@ -1213,13 +1362,7 @@ where
                         let identity = IndexKey::new_from(&values[fields.len()..])?;
                         Ok(Some(Tuple::new_with(index_key, &to_allocvec(&identity)?, None, None)))
                     })
-                    .map_err(|e| match e {
-                        SchemaError::DuplicateKey(_) if is_unique => SchemaError::UserError(format!(
-                            "cannot create unique index {name:?}: table {table_name:?} has \
-                             duplicate values for column(s) {column_names:?}"
-                        )),
-                        other => other,
-                    })?;
+                    .map_err(unique_error)?;
             }
             self.db.commit(txn)?;
             Ok(())

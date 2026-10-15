@@ -688,6 +688,34 @@ impl PageTuple for SlottedPage {
         Ok(())
     }
 
+    fn record_bytes(&self, i: usize) -> Option<&[u8]> {
+        (i < self.slot_count()).then(|| self.record(i))
+    }
+
+    fn truncate(&mut self, n: usize) -> Result<(), StoreError> {
+        let count = self.slot_count();
+        if n >= count {
+            return Ok(());
+        }
+        // Their heap bytes are dead until the next compaction.
+        let dead: usize = (n..count).map(|i| self.slot(i).len as usize).sum();
+        self.set_slot_count(n);
+        self.prefixes.truncate(n);
+        self.id_ends.truncate(n);
+        self.dead_heap_bytes += dead;
+        Ok(())
+    }
+
+    fn append_encoded(&mut self, encoded: &[u8]) -> Result<(), StoreError> {
+        let id_end = id_end(encoded)?;
+        let prefix = crate::pages::anytuple::order_prefix_of(IdRef::wire(
+            crate::wire::tuple_id_ending(encoded, id_end)?,
+        ));
+        self.ensure_room(encoded.len())?;
+        self.insert_at(self.slot_count(), encoded, prefix, id_end);
+        Ok(())
+    }
+
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError> {
         Ok(self.find_exact(id)?.is_some())
     }

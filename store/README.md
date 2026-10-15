@@ -165,7 +165,7 @@ Every page has the same format (`pages/slotted.rs`):
   - Dead heap bytes are compacted only when an insert would not otherwise
     fit.
 - **Nothing is decoded to be read.** Slots are kept in key order. A binary
-  search compares an 8-byte order prefix held per slot, and reads a key from
+  search compares a 16-byte order prefix held per slot, and reads a key from
   its bytes only on a tie (`wire.rs`, a zero-allocation reader of the
   postcard encoding). A tuple is *lent* to the caller as a `TupleRef`
   borrowing the page (a few nanoseconds), rather than built as an owned
@@ -184,11 +184,19 @@ Every page has the same format (`pages/slotted.rs`):
 
 ## B-link trees
 
-Each table has two parts:
+A table's tree takes one of two forms (`TableType`; see
+ROWS_IN_LEAVES_DESIGN.md):
 
-- **An index tree**, keyed by the tuple's key.
-- **A chain of data pages** holding the tuples. A leaf entry maps a key to
-  the data page holding its row.
+- **Rows in the leaves** (`RowsInLeaves`, catalog tag 10): the leaves hold
+  the tuples themselves. A lookup searches one leaf; a write changes one
+  locked leaf; a full scan walks the leaves in key order. Each leaf has a
+  per-tuple cap (`Db::create_table_with_rows_in_leaves`), and a write asks
+  the descent for room for its own tuple, so leaves fill. squeal-sql
+  creates secondary indexes, and tables whose rows fit an eighth of a
+  page, this way.
+- **Data pages** (the older form, still read and written): an index tree
+  keyed by the tuple's key, whose leaf entries map a key to the data page
+  holding its tuple, and a chain of data pages holding the tuples.
 
 The tree is a **B-link tree** (Lehman–Yao). Every page carries a `high_key`
 (the upper bound of the keys it covers) and a link to its right sibling.
@@ -205,12 +213,24 @@ arrives with an out-of-date route finds its key at or above the
   of throughput under 16 threads.
 - **Splits are by bytes, not entry count.** Short keys pack a page full,
   whatever the table's largest key might be. The split separator becomes
-  the left page's new `high_key`.
+  the left page's new `high_key`. A slotted page splits as bytes: the cut
+  is chosen from the slots' sizes, the moved slots are copied to the
+  sibling as their encodings, the page is truncated, and only the
+  separator's key is decoded.
 - **A data page's free space is found by a cached tail hint.** Sequential
   inserts are O(1) amortized rather than O(table size).
 
+**Many rows go in a leaf at a time** (`Db::insert_many`, for a tree with
+its rows in its leaves): each row is checked, recorded and logged as an
+insert would be, but in key order, with one descent and one page write
+for the rows that belong in a leaf. squeal-sql writes a multi-row
+`INSERT` this way.
+
 **A new tree can be bulk-loaded** (`Db::bulk_load`), from tuples already
-sorted by key: `CREATE INDEX` does this. The tree is built bottom-up:
+sorted by key, or (`Db::bulk_load_stored`, rows in leaves) from each
+tuple's key as stored keycode bytes and its data, written into the leaves
+as their encodings with no `Tuple` made: `CREATE INDEX` does the latter.
+The tree is built bottom-up:
 - each tuple goes onto the data pages, and its entry into a leaf filled
   until a split would have been due;
 - each level above is built from the bounds of the one below, with the

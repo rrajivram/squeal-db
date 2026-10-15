@@ -141,10 +141,19 @@ the persistence convention (PERSISTENCE_VERSIONING_PROGRESS.md):
   - squeal-sql's index-only scan and identity reads take key fields
     straight from the bytes.
   - Seeks and bounds are built as bytes.
-- [ ] **4. Sorting on bytes.** `CREATE INDEX` writes each entry's key bytes
-  once into one buffer, sorts positions by comparing bytes, and hands the
-  bytes to the bulk loader. No row of values per entry, and no second
-  sorter: the query sort moves to the same representation.
+- [x] **4. Sorting on bytes** — for `CREATE INDEX`, done 2026-10-14.
+  - `Schema::build_index_stored`: one pass over the rows, decoding only
+    the index's columns into a reused buffer; each entry's key written once
+    as stored keycode bytes into one buffer (a stored identity key copied
+    as it is), its data after it; positions sorted by comparing key bytes;
+    and `Db::bulk_load_stored` writing each tuple's encoding straight into
+    the leaves. No row of values, key as values, or `Tuple` per entry.
+  - It needs a tree with its rows in its leaves, keys with no 00 byte in a
+    string, and entries within the query's memory; otherwise the general
+    sort (which spills) is used.
+  - Index build on 500k orders: 483 -> 139 ms.
+  - Still open: the query sort on the same representation (part of
+    BATCH_EXECUTION_DESIGN.md stage 5).
 - [ ] **5. Drop the per-slot arrays** (MEMORY_ISSUES.md section 3). With
   byte keys a page is searched on its own bytes. The 16-byte prefix and
   4-byte offset per slot go, or shrink to what a cache line needs.

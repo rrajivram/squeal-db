@@ -74,6 +74,28 @@ pub trait PageTuple: Send + Sync {
 
     fn add(&mut self, tuple: Tuple) -> Result<(), StoreError>;
 
+    /// Appends a tuple given as its encoding (Tuple::encode_into's bytes),
+    /// whose key is above every key here — a bulk load's, in order. Only a
+    /// SlottedPage keeps tuples as their bytes.
+    /// Tuple `i`'s encoding, for content that keeps its tuples as bytes.
+    fn record_bytes(&self, _i: usize) -> Option<&[u8]> {
+        None
+    }
+
+    /// Drops every tuple from position `n` on (the upper part a split
+    /// moved to a sibling). Only content that keeps tuples as bytes.
+    fn truncate(&mut self, _n: usize) -> Result<(), StoreError> {
+        Err(StoreError::UnknownError(
+            "only a slotted page is truncated".into(),
+        ))
+    }
+
+    fn append_encoded(&mut self, _encoded: &[u8]) -> Result<(), StoreError> {
+        Err(StoreError::UnknownError(
+            "only a slotted page takes an encoded tuple".into(),
+        ))
+    }
+
     fn contains(&self, id: &DBIdType) -> Result<bool, StoreError>;
 
     fn get(&self, id: &DBIdType) -> Result<Option<TupleType>, StoreError>;

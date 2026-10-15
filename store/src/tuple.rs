@@ -532,9 +532,9 @@ impl<'a> IdRef<'a> {
         }
     }
 
-    // A record key's keycode bytes, if it is lent as them (see
-    // keycode::stored): two such keys compare as their bytes do.
-    pub(crate) fn stored_bytes(&self) -> Option<&'a [u8]> {
+    /// A record key's keycode bytes, if it is lent as them (see
+    /// keycode::stored): two such keys compare as their bytes do.
+    pub fn stored_bytes(&self) -> Option<&'a [u8]> {
         match self.0 {
             Id::Wire(WireId::Stored(k)) => Some(k.bytes()),
             _ => None,
@@ -647,7 +647,7 @@ impl<'a> IdRef<'a> {
 }
 
 // A LEB128 varint, as postcard writes an unsigned integer.
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push(v as u8 | 0x80);
         v >>= 7;
