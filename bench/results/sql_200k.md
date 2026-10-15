@@ -11,31 +11,31 @@ size 200000, 4 reader threads, median of 3 run(s), each engine in its own proces
 
 | phase | squeal | squealp | sqlite | turso | same answers |
 |---|---:|---:|---:|---:|---|
-| Bulk load, one transaction (per row) | 1.85 µs | 1.85 µs | 551 ns | 1.02 µs | — |
-| Create 3 indexes (per index) | 121.6 ms | 125.8 ms | 36.1 ms | 93.2 ms | — |
-| `ANALYZE` | 48.9 ms | 48.0 ms | 17.0 ms | 23.0 ms | — |
-| Point lookup by primary key | 2.07 µs | 1.16 µs | 1.39 µs | 1.80 µs | yes |
-| Secondary-index lookup + aggregate | 11.01 µs | 9.82 µs | 9.88 µs | 8.32 µs | yes |
-| Index range (1 week of 52) + aggregate | 2.1 ms | 2.0 ms | 1.8 ms | 2.1 ms | yes |
-| Full scan with `GROUP BY` | 30.8 ms | 30.5 ms | 46.7 ms | 41.4 ms | yes |
-| Join + `GROUP BY` | 74.7 ms | 72.8 ms | 138.0 ms | 168.9 ms | yes |
-| Join, filtered, `ORDER BY` + `LIMIT` | 916.05 µs | 941.70 µs | 439.39 µs | 486.55 µs | yes |
-| Sort the whole table (`ORDER BY` without an index) | 100.0 ms | 93.1 ms | 65.6 ms | 67.0 ms | yes |
-| `IN (subquery)` | 23.3 ms | 23.5 ms | 21.6 ms | 27.5 ms | yes |
-| Correlated `EXISTS` | 25.4 ms | 25.5 ms | 27.2 ms | 25.8 ms | yes |
-| Correlated `NOT EXISTS` | 13.4 ms | 13.5 ms | 67.8 ms | 45.6 ms | yes |
-| `UPDATE` one row, autocommit | 4.9 ms | 4.7 ms | 4.1 ms | 4.1 ms | — |
-| `INSERT` one row, autocommit | 4.7 ms | 4.2 ms | 4.1 ms | 4.1 ms | — |
-| `UPDATE`, 100 rows per transaction (per row) | 89.91 µs | 83.97 µs | 74.04 µs | 70.95 µs | — |
-| Check: totals after the writes | 12.1 ms | 13.7 ms | 16.2 ms | 16.6 ms | yes |
-| Point lookups, 4 threads (per lookup) | 1.38 µs | 1.00 µs | 1.49 µs | 971 ns | yes |
+| Bulk load, one transaction (per row) | 1.27 µs | 1.27 µs | 545 ns | 1.02 µs | — |
+| Create 3 indexes (per index) | 61.5 ms | 55.3 ms | 35.2 ms | 83.6 ms | — |
+| `ANALYZE` | 50.3 ms | 49.2 ms | 17.5 ms | 22.1 ms | — |
+| Point lookup by primary key | 2.01 µs | 1.15 µs | 1.33 µs | 1.66 µs | yes |
+| Secondary-index lookup + aggregate | 10.14 µs | 9.44 µs | 9.61 µs | 7.83 µs | yes |
+| Index range (1 week of 52) + aggregate | 1.8 ms | 1.8 ms | 1.8 ms | 1.9 ms | yes |
+| Full scan with `GROUP BY` | 30.2 ms | 30.4 ms | 45.1 ms | 39.8 ms | yes |
+| Join + `GROUP BY` | 63.8 ms | 64.4 ms | 135.0 ms | 159.4 ms | yes |
+| Join, filtered, `ORDER BY` + `LIMIT` | 888.45 µs | 901.76 µs | 423.89 µs | 447.82 µs | yes |
+| Sort the whole table (`ORDER BY` without an index) | 78.1 ms | 78.4 ms | 63.6 ms | 64.0 ms | yes |
+| `IN (subquery)` | 23.0 ms | 22.9 ms | 21.2 ms | 25.3 ms | yes |
+| Correlated `EXISTS` | 24.4 ms | 24.7 ms | 26.5 ms | 24.9 ms | yes |
+| Correlated `NOT EXISTS` | 13.0 ms | 13.0 ms | 66.7 ms | 42.5 ms | yes |
+| `UPDATE` one row, autocommit | 4.8 ms | 4.9 ms | 4.1 ms | 4.1 ms | — |
+| `INSERT` one row, autocommit | 4.6 ms | 4.6 ms | 4.1 ms | 4.3 ms | — |
+| `UPDATE`, 100 rows per transaction (per row) | 87.01 µs | 76.82 µs | 75.01 µs | 83.08 µs | — |
+| Check: totals after the writes | 11.5 ms | 9.0 ms | 13.8 ms | 19.8 ms | yes |
+| Point lookups, 4 threads (per lookup) | 1.31 µs | 957 ns | 1.39 µs | 897 ns | yes |
 
 | memory | squeal | squealp | sqlite | turso |
 |---|---:|---:|---:|---:|
 | after open | 3 MiB | 3 MiB | 3 MiB | 3 MiB |
-| after load | 72 MiB | 72 MiB | 35 MiB | 48 MiB |
-| after reads | 75 MiB | 75 MiB | 35 MiB | 62 MiB |
-| after writes | 108 MiB | 107 MiB | 35 MiB | 63 MiB |
-| at end | 108 MiB | 108 MiB | 45 MiB | 86 MiB |
-| peak | 143 MiB | 143 MiB | 46 MiB | 86 MiB |
+| after load | 85 MiB | 85 MiB | 35 MiB | 48 MiB |
+| after reads | 75 MiB | 77 MiB | 35 MiB | 62 MiB |
+| after writes | 97 MiB | 99 MiB | 35 MiB | 63 MiB |
+| at end | 97 MiB | 99 MiB | 45 MiB | 85 MiB |
+| peak | 147 MiB | 144 MiB | 45 MiB | 86 MiB |
 

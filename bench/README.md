@@ -75,43 +75,44 @@ point lookup gave 10.5 µs, not the report's 38.8.
 
 ### SQL: squeal-db, SQLite, Turso (200k orders)
 
-Re-measured 2026-10-13, `default` profile, median of 3, after rows moved
+Re-measured 2026-10-14, `default` profile, median of 3, after rows moved
 into the B+tree leaves (ROWS_IN_LEAVES_DESIGN.md), plans kept per
 statement shape (PLANNING_DESIGN.md) and the first batch work
-(BATCH_EXECUTION_DESIGN.md). `squeal` is sent SQL text; `squealp` runs
+(BATCH_EXECUTION_DESIGN.md), and bulk loads and index builds moved to
+bytes. `squeal` is sent SQL text; `squealp` runs
 prepared statements, as SQLite and Turso do.
 
 | phase | squeal | squealp | SQLite | Turso |
 |---|---:|---:|---:|---:|
-| Bulk load, one transaction, per row | 1.85 µs | 1.85 µs | 551 ns | 1.02 µs |
-| Create an index | 122 ms | 126 ms | 36 ms | 93 ms |
-| Point lookup by primary key | 2.07 µs | **1.16 µs** | 1.39 µs | 1.80 µs |
-| Secondary-index lookup + aggregate | 11.0 µs | 9.8 µs | 9.9 µs | 8.3 µs |
-| Index range (1 week) + aggregate | 2.1 ms | 2.0 ms | 1.8 ms | 2.1 ms |
-| Full scan with `GROUP BY` | **30.8 ms** | **30.5 ms** | 46.7 ms | 41.4 ms |
-| Join + `GROUP BY` | **74.7 ms** | **72.8 ms** | 138 ms | 169 ms |
-| Join, filtered, `ORDER BY` + `LIMIT` | 0.92 ms | 0.94 ms | 0.44 ms | 0.49 ms |
-| Sort the whole table | 100 ms | 93 ms | 66 ms | 67 ms |
-| `IN (subquery)` | 23 ms | 24 ms | 22 ms | 28 ms |
-| Correlated `EXISTS` | 25 ms | 26 ms | 27 ms | 26 ms |
-| Correlated `NOT EXISTS` | **13 ms** | **14 ms** | 68 ms | 46 ms |
-| `UPDATE` one row, autocommit | 4.9 ms | 4.7 ms | 4.1 ms | 4.1 ms |
-| `INSERT` one row, autocommit | 4.7 ms | 4.2 ms | 4.1 ms | 4.1 ms |
-| `UPDATE`, 100 rows a transaction, per row | 90 µs | 84 µs | 74 µs | 71 µs |
-| Point lookups on 4 threads | 1.38 µs | 1.00 µs | 1.49 µs | 0.97 µs |
+| Bulk load, one transaction, per row | 1.27 µs | 1.27 µs | 545 ns | 1.02 µs |
+| Create an index | 62 ms | 55 ms | 35 ms | 84 ms |
+| Point lookup by primary key | 2.01 µs | **1.15 µs** | 1.33 µs | 1.66 µs |
+| Secondary-index lookup + aggregate | 10.1 µs | 9.4 µs | 9.6 µs | 7.8 µs |
+| Index range (1 week) + aggregate | 1.8 ms | 1.8 ms | 1.8 ms | 1.9 ms |
+| Full scan with `GROUP BY` | **30.2 ms** | **30.4 ms** | 45.1 ms | 39.8 ms |
+| Join + `GROUP BY` | **63.8 ms** | **64.4 ms** | 135 ms | 159 ms |
+| Join, filtered, `ORDER BY` + `LIMIT` | 0.89 ms | 0.90 ms | 0.42 ms | 0.45 ms |
+| Sort the whole table | 78 ms | 78 ms | 64 ms | 64 ms |
+| `IN (subquery)` | 23 ms | 23 ms | 21 ms | 25 ms |
+| Correlated `EXISTS` | 24 ms | 25 ms | 27 ms | 25 ms |
+| Correlated `NOT EXISTS` | **13 ms** | **13 ms** | 67 ms | 43 ms |
+| `UPDATE` one row, autocommit | 4.8 ms | 4.9 ms | 4.1 ms | 4.1 ms |
+| `INSERT` one row, autocommit | 4.6 ms | 4.6 ms | 4.1 ms | 4.3 ms |
+| `UPDATE`, 100 rows a transaction, per row | 87 µs | 77 µs | 75 µs | 83 µs |
+| Point lookups on 4 threads | 1.31 µs | 0.96 µs | 1.39 µs | 0.90 µs |
 
 Memory (physical footprint):
 
 | | squeal-db | SQLite | Turso |
 |---|---:|---:|---:|
-| after the load | 72 MiB | 35 MiB | 48 MiB |
-| at the end | 108 MiB | 45 MiB | 86 MiB |
-| peak | 143 MiB | 46 MiB | 86 MiB |
+| after the load | 85 MiB | 35 MiB | 48 MiB |
+| at the end | 97 MiB | 45 MiB | 85 MiB |
+| peak | 147 MiB | 45 MiB | 86 MiB |
 
-Against the 2026-10-10 run: point lookups 9.5 µs -> 2.1 µs as text and
-1.2 µs prepared, secondary-index lookups 30 -> 11 µs, bulk load 8.4 -> 1.9
-µs a row, index builds 715 -> 122 ms, full-scan `GROUP BY` 46 -> 31 ms,
-join + `GROUP BY` 107 -> 75 ms, peak memory 223 -> 143 MiB.
+Against the 2026-10-10 run: point lookups 9.5 µs -> 2.0 µs as text and
+1.15 µs prepared, secondary-index lookups 30 -> 10 µs, bulk load 8.4 ->
+1.3 µs a row, index builds 715 -> 55-62 ms, full-scan `GROUP BY` 46 -> 30
+ms, join + `GROUP BY` 107 -> 64 ms, peak memory 223 -> 147 MiB.
 
 At 1M orders ([`sql_1m.md`](results/sql_1m.md)):
 - **squeal-db leads on the blocking queries.** Join + `GROUP BY` takes
