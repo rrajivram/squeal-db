@@ -4,7 +4,7 @@ A transactional database engine in Rust: one generic, indexable,
 transactional **blob store**, with SQL and MongoDB-style JSON documents built
 on top of it as separate layers.
 
-**Try it in a browser:** https://squeal-db-demo.rrajivram-seattle.workers.dev
+**Try it in a browser:** https://db.rrajivram.com
 (SQL and JSON documents, running entirely in WebAssembly).
 
 ## The thesis
